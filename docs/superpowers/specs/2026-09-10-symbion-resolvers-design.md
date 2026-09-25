@@ -1,7 +1,7 @@
 # Symbion resolvers — the catalog names, the project matches
 
 **Date:** 2026-09-10
-**Status:** Design approved (brainstorm) — ready for the implementation plan.
+**Status:** Implemented. A design record: the reasoning still holds, and the details are as of this date. What symbion does now is in the code, the tests, README.md and SKILL.md. Dated notes mark the decisions reversed since.
 **Amends:** `2026-09-04-symbion-design.md` §"Catalogs" (a catalog type's match rule is the built-in substring rule *unless the project declares a resolver command*); `2026-09-10-symbion-kinds-design.md` §"Out of scope" (this is the "next spec" it named).
 
 **Motivation:** An idea filed on 2026-09-10 by an adopter whose target names are measured values. `catalog.resolve` is "exact, else unique substring, else the input; ambiguity refuses". The refusal half is what such a project depends on and is kept. The matching half fragments a numeric catalog silently: `3.1416` is not a substring of `3.14159`, so it falls through to "the input" and mints a second target. Nothing raises, and the investigation then has two heads — the outcome arcs exist to prevent. Measured quantities vary in their trailing digits by construction, so for a numeric type this is the normal case, not an edge. What such a project wants instead is a numeric rule: match inside a window, return the canonical form on a miss, and refuse on more than one hit. This spec lets a project declare that rule, as a command, beside the catalog it applies to. Symbion still knows nothing about what the names measure.
@@ -68,7 +68,7 @@ A configured command must not write to the store. It would wait on the lock its 
 
 **`summary.py` / `schema`.** The targets list gains `resolver` beside `catalog` for a type that has one (`null` otherwise), so the hook and `symbion schema` show which types match by command.
 
-**Docs.** The starter toml gets the block above. `src/symbion/data/SKILL.md` gets a "Resolvers" paragraph beside the catalogs one, then `symbion init` here. README's config section names the table.
+**Docs.** The starter toml gets the block above (noted 2026-09-25: commented out, as an example to uncomment). `src/symbion/data/SKILL.md` gets a "Resolvers" paragraph beside the catalogs one, then `symbion init` here. README's config section names the table.
 
 **Cost.** A canonicalization on a resolver type is the catalog once per write plus the resolver once per name, instead of the catalog once per row. For a store-derived catalog the catalog is a `symbion` start, a few hundred milliseconds. The lock is held across every resolution in the write, so the worst case is rows × command_timeout (45 rows at the 30 s default is over twenty minutes); readers never wait, writers wait for the whole write. A per-row release would let a neighbour mint between rows, so the ceiling stays.
 
@@ -82,7 +82,7 @@ A configured command must not write to the store. It would wait on the lock its 
 | exit 2, no matches | `resolve_with` | `CatalogError` naming the command |
 | other exit, timeout | `resolve_with` | `CatalogError` naming the command and stderr |
 | empty catalog, resolver declared, a query in hand | — | not an error; the resolver gets zero candidates |
-| empty catalog, no resolver | `names` | `CatalogError` "produced no names", as today |
+| empty catalog, no resolver | `names` | `CatalogError` "produced no names", as today (amended 2026-09-20: `pool` raises its own error, naming the deadlock: a store-derived catalog with no resolver can never mint its first row) |
 | empty catalog on a seed sweep, resolver or not | `names` | `CatalogError` "produced no names": a sweep has no query |
 | catalog exits non-zero, empty stdout, resolver declared | `names` | `CatalogError` naming the command and stderr; the exit is checked before emptiness |
 
@@ -97,7 +97,7 @@ No new file, no migration, no change to `notes.jsonl`.
 
 ## Testing
 
-Both directions, per the project's rules. Resolvers are shell one-liners or two-line scripts written to `tmp_path`, the way `test_catalog.py` already drives catalog commands.
+Both directions: each test is shown to fail on the bug it guards. Resolvers are shell one-liners or two-line scripts written to `tmp_path`, the way `test_catalog.py` already drives catalog commands.
 
 - **Exit 0 stores the printed name**, including one outside the candidate list; the stored row's `target.name` is the printed string, not the query.
 - **Exit 2 raises `AmbiguousName`** whose `candidates` are the printed lines, in order; the `add` stores nothing. Exit 2 with nothing printed raises `CatalogError`.

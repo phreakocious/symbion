@@ -215,6 +215,22 @@ def canonicalize_rows(ctx: Ctx, rows) -> list[dict]:
     return out
 
 
+def rename_target(ctx: Ctx, target_type: str, old: str, new: str, *,
+                  author: str) -> tuple[int, int, str]:
+    """`store.rename_target` with `new` resolved the way `add` resolves a
+    name (the store call takes it as typed). Returns (re-targeted,
+    re-pointed, the name stored), so the caller can print what `new`
+    became."""
+    stored = [new]
+
+    def canon(n):
+        stored[0] = canonicalize_names(ctx, target_type, [n])[0]
+        return stored[0]
+    moved, refs = store.rename_target(ctx.store_dir, target_type, old, new,
+                                      author=author, canonicalize=canon)
+    return moved, refs, stored[0]
+
+
 def canonicalize_names(ctx: Ctx, target_type: str, names) -> list[str]:
     """`store.seed_arc` callback for EXPLICIT names; a sweep never calls it."""
     one = _canonicalizer(ctx)

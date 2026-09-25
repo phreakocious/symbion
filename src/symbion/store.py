@@ -717,7 +717,8 @@ def _rename_unlocked(store, notes, kinds, target_type, old, new, author) -> tupl
     return moved, repointed
 
 
-def rename_target(store, target_type, old, new, author=None) -> tuple[int, int]:
+def rename_target(store, target_type, old, new, author=None,
+                  canonicalize=None) -> tuple[int, int]:
     """Re-target every HEAD note for (target_type, old) onto (target_type, new),
     and re-point every ref to it, via supersede so the old rows remain as
     history. Projects rename catalog objects; notes key on the name string, so a rename orphans them without
@@ -739,9 +740,16 @@ def rename_target(store, target_type, old, new, author=None) -> tuple[int, int]:
     counting work that only happened once; with it, the second call's scan
     happens strictly after the first's lock is released and sees nothing
     left to rename. This also drops the reload-per-row that made the old
-    per-note-locked version O(n^2) on a sweep of n."""
+    per-note-locked version O(n^2) on a sweep of n.
+
+    `canonicalize(new) -> new` runs inside the lock, as in `add_many`:
+    without it `new` is stored as typed, and a short sha stays short.
+    `old` is never resolved: it names a departed object, which a live
+    catalog match would redirect."""
     ensure_store(store)
     with _lock(store):
+        if canonicalize is not None:
+            new = canonicalize(new)
         return _rename_unlocked(store, _load_unlocked(store), K.read_kinds(store),
                                 target_type, old, new, author)
 

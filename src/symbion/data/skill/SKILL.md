@@ -189,13 +189,13 @@ aid=$(symbion arc create --name "Adoption" --scope item --desc "…")
 symbion add --kind task --type item --name "write the README" --arc-id "$aid" --body "why; what done looks like"
 symbion arc todo "$aid" --json     # open items, same note rows as `list --json`
 symbion resolve <id>                      # tick the box
-symbion list --arc "$aid" --json    # every item, resolved included: how a finished campaign reads back
+symbion list --arc "$aid" --json    # every row in the arc, resolved included: how a finished campaign reads back
 ```
 
 A checklist item is any row in the arc that carries a status, so a `bug`
 added with `--arc-id` is a box too, not just context beside one; several
-items may share a target, and each is its own box. `arc todo` and
-`list --arc` are the same set, the first filtered to what is still open.
+items may share a target, and each is its own box. `arc todo` is the
+open boxes; `list --arc` is every row in the arc, notes and decisions too.
 
 `seed` mints one *bodiless* task per name; it exists for fanning out
 over a catalog, where the name is the whole ticket.
@@ -319,15 +319,17 @@ and never copy its bullets into rows a second time: two copies of one list is
 how the stale one ends up read as authoritative. Measured 2026-09-20: 33
 items in both a handoff file and one store, nothing pointing either way, and
 each wrap re-copied items the store had already resolved. The `/wrap` and
-`/next` of the continuity plugin (0.8.5 and later) honour a file that says
-so, without naming any tool, so that one sentence in the file is the whole seam.
+`/next` of the continuity plugin (0.8.5 and later,
+https://github.com/nullphase-net/enfurbish) honour a file that says so,
+without naming any tool, so that one sentence in the file is the whole seam.
 
 A workaround for symbion itself ("`show` does not exist", "never run it from
 inside the store") does not go into the handoff or CLAUDE.md either: it
-outlives the fix. File it in this project's store as a row tagged `symbion`,
-and tell the user, who can take it to
-https://github.com/phreakocious/symbion/issues. Measured 2026-09-24: four
-repos still told their agents `show` did not exist after it shipped.
+outlives the fix. Report it at https://github.com/phreakocious/symbion/issues:
+draft the issue and offer it to the user, who decides whether to file it,
+since the tracker is public. When the user's own instructions name another
+place for symbion reports, use that. Measured 2026-09-24: four repos still
+told their agents `show` did not exist after it shipped.
 
 ## Quick reference
 

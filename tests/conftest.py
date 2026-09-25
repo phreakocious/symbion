@@ -16,8 +16,12 @@ def _isolated_home(tmp_path_factory, monkeypatch):
     """`init` links the skill under ~/.claude and `summary` reads it there:
     without this every init test would write into the real home, and every
     summary test would read whatever that home holds. Git identity is pinned
-    for the same reason: a fresh HOME has no ~/.gitconfig."""
+    for the same reason: a fresh HOME has no ~/.gitconfig. The ceiling stops
+    git's repo search at pytest's temp root: with TMPDIR inside a repo, an
+    "outside any git repo" test otherwise found that repo, and `init` wrote a
+    `.symbion` into its root."""
     monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path_factory.getbasetemp()))
     for k in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
         monkeypatch.setenv(k, "t")
     for k in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):

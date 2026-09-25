@@ -40,7 +40,7 @@ if [ ! -e "$store/notes.jsonl" ] && [ ! -r "$root/.symbion" ] && [ -z "$SYMBION_
   exit 0
 fi
 if ! command -v symbion >/dev/null 2>&1; then
-  [ -e "$store/notes.jsonl" ] && echo "symbion: store exists at $store but 'symbion' is not on PATH -- see Install in symbion's own README"
+  [ -e "$store/notes.jsonl" ] && echo "symbion: store exists at $store but 'symbion' is not on PATH -- see Install at https://github.com/phreakocious/symbion"
   exit 0
 fi
 cd "$root" 2>/dev/null || true   # a failed cd falls back to cwd; the hook never fails a session

@@ -1026,10 +1026,10 @@ def _dispatch(args, ctx) -> int:
         return 0 if ok else 1
 
     if args.cmd == "rename":
-        moved, refs = store.rename_target(store_dir, args.type, args.old, args.new,
-                                          author=_resolved_author(args))
+        moved, refs, new = api.rename_target(ctx, args.type, args.old, args.new,
+                                             author=_resolved_author(args))
         print(f"re-targeted {moved} note(s), re-pointed {refs} ref(s): "
-              f"{args.type}:{args.old} -> {args.new}")
+              f"{args.type}:{args.old} -> {new}")
         return 0 if moved or refs else 1
 
     if args.cmd == "serve":

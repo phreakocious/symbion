@@ -1,11 +1,6 @@
-
-TODO.md
-IDEAS.md
-NEXT_SESSION.md
 CLAUDE.local.md
 
 .venv/
-.superpowers/
 .claude/worktrees/
 __pycache__/
 build/

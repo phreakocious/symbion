@@ -43,9 +43,11 @@ def main(ctx, *, author: str, port=None, show: bool = True,
     # Only the top-level process announces the URL. With --reload, uvicorn
     # spawns workers that re-run main(); their port is unused.
     if multiprocessing.current_process().name == "MainProcess":
-        print(f"symbion → http://localhost:{port}  (writing as {author})", flush=True)
+        print(f"symbion → http://127.0.0.1:{port}  (writing as {author})", flush=True)
+    # Loopback only: the GUI writes rows with no authentication, and
+    # ui.run() defaults to 0.0.0.0 outside native mode.
     ui.run(
-        port=port, show=show, reload=reload,
+        host="127.0.0.1", port=port, show=show, reload=reload,
         uvicorn_reload_dirs=str(Path(__file__).resolve().parent),
         uvicorn_reload_includes="*.py",
         title="symbion", dark=True, show_welcome_message=False,

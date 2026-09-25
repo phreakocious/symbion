@@ -1,7 +1,8 @@
 # Symbion GUI — a human browse-and-write surface over the same store
 
 **Date:** 2026-09-08
-**Status:** Design approved (brainstorm); spec under review before the implementation plan.
+**Status:** Implemented. A design record: the reasoning still holds, and the details are as of this date. What symbion does now is in the code, the tests, README.md and SKILL.md. Dated notes mark the decisions reversed since.
+**Changed since:** the vocabulary spec (2026-09-08) renamed activity→arc throughout, routes and api functions included; the kinds spec (2026-09-10) made the home boards one per kind; the resolvers spec (2026-09-10) split `canon_refs` into `check_refs` and `canonicalize_rows`.
 **Amends:** `2026-09-04-symbion-design.md` §Goal & non-goals, §CLI surface.
 
 **Motivation:** Symbion's v1 spec lists **a GUI** as its first non-goal, and designs `supersede --add-tag priority` explicitly so that `priority` "gets its mechanism *without a GUI*" (`2026-09-04-symbion-design.md:207`). That was right for v1: the store had to prove it was worth reading before anything was built to read it prettily. It is now being reversed deliberately, for one reason the CLI cannot address — **browsing**. A tag is a link; a target is a link; a supersede chain is a thread. In a terminal each of those is a fresh command you have to compose from memory. On a page it is a click.

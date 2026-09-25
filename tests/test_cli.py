@@ -234,6 +234,27 @@ def test_rename_reports_refs_and_a_ref_only_name_exits_0(tmp_path, capsys):
         "re-targeted 0 note(s), re-pointed 1 ref(s): item:old -> new\n"
 
 
+def test_rename_resolves_the_new_name_the_way_add_does(repo, tmp_path, capsys):
+    """rename wrote `new` as typed, where add resolves it: a short sha stayed
+    short, and `context --commit` on that sha missed the moved row. The
+    target and the re-pointed ref both land on the full sha."""
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+         "--allow-empty", "-m", "c1")
+    old, new = (subprocess.run(["git", "rev-parse", r], cwd=repo, check=True,
+                               capture_output=True, text=True).stdout.strip()
+                for r in ("HEAD~1", "HEAD"))
+    s = tmp_path / "s"
+    run("add", "--kind", "note", "--type", "commit", "--name", old, store_dir=s)
+    run("add", "--kind", "note", "--type", "project", "--ref", f"commit:{old}",
+        store_dir=s)
+    capsys.readouterr()
+    assert run("rename", old, new[:7], "--type", "commit", store_dir=s) == 0
+    assert capsys.readouterr().out.endswith(f" -> {new}\n")
+    hs = store.heads(store.load(s))
+    assert [n.target.name for n in hs if n.target.type == "commit"] == [new]
+    assert [r.name for n in hs for r in n.refs] == [new]
+
+
 def test_seed_dry_run_creates_nothing(tmp_path, capsys):
     run("arc", "create", "--name", "x", "--scope", "item", store_dir=tmp_path)
     aid = store.load_arcs(tmp_path)[0].id

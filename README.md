@@ -1,7 +1,8 @@
 # symbion
 
 A per-project notebook and ticket registry for small projects, driven by a
-human and a coding agent through one CLI.
+human and a coding agent through one CLI. The CLI works on its own; the agent
+surface (a skill and a SessionStart hook) is written for Claude Code.
 
 A note is dated, attributed, retractable, and attached to something stable: a
 commit, a file, a free-form item, or the project as a whole. Seven kinds by
@@ -15,7 +16,7 @@ per-object checklist with its decisions and notes filed under it. The store is
 a private sibling git repo of JSONL, so checking out an old branch never
 time-travels your tickets.
 
-Design and rationale: `docs/superpowers/specs/2026-09-04-symbion-design.md`.
+Design and rationale: [`docs/superpowers/specs/2026-09-04-symbion-design.md`](https://github.com/phreakocious/symbion/blob/main/docs/superpowers/specs/2026-09-04-symbion-design.md).
 The agent-facing surface, which is also the best command reference:
 `src/symbion/data/skill/SKILL.md` (linked at `~/.claude/skills/symbion`).
 
@@ -42,7 +43,7 @@ Without pipx or uv, install into a venv and put the console script on PATH:
 ```bash
 cd /path/to/symbion
 python3 -m venv .venv && .venv/bin/pip install -e .
-ln -s "$PWD/.venv/bin/symbion" ~/.local/bin/symbion
+ln -s "$PWD/.venv/bin/symbion" ~/.local/bin/symbion   # or any directory on your PATH
 ```
 
 Verify from any other directory:
@@ -100,8 +101,8 @@ ignored)`; one marked not ignored goes in with the next `git add -A`.
 ```
 - We use symbion for durable notes and tickets. Surface friction with it so it can be addressed.
 ```
-If that repo's `CLAUDE.md` is gitignored or gated by `/affirm`, propose the
-line to its owner instead of writing it.
+If that repo's `CLAUDE.md` is gitignored or its owner reviews every change to
+it, propose the line to the owner instead of writing it.
 
 ## First session
 
@@ -281,9 +282,10 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui,tty]'
 .venv/bin/python -m pytest -q
 ```
 
-The spec is binding and records why each decision was made. `SKILL.md` is
+The specs are dated design records: why each decision was made, and the design as of that date. `SKILL.md` is
 what an agent reads; keep it short and keep its footgun list honest. It lives
-at `src/symbion/data/skill/SKILL.md`, beside `adoption.md` and the hook, and
-`~/.claude/skills/symbion` links to that directory: an edit reaches every
-session on this machine at once, the same way an edit to `src/` reaches every
-`symbion` call through the editable install.
+at `src/symbion/data/skill/SKILL.md`, beside `adoption.md` and the hook. If
+this clone is your installed symbion (an editable install, then `symbion
+init`), `~/.claude/skills/symbion` links to that directory: an edit reaches
+every session on the machine at once, the same way an edit to `src/` reaches
+every `symbion` call.

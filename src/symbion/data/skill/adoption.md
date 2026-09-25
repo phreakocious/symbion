@@ -18,8 +18,8 @@ each, and some scratch items were already closed by later commits.
    `NEXT_SESSION.md`, `.superpowers/`) first: it is the only copy and it is
    about to go away. Tracked docs (`CLAUDE.md`, `NOTES.md`, `docs/audits/`)
    get a pointer, never a copy. `~/.claude` memory only when no tracked file
-   already says it. A `CLAUDE.md` that is gitignored or `/affirm`-gated is
-   the owner's: propose, do not write. Several candidate rules go in as one
+   already says it. A `CLAUDE.md` that is gitignored, or whose owner reviews
+   every change to it, is the owner's: propose, do not write. Several candidate rules go in as one
    arc, one `question` per rule, so each is accepted or
    declined on its own. Retros and handoffs: their
    open items, plus any lesson that names a file and that no tracked file
@@ -61,10 +61,9 @@ each, and some scratch items were already closed by later commits.
      migration.
    - **The handoff file.** Replace its open-threads section with the one
      SKILL.md's "Session end" describes, and strike the other items that became rows;
-     its prose stays. Continuity reads that section as delegation, and a
-     hand edit only marks the file `stamp:edited`. Left for the next
-     `/wrap`, migrated threads stayed in it, the list `/next` would brief
-     from (2026-09-23).
+     its prose stays. Edit it now, by hand: left to a tool that rewrites the
+     file at session end, the migrated threads stayed in it, and the next
+     session was briefed from them (2026-09-23).
    - **Auto-memory** (`~/.claude/projects/<slug>/memory/`). Copy the migrated
      topic files verbatim to `<store>/archive/claude-memory/`, delete them
      and their `MEMORY.md` lines, and make `MEMORY.md` state the split: memory

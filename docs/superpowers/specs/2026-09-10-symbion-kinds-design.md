@@ -1,7 +1,8 @@
 # Symbion kinds — labels are the project's, shapes are symbion's
 
 **Date:** 2026-09-10
-**Status:** Design approved (brainstorm) — ready for the implementation plan.
+**Status:** Implemented. A design record: the reasoning still holds, and the details are as of this date. What symbion does now is in the code, the tests, README.md and SKILL.md. Dated notes mark the decisions reversed since.
+**Changed since:** the resolvers spec (2026-09-10) added `resolver` to `schema`'s targets.
 **Amends:** `2026-09-08-symbion-vocabulary-design.md` ("Seven kinds, fixed" becomes seven *default labels* on three fixed bits); `2026-09-04-symbion-design.md` §"Note schema" (`status` is determined by the kind's `status` bit, not by a hard-coded set); `2026-09-08-symbion-gui-design.md` (the home page's boards are derived from the table).
 
 **Motivation:** Two ideas filed on 2026-09-10 by an adopter whose results are measurements asked for an eighth kind, `prediction`, and noted that `measurement` has no home among the seven. Both are one symptom: the seven labels are symbion's, and a project whose work is not software (the research notebook symbion was extracted from is one) has words of its own that are correct where they live. The 2026-09-08 spec fixed the labels for a software audience and was right to; what it also fixed, without needing to, was the *set*. This spec separates the two. Symbion owns the few behaviours a kind can have. The project owns the labels, and ships with the seven.
@@ -89,7 +90,7 @@ Target types are not in scope: `commit`, `item`, `project` and `arc` keep their 
 - `resolve` takes `--result`; its help reads "mark an open row resolved". On a `status` + `verdict` row, omitting it is refused by the store rule above, and the error names `--result`.
 - `arc seed --kind LABEL`, default `task`. **Eligible kinds have `status`, and neither `parked` nor `verdict`**: a seeded row is a checklist box that is nothing but its name, and `seed_arc` never stamps provenance, so a seeded `verdict` row would be a prediction with no commitment sha and no falsifier. An ineligible label, or a default `task` that is undeclared or ineligible, is refused with the reason and the flag.
 - `_print_note` renders `checked=… result=… state=…` on the `verdict` bit.
-- `symbion schema` is new (below); the session hook runs it after `summary`.
+- `symbion schema` is new (below); the session hook runs it after `summary`. (Reversed 2026-09-24: see open question 2.)
 
 **`summary.py`.** The three named counts become one field, `open`: an object keyed by label in declared order, one entry per non-parked `status` kind, counting open heads **outside arcs**. This is one simplification over today, where bugs inside arcs were counted and tasks were not: an arc's rows are reached through its own progress line, for every kind. `standalone_tasks` and per-label `open_notes` calls go; `open_notes(notes, kind)` stays as the generic helper. The rendered line is label-first so no label is pluralised (`anomalys`):
 
@@ -127,7 +128,7 @@ targets
 
 Consumers:
 
-1. **The SessionStart hook** prints `symbion schema` after `symbion summary`, every session. The vocabulary is what an agent must know before its first write, the hook is the one read that is guaranteed, and it costs ten lines.
+1. **The SessionStart hook** prints `symbion schema` after `symbion summary`, every session. (Reversed 2026-09-24: see open question 2.) The vocabulary is what an agent must know before its first write, the hook is the one read that is guaranteed, and it costs ten lines.
 2. **SKILL.md** embeds `` !`symbion schema` `` where the "Picking a kind" table is today (Claude Code substitutes a skill's inline command output at invocation time; no frontmatter needed). The table is deleted from SKILL.md. What stays is fixed text: one paragraph per bit saying what it does mechanically, the `--body`-is-markdown note, and the write-only-use guard. The `symbion init` SKILL/hook drift test is unaffected: the embedded text is the command, not its output.
 3. **A human** runs it to see the words before editing the toml.
 
@@ -167,7 +168,7 @@ No new file. No migration.
 
 ## Testing
 
-Both directions, per the project's rules.
+Both directions: each test is shown to fail on the bug it guards.
 
 - A declared label is accepted by `add`, `add --from-json`, `list --kind` and the reader; an undeclared one is refused by each, and the reader files it under `load_malformed` with the label in the error.
 - `parked` without `status` is refused at config load with the offending label; `parked` with `status` loads. An unknown key in a kind entry is refused.
@@ -190,7 +191,7 @@ Both directions, per the project's rules.
 ## Open questions
 
 1. **`note` heads in the default `context` view.** Included by the plain-kind rule. If a store's note count makes `context` noisy, the rule narrows to "plain kinds tagged for context" or reverts to decisions only; decide after using it. **Decided 2026-09-22, after use: the rule stays; the exit was missing.** Measured on symbion's own store: 60 rows in the default view, 24 of them note heads. Read one by one, 11 were durable gotchas (what the rule is for) and 13 were "built at" markers, progress logs, review records and wishes: finished work written as a note, which a plain kind could never leave, since it has no status to resolve and `supersede` cannot change a kind. Decisions-only would have dropped the 11 with the 13; an include-tag needs remembering on every future gotcha. So the tag runs the other way: a plain head tagged `retired` (`supersede --add-tag retired`) leaves the default view and stays on its object and in `list`. Scoped to plain kinds: an open row tagged `retired` is still open work and stays in. The 13 were retired and the two GUI wishes became tasks; the view read 48 rows after, 11 of them notes.
-2. **The schema at every session start.** Ten lines, every session, on every store. If it reads as noise on default stores, print it only when `declared` is true and leave the SKILL embed as the always-on surface.
+2. **The schema at every session start.** Ten lines, every session, on every store. If it reads as noise on default stores, print it only when `declared` is true and leave the SKILL embed as the always-on surface. **Decided 2026-09-24:** out of the hook. SKILL.md embeds it, so an agent with the skill loaded read it twice, and it changes only when `symbion.toml` does.
 
 ## Out of scope
 

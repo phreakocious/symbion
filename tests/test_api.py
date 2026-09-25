@@ -309,6 +309,7 @@ def test_every_write_requires_author_by_keyword(repo, tmp_path):
         (api.retag,           (ctx, "someid")),
         (api.seed,            (ctx, "actid", "item", ["x"])),
         (api.create_arc, (ctx, "n", "d", "item")),
+        (api.rename_target,   (ctx, "item", "old", "new")),
     ]
     assert sorted(fn.__name__ for fn, _ in cases) == sorted(writers), \
         "cases must cover every author-required writer api.py actually has"

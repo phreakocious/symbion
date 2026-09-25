@@ -20,7 +20,9 @@ Reads source text rather than importing, so it runs without nicegui installed.
 """
 from __future__ import annotations
 
+import io
 import re
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -51,17 +53,26 @@ def _store_aliases(text: str) -> set:
     return names
 
 
-def _violations(text: str) -> set:
-    """Store attributes touched here that are not reads on the allowlist.
+def _code(text: str) -> str:
+    """`text` without its comments: a comment that says `not store.supersede`
+    is not a call. tokenize, not a `#` regex, so a `#` inside a string does
+    not cut off the code after it."""
+    toks = tokenize.generate_tokens(io.StringIO(text).readline)
+    return tokenize.untokenize(t for t in toks if t.type != tokenize.COMMENT)
+
+
+def _violations(text: str, allowed=ALLOWED_STORE_READS) -> set:
+    """Store attributes touched here that are not on the allowlist.
 
     A symbol imported out of store directly is reported under its own name: it
     is used bare, so no attribute access exists for the allowlist to judge."""
+    text = _code(text)
     bad = set()
     for m in _SYMBOL_IMPORT.finditer(text):
         bad |= {p.strip().split()[0] for p in m.group(1).split(",") if p.strip()}
     for alias in _store_aliases(text) or {"store"}:
         attrs = re.findall(rf"\b{re.escape(alias)}\.([A-Za-z_][A-Za-z0-9_]*)", text)
-        bad |= set(attrs) - ALLOWED_STORE_READS
+        bad |= set(attrs) - allowed
     return bad
 
 
@@ -83,6 +94,30 @@ def test_the_audit_fires_on_a_planted_violation():
     assert _violations("x = store.supersede(d, i)") == {"supersede"}
     assert _violations("store.add_many(d, rows)") == {"add_many"}
     assert _violations("rows = store.query(notes, tag='x')") == set()
+
+
+def test_the_audit_skips_comments_but_not_code_after_a_hash_in_a_string():
+    assert _violations("# api.supersede, not store.supersede\nstore.load(d)\n") == set()
+    assert _violations('x = "#"; store.add(d)\n') == {"add"}
+
+
+# cli.py reads more than gui/ does, and makes two writes no api function
+# covers: `init` creates the store (no row), and `arc reconcile --apply` moves
+# rows onto names taken from the catalog, canonical already. Every other write
+# goes through api. `rename` did not, and stored a short sha as typed.
+CLI_FILE = GUI_DIR.parent / "cli.py"
+CLI_STORE_CALLS = ALLOWED_STORE_READS | {
+    "note_from_dict", "read_dict", "reconcile_arc",      # reads
+    "ensure_store", "apply_reconciliation",               # the two writes
+}
+
+
+def test_cli_writes_through_api_but_for_two_named_calls():
+    assert CLI_FILE.is_file(), f"{CLI_FILE} missing"
+    bad = _violations(CLI_FILE.read_text(encoding="utf-8"), CLI_STORE_CALLS)
+    assert not bad, (
+        f"cli.py calls store directly for {sorted(bad)}. Write through "
+        f"symbion.api, which resolves names and refs the way add does.")
 
 
 def test_the_audit_follows_an_aliased_import():
@@ -159,3 +194,16 @@ def test_a_broken_gui_import_is_not_reported_as_a_missing_extra(
     monkeypatch.setattr(builtins, "__import__", broken_pages)
     with pytest.raises(ImportError, match="pages"):
         cli.main(["--dir", str(tmp_path), "serve"])
+
+
+def test_serve_listens_on_loopback_only(monkeypatch):
+    """The GUI writes rows with no authentication, so it must not be reachable
+    from the network. NiceGUI's ui.run() defaults to host 0.0.0.0 outside
+    native mode; serve has to pass the loopback address itself."""
+    pytest.importorskip("nicegui")
+    from symbion.gui import serve
+    seen = {}
+    monkeypatch.setattr(serve, "build_page", lambda ctx, author: None)
+    monkeypatch.setattr(serve.ui, "run", lambda **kw: seen.update(kw))
+    serve.main(None, author="t", port=1, show=False)
+    assert seen["host"] == "127.0.0.1"
