@@ -1,0 +1,544 @@
+from __future__ import annotations
+
+import pytest
+
+pytest.importorskip("nicegui")
+
+from nicegui import ui                      # noqa: E402
+from nicegui.testing import User            # noqa: E402
+
+from symbion import api, store              # noqa: E402
+from symbion.gui.notes import render_note   # noqa: E402
+
+
+async def test_renders_body_kind_and_tags(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "check", "target": {"type": "project", "name": None},
+                      "checked": "the suite", "result": "412 passed",
+                      "body": "ran on a clean tree", "tags": ["release"]},
+                author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("ran on a clean tree")   # markdown body
+    await user.should_see("check")                 # kind chip
+    await user.should_see("412 passed")            # check result
+    await user.should_see("#release")              # tag chip
+    await user.should_see("ada")                   # author
+
+
+async def test_check_badge_says_why_it_is_unverifiable(user: User, repo, tmp_path):
+    """check_state collapses three causes into 'unverifiable'; the badge must
+    say which, or a dirty stamp reads like a squashed sha."""
+    ctx = api.resolve(str(tmp_path))
+    n = store.add(tmp_path, kind="check", target={"type": "project", "name": None},
+                  checked="x", result="y", author="t",
+                  provenance={"sha": "0" * 40, "dirty": True})
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("unverifiable")
+    await user.should_see("dirty tree")
+
+
+async def test_tag_chip_is_a_link_into_the_filtered_view(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "b", "tags": ["priority"]}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    # By marker, not by text: the star button's tooltip also says "#priority",
+    # and find() returns a SET -- popping it is a coin flip between the two.
+    link = user.find(marker="tag-priority").elements.pop()
+    assert link.props["href"] == "/notes?tag=priority"
+
+
+async def test_a_clean_check_badge_reads_current(user: User, repo, tmp_path):
+    """The other direction of the badge. Only ever asserting 'unverifiable'
+    would pass on a render_note that can report nothing else."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "check", "target": {"type": "commit", "name": "HEAD"},
+                      "checked": "x", "result": "y"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("current")
+    await user.should_not_see("unverifiable")
+
+
+async def test_a_non_project_target_links_to_the_object_view(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "item", "name": "src/x.py"},
+                      "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada", show_target=True)
+
+    await user.open("/t")
+    link = user.find(marker="note-target").elements.pop()
+    assert link.props["href"] == "/object?type=item&name=src%2Fx.py"
+
+
+# ---- write surfaces ----
+async def test_star_button_toggles_priority_through_retag(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "b", "tags": ["keep"]}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-star").click()
+
+    head = store.heads(store.load(tmp_path))[0]
+    assert set(head.tags) == {"keep", "priority"}
+    assert head.author == "ada", "a GUI write is the human's"
+
+
+async def test_star_button_unstars_an_already_starred_note(user: User, repo, tmp_path):
+    """The other direction. A star asserted only on the way in passes on a
+    button that can only ever add the tag."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "b", "tags": ["keep", "priority"]}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-star").click()
+
+    assert set(store.heads(store.load(tmp_path))[0].tags) == {"keep"}
+
+
+async def test_resolve_button_only_on_open_stateful_kinds(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    bug = api.add(ctx, {"kind": "bug",
+                            "target": {"type": "project", "name": None},
+                            "body": "broken"}, author="ada")
+    decision = api.add(ctx, {"kind": "decision",
+                             "target": {"type": "project", "name": None},
+                             "body": "chose x"}, author="ada")
+
+    @ui.page("/a")
+    def page_a():
+        render_note(ctx, bug, lambda: None, author="ada")
+
+    @ui.page("/d")
+    def page_d():
+        render_note(ctx, decision, lambda: None, author="ada")
+
+    await user.open("/a")
+    assert user.find(marker="note-resolve").elements, "an open bug resolves"
+
+    await user.open("/d")
+    with pytest.raises(AssertionError):
+        user.find(marker="note-resolve")     # a decision carries no status
+
+
+async def test_add_form_writes_through_api_with_provenance(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    from symbion.gui.notes import add_form
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-body").type("written in the gui")
+    user.find(marker="note-add").click()
+
+    rows = store.load(tmp_path)
+    assert len(rows) == 1
+    assert rows[0].author == "ada" and rows[0].body == "written in the gui"
+
+
+async def test_a_check_added_in_the_gui_carries_provenance(user: User, repo, tmp_path):
+    """api.add stamps provenance by kind. Without it a GUI check is a claim
+    about a tree with no record of which tree."""
+    ctx = api.resolve(str(tmp_path))
+    from symbion.gui.notes import add_form
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-kind-select").click()
+    user.find("check").click()
+    user.find(marker="note-checked").type("the suite")
+    user.find(marker="note-result").type("254 passed")
+    user.find(marker="note-add").click()
+
+    rows = store.load(tmp_path)
+    assert len(rows) == 1, f"expected one row, got {[r.kind for r in rows]}"
+    assert rows[0].kind == "check"
+    assert rows[0].provenance and rows[0].provenance.get("sha")
+
+
+# ---- tags and arc on the write surfaces ----
+def test_split_tags_accepts_every_way_a_person_types_a_list():
+    from symbion.gui.notes import split_tags
+    assert split_tags("gui, ux") == ["gui", "ux"]
+    assert split_tags("#gui #ux") == ["gui", "ux"]
+    assert split_tags("gui,ux  #seed") == ["gui", "ux", "seed"]
+    assert split_tags("") == [] and split_tags(None) == []
+    assert split_tags("  ,  # ") == [], "separators alone are not a tag"
+
+
+async def test_a_hashtag_in_the_body_becomes_a_tag(user: User, repo, tmp_path):
+    """The bug: '#gui' typed in the body was stored as prose and the
+    note came back with tags=[]."""
+    ctx = api.resolve(str(tmp_path))
+    from symbion.gui.notes import add_form
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-body").type("#gui replace the nicegui art")
+    user.find(marker="note-add").click()
+
+    row = store.load(tmp_path)[0]
+    assert row.tags == ("gui",)
+    assert row.body == "replace the nicegui art", "the tag is a column, not prose"
+
+
+async def test_a_body_with_no_hashtag_still_stores_its_prose(user: User, repo, tmp_path):
+    """The other direction: the harvest must not eat ordinary bodies."""
+    ctx = api.resolve(str(tmp_path))
+    from symbion.gui.notes import add_form
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-body").type("no hashes here at all")
+    user.find(marker="note-add").click()
+
+    row = store.load(tmp_path)[0]
+    assert row.body == "no hashes here at all"
+    assert row.tags == ()
+
+
+async def test_a_note_can_be_filed_under_an_arc_on_creation(
+        user: User, repo, tmp_path):
+    """The gap: nothing in the GUI set arc_id."""
+    ctx = api.resolve(str(tmp_path))
+    act = api.create_arc(ctx, "theming", "d", "project", author="ada")
+    from symbion.gui.notes import arc_options, add_form
+
+    assert act.id in arc_options(ctx)
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-arc-select").click()
+    user.find("theming").click()
+    user.find(marker="note-body").type("filed under the arc")
+    user.find(marker="note-add").click()
+
+    row = store.load(tmp_path)[0]
+    assert row.arc_id == act.id
+
+
+def test_an_archived_arc_is_not_offered(repo, tmp_path):
+    """Offering a closed ticket invites reopening one by accident."""
+    ctx = api.resolve(str(tmp_path))
+    from symbion.gui.notes import arc_options
+    act = api.create_arc(ctx, "old", "d", "project", author="ada")
+    assert act.id in arc_options(ctx)
+    api.archive_arc(ctx, act.id)
+    assert act.id not in arc_options(ctx)
+
+
+def test_supersede_can_attach_an_existing_note_to_an_arc(repo, tmp_path):
+    """What the edit dialog does. supersede refuses target and provenance;
+    arc_id and tags are neither, so an already-written note is filable."""
+    ctx = api.resolve(str(tmp_path))
+    act = api.create_arc(ctx, "theming", "d", "project", author="ada")
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "written before the arc existed"}, author="ada")
+    assert n.arc_id is None
+
+    out = api.supersede(ctx, n.id, author="ada", arc_id=act.id, tags=["gui"])
+    assert out.arc_id == act.id
+    assert out.tags == ("gui",)
+    assert out.target == n.target, "target is still inherited"
+
+
+async def test_a_project_target_links_to_the_note_itself(user: User, repo, tmp_path):
+    """The other direction of the target link. `project` has no object page --
+    /object redirects when name is empty -- so before /notes?id= this row was a
+    dead label, and a project note filed under an arc rendered on the
+    arc page with nothing to click."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada", show_target=True)
+
+    await user.open("/t")
+    link = user.find(marker="note-target").elements.pop()
+    assert link.props["href"] == f"/notes?id={n.id}"
+
+
+async def test_edit_dialog_corrects_a_check_verdict(user: User, repo, tmp_path):
+    """The GUI half of the same gap: the edit dialog offered body, tags and
+    arc, so the two fields that make a check queryable were unreachable from
+    either surface."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "check", "target": {"type": "project", "name": None},
+                      "checked": "the suit", "result": "412 pased",
+                      "body": "ran it"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-checked")
+    user.find(marker="edit-checked").elements.pop().set_value("the suite")
+    user.find(marker="edit-result").elements.pop().set_value("412 passed")
+    user.find(marker="edit-save").click()
+
+    head = store.heads(store.load(tmp_path))[0]
+    assert (head.checked, head.result) == ("the suite", "412 passed")
+    assert head.body == "ran it"
+
+
+async def test_edit_dialog_hides_the_verdict_fields_on_a_non_check(
+        user: User, repo, tmp_path):
+    """The other direction. Rendered unconditionally, every note would offer
+    two fields that mean nothing on it -- and a save would then write
+    checked=None onto rows that never had the field."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "prose"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-body")
+    await user.should_not_see(marker="edit-checked")
+
+
+PREREG = ('[kinds]\nprediction = { status = true, verdict = true }\n'
+          'bug = { status = true }\nnote = {}\n')
+
+
+def _declare(store_dir, text):
+    store.ensure_store(store_dir)
+    (store_dir / "symbion.toml").write_text(text)
+
+
+def test_chip_class_is_by_bits():
+    from symbion import kinds as K
+    from symbion.gui.notes import chip_class
+    assert chip_class(K.Kind(verdict=True)) == "sb-chip-check"
+    assert chip_class(K.Kind(status=True, verdict=True)) == "sb-chip-check"
+    assert chip_class(K.Kind(status=True)) == "sb-chip-task"
+    assert chip_class(K.Kind(status=True, parked=True)) == ""
+    assert chip_class(K.Kind()) == ""
+
+
+async def test_add_form_lists_exactly_the_declared_kinds(user: User, repo, tmp_path):
+    from symbion.gui.notes import add_form
+    _declare(tmp_path, '[kinds]\nanomaly = { status = true }\nfact = {}\n')
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    sel = user.find(marker="note-kind-select").elements.pop()
+    assert sel.options == ["anomaly", "fact"]
+    assert sel.value == "anomaly", "no `note` declared: the first label is the default"
+
+
+async def test_add_form_shows_the_verdict_fields_on_exactly_the_verdict_kinds(
+        user: User, repo, tmp_path):
+    from symbion.gui.notes import add_form
+    _declare(tmp_path, PREREG)
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    sel = user.find(marker="note-kind-select").elements.pop()
+    # note-checked starts hidden (default kind is "note", no verdict bit), and
+    # User.find()'s only_visible=True default can never hand back a hidden
+    # element -- so the handle is grabbed AFTER the field is made visible, not
+    # before. The other direction still exercises the live handle, not find().
+    sel.set_value("prediction")
+    checked = user.find(marker="note-checked").elements.pop()
+    assert checked.visible
+    sel.set_value("bug")
+    assert not checked.visible
+
+
+async def test_resolve_button_on_a_prediction_opens_the_dialog_instead_of_resolving(
+        user: User, repo, tmp_path):
+    """Both directions: the click does not resolve; saving with a result does."""
+    _declare(tmp_path, PREREG)
+    ctx = api.resolve(str(tmp_path))
+    p = api.add(ctx, {"kind": "prediction", "target": {"type": "project", "name": None},
+                      "body": "falsified if"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, p, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-resolve").click()
+    assert store.read_status(store.heads(store.load(tmp_path))[0]) == "open"
+    user.find(marker="edit-save").click()                     # empty result: refused
+    await user.should_see("result")
+    assert store.read_status(store.heads(store.load(tmp_path))[0]) == "open"
+    user.find(marker="edit-result").elements.pop().set_value("HELD")
+    user.find(marker="edit-save").click()
+    head = store.heads(store.load(tmp_path))[0]
+    assert (store.read_status(head), head.result, head.author) == ("resolved", "HELD", "ada")
+
+
+async def test_resolve_button_on_a_status_only_kind_still_resolves_in_one_click(
+        user: User, repo, tmp_path):
+    _declare(tmp_path, PREREG)
+    ctx = api.resolve(str(tmp_path))
+    b = api.add(ctx, {"kind": "bug", "target": {"type": "project", "name": None},
+                      "body": "broken"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, b, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-resolve").click()
+    assert store.read_status(store.heads(store.load(tmp_path))[0]) == "resolved"
+
+
+# ---- due ----
+async def test_an_open_row_past_due_shows_it_and_a_resolved_one_does_not(
+        user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    late = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                         "body": "late", "due": "2000-01-01"}, author="ada")
+    done = store.supersede(tmp_path, late.id, status="resolved")
+
+    @ui.page("/late")
+    def page_late():
+        render_note(ctx, late, lambda: None, author="ada")
+
+    @ui.page("/done")
+    def page_done():
+        render_note(ctx, done, lambda: None, author="ada")
+
+    await user.open("/late")
+    chip = user.find(marker="note-due").elements.pop()
+    assert chip.text.startswith("overdue ") and "sb-chip-bad" in chip.classes
+    await user.open("/done")
+    chip = user.find(marker="note-due").elements.pop()
+    assert chip.text == "due 2000-01-01" and "sb-chip-bad" not in chip.classes
+
+
+async def test_edit_dialog_keeps_an_untouched_datetime_due(user: User, repo, tmp_path):
+    """A native date input cannot hold a datetime: it would render empty, and
+    a save that only fixed a typo in the body would clear the due date."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "typo", "due": "2026-10-01T22:30Z"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-due")
+    user.find(marker="edit-body").elements.pop().set_value("fixed")
+    user.find(marker="edit-save").click()
+    head = store.heads(store.load(tmp_path))[0]
+    assert (head.body, head.due) == ("fixed", "2026-10-01T22:30:00+00:00")
+
+
+async def test_edit_dialog_sets_and_clears_due(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, store.heads(store.load(tmp_path))[0], lambda: None, author="ada")
+
+    for value, want in (("2026-10-01", "2026-10-01"), ("", None)):
+        await user.open("/t")
+        user.find(marker="note-edit").click()
+        await user.should_see(marker="edit-due")
+        user.find(marker="edit-due").elements.pop().set_value(value)
+        user.find(marker="edit-save").click()
+        assert store.heads(store.load(tmp_path))[0].due == want
+
+
+async def test_edit_dialog_offers_due_only_on_a_status_kind(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "prose"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-body")
+    await user.should_not_see(marker="edit-due")
+
+
+async def test_add_form_takes_due_on_a_status_kind(user: User, repo, tmp_path):
+    from symbion.gui.notes import add_form
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    sel = user.find(marker="note-kind-select").elements.pop()
+    sel.set_value("task")
+    due = user.find(marker="note-due").elements.pop()      # visible only now
+    due.set_value("2026-10-01")
+    user.find(marker="note-body").type("with a date")
+    user.find(marker="note-add").click()
+    assert store.load(tmp_path)[0].due == "2026-10-01"
+    sel.set_value("note")
+    assert not due.visible

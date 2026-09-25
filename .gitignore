@@ -1,0 +1,12 @@
+
+TODO.md
+IDEAS.md
+NEXT_SESSION.md
+
+.venv/
+.superpowers/
+.claude/worktrees/
+__pycache__/
+build/
+dist/
+*.egg-info/

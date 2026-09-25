@@ -1,0 +1,36 @@
+[project]
+name = "symbion"
+version = "0.1.0"
+description = "A notebook and ticket registry for agents: dated rows attached to a commit, a file, an item, an arc or the project, kept in a sibling git repo of JSONL."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "phreakocious" }]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+symbion = "symbion.cli:main"
+
+[project.optional-dependencies]
+gui = ["nicegui>=3.0"]
+tty = ["rich"]
+test = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# NiceGUI's user fixture runpy's this file to discover an app's pages, and
+# defaults it to ./main.py. symbion has no such entry point -- pages are
+# registered by build_page(ctx) against a resolved store -- and the gui tests
+# declare the pages they need. Empty means "no main file", not "look for one".
+main_file = ""
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+symbion = ["data/*", "data/skill/*"]
