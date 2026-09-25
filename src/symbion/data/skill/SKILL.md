@@ -1,25 +1,23 @@
 ---
 name: symbion
 description: "Use when recording or retrieving a durable, dated, object-attached conclusion about this project — a test/build check (checked/result), an ADR-style decision, a known-broken bug, or a ticket task — instead of letting it evaporate in chat. Also for running a project-wide campaign as a per-object checklist (arcs), or on explicit /symbion. Keywords: notebook, ticket registry, audit trail, queryable notes, bootstrap an existing project."
-trigger: /symbion
 ---
 
 # symbion — this project's notebook and ticket registry
 
 Durable, dated, object-attached notes (a commit, a file, an arc, or the
 project as a whole), kept queryable instead of evaporating in chat. Backed by
-a private sibling git repo of JSONL lines, auto-created on first write.
+a separate git repo of JSONL beside the project, auto-created on first write.
 
 ## Invocation
 
-Run `symbion`. It is an installed console script — works from any cwd,
-`--dir` may go anywhere in the argv, no module form, no venv path. If
-`command -v symbion` fails, it was installed into a venv only and the
-SessionStart hook is silent: see the Install section of symbion's own README,
-in the repo it was installed from (this project holds no copy). This file
-is symbion's own package data, linked once per user at
-`~/.claude/skills/symbion` by `symbion init`, so it is always the installed
-symbion's; no project holds a copy.
+Run `symbion`, the installed console script, never through `python -m` or a
+venv path. It works from any cwd, and `--dir` may go anywhere in the argv.
+If `command -v symbion` fails, it was installed into a venv only and the
+SessionStart hook is silent: see Install at
+https://github.com/phreakocious/symbion. This file is symbion's own package
+data, linked once per user at `~/.claude/skills/symbion` by `symbion init`,
+so it is always the installed symbion's; no project holds a copy.
 
 ## Picking a kind
 
@@ -46,7 +44,10 @@ A kind is a label on three bits, and the bits are all symbion knows:
   it with `supersede <id> --append --body-file -`: the registered text stays
   a byte-identical prefix, and the new text follows a blank line. Give it
   `--due` the date its window closes. Open ones list first at session
-  start, ahead of the newer rows.
+  start, ahead of the newer rows. No default kind has both bits: declare
+  one, e.g. `prediction = { status = true, verdict = true }`, in a `[kinds]`
+  table. The table replaces the defaults entirely, so copy in the ones you
+  keep.
   A finished result is not a pre-registration: it goes on a verdict-only
   kind, and a pending half of it ("not yet verified until …") is its own
   status row. Measured 2026-09-24: stores that gave a result kind both
@@ -84,6 +85,10 @@ it as written on a pipe (and render it on a terminal with the `[tty]` extra),
 `summary` flattens it to one line. A body with backticks goes through
 `--body-file -` and a QUOTED heredoc (`<<'EOF'`): in `--body "…"` or an
 unquoted `<<EOF` the shell runs each backtick span as a command, silently.
+
+The examples here use `--type file`, a catalog type: a store has it only
+when its `symbion.toml` declares it (the starter file has it commented out),
+and `symbion schema` above lists this store's types.
 
 ```bash
 symbion add --kind check --type commit --name HEAD \
@@ -127,27 +132,32 @@ name, suffixed on collision.
 A note is one shape everywhere: `id`, `kind`, `target: {type, name}` (`name`
 is `null` on a `project` target, so guard it before a jq `test()`),
 `created_at`, `author`, `body`, `status`, `checked`, `result`, `arc_id`,
-`due`, `supersedes`, `tags`, `refs`, plus `state` and `distance` on verdict kinds.
-There is no `ts` or `title`: a guessed key reads as a silent `null`. The ENVELOPE differs, though: `list`, `arc list`
-and `arc todo` return a bare array, while `summary` and `context` return
-an object (`context` puts its rows under `notes`). Index the array; reach for
-`.notes` only on `context`. `arc reconcile --json` is a report, not notes:
-a bare array of `id`, `target_type`, `target_name`, `status` (`live`,
-`renamed`, `stale`, `uncheckable`), `suggestion` and `needs_result`, as found
-before any `--apply`, whose counts go to stderr. `summary --json` also carries `store`: the resolved path, or
-`null` when no store exists. Gate on that key, never on the counts or the exit
-code: an absent store and an empty one both print zeros at exit 0.
+`due`, `supersedes`, `tags`, `refs`, plus `state` and `distance` on verdict
+kinds. There is no `ts` or `title`: a guessed key reads as a silent `null`.
+
+The ENVELOPE differs, though: `list`, `arc list` and `arc todo` return a bare
+array, while `summary` and `context` return an object (`context` puts its
+rows under `notes`). Index the array; reach for `.notes` only on `context`.
+`arc reconcile --json` is a report, not notes: a bare array of `id`,
+`target_type`, `target_name`, `status` (`live`, `renamed`, `stale`,
+`uncheckable`), `suggestion` and `needs_result`, as found before any
+`--apply`, whose counts go to stderr. `summary --json` also carries `store`:
+the resolved path, or `null` when no store exists. Gate on that key, never on
+the counts or the exit code: an absent store and an empty one both print
+zeros at exit 0.
 
 A human may be browsing the same store at `symbion serve`. Notes authored by a
 person rather than `claude` came from there; they are not a different shape.
 
 ```bash
 symbion list --status open --json
-symbion list --id <id>                   # one row by id (`symbion show <id>` is the same); implies --all, so a superseded id still resolves
-                                         # and names its chain's head: `superseded -> <id> [resolved]` ("head" in --json)
+symbion show <id>                        # one row by id; same as `list --id <id>`
 symbion summary --json
 symbion context --target file:src/x.py --json
 ```
+
+`show` implies `--all`, so a superseded id still resolves and names its
+chain's head: `superseded -> <id> [resolved]` (`head` in `--json`).
 
 Search bodies with `list --grep PATTERN` (a case-insensitive regex over
 body, target name, checked and result), never `list | grep`: the pipe reads
@@ -160,8 +170,8 @@ line each, under a first line that carries the total, what is shown, and each
 hidden set with the flag that reveals it (`+N resolved (--status resolved)`,
 `+N superseded (--all)`). With a filter the first line reads `N of M match
 --kind bug --tag x`, M being the rows scanned, so a 0 never reads as 0-of-0;
-`--all` always says how many superseded rows it included. `--limit N` widens (0 for all); `--full` prints
-bodies as stored; `--id` is always the whole row. `--json` is never a page
+`--all` always says how many superseded rows it included. `--limit N` widens
+(0 for all); `--full` prints bodies as stored; `--id` is always the whole row. `--json` is never a page
 unless `--limit` is given, and then says `showing N of M` on stderr.
 Text `summary` is capped the same way, and every `+N more ... (--full)` line
 names the one flag that lifts all of its caps.
@@ -182,8 +192,8 @@ symbion resolve <id>                      # tick the box
 symbion list --arc "$aid" --json    # every item, resolved included: how a finished campaign reads back
 ```
 
-A checklist item is any row in the arc that carries a status, so an
-`bug --arc-id` is a box too, not just context beside one; several
+A checklist item is any row in the arc that carries a status, so a `bug`
+added with `--arc-id` is a box too, not just context beside one; several
 items may share a target, and each is its own box. `arc todo` and
 `list --arc` are the same set, the first filtered to what is still open.
 
@@ -202,15 +212,15 @@ symbion arc seed --scope file --dry-run
 
 A catalog runs in the root of the current worktree.
 
-A catalog is just a configured shell command, and its output format is not
-guaranteed stable across even *patch* releases of the same tool — you cannot
-know what it emits from documentation, or from what it did in another
-project, or from what it did here last month. You have to run it, in this
-project, at this version, today. Measured: `pytest --collect-only -q` emits
-per-file counts (`tests/test_store.py: 39`) on pytest 9.0.2 — but on
-pytest 9.1.1, the same flags emit one full test node id per line instead.
-Seeding on the wrong one of those mints dozens of tasks against garbage
-targets. `--dry-run` prints the resolved names and count and creates
+A catalog is just a configured shell command, and its output depends on the
+tool's version and on the project's own config: you cannot know what it
+emits from documentation, or from what it did in another project, or from
+what it did here last month. You have to run it, in this project, at this
+version, today. Measured: `pytest --collect-only -q` prints one test node id
+per line, but in a project whose pytest config puts `-q` in `addopts` the
+flags stack to `-qq`, and the same command prints per-file counts
+(`tests/test_store.py: 39`) instead. Seeding on the wrong one of those mints
+dozens of tasks against garbage targets. `--dry-run` prints the resolved names and count and creates
 nothing; check the names before dropping the flag.
 
 ## Resolvers: when substring is the wrong match, and for every store-derived catalog
@@ -280,8 +290,9 @@ a bootstrap writes its first row.
 per kind outside arcs, every open row past due or due within 7 days, arc
 progress, anything tagged `priority`, and the open rows outside arcs, one line
 each (open pre-registrations first, then the newest of the rest; each row
-prints once) — from a SessionStart hook in
-`~/.claude/settings.json`, so it runs at the start of every session; in a
+prints once) — from a SessionStart hook in `~/.claude/settings.json`, so it
+runs at the start of every session (`symbion init` writes that file when it
+is absent, and otherwise prints the block to add); in a
 project with no store it says nothing. From there:
 
 - `symbion context --branch <ref>` — every note attached to a commit reachable
@@ -307,14 +318,16 @@ summary`, `symbion list --status open`). Never write the list into that file,
 and never copy its bullets into rows a second time: two copies of one list is
 how the stale one ends up read as authoritative. Measured 2026-09-20: 33
 items in both a handoff file and one store, nothing pointing either way, and
-each wrap re-copied items the store had already resolved. The continuity
-plugin's `/wrap` and `/next` (0.8.5) honour a file that says so and name no
-tool, so the sentence in the file is the whole seam.
+each wrap re-copied items the store had already resolved. The `/wrap` and
+`/next` of the continuity plugin (0.8.5 and later) honour a file that says
+so, without naming any tool, so that one sentence in the file is the whole seam.
 
 A workaround for symbion itself ("`show` does not exist", "never run it from
 inside the store") does not go into the handoff or CLAUDE.md either: it
-outlives the fix. Report it where symbion's issues go. Measured 2026-09-24:
-four repos still told their agents `show` did not exist after it shipped.
+outlives the fix. File it in this project's store as a row tagged `symbion`,
+and tell the user, who can take it to
+https://github.com/phreakocious/symbion/issues. Measured 2026-09-24: four
+repos still told their agents `show` did not exist after it shipped.
 
 ## Quick reference
 

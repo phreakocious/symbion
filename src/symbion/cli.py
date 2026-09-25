@@ -203,10 +203,10 @@ default_branch = "{cfg.default_branch}"
 # A catalog type is a command emitting ONE NAME PER LINE and nothing else. It
 # runs in the root of the current worktree.
 # Verify with `symbion arc seed --scope <type> --dry-run` (no arc needed) every time
-# you add one -- a catalog command's output format can change between PATCH
-# releases of the same tool, so docs and prior runs elsewhere tell you nothing:
-# `pytest --collect-only -q` emits per-file counts ("tests/test_x.py: 39") on
-# pytest 9.0.2, but full test node ids on pytest 9.1.1, for the same flags.
+# you add one -- a catalog command's output depends on the tool's version and
+# on the project's own config, so docs and prior runs elsewhere tell you nothing:
+# `pytest --collect-only -q` emits full test node ids, but per-file counts
+# ("tests/test_x.py: 39") where the project's pytest config adds `-q` to addopts.
 [catalogs]
 # `--others --exclude-standard` lists files not yet committed, so a note on a
 # file made this session resolves instead of warning `stored as typed`.

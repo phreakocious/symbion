@@ -22,8 +22,16 @@ The agent-facing surface, which is also the best command reference:
 ## Install
 
 Python 3.11+ and git. The core has no dependencies. Two optional extras:
-`pip install 'symbion[gui]'` for the web UI (`symbion serve`), and
-`'symbion[tty]'` to render note bodies as markdown on a terminal.
+`gui` for the web UI (`symbion serve`), and `tty` to render note bodies as
+markdown on a terminal. symbion is not on PyPI; install it from GitHub:
+
+```bash
+pipx install 'symbion[gui,tty] @ git+https://github.com/phreakocious/symbion'
+# or: uv tool install 'symbion[gui,tty] @ git+https://github.com/phreakocious/symbion'
+# drop [gui,tty] for the core alone
+```
+
+To work on symbion itself, install a clone editable:
 
 ```bash
 pipx install -e /path/to/symbion        # or: uv tool install -e /path/to/symbion
@@ -140,8 +148,7 @@ written.
 ## Browse it (optional)
 
 ```bash
-pipx install -e '/path/to/symbion[gui]'
-symbion serve
+symbion serve        # needs the gui extra: see Install
 ```
 
 A local page at `http://localhost:43210`: boards, a filtered note list where
@@ -179,8 +186,8 @@ warns `stored as typed` on a correct name, and that warning is the only thing
 that catches a typo.
 
 **Always dry-run the first seed of any catalog type.** A command's output
-format can change between patch releases of the same tool; the only way to
-know what it prints is to run it here, today.
+depends on the tool's version and on the project's own config; the only way
+to know what it prints is to run it here, today.
 
 ```bash
 symbion arc seed --scope file --dry-run     # no arc needed; writes nothing
@@ -270,6 +277,7 @@ store both.
 ## Development
 
 ```bash
+python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui,tty]'
 .venv/bin/python -m pytest -q
 ```
 

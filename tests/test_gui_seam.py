@@ -146,6 +146,7 @@ def test_a_broken_gui_import_is_not_reported_as_a_missing_extra(
     """The other direction, and the reason the handler inspects the message.
     Answering every ImportError with 'pip install symbion[gui]' sends the
     reader to reinstall an extra they already have."""
+    pytest.importorskip("nicegui")   # without it, serve stops at the missing extra
     real_import = builtins.__import__
 
     def broken_pages(name, *a, **kw):

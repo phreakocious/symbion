@@ -13,54 +13,46 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
 - IMPORTANT: we dogfood symbion here. Each new thread or idea is a candidate arc or row,
   and later work on it goes into the same rows, so we both have its history. When the
   tool gets in your way, file the friction as a row tagged `dogfood` and say so in chat.
+  The store is the default sibling, `../symbion-notes`, created on the first write. It
+  is local to your machine: if you are not the maintainer, friction worth fixing also
+  goes to the repo's issue tracker, where the maintainer can see it.
 
 ## Where things are
 
 - `src/symbion/`: `store.py` (rows, invariants, the lock), `api.py` (the door every
   writer uses), `cli.py`, `summary.py` (the session-start text), `gui/` (`symbion serve`).
 - `src/symbion/data/skill/`: `SKILL.md`, `adoption.md` and `session_start.sh`, the agent
-  surface. `~/.claude/skills/symbion` links to this directory.
+  surface. `symbion init` links `~/.claude/skills/symbion` to the installed copy.
 - `README.md`: the bootstrap guide for a new project.
-- `docs/superpowers/specs/`: the designs, amended inline with dated measurements.
-  Plans do not go here: write them to `../symbion-notes/archive/symbion-docs/plans/`.
-  They are execution scripts full of field detail, and this repo is published.
-- `../symbion-notes`: this project's store. Its open rows are the work list;
-  `NEXT_SESSION.md` is orientation only and points there.
+- `docs/superpowers/specs/`: the designs, amended inline with dated measurements. They
+  are binding: a change that departs from one amends it inline, dated.
+- Implementation plans stay out of the repo, including `docs/superpowers/plans/`, where
+  the superpowers plugin writes them by default. They are execution scripts full of
+  local detail; keep yours beside your store, and put what a reviewer needs in the
+  change's description.
 
-## This checkout is live on the whole machine
+## Setup and tests
 
-- `symbion` on PATH is an editable install of `src/`, and every session's skill and
-  SessionStart hook read `src/symbion/data/skill/`. A broken file here breaks every
-  project's session start. Keep each save runnable: edit bottom-up (store, api, cli),
-  and do not edit `src/` while a subagent runs `symbion`.
-- Run tests as `.venv/bin/python -m pytest -q`. Bare `pytest` is a system Python without
-  the test deps: 4 hook failures and 35 GUI errors mean the wrong interpreter, not a bug.
+- `python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui,tty]'`, then run tests
+  as `.venv/bin/python -m pytest -q`. With `.[test]` alone the GUI and rich tests skip.
+  A bare `pytest` is some other Python: its failures and errors mean the wrong
+  interpreter, not a bug.
+- To dogfood, `symbion` must be on PATH: install this checkout editable as README's
+  Install says, then run `symbion init`. The section below then applies.
 - To test an old commit in a `git worktree`, run with `PYTHONPATH=$WT/src`. Without it
   the editable install tests this checkout, not the commit.
 
-## This repo is published
+## When this checkout is the installed symbion
 
-- Field provenance goes in a symbion row, never in code, tests, docs or a commit
-  message: another project's name, a row id, a count that identifies its store, a
-  quote of its rows, a path or line in its repo. Those state the mechanism: "a bare
-  `0 rows` read as 0-of-0", not "(measured in <project>)". Unnamed dates are fine.
-- In the maintainer's clone, `.git/hooks/pre-commit` and `commit-msg` run a
-  private-name check whose list lives in `../symbion-notes/tools/`, because the list
-  is private too. A refusal means rewrite the line, never `--no-verify`.
+With `symbion` on PATH as an editable install of this checkout and `symbion init` run,
+every `symbion` call runs `src/`, and every session on the machine reads its skill and
+SessionStart hook from `src/symbion/data/skill/`. A broken file here then breaks every
+project's session start. Keep each save runnable: edit bottom-up (store, api, cli), and
+do not edit `src/` while a subagent runs `symbion`.
 
-## Adjacent stores
+## This repo is public
 
-Other projects' stores are the field data for this tool. Read them when a question needs
-context: how agents use a feature, whether a fix reached them, what a friction report
-looked like at its source.
-
-- The stores are the `../*-notes` siblings of this checkout. Most sit beside a repo of
-  the same name; a `.symbion` file in a repo names any other. The store's rows tagged
-  `adjacent-stores` record the exceptions.
-- Read from the project's directory, `(cd ../<project> && symbion summary)`, so its
-  catalogs and check state resolve against its own repo.
-- The project's `NEXT_SESSION.md`, `CLAUDE.md` and the store's `symbion.toml` are fair
-  reading too.
-- Read only. Another session may be live there: a write to another project's store,
-  config or files waits for the owner's word.
-- Cite what you read by project and row id in the row you write here, and only there.
+Evidence from other projects goes in a symbion row, never in code, tests, docs or a
+commit message: another project's name, a row id, a count that identifies its store, a
+quote of its rows, a path or line in its repo. Those state the mechanism: "a bare
+`0 rows` read as 0-of-0", not "(measured in <project>)". Unnamed dates are fine.

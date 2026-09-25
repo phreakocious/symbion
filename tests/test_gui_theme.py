@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 GUI_DIR = Path(__file__).resolve().parent.parent / "src" / "symbion" / "gui"
 HEX = re.compile(r"#[0-9a-fA-F]{6}\b")
 
@@ -38,6 +40,7 @@ def test_every_kind_chip_class_is_defined_in_theme():
     while the stylesheet still defined `.sb-chip-audit`. Chips are now by
     bits (`chip_class`), so the audit covers every bit combination rather
     than every declared label."""
+    pytest.importorskip("nicegui")   # chip_class lives in gui.notes, which imports it
     import itertools
     from symbion import kinds as K
     from symbion.gui.notes import chip_class
