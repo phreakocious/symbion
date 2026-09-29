@@ -25,9 +25,9 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
   person sees at a terminal: `list`, `show` and `context` in columns, and the palette
   every other command and `--help` print in), `gui/`
   (`symbion serve`).
-- `src/symbion/data/skill/`: `SKILL.md`, `adoption.md` and `session_start.sh`, the agent
-  surface. They ship in the package; `symbion init` links `~/.claude/skills/symbion` to
-  the installed copy.
+- `src/symbion/data/skill/`: `SKILL.md`, `adoption.md`, `catalogs.md` and
+  `session_start.sh`, the agent surface. They ship in the package; `symbion init` links
+  `~/.claude/skills/symbion` to the installed copy.
 - `README.md`: install, and the guide to adopting symbion in a project.
 - `docs/superpowers/specs/`: the designs, dated.
 

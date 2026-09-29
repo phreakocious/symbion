@@ -203,6 +203,13 @@ def check_self_ref(target: dict, refs) -> None:
 NULL_WORDS = ("None", "null")
 
 
+def has_result(value) -> bool:
+    """Is a verdict present? Not absent, not blank, not a null's spelling
+    (which rule 5 of `check_fields` refuses now, and older rows still hold).
+    The resolve gate and `api.verdict_state`'s `pending` ask the same."""
+    return bool((value or "").strip()) and value not in NULL_WORDS
+
+
 def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
     """The write-side invariants, determined by the kind's bits and shared by
     `add_many`, `_supersede_unlocked` and `api.fields_from_row` -- a
@@ -234,7 +241,7 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
                          f"it has no verdict bit; put the evidence in --body "
                          f"(`symbion schema` lists the verdict kinds)")
     if (spec.status and spec.verdict and d.get("status") == "resolved"
-            and not (d.get("result") or "").strip()):
+            and not has_result(d.get("result"))):
         raise ValueError(f"kind {kind!r} cannot be resolved without --result: it is a "
                          f"pre-registration, and the resolving row carries the verdict: "
                          f"`resolve <id> --result \"what the data said\"`")

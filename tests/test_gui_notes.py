@@ -95,6 +95,23 @@ async def test_a_clean_check_badge_reads_current(user: User, repo, tmp_path):
     await user.should_not_see("unverifiable")
 
 
+async def test_an_open_pre_registration_badge_reads_pending(user: User, repo, tmp_path):
+    """Stamped at registration, before the run: `current` read as run."""
+    (tmp_path / "symbion.toml").write_text(
+        '[kinds]\nprediction = { status = true, verdict = true }\n')
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "prediction", "target": {"type": "item", "name": "p"},
+                      "checked": "the sweep"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("pending")
+    await user.should_not_see("current")
+
+
 async def test_a_behind_badge_lists_the_commits_since_its_stamp(user: User, repo, tmp_path):
     """The badge lit up on hover and a click did nothing (the owner's bug).
     Its tooltip now names the stamp and the commits `behind N` counts."""

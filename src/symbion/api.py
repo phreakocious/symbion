@@ -428,6 +428,19 @@ def seed_names(ctx: Ctx, scope: str, names) -> list[str]:
 
 
 # ---- provenance reporting ----
+def verdict_state(cfg, n) -> tuple[str, int | None]:
+    """A verdict row's (state, distance). An open status+verdict row with
+    no result is `pending`: its stamp is where it was registered, before the
+    run, and `current` against that stamp read as run (2026-09-29). The
+    result, not the open status, is the evidence of a run: two adopter
+    stores keep finished verifications open under a two-bit kind, and those
+    ran at their stamp. `resolve` restamps a pre-registration, and from then
+    on it reads as any check does."""
+    if n.spec.status and store.read_status(n) == "open" and not store.has_result(n.result):
+        return ("pending", None)
+    return gitref.check_state(cfg, n.provenance)
+
+
 def why_unverifiable(prov) -> str:
     """Which of the three causes `gitref.check_state` collapsed into
     ("unverifiable", None). Same precedence as check_state itself. Without

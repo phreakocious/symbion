@@ -97,17 +97,18 @@ def check_tip(cfg, prov, state, distance) -> str:
 
 
 def _check_badge(ctx, n) -> None:
-    state, distance = gitref.check_state(ctx.cfg, n.provenance)
+    state, distance = api.verdict_state(ctx.cfg, n)
     text = f"{state} {distance}" if state in ("behind", "ahead") else state
     if state == "unverifiable":
         text = f"unverifiable — {api.why_unverifiable(n.provenance)}"
     elif state == "external":
         text = f"external — {summ.age_phrase(n.provenance['at'])}"
     cls = {"current": "sb-chip-good", "behind": "sb-chip-notable", "external": "",
+           "pending": "",
            "ahead": "sb-chip-notable",
            "diverged": "sb-chip-bad", "unverifiable": "sb-chip-bad"}[state]
     chip = ui.label(text).classes(f"sb-chip {cls}").mark("check-state")
-    if not (n.provenance or {}).get("sha") or state == "external":
+    if not (n.provenance or {}).get("sha") or state in ("external", "pending"):
         return
     # Filled on first hover: a `git log` per badge at render time doubled
     # the cost of a board of checks (45 badges: 1.5s to 2.9s).

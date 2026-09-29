@@ -176,7 +176,8 @@ def test_init_starter_toml_carries_a_resolvers_block_that_parses(repo, tmp_path)
 
 
 def test_skill_documents_resolvers_next_to_catalogs():
-    text = (SKILL_DIR / "SKILL.md").read_text()
+    assert "`catalogs.md`" in (SKILL_DIR / "SKILL.md").read_text(), "the pointer an agent follows"
+    text = (SKILL_DIR / "catalogs.md").read_text()
     assert "[resolvers]" in text
     assert "exit 2" in text.lower(), "the ambiguity contract is the part an agent has to know"
     assert "fragment" in text, "the numeric-catalog warning"

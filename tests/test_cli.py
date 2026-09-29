@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -763,6 +764,84 @@ def test_list_text_renders_the_check_state(repo, tmp_path, capsys):
     capsys.readouterr()
     run("list", "--kind", "check", store_dir=store_dir)
     assert "state=current" in capsys.readouterr().out
+
+
+def test_an_open_pre_registration_reads_pending_until_its_result(repo, tmp_path, capsys):
+    """A pre-registration is stamped at `add`, before its run, so it listed
+    `checked at <sha>` and `state=current` as if the run had happened
+    there (a fresh agent read its own unrun prediction that way,
+    2026-09-29). Open, it says what will be checked and where it was
+    registered; resolved, the restamped row reads as any check does."""
+    store_dir = tmp_path / "store"
+    _declare(store_dir, PREREG)
+    run("add", "prediction", "--target", "item:p", "--checked", "the sweep",
+        "--body", "falsified if X", store_dir=store_dir)
+    pid = capsys.readouterr().out.strip()
+    sha = store.load(store_dir)[0].provenance["sha"][:7]
+    run("list", "--kind", "prediction", store_dir=store_dir)
+    out = capsys.readouterr().out
+    assert "state=pending" in out and f"to check, registered at {sha}: the sweep" in out, out
+    assert "checked at" not in out and "state=current" not in out, out
+    run("list", "--kind", "prediction", "--json", store_dir=store_dir)
+    row = json.loads(capsys.readouterr().out)[0]
+    assert (row["state"], row["distance"]) == ("pending", None)
+
+    # A result cleared with `--result ''` is no result: still pending.
+    run("supersede", pid, "--result", "HELD", store_dir=store_dir)
+    run("supersede", capsys.readouterr().out.strip(), "--result", "", store_dir=store_dir)
+    pid = capsys.readouterr().out.strip()
+    run("list", "--kind", "prediction", store_dir=store_dir)
+    assert "state=pending" in capsys.readouterr().out
+
+    run("resolve", pid, "--result", "HELD", store_dir=store_dir)
+    capsys.readouterr()
+    run("list", "--kind", "prediction", store_dir=store_dir)
+    out = capsys.readouterr().out
+    assert "state=current" in out and f"checked at {sha}: the sweep" in out, out
+    assert "pending" not in out and "to check" not in out, out
+
+
+def test_an_open_two_bit_row_with_a_result_reads_as_the_check_it_is(repo, tmp_path, capsys):
+    """The other shape of an open status+verdict row: a kind declared with
+    both bits for finished verifications (two adopter stores do), added
+    with its result. It ran at its stamp, so `pending` would be false; the
+    result, not the open status, says a run happened."""
+    store_dir = tmp_path / "store"
+    _declare(store_dir, '[kinds]\naudit = { status = true, verdict = true }\n')
+    run("add", "audit", "--target", "item:a", "--checked", "the harness", "--result", "30/30",
+        store_dir=store_dir)
+    capsys.readouterr()
+    sha = store.load(store_dir)[0].provenance["sha"][:7]
+    run("list", "--kind", "audit", store_dir=store_dir)
+    out = capsys.readouterr().out
+    assert "[open] state=current" in out and f"checked at {sha}: the harness" in out, out
+    assert "pending" not in out and "to check" not in out, out
+
+
+def test_an_open_external_pre_registration_reads_pending_without_a_sha(repo, tmp_path, capsys):
+    """An `--external` stamp has no sha to be registered at."""
+    store_dir = tmp_path / "store"
+    _declare(store_dir, PREREG)
+    run("add", "prediction", "--target", "item:p", "--external", "--checked", "the probe",
+        store_dir=store_dir)
+    capsys.readouterr()
+    assert run("list", "--kind", "prediction", store_dir=store_dir) == 0
+    out = capsys.readouterr().out
+    assert "state=pending" in out and "to check, registered: the probe" in out, out
+
+
+def test_a_tty_shows_an_open_pre_registration_as_pending(repo, tmp_path, capsys, tty):
+    store_dir = tmp_path / "store"
+    _declare(store_dir, PREREG)
+    tty()
+    pid = _add(store_dir, capsys, "prediction", "--target", "item:p", "--checked", "the sweep",
+               "--body", "falsified if X")
+    sha = store.load(store_dir)[0].provenance["sha"][:7]
+    run("show", pid, store_dir=store_dir)
+    lines = _screen(capsys.readouterr().out)
+    assert "pending" in lines[0] and "current" not in lines[0], lines
+    assert any(ln.strip() == f"to check, registered at {sha}: the sweep" for ln in lines), lines
+    assert not any("checked at" in ln for ln in lines), lines
 
 
 def test_a_check_reads_as_labelled_lines_not_python_reprs(repo, tmp_path, capsys):
@@ -2602,6 +2681,36 @@ def test_an_open_pre_registration_names_its_registration_date(tmp_path, capsys):
     assert line.startswith("  [prediction, registered 2026-09-20] item:p  falsified if X"), line
 
 
+def test_a_row_keeps_its_labels_in_every_summary_block(tmp_path, capsys, monkeypatch):
+    """`from <author>` and a pre-registration's `registered <date>` rode on
+    the heads block only, so a star, or a due date coming near, moved a row
+    to a block that dropped both (a fresh agent starred its prediction and
+    lost the date, 2026-09-29). The labels are the row's, not the block's."""
+    import datetime as dt
+    monkeypatch.setenv("SYMBION_AUTHOR", "claude")
+    _declare(tmp_path, PREREG)
+    soon = (dt.date.today() + dt.timedelta(days=2)).isoformat()
+    kw = dict(kind="prediction", status="open", checked="the sweep", author="ada",
+              created_at="2026-09-20T12:00:00+00:00")
+    store.add(tmp_path, target={"type": "item", "name": "starred"}, body="s",
+              tags=["priority"], **kw)
+    store.add(tmp_path, target={"type": "item", "name": "due"}, body="d", due=soon, **kw)
+    store.add(tmp_path, target={"type": "item", "name": "plain"}, body="p", **kw)
+    run("add", "task", "--target", "item:mine", "--tag", "priority", "--body", "m",
+        store_dir=tmp_path)
+    capsys.readouterr()
+    run("summary", store_dir=tmp_path)
+    lines = capsys.readouterr().out.splitlines()
+
+    def line(name):
+        return next(ln for ln in lines if f"item:{name} " in ln)
+    assert line("starred").startswith("  priority from ada "), line("starred")
+    assert line("due").startswith("  due in 2d from ada "), line("due")
+    for name in ("starred", "due", "plain"):
+        assert "from ada [prediction, registered 2026-09-20] " in line(name), line(name)
+    assert line("mine").startswith("  priority [task] item:mine "), line("mine")
+
+
 def test_a_full_row_says_when_and_by_whom_and_what_it_revises(tmp_path, capsys):
     """Text `show` had no date, no author and no earlier versions; only
     --json carried created_at and supersedes (newcomer walk-through,
@@ -2799,6 +2908,23 @@ def test_schema_on_an_absent_store_names_it_in_text_and_prints_defaults_in_json(
     assert run("schema", "--json", store_dir=tmp_path / "nowhere") == 0
     d = json.loads(capsys.readouterr().out)
     assert d["declared"] is False and len(d["kinds"]) == 7
+
+
+def test_schema_toml_prints_the_table_to_paste(tmp_path, capsys):
+    """A `[kinds]` table replaces the defaults, so a store adding a kind
+    copies the ones it keeps; with no table in its symbion.toml there was
+    nothing to copy, and 3 of 4 fresh agents guessed the `when` key
+    (2026-09-29). Both shapes: no table prints the defaults, a declared
+    table prints itself."""
+    store.ensure_store(tmp_path)
+    assert run("schema", "--toml", store_dir=tmp_path) == 0
+    text = capsys.readouterr().out
+    assert text.startswith("[kinds]\n") and "when = " in text
+    assert K.parse_kinds(tomllib.loads(text)["kinds"]) == K.DEFAULT_KINDS
+    _declare(tmp_path, PREREG)
+    assert run("schema", "--toml", store_dir=tmp_path) == 0
+    got = K.parse_kinds(tomllib.loads(capsys.readouterr().out)["kinds"])
+    assert got == K.read_kinds(tmp_path) and "prediction" in got
 
 
 # ---- resolvers, end to end ----
@@ -3741,7 +3867,7 @@ def test_from_json_takes_due(tmp_path, capsys, monkeypatch):
     assert store.load(tmp_path)[0].due == "2026-10-01"
 
 
-_DOCS = [Path(cli.__file__).parent / "data" / "skill" / f for f in ("SKILL.md", "adoption.md")] \
+_DOCS = [Path(cli.__file__).parent / "data" / "skill" / f for f in ("SKILL.md", "adoption.md", "catalogs.md")] \
     + [Path(__file__).parent.parent / "README.md"]
 
 
@@ -3774,7 +3900,7 @@ def test_every_flag_a_doc_names_is_one_the_parser_takes(doc, tmp_path, capsys):
     arguments`. Each doc is read through `-h` of the command
     it names, so a flag that exists only on another verb still fails."""
     pairs = _doc_flags(doc.read_text())
-    assert len(pairs) >= {"SKILL.md": 50, "README.md": 20}.get(doc.name, 1), \
+    assert len(pairs) >= {"SKILL.md": 35, "README.md": 20, "catalogs.md": 6}.get(doc.name, 1), \
         f"the scan read {len(pairs)} pairs: the pattern broke, not the docs"
     parser = cli._build_parser(frozenset(), frozenset(), frozenset(), tmp_path,
                                K.DEFAULT_KINDS)

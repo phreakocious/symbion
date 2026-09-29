@@ -9,6 +9,7 @@ are the defaults; a [kinds] table in symbion.toml replaces them entirely.
 """
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from dataclasses import dataclass
@@ -88,14 +89,13 @@ def is_declared(store_dir) -> bool:
 
 
 def render_toml(kinds: dict[str, Kind]) -> str:
-    """The table as toml, for `init`'s starter file. `when` strings must not
-    carry a double quote; the defaults do not, and this only renders those."""
+    """The table as toml: `init`'s starter file and `schema --toml`. A JSON
+    string is a valid toml basic string, so any `when` round-trips."""
     lines = ["[kinds]"]
     w = max(len(label) for label in kinds)
     for label, k in kinds.items():
         parts = [f"{b} = true" for b in BITS if getattr(k, b)]
         if k.when:
-            assert '"' not in k.when, k.when
-            parts.append(f'when = "{k.when}"')
+            parts.append(f"when = {json.dumps(k.when, ensure_ascii=False)}")
         lines.append(f"{label:<{w}} = {{ {', '.join(parts)} }}")
     return "\n".join(lines) + "\n"

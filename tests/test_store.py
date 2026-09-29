@@ -279,6 +279,15 @@ def test_a_row_with_a_verdict_field_on_a_plain_kind_still_loads(tmp_path):
     assert store.load(tmp_path)[0].result == "stray"
 
 
+@pytest.mark.parametrize("value,has", [(None, False), ("", False), ("  ", False),
+                                       ("None", False), ("null", False),
+                                       ("HELD", True), ("0", True)])
+def test_has_result_is_one_rule_for_a_verdict_present(value, has):
+    """The resolve gate and the `pending` state both ask it: a blank, or a
+    null's spelling left on disk by an older write, is no verdict."""
+    assert store.has_result(value) is has
+
+
 def test_a_prediction_cannot_be_resolved_without_a_result(tmp_path):
     _declare(tmp_path, PREREG)
     p = store.add(tmp_path, kind="prediction", target={"type": "project", "name": None},

@@ -247,6 +247,18 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     # while its answer went into a handoff file (2026-09-24). Its own cap,
     # ahead of the rest, keeps the ceiling.
     by_id = {n.id: n for n in loaded}
+
+    def digest(n, chars):
+        """One row's fields, the same in every block: a star or a near due
+        date moved a row to a block that dropped its `from` and its
+        registration date (2026-09-29). The labels are the row's."""
+        return {"id": n.id, "kind": n.kind,
+                "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
+                "body": clip(n.body, chars),
+                **({"from": n.author} if wrote_it(reader, n.author) else {}),
+                **({"registered": _root(by_id, n).created_at[:10]}
+                   if n.spec.status and n.spec.verdict else {})}
+
     prereg = [n for n in heads if n.spec.verdict]
     rest = deal_by_kind([n for n in heads if not n.spec.verdict])
     shown = prereg + rest if full else prereg[:PREREG_CAP] + rest[:HEAD_CAP]
@@ -283,32 +295,17 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         "open_in_arcs": sum(r["open"] for r in rows),
         "arcs": rows[:a_cap],
         "arcs_elided": max(0, len(rows) - a_cap),
-        "priority": [{"id": n.id,
-                      "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
-                      "kind": n.kind,
-                      "body": clip(n.body, BODY_CHARS)}
-                     for n in priority[:p_cap]],
+        "priority": [digest(n, BODY_CHARS) for n in priority[:p_cap]],
         "priority_elided": max(0, len(priority) - p_cap),
-        "people": [{"id": n.id, "kind": n.kind, "author": n.author,
-                    "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
-                    "body": clip(n.body, HEAD_CHARS)}
-                   for n in people[:o_cap]],
+        "people": [{**digest(n, HEAD_CHARS), "author": n.author} for n in people[:o_cap]],
         "people_elided": max(0, len(people) - o_cap),
-        "heads": [{"id": n.id, "kind": n.kind,
-                   "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
-                   "body": clip(n.body, HEAD_CHARS),
-                   # The people block names an author only for the rows no
-                   # other block printed, so a person's row that fell INSIDE
-                   # the cap lost its attribution -- and which side of the cap
-                   # it falls on is not something a reader can reason about.
-                   **({"from": n.author} if wrote_it(reader, n.author) else {}),
-                   **({"registered": _root(by_id, n).created_at[:10]}
-                      if n.spec.status and n.spec.verdict else {})}
-                  for n in shown],
+        # The people block names an author only for the rows no other block
+        # printed, so a person's row that fell INSIDE the head cap lost its
+        # attribution; which side of a cap a row falls on is not something a
+        # reader can reason about. `digest` labels it in every block.
+        "heads": [digest(n, HEAD_CHARS) for n in shown],
         "heads_elided": len(heads) - len(shown),
-        "due": [{"id": n.id, "kind": n.kind,
-                 "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
-                 "body": clip(n.body, BODY_CHARS), "due": n.due,
+        "due": [{**digest(n, BODY_CHARS), "due": n.due,
                  "past": past, "days": days, "phrase": due_phrase((past, days))}
                 for n, (past, days) in due[:d_cap]],
         "due_elided": max(0, len(due) - d_cap),
@@ -371,6 +368,15 @@ def _count(n: int, noun: str) -> str:
     return f"{n} {noun}{'' if n == 1 else 's'}"
 
 
+def _labelled(paint, r) -> str:
+    """A summary row with its own labels: `from <author>` and, on a
+    pre-registration, its registration date, in whichever block it prints."""
+    who = f"from {r['from']} " if r.get("from") else ""
+    reg = f", registered {r['registered']}" if r.get("registered") else ""
+    return who + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
+                          label=r["kind"] + reg)
+
+
 def render_summary(d: dict, paint=plain) -> str:
     counts = ", ".join(f"{paint(label, 'kind:' + label)} {n}" for label, n in d["open"].items())
     # `bug 0` beside a bug filed in an arc read as bug-free (2026-09-27).
@@ -380,7 +386,7 @@ def render_summary(d: dict, paint=plain) -> str:
            f"{counts or 'no status kinds declared'}{in_arcs}"]
     for r in d.get("due", ()):
         out.append(f"  {paint(r['phrase'], due_role(r['past'], r['days']))} "
-                   + row_line(paint, r["kind"], r["target"], r["body"], r["id"]))
+                   + _labelled(paint, r))
     if d.get("due_elided"):
         out.append("  " + paint(f"+{d['due_elided']} more due (--full)", "meta"))
     w = max((len(r["id"]) for r in d["arcs"]), default=0)
@@ -401,20 +407,15 @@ def render_summary(d: dict, paint=plain) -> str:
     # bare `*` beside a header that disagreed with it read as a bug in the
     # tool at first sight (measured 2026-09-20).
     for p in d["priority"]:
-        out.append(f"  {paint('priority', 'warn')} "
-                   + row_line(paint, p["kind"], p["target"], p["body"], p["id"]))
+        out.append(f"  {paint('priority', 'warn')} " + _labelled(paint, p))
     if d["priority_elided"]:
         out.append("  " + paint(f"+{d['priority_elided']} more priority (--full)", "meta"))
     for p in d.get("people", ()):
-        out.append(f"  from {p['author']} "
-                   + row_line(paint, p["kind"], p["target"], p["body"], p["id"]))
+        out.append("  " + _labelled(paint, {**p, "from": p["author"]}))
     if d.get("people_elided"):
         out.append("  " + paint(f"+{d['people_elided']} more from others (--full)", "meta"))
     for h in d.get("heads", ()):
-        reg = f", registered {h['registered']}" if h.get("registered") else ""
-        who = f"from {h['from']} " if h.get("from") else ""
-        out.append(f"  {who}" + row_line(paint, h["kind"], h["target"], h["body"], h["id"],
-                                         label=h["kind"] + reg))
+        out.append("  " + _labelled(paint, h))
     if d.get("heads_elided"):
         out.append("  " + paint(f"+{d['heads_elided']} more open (--full)", "meta"))
     if d["uncommitted_notes"] or d["registry_modified"]:

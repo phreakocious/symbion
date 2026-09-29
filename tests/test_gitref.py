@@ -131,6 +131,38 @@ def test_a_git_error_reads_unverifiable_not_diverged(repo):
     (repo / ".git" / "objects" / mid[:2] / mid[2:]).unlink()
     assert gitref.check_state(cfg, prov) == ("unverifiable", None)
 
+
+def test_an_older_git_that_exits_1_with_an_error_still_reads_unverifiable(repo, monkeypatch):
+    """The test above runs whatever git is installed. git 2.39 (macOS's own)
+    exits 1, not 128, when it cannot read the history, and says `error:` on
+    stderr; read as "no", the missing object showed `diverged` again (found
+    running the suite from the sdist on the system git, 2026-09-29). This
+    replays that contract on the same broken repo: real git, its 128 turned
+    into 1 with the stderr kept. A warning on a real "no" stays a "no"."""
+    cfg = Config(project_root=repo)
+    stamp, mid = _run(repo, "rev-parse", "HEAD~1"), _run(repo, "rev-parse", "HEAD")
+    (repo / "f2").write_text("x")
+    _run(repo, "add", "-A")
+    _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c2")
+    real = gitref._git
+
+    def old_git(c, *args):
+        r = real(c, *args)
+        if args[:2] == ("merge-base", "--is-ancestor") and r.returncode == 128:
+            return subprocess.CompletedProcess(r.args, 1, r.stdout, r.stderr)
+        return r
+    monkeypatch.setattr(gitref, "_git", old_git)
+    (repo / ".git" / "objects" / mid[:2] / mid[2:]).unlink()
+    assert gitref.check_state(cfg, {"sha": stamp, "dirty": False}) == ("unverifiable", None)
+
+    def warns(c, *args):
+        r = real(c, *args)
+        if args[:2] == ("merge-base", "--is-ancestor"):
+            return subprocess.CompletedProcess(r.args, 1, "", "warning: unable to access x\n")
+        return r
+    monkeypatch.setattr(gitref, "_git", warns)          # both directions answer "no"
+    assert gitref.check_state(cfg, {"sha": stamp, "dirty": False}) == ("diverged", None)
+
 def test_a_catalog_miss_says_when_the_path_is_on_the_default_branch(repo, capsys):
     """A catalog runs in the checkout you are in, so a row about a file only
     the default branch holds missed the catalog and was taken as typed, with

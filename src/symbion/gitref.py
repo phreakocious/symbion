@@ -105,6 +105,20 @@ def provenance_stamp(cfg, spec):
             **({"dirty_count": len(paths), "dirty_paths": paths[:20]} if paths else {})}
 
 
+def _is_ancestor(cfg, a, b):
+    """True, False, or None when git cannot answer (a missing object between
+    the two). `--is-ancestor` exits 1 for "no" and 128 when it cannot read
+    the history, but git 2.39 exits 1 for both and says so on stderr: only
+    a 1 with no `error:` or `fatal:` line is a "no"."""
+    r = _git(cfg, "merge-base", "--is-ancestor", a, b)
+    if r.returncode == 0:
+        return True
+    if r.returncode == 1 and not any(ln.startswith(("error:", "fatal:"))
+                                     for ln in r.stderr.splitlines()):
+        return False
+    return None
+
+
 def check_state(cfg, prov):
     """(state, distance). `dirty` outranks every sha relationship.
 
@@ -131,21 +145,19 @@ def check_state(cfg, prov):
     head = _git(cfg, "rev-parse", "HEAD").stdout.strip()
     if sha == head:
         return ("current", 0)
-    # `--is-ancestor` exits 1 for "no" and 128 when git cannot answer (a
-    # missing object between the two): only a 0 or a 1 is an answer.
-    up = _git(cfg, "merge-base", "--is-ancestor", sha, "HEAD").returncode
-    if up == 1:
-        down = _git(cfg, "merge-base", "--is-ancestor", head, sha).returncode
-        if down == 0:
+    up = _is_ancestor(cfg, sha, "HEAD")
+    if up is False:
+        down = _is_ancestor(cfg, head, sha)
+        if down:
             # HEAD is an ancestor of the stamp: the SAME line, read from a
             # checkout that lags it. A dated baseline stamped on the default
             # branch read `diverged` -- "another line of development" -- from
             # every worktree behind it (2026-09-28).
             n = _git(cfg, "rev-list", "--count", f"HEAD..{sha}").stdout.strip()
             return ("ahead", int(n))
-        if down == 1:
+        if down is False:
             return ("diverged", None)          # another line of development
-    if up != 0:
+    if up is not True:
         return ("unverifiable", None)
     n = _git(cfg, "rev-list", "--count", f"{sha}..HEAD").stdout.strip()
     return ("behind", int(n))

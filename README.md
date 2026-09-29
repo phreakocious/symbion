@@ -26,12 +26,13 @@ Python 3.11+ and git. The core needs two packages, `rich` and `rich-argparse`,
 for a person at a terminal: `list`, `show` and `context` as aligned, coloured
 columns with bodies rendered as markdown, and every other command and `--help`
 in the same colours. A pipe gets plain text. One optional extra, `gui`, adds the web UI
-(`symbion serve`). symbion is not on PyPI; install it from GitHub:
+(`symbion serve`):
 
 ```bash
-pipx install 'symbion[gui] @ git+https://github.com/phreakocious/symbion'
-# or: uv tool install 'symbion[gui] @ git+https://github.com/phreakocious/symbion'
-# drop [gui] for the core alone
+pipx install 'symbion[gui]'
+# or: uv tool install 'symbion[gui]'
+# drop [gui] for the core alone; for the unreleased main branch:
+# pipx install 'symbion[gui] @ git+https://github.com/phreakocious/symbion'
 ```
 
 To work on symbion itself, install a clone editable:
@@ -72,8 +73,8 @@ symbion init
 This creates `../<repo>-notes` (a git repo, no remote) with an annotated
 `symbion.toml`; nothing requires the toml, every value has a default. The
 first `init` on a machine also links `~/.claude/skills/symbion` to the skill
-directory inside the installed package (SKILL.md, adoption.md and the
-SessionStart hook script), so an upgrade reaches every project with nothing
+directory inside the installed package (SKILL.md, adoption.md, catalogs.md
+and the SessionStart hook script), so an upgrade reaches every project with nothing
 to refresh, and registers the hook in `~/.claude/settings.json` when that file
 does not exist. If it exists, `init` reads its `hooks.SessionStart` and says
 which of the three it found: `kept hook in ...`, the block to add instead of

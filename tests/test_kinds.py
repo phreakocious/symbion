@@ -85,3 +85,11 @@ def test_render_toml_round_trips_the_defaults():
     text = K.render_toml(K.DEFAULT_KINDS)
     assert text.startswith("[kinds]\n")
     assert K.parse_kinds(tomllib.loads(text)["kinds"]) == K.DEFAULT_KINDS
+
+
+def test_render_toml_round_trips_a_declared_when_with_quotes():
+    """`schema --toml` renders a store's own table, whose `when` may hold
+    anything a toml string can: an f-string of it broke on the first `"`."""
+    kinds = {"prediction": K.Kind(status=True, verdict=True,
+                                  when='say "falsified if" and a \\ path\tand a tab')}
+    assert K.parse_kinds(tomllib.loads(K.render_toml(kinds))["kinds"]) == kinds

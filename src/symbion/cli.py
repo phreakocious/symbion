@@ -309,7 +309,7 @@ def _painter():
 
 
 def _print_note(n, *, state=None, subject=None, full=True, head=None) -> None:
-    """`state` is (check_state, distance) for a check note, computed by the
+    """`state` is api.verdict_state's pair for a verdict row, computed by the
     caller (batched per-listing where it needs a subject lookup); `subject`
     is the commit's subject line for a commit-target note, degrading to the
     bare sha when the caller has none. `full=False` clips the body to one
@@ -359,7 +359,9 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None) -> None:
         text = summ.flatten if full else (lambda v: summ.clip(v, summ.LIST_BODY_CHARS))
         sha = (n.provenance or {}).get("sha")
         at = f" at {sha[:7]}" if sha else ""
-        if n.checked is not None or at:
+        if state and state[0] == "pending":
+            print(f"    to check, registered{at}: {text(n.checked)}")
+        elif n.checked is not None or at:
             print(f"    checked{at}: {text(n.checked)}")
         if n.result is not None:
             print(f"    result: {text(n.result)}")
@@ -847,7 +849,11 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
 
     sc = sub.add_parser("schema", help="this store's vocabulary: every kind with its bits "
                                        "and row count, then the target types")
-    sc.add_argument("--json", action="store_true")
+    sgrp = sc.add_mutually_exclusive_group()
+    sgrp.add_argument("--json", action="store_true")
+    sgrp.add_argument("--toml", action="store_true",
+                      help="the kinds as a [kinds] table to paste into symbion.toml; a table "
+                           "there replaces the defaults, so keep the ones you use")
 
     ctx = sub.add_parser("context", help="every note on one object (--target), commit "
                                          "(--commit) or branch (--branch)")
@@ -1348,7 +1354,7 @@ def _dispatch(args, ctx) -> int:
             for n in notes:
                 d = store.read_dict(n)
                 if n.spec.verdict:
-                    state, distance = gitref.check_state(cfg, n.provenance)
+                    state, distance = api.verdict_state(cfg, n)
                     d["state"] = state
                     d["distance"] = distance
                 if n.id in heads_of:
@@ -1384,7 +1390,7 @@ def _dispatch(args, ctx) -> int:
                    if n.target.type == "commit" and n.target.name}
             subjects = gitref.subjects(cfg, shas) if shas else {}
             for n in notes:
-                state = gitref.check_state(cfg, n.provenance) if n.spec.verdict else None
+                state = api.verdict_state(cfg, n) if n.spec.verdict else None
                 subject = subjects.get(n.target.name) if n.target.type == "commit" else None
                 _print_note(n, state=state, subject=subject,
                             full=args.full or bool(args.note_id), head=heads_of.get(n.id))
@@ -1575,6 +1581,9 @@ def _dispatch(args, ctx) -> int:
         return 0
 
     if args.cmd == "schema":
+        if args.toml:
+            print(K.render_toml(ctx.kinds), end="")
+            return 0
         data = summ.schema(store_dir, cfg, ctx.kinds)
         print(json.dumps(data) if args.json else summ.render_schema(data, _painter()))
         return 0

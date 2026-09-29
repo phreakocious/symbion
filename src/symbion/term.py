@@ -140,6 +140,8 @@ def _state(n, state) -> tuple[str, str]:
         return f"external ({summ.age_phrase(n.provenance['at'])})", META
     if st == "current":
         return st, GOOD
+    if st == "pending":            # registered, not yet run: nothing to judge
+        return st, META
     return (st if dist is None else f"{st} {dist}"), WARN
 
 
@@ -212,7 +214,7 @@ def _teaser(n, faded: bool, indent: int, width: int) -> Text | None:
     return line
 
 
-def _details(n, head) -> list[Text]:
+def _details(n, head, state) -> list[Text]:
     """The full view's lines between the head and the body."""
     def labelled(label, value):
         t = Text("    ")
@@ -227,16 +229,18 @@ def _details(n, head) -> list[Text]:
         out.append(labelled("refs  ", ", ".join(summ.ref_label(r) for r in n.refs)))
     if n.spec.verdict:
         sha = (n.provenance or {}).get("sha")
-        if n.checked is not None or sha:
-            out.append(labelled(f"checked{f' at {sha[:7]}' if sha else ''}: ",
-                                summ.flatten(n.checked)))
+        at = f" at {sha[:7]}" if sha else ""
+        if state and state[0] == "pending":
+            out.append(labelled(f"to check, registered{at}: ", summ.flatten(n.checked)))
+        elif n.checked is not None or at:
+            out.append(labelled(f"checked{at}: ", summ.flatten(n.checked)))
         if n.result is not None:
             out.append(labelled("result: ", summ.flatten(n.result)))
     return out
 
 
 def print_note(n, *, status, state, due, subject, head, full) -> None:
-    """`status` is the chain head's, `state` a check's (state, distance) and
+    """`status` is the chain head's, `state` api.verdict_state's pair and
     `due` store.due_state's pair for an open row, all computed by the caller
     the same way for the pipe line."""
     con = Console(highlight=False, markup=False, emoji=False, theme=MARKDOWN)
@@ -250,7 +254,7 @@ def print_note(n, *, status, state, due, subject, head, full) -> None:
             con.print(teaser, no_wrap=True, overflow="ellipsis", crop=True)
         return
     con.print(line)
-    for t in _details(n, head):
+    for t in _details(n, head, state):
         con.print(t)
     if n.body:
         con.print(Padding(Markdown(n.body, code_theme=_CodeTheme()), (0, 0, 0, 4)))
