@@ -7,14 +7,17 @@ description: "Use when recording or retrieving a durable, dated, object-attached
 
 Durable, dated, object-attached notes (a commit, a file, an arc, or the
 project as a whole), kept queryable instead of evaporating in chat. Backed by
-a separate git repo of JSONL beside the project, auto-created on first write.
+a separate git repo of JSONL beside the project, which `symbion init` creates.
+A write to a store init never made is refused, naming the path, so a wrong
+`--dir` cannot start a second store.
 
 ## Invocation
 
 Run `symbion`, the installed console script, never through `python -m` or a
 venv path. It works from any cwd, and `--dir` may go anywhere in the argv.
-If `command -v symbion` fails, it was installed into a venv only and the
-SessionStart hook is silent: see Install at
+If `command -v symbion` fails, it was installed into a venv only, and the
+SessionStart hook prints only a `not on PATH` line where a store exists: see
+Install at
 https://github.com/phreakocious/symbion. This file is symbion's own package
 data, linked once per user at `~/.claude/skills/symbion` by `symbion init`,
 so it is always the installed symbion's; no project holds a copy.
@@ -31,20 +34,37 @@ A kind is a label on three bits, and the bits are all symbion knows:
 - **`status`** — the row carries open/resolved, defaults to open, and
   `resolve <id>` closes it. Open rows count in arc progress, `arc todo`,
   the session-start line and the default `context` view.
-- **`parked`** — open rows are hidden from every open view. `resolve <id>
-  --add-tag adopted` or `--add-tag retired`, with a `--body` saying why.
+- **`parked`** — open rows are hidden from the open views (`arc todo`, arc
+  progress, the default `context`, summary's open rows); summary shows one
+  only when it is due soon or a person other than the reader wrote it.
+  `resolve <id> --add-tag adopted` or `--add-tag retired`, with a `--body`
+  saying why.
 - **`verdict`** — `--checked "pytest -q"` (what ran) and `--result "412
   passed"` (what it said); provenance is stamped at write, so `list` reports
-  `current`, `behind N` or `diverged` against today's HEAD. The body is
-  optional.
+  `current`, `behind N`, `ahead N` (stamped past this checkout) or
+  `diverged` against today's HEAD. The body is optional. A check on something
+  outside the repo (DNS, a host's logs, a live database) takes `--external`:
+  it is stamped with when it ran, not HEAD, needs no repo, and lists
+  `state=external (3d ago)`. Without it, a
+  commit or an unrelated edit makes it read `behind N` or `unverifiable
+  (dirty tree)`, about a fact no commit can change.
 - **`status` + `verdict`** is a pre-registration: file it before the data
   exists, with `--checked` naming what will run and its control and the body
   stating the prediction and what would falsify it. `resolve <id> --result
-  "…"` closes it; without `--result` it is refused, on every path. Amend
+  "…"` closes it; with no result, given now or already on the row, it is
+  refused, on every path. Amend
   it with `supersede <id> --append --body-file -`: the registered text stays
   a byte-identical prefix, and the new text follows a blank line. Give it
-  `--due` the date its window closes. Open ones list first at session
-  start, ahead of the newer rows. No default kind has both bits: declare
+  `--due` the date its window closes. A window that closes with the test
+  unrun — the condition it predicted about never occurred — is not a result:
+  amend it the same way, with a new `--due`, naming what did and did not
+  happen. `resolve` demands a `--result`, and any result scores claims the
+  run never reached: a prediction about a rare failure reads as falsified
+  when the failure simply never came up. Open ones list first at session
+  start, ahead of the newer rows, each with its registration date (the
+  first row's, which an amendment keeps; `add` stamps the time), so the
+  body need not restate it; a project whose convention stamps it in the
+  body anyway keeps its convention. No default kind has both bits: declare
   one, e.g. `prediction = { status = true, verdict = true }`, in a `[kinds]`
   table. The table replaces the defaults entirely, so copy in the ones you
   keep.
@@ -80,11 +100,18 @@ revises one, `resolve` or `supersede` that one: an open head beside the row
 that answered it prints at every session start. Before asserting what the
 store does or does not hold, search it: `list --grep 'a|b'`.
 
-`--body` is markdown. Use code fences and links; `list` and `context` print
-it as written on a pipe (and render it on a terminal with the `[tty]` extra),
-`summary` flattens it to one line. A body with backticks goes through
-`--body-file -` and a QUOTED heredoc (`<<'EOF'`): in `--body "…"` or an
-unquoted `<<EOF` the shell runs each backtick span as a command, silently.
+**Lead a status row with its claim or its ask.** Session start prints an open
+row as its first 100 characters, one line. A body that opens with where it
+came from ("From X, 2026-09-26.") or with background spends them before the
+point, and the reader needs a `show` per row to triage. Put the claim or the
+question first, in one sentence; evidence and provenance follow it. `add`
+prints the cut on stderr when a body runs past it.
+
+`--body` is markdown. Use code fences and links; `list --full`, `show` and
+`context` print it as written on a pipe (and render it on a terminal); a plain
+`list` page and `summary` flatten it to one clipped line. A body with backticks
+goes through `--body-file -` and a QUOTED heredoc (`<<'EOF'`): in `--body "…"`
+or an unquoted `<<EOF` the shell runs each backtick span as a command, silently.
 
 The examples here use `--type file`, a catalog type: a store has it only
 when its `symbion.toml` declares it (the starter file has it commented out),
@@ -98,16 +125,20 @@ symbion add --kind bug --type item --name "flaky upload test" --body "fails ~1/2
 ```
 
 `--type` is `commit`, `item`, `project` (no `--name`), `arc`, or a
-project-configured catalog type (e.g. `file`). `--tag` is repeatable.
+project-configured catalog type (e.g. `file`). `--tag` is repeatable; a tag
+no other row carries that nearly matches one in use (`flaky-tests` beside
+`flaky-test`) is named on stderr, since `--tag` matches exactly.
 `--ref TYPE:NAME` (repeatable) cross-references a second object: `context
 --target` on that object surfaces the note. Use it instead of naming the
 second object in prose. `supersede <id> --ref TYPE:NAME` takes the same flag,
 so a note already written can be attached to an object afterwards; it replaces
-the inherited refs the way `--tag` replaces the inherited tags.
+the inherited refs the way `--tag` replaces the inherited tags, and `--ref ''`
+clears them. `resolve <id> --ref commit:SHA` adds to the inherited refs
+instead: the commit that closed it. A ref to the row's own target is refused.
 
 **Many rows: `add --from-json PATH`** (`-` for stdin), one JSON object per
 line in the `list --json` shape: `kind`, `target: {type, name}`, and any of
-`body`, `status`, `checked`, `result`, `arc_id`, `due`, `tags`, `refs` (the
+`body`, `status`, `checked`, `result`, `external`, `arc_id`, `due`, `tags`, `refs` (the
 JSON form of `--ref TYPE:NAME`: `[{"type": …, "name": …}]`), `author`. Ids,
 dates and provenance are minted, and a row carrying one is refused by line
 number, as is any bad row; nothing is written unless every row passes. It
@@ -120,20 +151,26 @@ symbion add --from-json - <<'EOF'
 EOF
 ```
 
-**`add`, `resolve`, `supersede`, and `arc create` print the new id on stdout** —
+**`add`, `resolve`, `supersede`, `arc create` and `arc seed` print the new ids on stdout** —
 capture it (e.g. `nid=$(symbion add …)`) to `resolve` or `supersede` that
 same note later. A note id is a timestamp; an arc id is the slug of its
-name, suffixed on collision.
+name, suffixed on collision. `show`, `list --id`, `resolve` and `supersede`
+also take the id's tail when one id alone ends in it (`123456-a1b`, `a1b`,
+`…a1b`); a tail several ids share lists them and exits 1. Cite the 10-character
+tail, which the terminal view prints: 3 characters are often shared.
 
 ## Reading
 
 `--json` is the default for agent use — every row-producing command
 (`list`, `summary`, `context`, `arc list`, `arc todo`) takes it.
-A note is one shape everywhere: `id`, `kind`, `target: {type, name}` (`name`
-is `null` on a `project` target, so guard it before a jq `test()`),
-`created_at`, `author`, `body`, `status`, `checked`, `result`, `arc_id`,
-`due`, `supersedes`, `tags`, `refs`, plus `state` and `distance` on verdict
-kinds. There is no `ts` or `title`: a guessed key reads as a silent `null`.
+A note is one shape in `list`, `context` and `arc todo`: `id`, `kind`,
+`target: {type, name}` (`name` is `null` on a `project` target, so guard it
+before a jq `test()`), `created_at`, `author`, `body`, `status`, `checked`,
+`result`, `arc_id`, `due`, `supersedes`, `tags`, `refs`, `provenance`,
+`measurements`, `evidence`; `list` adds `state` and `distance` on verdict
+kinds and `head` on a superseded row. `summary --json` rows are digests:
+`target` is a `type:name` string and `body` is clipped. There is no `ts` or
+`title`: a guessed key reads as a silent `null`.
 
 The ENVELOPE differs, though: `list`, `arc list` and `arc todo` return a bare
 array, while `summary` and `context` return an object (`context` puts its
@@ -160,24 +197,35 @@ symbion context --target file:src/x.py --json
 chain's head: `superseded -> <id> [resolved]` (`head` in `--json`).
 
 Search bodies with `list --grep PATTERN` (a case-insensitive regex over
-body, target name, checked and result), never `list | grep`: the pipe reads
-one page, drops its header, and the silence reads as absence. Measured
-2026-09-24: two rows in one store claimed "no row about this" beside the row
-about exactly that.
+body, target name, checked, result and each ref as `type:name`; `^` and `$`
+anchor a line), never `list | grep`: the pipe reads one page, drops its
+header, and the silence reads as absence. Measured 2026-09-24: two rows in
+one store claimed "no row about this" beside the row about exactly that.
+It is a regex, so `$ | [ ( . * + ?` are operators: a literal pasted from a
+row reads 0 (`$HOME`) or far too many (`list | grep`, `[question]`). Add
+`-F` to search for it literally. A regex that holds operators and matches
+nothing says so on stderr when `-F` would match, with the count, and a `-F`
+pattern holding `|` that matches nothing says what the regex would match.
 
 Text `list` is a page, not the whole: the 25 newest rows, one clipped body
-line each, under a first line that carries the total, what is shown, and each
+line each, ending `+N more not shown` when the page is partial, under a
+first line that carries the total, what is shown, and each
 hidden set with the flag that reveals it (`+N resolved (--status resolved)`,
 `+N superseded (--all)`). With a filter the first line reads `N of M match
 --kind bug --tag x`, M being the rows scanned, so a 0 never reads as 0-of-0;
 `--all` always says how many superseded rows it included. `--limit N` widens
 (0 for all); `--full` prints bodies as stored; `--id` is always the whole row. `--json` is never a page
-unless `--limit` is given, and then says `showing N of M` on stderr.
+unless `--limit` is given, and then says `showing N of M` on stderr; a
+filtered one names the matches it hides there too (`+N superseded (--all)`).
 Text `summary` is capped the same way, and every `+N more ... (--full)` line
 names the one flag that lifts all of its caps.
+A person at a terminal sees rows as columns instead: the id's last 10
+characters first, its age, `○` open or `✓` resolved, and a count of refs. Output they paste in carries only that id tail, which `show`,
+`resolve` and `supersede` take as it is. Your own reads are pipes, so they
+always get the lines described above.
 `arc todo` and `context` open with the same kind of line (`0 open of 4 items;
-+4 resolved (list --arc ID)`, `0 notes for file:x`), an empty store names the
-verb that fills it, and a miss names the legal values (`no arc 'x'; did you
++4 resolved (list --arc ID)`, `0 notes for file:x`), a plain `list` of an
+empty store names the verb that fills it, and a miss names the legal values (`no arc 'x'; did you
 mean y? (arc list)`).
 
 ## Checklists: `add`, not `seed`, unless there is a catalog
@@ -192,10 +240,13 @@ symbion resolve <id>                      # tick the box
 symbion list --arc "$aid" --json    # every row in the arc, resolved included: how a finished campaign reads back
 ```
 
-A checklist item is any row in the arc that carries a status, so a `bug`
+A checklist item is any unparked row in the arc that carries a status, so a `bug`
 added with `--arc-id` is a box too, not just context beside one; several
 items may share a target, and each is its own box. `arc todo` is the
 open boxes; `list --arc` is every row in the arc, notes and decisions too.
+`--arc-id` must name an arc (`arc list`). `arc archive ID` takes the arc's
+progress line off the session-start summary, and its open rows then list
+with the rows outside arcs.
 
 `seed` mints one *bodiless* task per name; it exists for fanning out
 over a catalog, where the name is the whole ticket.
@@ -274,7 +325,8 @@ a bootstrap writes its first row.
   it says the store exists on one disk.
 - **Name resolution falls back to your typed string on a catalog miss.** A
   substring match against a configured catalog expands to the full name; a
-  typo that matches nothing becomes its own target, silently — no error. A
+  typo that matches nothing becomes its own target, with only a stderr note
+  and exit 0. A
   numeric type needs a `[resolvers]` entry or it fragments (see Resolvers).
 - **`--apply` on `arc reconcile` will not close stale tasks.** It
   moves each `renamed` item's old name onto the live one across the whole
@@ -288,9 +340,12 @@ a bootstrap writes its first row.
 
 `session_start.sh`, beside this file, runs `symbion summary` — open counts
 per kind outside arcs, every open row past due or due within 7 days, arc
-progress, anything tagged `priority`, and the open rows outside arcs, one line
-each (open pre-registrations first, then the newest of the rest; each row
-prints once) — from a SessionStart hook in `~/.claude/settings.json`, so it
+progress, anything tagged `priority`, the open rows outside arcs (open
+pre-registrations first, then the rest dealt one kind at a time, newest
+first within each, so no kind the header counts is left unlisted), and open
+rows a person other than the reader wrote, parked ones included, one line
+each; each row prints once, and whichever block prints it, a row the reader
+did not write carries `from <author>` — from a SessionStart hook in `~/.claude/settings.json`, so it
 runs at the start of every session (`symbion init` writes that file when it
 is absent, and otherwise prints the block to add); in a
 project with no store it says nothing. From there:
@@ -335,27 +390,31 @@ told their agents `show` did not exist after it shipped.
 
 | command | does |
 |---|---|
-| `add KIND --target T:N` or `add --kind K --type T [--name N]`, then `[--body …] [--status open\|resolved] [--checked …] [--result …] [--arc-id ID] [--due DATE] [--tag …]… [--ref T:N]… [--author …]` | append a note; prints its id |
+| `add KIND --target T:N` or `add --kind K --type T [--name N]`, then `[--body …] [--status open\|resolved] [--checked …] [--result …] [--external] [--arc-id ID] [--due DATE] [--tag …]… [--ref T:N]… [--author …]` | append a note; prints its id |
 | `add --from-json PATH [--author …]` | append one note per JSON line (`-` = stdin); all rows validated first; prints each id |
-| `list [--type T] [--name N] [--kind K] [--status S] [--tag TAG] [--arc ID] [--author A] [--grep PAT] [--overdue] [--all] [--limit N] [--full] [--json]` | list heads, newest-first; text is a 25-row page with a count header; `--overdue` is open rows past their due date |
+| `list [--type T] [--name N] [--kind K] [--status S] [--tag TAG] [--arc ID] [--author A] [--grep PAT [-F]] [--overdue] [--since WHEN] [--all] [--limit N] [--full] [--json]` | list heads, newest-first; text is a 25-row page with a count header; `--overdue` is open rows past their due date; `--since 2h` (or `3d`, a date, an ISO datetime) is what was written since |
 | `show <id> [--json]` | one row by id: `list --id <id>` |
-| `resolve <id> [--body …] [--body-file PATH] [--append] [--add-tag …]… [--result …]` | supersede with `status=resolved`; `--result` is required on a status+verdict kind; `--append` adds the body after the current one instead of replacing it |
-| `supersede <id> [--body …] [--body-file PATH] [--append] [--status …] [--tag …] [--add-tag …] [--rm-tag …] [--ref T:N] [--checked …] [--result …] [--due DATE]…` | append a correction, prints the new id (`--tag` and `--ref` replace what was inherited; `--due ''` clears the date; `--add-tag`/`--rm-tag` edit the tags; `--checked`/`--result` correct a check's verdict; `--append` adds the body after the current one, which stays byte-identical) |
+| `resolve <id> [--body …] [--body-file PATH] [--add-tag …]… [--ref T:N]… [--result …]` | supersede with `status=resolved`; `--body` goes after the current body, after a blank line symbion inserts, so the row still states what it was about (to replace the body instead: `supersede <id> --status resolved --body …`); `--result` is required on a status+verdict kind; `--ref` adds to the inherited refs (the commit that closed it) |
+| `supersede <id> [--body …] [--body-file PATH] [--append] [--status …] [--tag …] [--add-tag …] [--rm-tag …] [--ref T:N] [--checked …] [--result …] [--due DATE]…` | append a correction, prints the new id (`--tag` and `--ref` replace what was inherited; `--ref ''` clears the refs; `--due ''` clears the date; `--add-tag`/`--rm-tag` edit the tags; `--checked`/`--result` correct a check's verdict; `--append` adds the body after the current one, after a blank line symbion inserts, and the current one stays byte-identical) |
 | `commit [-m MSG]` | `git add -A` + commit the store |
-| `rename <old> <new> --type T` | re-target all notes for a renamed object and re-point every `--ref` to it; exits 1 when nothing carried the name |
+| `rename <old> <new> --type T` | re-target all notes for a renamed object and re-point every `--ref` to it; `old` matches exactly, and when nothing carried it, exits 1 and names the stored names that hold it |
 | `tags` | tag vocabulary with counts |
 | `summary [--full] [--json]` | bounded session-start summary |
 | `schema [--json]` | this store's kinds with their bits and row counts, then its target types |
 | `context [--target T:N \| --commit SHA \| --branch REF [--since REF]] [--json]` | pull-based detail |
-| `arc create --name … --scope SCOPE` / `seed <id> --scope T [--name …] [--kind LABEL]` / `seed --scope T --dry-run` / `list` / `todo <id>` / `rename <id> <new_name>` / `archive <id>` / `reconcile <id> [--apply] [--resolve-stale] [--json]` | campaign registry |
+| `arc create --name … [--scope SCOPE]` / `seed <id> [--scope T] [--name …] [--kind LABEL]` / `seed --scope T --dry-run` / `list` / `todo <id>` / `rename <id> <new_name>` / `archive <id>` / `reconcile <id> [--apply] [--resolve-stale] [--json]` | campaign registry |
 
 `--dir PATH` overrides the store, anywhere in argv; default is `SYMBION_DIR`,
 else a `.symbion` file in the repo root naming the store (one line, relative
 or absolute), else the sibling repo `../<project>-notes`. A store whose name
-does not match its repo NEEDS that file: without it a bare command finds no
-store and the next write starts a second one, silently. A `<project>-notes`
-store named with `--dir` from another repo, or from outside any repo,
-resolves catalogs and check state in `<project>` and says so on stderr;
+does not match its repo NEEDS that file: without it every bare command finds
+no store. A store named with
+`--dir` from another repo, or from outside any repo, resolves catalogs and
+check state in its project and says so on stderr: `<project>` for a
+`<project>-notes` store, else the one sibling repo whose `.symbion` names it;
 `init` alone keeps the cwd's project. A cwd inside a store uses that store
-and resolves the same way; `init` there refuses. Any read of an absent store
-prints `no store at <path>` on stderr and exits 1 (`summary`: stdout, 0).
+and resolves the same way; `init` there refuses. Any command but `init` on an
+absent store, a write too, prints `no store at <path>` on stderr and exits 1
+(`summary`: stdout, 0); a
+`--json` read prints its empty shape at exit 0 with that note on stderr, and
+`summary --json` answers `store: null`.

@@ -10,6 +10,8 @@ from nicegui.testing import User          # noqa: E402
 from symbion import api, store            # noqa: E402
 from symbion.gui.arcs import checklist   # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("tmp_store")
+
 
 @pytest.fixture
 def seeded(repo, tmp_path):

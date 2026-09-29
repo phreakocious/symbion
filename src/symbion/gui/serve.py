@@ -1,10 +1,14 @@
 """Process entry for `symbion serve`.
 
---reload is special: multiprocessing's spawn reloader deliberately skips
-re-running a package __main__ (its module spec name ends in '.__main__'; see
-multiprocessing.spawn._fixup_main_from_name), so NiceGUI's ui.run() would never
-re-execute in the reload worker and startup dies with "You must call ui.run()".
-This module is not a __main__, so the worker re-runs it.
+--reload is special. uvicorn's reload worker is a spawned process, and spawn
+re-runs the parent's __main__ in it and nothing else. From the console script
+that is its `if __name__ == "__main__"` guard, which skips main(); from
+`python -m symbion` it is a package __main__, which spawn skips outright
+(multiprocessing.spawn._fixup_main_from_name). Either way the worker never
+calls ui.run() and startup dies with "You must call ui.run()". So main()
+re-execs as `python -m symbion.gui.serve`: this module is then __main__, the
+worker re-runs it as __mp_main__, and the block at the bottom sends both into
+the same `serve` branch of the CLI.
 
 `nicegui` is imported at MODULE scope, not inside main(): cli.py catches the
 ImportError at `from .gui import serve` and turns it into an install
@@ -14,12 +18,15 @@ the bare traceback the handler exists to prevent.
 from __future__ import annotations
 
 import multiprocessing
+import os
 import socket
+import sys
 from pathlib import Path
 
 from nicegui import ui
 
 from .pages import build_page
+from .theme import FAVICON_SVG
 
 _DEFAULT_PORT = 43210
 
@@ -37,12 +44,18 @@ def pick_free_port(preferred: int = _DEFAULT_PORT) -> int:
 
 
 def main(ctx, *, author: str, port=None, show: bool = True,
-         reload: bool = False) -> None:
+         reload: bool = False, argv=()) -> None:
+    """`argv` is the CLI's own, `--dir` included: --reload re-runs it."""
+    # With --reload, uvicorn spawns a worker that re-runs main(); its port is
+    # unused, and it must neither announce the URL nor re-exec. The worker's
+    # __main__ is still spawn's stub while this runs, so only the process
+    # name tells the two apart.
+    top = multiprocessing.current_process().name == "MainProcess"
+    if reload and top and getattr(sys.modules["__main__"].__spec__, "name", None) != __name__:
+        os.execv(sys.executable, [sys.executable, "-m", __name__, *argv])
     build_page(ctx, author=author)
     port = port if port is not None else pick_free_port()
-    # Only the top-level process announces the URL. With --reload, uvicorn
-    # spawns workers that re-run main(); their port is unused.
-    if multiprocessing.current_process().name == "MainProcess":
+    if top:
         print(f"symbion → http://127.0.0.1:{port}  (writing as {author})", flush=True)
     # Loopback only: the GUI writes rows with no authentication, and
     # ui.run() defaults to 0.0.0.0 outside native mode.
@@ -50,6 +63,13 @@ def main(ctx, *, author: str, port=None, show: bool = True,
         host="127.0.0.1", port=port, show=show, reload=reload,
         uvicorn_reload_dirs=str(Path(__file__).resolve().parent),
         uvicorn_reload_includes="*.py",
-        title="symbion", dark=True, show_welcome_message=False,
+        title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON_SVG,
         reconnect_timeout=30.0,
     )
+
+
+if __name__ in {"__main__", "__mp_main__"}:
+    from symbion.cli import main as _cli_main
+    _rc = _cli_main()
+    if __name__ == "__main__":       # the worker returns: uvicorn runs the app
+        sys.exit(_rc)

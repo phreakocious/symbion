@@ -6,6 +6,8 @@ import pytest
 from symbion import store, summary
 from symbion.config import Config
 
+pytestmark = pytest.mark.usefixtures("tmp_store")
+
 
 def _run(cwd, *a):
     return subprocess.run(["git", "-C", str(cwd), *a],
@@ -243,6 +245,7 @@ def test_context_commit_canonicalizes_then_queries(repo, tmp_path):
     that would just as happily return everything."""
     cfg = Config(project_root=repo)
     store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
     head = _run(repo, "rev-parse", "HEAD")
     parent = _run(repo, "rev-parse", "HEAD~1")
     store.add(store_dir, kind="note", target={"type": "commit", "name": head}, body="reviewed")
@@ -254,6 +257,7 @@ def test_context_commit_canonicalizes_then_queries(repo, tmp_path):
 def test_context_branch_filters_heads_by_branch_commits(repo, tmp_path):
     cfg = Config(project_root=repo, default_branch="main")
     store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
     main_head = _run(repo, "rev-parse", "main")
     _run(repo, "checkout", "-q", "-b", "topic")
     (repo / "topic_file").write_text("z")
@@ -414,6 +418,26 @@ def test_summary_open_counts_rows_outside_arcs_only(tmp_path):
     d = summary.summary(tmp_path, cfg)
     assert d["open"]["bug"] == 1
     assert d["arcs"][0]["total"] == 1, "the arc still counts its own bug"
+
+
+def test_open_rows_in_an_archived_or_unknown_arc_count_outside_arcs(tmp_path):
+    """summary kept only active arcs and dropped every row with an arc_id, so
+    an open row in an archived arc, or under an id that names no arc, showed
+    nowhere: no count, no line, no +N, while `list --status open` held it.
+    A row is on an arc's checklist only while that arc is active."""
+    cfg = Config(project_root=tmp_path)
+    live = store.create_arc(tmp_path, "live", "", "item")
+    gone = store.create_arc(tmp_path, "gone", "", "item")
+    store.add(tmp_path, kind="bug", target={"type": "item", "name": "a"}, arc_id=live.id)
+    archived = store.add(tmp_path, kind="bug", target={"type": "item", "name": "b"},
+                         arc_id=gone.id)
+    ghost = store.add(tmp_path, kind="bug", target={"type": "item", "name": "c"},
+                      arc_id="nosuch")
+    store.archive_arc(tmp_path, gone.id)
+    d = summary.summary(tmp_path, cfg)
+    assert d["open"]["bug"] == 2
+    assert {h["id"] for h in d["heads"]} == {archived.id, ghost.id}
+    assert [r["id"] for r in d["arcs"]] == [live.id]
 
 
 def test_summary_line_reads_the_same_shape_on_a_default_store(tmp_path):
@@ -664,6 +688,33 @@ def test_open_preregistrations_are_not_pushed_off_by_newer_rows(tmp_path):
     assert kinds == ["prediction"] * 3 + ["bug"] * summary.HEAD_CAP
     assert data["heads_elided"] == 2
     assert "+2 more open (--full)" in summary.render_summary(data)
+
+
+def test_a_kind_the_header_counts_cannot_be_missing_from_the_heads(tmp_path):
+    """The header counts open rows per kind and the list was one newest-first
+    cap over all of them, so a whole kind could be counted and unlisted:
+    measured 2026-09-28 on an adopter store where a bootstrap wrote its two
+    `question` rows first and both landed in `+6 more open`, though the kind
+    exists for the owner to see at session start. The heads are dealt one kind
+    at a time now. Both directions: every counted kind appears, and the cap
+    still holds."""
+    cfg = Config(project_root=tmp_path)
+    _declare(tmp_path, '[kinds]\nbug = { status = true }\ntask = { status = true }\n'
+                       'question = { status = true }\n')
+    for i in range(2):                      # the oldest rows in the store
+        store.add(tmp_path, kind="question", target={"type": "item", "name": f"q{i}"})
+    for i in range(7):
+        store.add(tmp_path, kind="bug", target={"type": "item", "name": f"b{i}"})
+        store.add(tmp_path, kind="task", target={"type": "item", "name": f"t{i}"})
+    data = summary.summary(tmp_path, cfg)
+    assert data["open"] == {"bug": 7, "task": 7, "question": 2}
+    kinds = [h["kind"] for h in data["heads"]]
+    assert kinds.count("question") == 2, kinds
+    assert len(kinds) == summary.HEAD_CAP and data["heads_elided"] == 16 - summary.HEAD_CAP
+    assert "+8 more open (--full)" in summary.render_summary(data)
+    full = summary.summary(tmp_path, cfg, full=True)
+    assert [h["id"] for h in full["heads"][:summary.HEAD_CAP]] == [h["id"] for h in data["heads"]], \
+        "--full lifts the cap; it must not re-order what was already shown"
 
 
 def test_the_due_block_lists_past_due_and_due_soon_open_rows_once(tmp_path):

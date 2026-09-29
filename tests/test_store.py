@@ -8,6 +8,8 @@ import pytest
 from symbion import kinds as K
 from symbion import store
 
+pytestmark = pytest.mark.usefixtures("tmp_store")
+
 
 def _write_raw_legacy_row(store_dir, **overrides):
     """A pre-invariant row written straight into notes.jsonl, bypassing
@@ -502,17 +504,18 @@ def test_supersede_with_a_raising_canonicalize_writes_nothing(tmp_path):
 # ---- due: a date an open row falls past due ----
 from datetime import timedelta, timezone
 
-NOW = datetime(2026, 9, 24, 12, 0, tzinfo=timezone(timedelta(hours=-5)))
+NOW = datetime(2026, 9, 24, 12, 0, tzinfo=timezone(timedelta(hours=9)))
 
 
 @pytest.mark.parametrize("due, want", [
     ("2026-09-23", (True, -1)),
     ("2026-09-24", (False, 0)),               # a date is due through the end of its day
     ("2026-10-01", (False, 7)),
-    ("2026-09-24T11:00:00-05:00", (True, 0)),  # an instant earlier today is past
-    ("2026-09-24T13:00:00-05:00", (False, 0)),
-    ("2026-09-24T16:30:00+00:00", (True, 0)),  # 11:30 at NOW's offset
-    ("2026-09-25T04:00:00+00:00", (False, 0)),  # 23:00 at NOW's offset: still today
+    ("2026-09-24T11:00:00+09:00", (True, 0)),  # an instant earlier today is past
+    ("2026-09-24T13:00:00+09:00", (False, 0)),
+    ("2026-09-24T02:30:00+00:00", (True, 0)),  # 11:30 at NOW's offset
+    ("2026-09-23T23:00:00+00:00", (True, 0)),  # 08:00 at NOW's offset: today, though UTC reads the 23rd
+    ("2026-09-24T14:00:00+00:00", (False, 0)),  # 23:00 at NOW's offset: still today
 ])
 def test_due_state_is_past_due_and_calendar_days_at_now(due, want):
     assert store.due_state(due, NOW) == want
@@ -591,31 +594,46 @@ def test_rename_moves_targets_and_repoints_refs_one_case_per_shape(tmp_path):
     note that REF'd it on the old name, so `context --target` on the new
     name omitted it. One row per shape: target only, ref only, both on one
     row, a ref list with a second entry that must survive, a row that
-    already REF'd the new name, and the same name under another type, which
-    must not move."""
+    already REF'd the new name, the same name under another type, which
+    must not move, and an unrelated row with a legacy self-edge, which the
+    sweep once superseded uncounted (2026-09-29)."""
     add = lambda **kw: store.add(tmp_path, kind="note", **kw).id
     on = add(target=_ref("item", "old"))
     ref_only = add(target=_ref("project", None), refs=[_ref("item", "old")])
-    both = add(target=_ref("item", "old"), refs=[_ref("item", "old")])
+    # A self-edge from before add refused one: written the way it arrived.
+    legacy = store.note_from_dict({"id": store.new_id(), "kind": "note",
+                                   "created_at": "2026-09-01T00:00:00Z",
+                                   "target": _ref("item", "old"), "refs": [_ref("item", "old")]})
+    store._append_note_unlocked(tmp_path, legacy)
+    both = legacy.id
+    stray = store.note_from_dict({"id": store.new_id(), "kind": "note",
+                                  "created_at": "2026-09-01T00:00:00Z",
+                                  "target": _ref("item", "elsewhere"),
+                                  "refs": [_ref("item", "elsewhere")]})
+    store._append_note_unlocked(tmp_path, stray)
+    onto_ref = add(target=_ref("item", "old"), refs=[_ref("item", "new")])
     mixed = add(target=_ref("project", None),
                 refs=[_ref("file", "a.py"), _ref("item", "old"), _ref("commit", "abc")])
     other_type = add(target=_ref("project", None), refs=[_ref("file", "old")])
     already = add(target=_ref("project", None), refs=[_ref("item", "new"), _ref("item", "old")])
 
-    assert store.rename_target(tmp_path, "item", "old", "new") == (2, 4)
+    assert store.rename_target(tmp_path, "item", "old", "new") == (3, 4)
 
     notes = store.load(tmp_path)
     head = {n.supersedes or n.id: n for n in store.heads(notes)}
     T = store.Target
     assert head[on].target == T("item", "new")
     assert head[ref_only].refs == (T("item", "new"),)
-    assert (head[both].target, head[both].refs) == (T("item", "new"), (T("item", "new"),))
+    assert (head[both].target, head[both].refs) == (T("item", "new"), ()), "self-edge dropped"
+    assert (head[onto_ref].target, head[onto_ref].refs) == (T("item", "new"), ()), \
+        "a rename never makes a self-edge"
     assert head[mixed].refs == (T("file", "a.py"), T("item", "new"), T("commit", "abc"))
     assert head[other_type].id == other_type, "a file:old ref moved on an item rename"
+    assert head[stray.id].id == stray.id, "a row the rename does not touch was rewritten"
     assert head[already].refs == (T("item", "new"),), "one object, one entry"
-    assert len(notes) == 6 + 5, "each changed row is superseded exactly once"
+    assert len(notes) == 8 + 6, "each changed row is superseded exactly once"
     assert {n.id for n in store.heads_for(tmp_path, "item", "new")} == \
-        {head[k].id for k in (on, ref_only, both, mixed, already)}
+        {head[k].id for k in (on, ref_only, both, onto_ref, mixed, already)}
     assert store.heads_for(tmp_path, "item", "old") == []
 
 

@@ -1,6 +1,8 @@
 import pytest
 from symbion import store
 
+pytestmark = pytest.mark.usefixtures("tmp_store")
+
 
 def test_arc_from_dict_validates_scope_against_an_injected_set():
     d = {"id": "x", "name": "x", "target_scope": "item", "created_at": "2026-01-01T00:00:00"}

@@ -1,6 +1,9 @@
 import json
+import pytest
 from symbion import store
 from symbion.config import Config
+
+pytestmark = pytest.mark.usefixtures("tmp_store")
 
 
 def test_supersede_stamps_the_new_author_not_the_old_one(tmp_path):

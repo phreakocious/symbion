@@ -86,7 +86,7 @@ Commands come from a config file in your own store, run by you, against your own
 
 ### Store
 
-Three files in the store directory, auto-created on first write (`git init` + empty files + `.gitignore` for `.lock` and `.tmp.*`):
+Three files in the store directory, auto-created on first write (`git init` + empty files + `.gitignore` for `.lock` and `.tmp.*`) (reversed 2026-09-28: only `symbion init` creates them, and a write to a store init never made is refused, naming the path; a renamed repo, a mistyped `--dir` or a stale `SYMBION_DIR` had each started a second store with an ordinary id printed):
 
 - **`notes.jsonl`** — append-only, one note per line, supersede chains.
 - **`activities.jsonl`** — the activity registry, rewritten in place (atomic: temp + fsync + rename).
@@ -191,6 +191,8 @@ Two things fall out for free:
 `diverged` and `unavailable` likewise report as **unverifiable, never as current**. The distinction matters because of squash and rebase merges: an audit run on a topic-branch commit that was squashed into `main` is describing work that *is* in the tree, but its sha is no longer reachable — reading that as "fine, different branch" would silently vouch for a verification nobody can re-check. Symbion says it cannot tell, which is the honest and the fail-safe answer. Changing the note's *target* does not help — provenance stamps HEAD regardless of what the note is attached to — so the only thing that survives a squash is **re-stamping**: a superseding audit written after the merge, whose provenance records the squashed commit that is actually in `main`. (Amended 2026-09-08: `supersede` inherits provenance, since a correction is about the same run, so the re-stamp is a new `check` written with `add`. Resolving an open pre-registration is the one supersede that re-stamps; see the kinds spec.)
 
 `symbion list --kind audit` renders the state, and the distance whenever `audit_state` gives one (`current` is distance 0, `behind` is distance N — only `unverifiable`/`diverged` render no distance); `--json` carries both as `state`/`distance` fields.
+
+(Amended 2026-09-28: a check whose subject is outside the tree, such as DNS, a host's logs or a live database, is written with `add --external` and stamped `{"external": true, "at": <write time>}` instead. It reads `external` with its age, never `behind` or `unverifiable`, and needs no repo. The reason for the four states above still holds for every check that reads the tree. It does not hold for one that reads the world: a dirty tree or a later commit said "stale" about a fact HEAD cannot change, and in a store whose checks mostly read the world, that was most verdict rows. The writer declares it per row, because neither the target type nor the kind separates the two shapes: one store's single kind held both a test run and a live-database query.)
 
 `[provenance] command` + `render` remain as the override for a project wanting something else, but the default needs no configuration to be useful.
 

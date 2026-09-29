@@ -9,6 +9,7 @@ from nicegui import ui
 
 from .. import api
 from .. import store as S
+from .. import summary as summ
 from .notes import target_link, edit_dialog
 
 
@@ -33,10 +34,12 @@ def seedable(ctx, kind: str = "task") -> bool:
 
 
 def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
-    """Head tasks for an arc, not-done first then by target name."""
+    """Head tasks for an arc, not-done first, then by target name, then in
+    the order written. Each row carries its kind and clipped body: six boxes
+    on one file drew six identical target lines (2026-09-27)."""
     items = S.arc_items(S.load(ctx.store_dir), arc_id)
     items.sort(key=lambda n: (S.read_status(n) == "resolved",
-                              (n.target.name or "").lower()))
+                              (n.target.name or "").lower(), n.created_at, n.id))
     if not items:
         ui.label("no targets yet — seed a scope above").classes("text-muted")
         return
@@ -56,9 +59,13 @@ def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
         with ui.row().classes("items-center gap-2 w-full sb-note").mark("checklist-row"):
             ui.button(icon="check_box" if done else "check_box_outline_blank",
                       on_click=_toggle) \
-                .props("flat dense round" + (" color=positive" if done else "")) \
+                .props("flat dense round" + (" color=positive" if done else "")
+                       + f' aria-label="{"reopen" if done else "resolve"}"') \
                 .mark("checklist-toggle", f"toggle-{fu.id}")   # per-row: find() returns a SET
+            ui.label(fu.kind).classes("sb-chip")
             target_link(fu)
+            ui.label(summ.clip(fu.body, summ.HEAD_CHARS)).classes("sb-note-meta") \
+                .mark("checklist-body")
             ui.space()
             if done:
                 ui.label(fu.created_at.replace("T", " ")).classes("sb-note-meta")
@@ -106,5 +113,7 @@ def index(ctx, *, author: str) -> None:
     if archived:
         with ui.expansion(f"archived ({len(archived)})").classes("w-full sb-card"):
             for a in archived:
-                ui.label(f"{a.name} · archived {a.archived_at or '—'}") \
-                    .classes("sb-note-meta")
+                with ui.row().classes("items-center gap-2"):
+                    ui.link(a.name, f"/arc?id={quote(a.id)}").classes("text-body") \
+                        .mark("archived-arc")
+                    ui.label(f"archived {a.archived_at or '—'}").classes("sb-note-meta")

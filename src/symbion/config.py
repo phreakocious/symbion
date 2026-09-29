@@ -89,8 +89,9 @@ def _pointer(root: Path) -> Path | None:
     file rather than an env var because the thing it fixes is durable:
     measured 2026-09-11, renaming a repo DIRECTORY does not lose its store,
     it FORKS it. `summary` prints nothing and exits 0 (the README's table
-    reads that as "no store yet") and the next `add` creates a second store
-    and prints an ordinary id.
+    reads that as "no store yet") and the next `add` created a second store
+    and printed an ordinary id. (Since 2026-09-28 that `add` refuses and names
+    the path: only `init` creates a store.)
 
     First non-blank line, the same rule as a resolver's stdout, so a `# why:`
     line can follow it. Blank or whitespace-only falls through to the
@@ -132,21 +133,36 @@ def store_owner(store) -> Path | None:
     store named with `--dir` from another repo can resolve in its project
     (measured 2026-09-23: symbion's catalog ran in another project).
 
-    ponytail: a store reached only through a pointer (not `<name>-notes`)
-    has no back-reference and answers None; record the project in the store
-    if that case is ever measured."""
+    A store whose name does not match (reached through a `.symbion`) is owned
+    by the one sibling repo whose pointer names it; measured 2026-09-24, it
+    had no owner and `--dir` resolved check state in the cwd's repo: 100 of
+    100 rows `unverifiable`, stderr empty. Two such repos: no owner.
+
+    ponytail: only siblings are scanned; a pointer from a repo elsewhere
+    stays unowned until the store records its project."""
     store = Path(store).resolve()
-    if not store.name.endswith("-notes"):
+    if store.name.endswith("-notes"):
+        root = _claims(store.parent / store.name[:-len("-notes")], store)
+        if root is not None:
+            return root
+    if not store.parent.is_dir():
         return None
-    cand = store.parent / store.name[:-len("-notes")]
+    pointers = [c for c in store.parent.iterdir()
+                if c != store and (c / ".symbion").is_file()]
+    owners = [r for r in (_claims(c, store) for c in pointers) if r is not None]
+    return owners[0] if len(owners) == 1 else None
+
+
+def _claims(cand: Path, store: Path) -> Path | None:
+    """`cand` when it is the top of a MAIN worktree whose own rules name
+    `store`. A subdirectory of a repo resolves to the repo, a linked worktree
+    to its main one: neither is `cand`, so neither claims the store."""
     if not cand.is_dir():
         return None
     try:
         root = project_root(cand)
     except (subprocess.CalledProcessError, RuntimeError):
         return None
-    # A subdirectory of a repo resolves to the repo, a linked worktree to its
-    # main one: neither is `cand`, so neither claims the store.
     if root != cand.resolve() or tree_store(root) != store:
         return None
     return root

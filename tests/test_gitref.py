@@ -76,10 +76,15 @@ def test_missing_commit_is_unverifiable(repo):
 
 
 def test_commit_that_exists_but_is_not_an_ancestor_of_head_is_diverged(repo):
-    """A commit reachable in the repo (so cat-file -e succeeds) but not an
-    ancestor of current HEAD — e.g. a branch tip never merged back — is a
-    distinct line of development, not `unverifiable`'s rev-parse failure and
-    not `current`."""
+    """A commit reachable in the repo (so cat-file -e succeeds) with neither
+    it nor HEAD an ancestor of the other — a branch tip never merged back,
+    beside a main that moved on — is a distinct line of development, not
+    `unverifiable`'s rev-parse failure, not `current`, and not `ahead`.
+
+    BOTH sides need their own commit. A topic branch off a main that has not
+    moved is `ahead` by every definition git has, and the fixture that left
+    main where it was asserted `diverged` about it — passing on the code that
+    collapsed the two states."""
     cfg = Config(project_root=repo)
     _run(repo, "checkout", "-q", "-b", "topic")
     (repo / "topic_only").write_text("z")
@@ -87,7 +92,72 @@ def test_commit_that_exists_but_is_not_an_ancestor_of_head_is_diverged(repo):
     _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "topic-commit")
     topic_sha = _run(repo, "rev-parse", "HEAD")
     _run(repo, "checkout", "-q", "main")
+    (repo / "main_only").write_text("m")
+    _run(repo, "add", "-A")
+    _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main-commit")
     assert gitref.check_state(cfg, {"sha": topic_sha, "dirty": False}) == ("diverged", None)
+
+
+def test_a_stamp_this_checkout_has_not_reached_is_ahead_not_diverged(repo):
+    """The stamp is a DESCENDANT of HEAD: the same line of development, read
+    from a checkout that lags it. `merge-base --is-ancestor sha HEAD` fails
+    there too, so it read `diverged` — "another line of development" about
+    the one line. Measured 2026-09-28: a project keeping `main` in its own
+    worktree stamped a dated baseline there, and every checkout behind it
+    read that baseline as diverged."""
+    cfg = Config(project_root=repo)
+    behind = _run(repo, "rev-parse", "HEAD")
+    for i in (2, 3):
+        (repo / f"f{i}").write_text("x")
+        _run(repo, "add", "-A")
+        _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", f"c{i}")
+    tip = _run(repo, "rev-parse", "HEAD")
+    _run(repo, "checkout", "-q", behind)
+    assert gitref.check_state(cfg, {"sha": tip, "dirty": False}) == ("ahead", 2)
+
+
+def test_a_git_error_reads_unverifiable_not_diverged(repo):
+    """`merge-base --is-ancestor` exits 1 for "not an ancestor" and 128 when
+    git cannot answer. Reading every nonzero exit as "not an ancestor" showed
+    a commit object missing between the stamp and HEAD as `diverged`, another
+    line of development, about the one line (2026-09-29)."""
+    cfg = Config(project_root=repo)
+    stamp, mid = _run(repo, "rev-parse", "HEAD~1"), _run(repo, "rev-parse", "HEAD")
+    (repo / "f2").write_text("x")
+    _run(repo, "add", "-A")
+    _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c2")
+    prov = {"sha": stamp, "dirty": False}
+    assert gitref.check_state(cfg, prov) == ("behind", 2)      # the path is reached
+    (repo / ".git" / "objects" / mid[:2] / mid[2:]).unlink()
+    assert gitref.check_state(cfg, prov) == ("unverifiable", None)
+
+def test_a_catalog_miss_says_when_the_path_is_on_the_default_branch(repo, capsys):
+    """A catalog runs in the checkout you are in, so a row about a file only
+    the default branch holds missed the catalog and was taken as typed, with
+    only the generic note — indistinguishable from a typo (2026-09-28).
+
+    The other two shapes stay quiet, and they are why the probe tests the
+    worktree too: a path that IS here but that a FILTERING catalog
+    (`git ls-files '*.py'`) leaves out is not missing from this worktree, and
+    a name on no branch at all is an ordinary miss."""
+    base = _run(repo, "rev-parse", "HEAD")
+    (repo / "only_main.py").write_text("x")
+    _run(repo, "add", "-A")
+    _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main-only")
+    _run(repo, "checkout", "-q", "-b", "wip", base)
+    assert not (repo / "only_main.py").exists()
+
+    cfg = Config(project_root=repo, catalogs={"file": "true"})
+    assert gitref.only_on_default_branch(cfg, "only_main.py") == "main"
+    assert gitref.only_on_default_branch(cfg, "f0") is None, "in this worktree"
+    assert gitref.only_on_default_branch(cfg, "nowhere.py") is None, "on no branch"
+
+    catalog.match(cfg, "file", "only_main.py", ["f0", "f1"])
+    err = capsys.readouterr().err
+    assert "taken as typed; it is on main, not in this worktree" in err, err
+    catalog.match(cfg, "file", "nowhere.py", ["f0", "f1"])
+    err = capsys.readouterr().err
+    assert "taken as typed\n" in err and "worktree" not in err, err
 
 
 def test_provenance_is_stamped_only_for_verdict_kinds(repo):
@@ -124,6 +194,19 @@ def test_branch_commits_returns_commits_since_default_branch(repo):
     _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "topic1")
     topic_head = _run(repo, "rev-parse", "HEAD")
     assert gitref.branch_commits(cfg, "topic") == {topic_head}
+
+
+@pytest.mark.parametrize("ref, base", [("no-such-ref", "main"), ("topic", "master")])
+def test_branch_commits_refuses_a_ref_git_cannot_read(repo, ref, base):
+    """A failed rev-list returned an empty set, so `context --branch
+    no-such-ref`, or any branch in a repo whose default is not the
+    configured `main`, read `0 notes` at exit 0 (doc claims audit,
+    2026-09-27). The error names the range and where the base comes from."""
+    _run(repo, "branch", "topic")
+    cfg = Config(project_root=repo, default_branch=base)
+    with pytest.raises(ValueError, match=rf"git cannot list {base}\.\.{ref}: .*--since"):
+        gitref.branch_commits(cfg, ref)
+    assert gitref.branch_commits(cfg, "topic", since="topic") == set(), "a real empty range"
 
 
 def test_subjects_maps_sha_to_subject_line(repo):

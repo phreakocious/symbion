@@ -1,7 +1,20 @@
 import importlib.util
+import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
+
+# This tree's src/, ahead of the editable install's .pth entry. In a git
+# worktree that shares the main checkout's venv, the install points at the
+# MAIN checkout's src/, and the suite tested that tree and said nothing.
+# PYTHONPATH carries it into subprocesses that inherit the environment;
+# test_hook.py adds it to the environments it builds.
+SRC = str(Path(__file__).resolve().parents[1] / "src")
+sys.path.insert(0, SRC)
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    p for p in (SRC, os.environ.get("PYTHONPATH")) if p)
 
 # NiceGUI's `user` fixture lives in a plugin that is not auto-registered.
 # Conditional so a checkout without the [gui] extra still collects: the gui
@@ -49,6 +62,29 @@ def _isolated_cwd(_neutral_repo, monkeypatch):
     which is no repo, 14 of them failed. One empty repo shared by the session:
     a test that writes into its cwd or commits asks for `repo` instead."""
     monkeypatch.chdir(_neutral_repo)
+
+
+@pytest.fixture
+def tmp_store(tmp_path):
+    """tmp_path as a store `symbion init` made. A write refuses any other,
+    and most tests write to tmp_path as their store; a test of the refusal,
+    or one that needs tmp_path outside any repo, leaves this out."""
+    from symbion import store
+    store.ensure_store(tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def refusing_hook():
+    """Installs a pre-commit hook in a store that refuses every commit and
+    says why on stderr, the way a secret scanner does. Returns what it says."""
+    def install(store_dir, words="hook: 1 secret found"):
+        hook = Path(store_dir) / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text(f"#!/bin/sh\necho '{words}' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        return words
+    return install
 
 
 @pytest.fixture

@@ -1,7 +1,10 @@
 import json
 
+import pytest
 from symbion import store
 from symbion import summary as summ
+
+pytestmark = pytest.mark.usefixtures("tmp_store")
 
 
 def _n(store_dir, **kw):
@@ -39,8 +42,8 @@ def test_open_outside_arcs_excludes_arc_members_for_any_kind(tmp_path):
     _n(tmp_path, kind="task", arc_id="camp-1")
     _n(tmp_path, kind="bug", arc_id="camp-1")
     heads = store.heads(store.load(tmp_path))
-    assert len(summ.open_outside_arcs(heads, "task")) == 1
-    assert summ.open_outside_arcs(heads, "bug") == [], "a bug in an arc is the arc's"
+    assert len(summ.open_outside_arcs(heads, "task", {"camp-1"})) == 1
+    assert summ.open_outside_arcs(heads, "bug", {"camp-1"}) == [], "a bug in an arc is the arc's"
 
 
 def test_starred_includes_a_decision(tmp_path):

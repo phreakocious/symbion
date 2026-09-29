@@ -31,7 +31,8 @@ GUI_DIR = Path(__file__).resolve().parent.parent / "src" / "symbion" / "gui"
 
 ALLOWED_STORE_READS = {
     "load", "load_malformed", "load_arcs", "heads", "heads_for", "query",
-    "tag_counts", "arc_items", "arc_progress", "read_status", "due_state", "exists",
+    "tag_counts", "arc_items", "arc_progress", "read_status", "due_state", "since_cutoff",
+    "exists",
     "notes_path", "arcs_path", "Note", "Arc", "Target",
     "STATUSES", "BUILTIN_TARGET_TYPES",
 }
@@ -153,7 +154,7 @@ def test_the_gui_directory_is_actually_being_scanned():
 import builtins  # noqa: E402
 import sys  # noqa: E402
 
-from symbion import cli  # noqa: E402
+from symbion import store, cli  # noqa: E402
 
 
 def test_serve_without_the_extra_explains_itself(repo, tmp_path, monkeypatch, capsys):
@@ -169,6 +170,7 @@ def test_serve_without_the_extra_explains_itself(repo, tmp_path, monkeypatch, ca
     # nothing about the handler.
     for mod in [m for m in sys.modules if m.startswith("symbion.gui")]:
         monkeypatch.delitem(sys.modules, mod, raising=False)
+    store.ensure_store(tmp_path)      # an absent store stops serve first
     monkeypatch.setattr(builtins, "__import__", no_nicegui)
     rc = cli.main(["--dir", str(tmp_path), "serve"])
 
@@ -191,6 +193,7 @@ def test_a_broken_gui_import_is_not_reported_as_a_missing_extra(
 
     for mod in [m for m in sys.modules if m.startswith("symbion.gui")]:
         monkeypatch.delitem(sys.modules, mod, raising=False)
+    store.ensure_store(tmp_path)      # an absent store stops serve first
     monkeypatch.setattr(builtins, "__import__", broken_pages)
     with pytest.raises(ImportError, match="pages"):
         cli.main(["--dir", str(tmp_path), "serve"])

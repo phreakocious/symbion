@@ -1,11 +1,14 @@
 import inspect
 import subprocess
+from datetime import datetime, timedelta
 import sys
 from pathlib import Path
 
 import pytest
 
-from symbion import api, cli, store
+from symbion import api, cli, gitref, store
+
+pytestmark = pytest.mark.usefixtures("tmp_store")
 
 
 def test_resolve_derives_type_sets_from_catalogs(repo, tmp_path):
@@ -254,6 +257,8 @@ _NON_WRITERS = {
     "seed_names",          # pure: expands a catalog
     "canonicalize_rows",   # pure: resolves names; add_many/supersede append
     "canonicalize_names",  # pure: resolves names; seed_arc appends
+    "check_arc",           # pure: refuses an arc id that names no arc
+    "check_arc_targets",   # pure: the same, for arc: targets and refs
     "add_fields",   # takes fields, not a row -- no single keyword-only author
                     # for this audit to see; it demands one per row itself
                     # (raises ValueError, not TypeError) -- see
@@ -377,6 +382,33 @@ def test_commit_reports_nothing_to_commit_when_clean(repo, tmp_path):
             author="t")
     assert api.commit(ctx, "first") is True
     assert api.commit(ctx, "again") is False
+
+
+def test_commit_raises_with_the_hooks_words_when_a_hook_refuses(repo, tmp_path,
+                                                                refusing_hook):
+    """A refusal read as 'nothing to commit', with git's output dropped
+    (2026-09-28): a secret scanner in the store's pre-commit hook caught a
+    token, and the caller heard that nothing had changed. The notes stay
+    staged, so the next commit past the hook takes them."""
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}},
+            author="t")
+    words = refusing_hook(tmp_path)
+    with pytest.raises(RuntimeError, match=words):
+        api.commit(ctx, "refused")
+    (tmp_path / ".git" / "hooks" / "pre-commit").unlink()
+    assert api.commit(ctx, "after") is True
+
+
+def test_commit_raises_when_git_cannot_stage(repo, tmp_path):
+    """The other shape: `git add -A` fails (a held index.lock), stages
+    nothing, and the empty index read as 'nothing to commit'."""
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}},
+            author="t")
+    (tmp_path / ".git" / "index.lock").touch()
+    with pytest.raises(RuntimeError, match="index.lock"):
+        api.commit(ctx, "locked")
 
 
 def test_supersede_refuses_a_target(repo, tmp_path):
@@ -572,6 +604,57 @@ def test_correcting_a_check_verdict_still_inherits_provenance(repo, tmp_path):
     assert fixed.provenance == c.provenance
 
 
+def test_an_external_check_reads_external_whatever_the_tree_does(repo, tmp_path):
+    """A check on something outside the tree (DNS, a host's logs) is stamped
+    with when it ran, not HEAD: a dirty tree or a later commit says nothing
+    about it. The same write without `external` on the same dirty tree reads
+    unverifiable -- the other direction."""
+    ctx = api.resolve(str(tmp_path))
+    (repo / "f").write_text("unrelated edit")
+    row = {"kind": "check", "target": {"type": "item", "name": "dns"},
+           "checked": "dig", "result": "CNAME ok"}
+    ext = api.add(ctx, {**row, "external": True}, author="ada")
+    tree = api.add(ctx, row, author="ada")
+    assert set(ext.provenance) == {"external", "at"} and ext.provenance["external"] is True
+    lag = datetime.fromisoformat(ext.created_at) - datetime.fromisoformat(ext.provenance["at"])
+    assert timedelta(0) <= lag < timedelta(seconds=5), "stamped just before the row is minted"
+    assert gitref.check_state(ctx.cfg, ext.provenance) == ("external", None)
+    assert gitref.check_state(ctx.cfg, tree.provenance) == ("unverifiable", None)
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "--", "f"], check=True)
+    _commit_empty(repo, "moved on")
+    assert gitref.check_state(ctx.cfg, ext.provenance) == ("external", None)
+
+
+def test_external_is_refused_off_a_verdict_kind_and_off_a_boolean(repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    with pytest.raises(ValueError, match="verdict"):
+        api.fields_from_row(ctx, {"kind": "note", "external": True,
+                                  "target": {"type": "project", "name": None}}, "t")
+    with pytest.raises(ValueError, match="true or false"):
+        api.fields_from_row(ctx, {"kind": "check", "external": "yes",
+                                  "target": {"type": "project", "name": None}}, "t")
+    tree = api.fields_from_row(ctx, {"kind": "check", "external": False,
+                                     "target": {"type": "project", "name": None}}, "t")
+    assert "sha" in tree["provenance"], "false is the default, a tree stamp"
+
+
+def test_an_external_prediction_restamps_external_and_a_correction_inherits(repo, tmp_path):
+    """Resolving re-stamps with the time the verdict was made; it must not
+    turn into a tree stamp. A plain correction keeps the run's time."""
+    _declare(tmp_path, PREREG)
+    ctx = api.resolve(str(tmp_path))
+    assert api.fields_from_row(ctx, {"kind": "prediction", "external": True, "target":
+                                     {"type": "project", "name": None}}, "t")["provenance"]["external"]
+    # Written dated, since a stamp is to the second and the fixture is fast.
+    p = store.add(tmp_path, kind="prediction", target={"type": "project", "name": None},
+                  checked="the host's log", author="ada",
+                  provenance={"external": True, "at": "2026-01-01T00:00:00+00:00"})
+    c = api.supersede(ctx, p.id, author="ada", body="sharpened")
+    assert c.provenance == p.provenance
+    r = api.supersede(ctx, c.id, author="ada", status="resolved", result="HELD")
+    assert set(r.provenance) == {"external", "at"} and r.provenance["at"] != p.provenance["at"]
+
+
 def test_resolving_a_prediction_without_a_result_is_refused_at_the_api(repo, tmp_path):
     _declare(tmp_path, PREREG)
     ctx = api.resolve(str(tmp_path))
@@ -648,7 +731,7 @@ def test_pending_never_duplicates_a_name_already_in_the_catalog(repo, tmp_path):
     """Two rows naming `parser` against a catalog of src/parser.py, no
     resolver. Both must store src/parser.py."""
     store_dir = tmp_path / "s"
-    store_dir.mkdir()
+    store.ensure_store(store_dir)
     (store_dir / "symbion.toml").write_text('[catalogs]\nfile = "echo src/parser.py"\n')
     ctx = api.resolve(str(store_dir))
     notes = api.add_many(ctx, [_row("parser", "file"), _row("parser", "file")], author="t")
@@ -657,7 +740,7 @@ def test_pending_never_duplicates_a_name_already_in_the_catalog(repo, tmp_path):
 
 def test_the_catalog_runs_once_per_write_not_once_per_row(repo, tmp_path):
     store_dir = tmp_path / "s"
-    store_dir.mkdir()
+    store.ensure_store(store_dir)
     (store_dir / "symbion.toml").write_text(
         f'[catalogs]\nfile = "echo run >> {tmp_path}/cat.calls; echo src/parser.py"\n')
     ctx = api.resolve(str(store_dir))
@@ -666,6 +749,7 @@ def test_the_catalog_runs_once_per_write_not_once_per_row(repo, tmp_path):
 
 
 def test_a_commit_target_is_still_peeled_under_the_lock(repo, tmp_path):
+    store.ensure_store(tmp_path / "s")
     ctx = api.resolve(str(tmp_path / "s"))
     n = api.add(ctx, _row("HEAD", "commit"), author="t")
     assert len(n.target.name) == 40
@@ -673,8 +757,9 @@ def test_a_commit_target_is_still_peeled_under_the_lock(repo, tmp_path):
 
 def test_refs_resolve_against_pending_too(repo, tmp_path):
     ctx = api.resolve(str(reading_store(tmp_path)))
-    n = api.add(ctx, _row("40.40", refs=[{"type": "reading", "name": "40.45"}]),
-                author="t")
+    _, n = api.add_many(ctx, [_row("40.40"),
+                              _row("50.00", refs=[{"type": "reading", "name": "40.45"}])],
+                        author="t")
     assert n.refs[0].name == "40.40"
 
 
@@ -683,13 +768,14 @@ def test_supersede_resolves_only_the_refs_supplied(repo, tmp_path):
     row carrying refs runs it zero times and keeps them verbatim."""
     store_dir = reading_store(tmp_path, counter=True)
     ctx = api.resolve(str(store_dir))
-    n = api.add(ctx, _row("40.40"), author="t")
+    api.add(ctx, _row("40.40"), author="t")
+    n = api.add(ctx, _row("50.00"), author="t")
     before = calls(store_dir)
     m = api.supersede(ctx, n.id, author="t", refs=[{"type": "reading", "name": "41.25"}])
     assert m.refs[0].name == "40.40" and calls(store_dir) == before + 1
     k = api.supersede(ctx, m.id, author="t", body="edited")
     assert [r.name for r in k.refs] == ["40.40"] and calls(store_dir) == before + 1
-    assert k.target.name == "40.40"
+    assert k.target.name == "50.00"
 
 
 def test_check_refs_validates_without_running_a_catalog(repo, tmp_path):
@@ -764,7 +850,7 @@ def test_the_catalog_runs_once_per_supersede_not_once_per_ref(repo, tmp_path):
     supersede's new refs go through the same _canonicalizer and must share
     its one-run pool."""
     store_dir = tmp_path / "s"
-    store_dir.mkdir()
+    store.ensure_store(store_dir)
     (store_dir / "symbion.toml").write_text(
         f'[catalogs]\nfile = "echo run >> {tmp_path}/cat.calls; echo src/parser.py; echo src/lexer.py"\n')
     ctx = api.resolve(str(store_dir))

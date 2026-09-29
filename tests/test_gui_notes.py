@@ -10,6 +10,8 @@ from nicegui.testing import User            # noqa: E402
 from symbion import api, store              # noqa: E402
 from symbion.gui.notes import render_note   # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("tmp_store")
+
 
 async def test_renders_body_kind_and_tags(user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
@@ -47,6 +49,20 @@ async def test_check_badge_says_why_it_is_unverifiable(user: User, repo, tmp_pat
     await user.should_see("dirty tree")
 
 
+async def test_an_external_check_badge_reads_external(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "check", "target": {"type": "item", "name": "dns"},
+                      "checked": "dig", "result": "ok", "external": True}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("external — <1d ago")
+    await user.should_not_see("current")
+
+
 async def test_tag_chip_is_a_link_into_the_filtered_view(user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
@@ -77,6 +93,114 @@ async def test_a_clean_check_badge_reads_current(user: User, repo, tmp_path):
     await user.open("/t")
     await user.should_see("current")
     await user.should_not_see("unverifiable")
+
+
+async def test_a_behind_badge_lists_the_commits_since_its_stamp(user: User, repo, tmp_path):
+    """The badge lit up on hover and a click did nothing (the owner's bug).
+    Its tooltip now names the stamp and the commits `behind N` counts."""
+    import subprocess
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "check", "target": {"type": "commit", "name": "HEAD"},
+                      "checked": "x", "result": "y"}, author="ada")
+    for i in range(10):
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", f"later {i}"],
+                       check=True, cwd=repo)
+    from symbion import gitref
+    from symbion.gui.notes import TIP_COMMITS, check_tip
+    state, distance = gitref.check_state(ctx.cfg, n.provenance)
+    assert (state, distance) == ("behind", 10)
+    tip = check_tip(ctx.cfg, n.provenance, state, distance).splitlines()
+    assert tip[0] == f"stamped at {n.provenance['sha'][:7]}; HEAD is 10 commits past it:"
+    assert [t.split(" ", 1)[1] for t in tip[1:-1]] == \
+        [f"later {i}" for i in range(9, 9 - TIP_COMMITS, -1)]      # newest first
+    assert tip[-1] == f"+{10 - TIP_COMMITS} more"
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("behind 10")
+    await user.should_not_see(f"stamped at {n.provenance['sha'][:7]}")   # not yet: lazy
+    user.find(marker="check-state").trigger("mouseenter")
+    await user.should_see(f"stamped at {n.provenance['sha'][:7]}")       # the tooltip
+
+
+def test_a_tip_names_the_stamp_or_nothing():
+    from symbion.gui.notes import check_tip
+    sha = "0123456789abcdef"
+    assert check_tip(None, {"sha": sha}, "current", 0) == "stamped at 0123456, this checkout's HEAD"
+    assert check_tip(None, {"sha": sha}, "diverged", None).startswith("stamped at 0123456, on another")
+    assert check_tip(None, None, "unverifiable", None) == ""
+    assert check_tip(None, {"external": True, "at": "x"}, "external", None) == ""
+
+
+async def test_an_id_cited_in_a_body_links_to_that_note(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    cited = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                          "body": "the cited row"}, author="ada")
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": f"settled by {cited.id}; the code `{cited.id}` stays text"},
+                author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    html = md.props["innerHTML"]                  # rendered; .content is the source
+    assert html.count(f'href="/notes?id={cited.id}"') == 1, html
+    assert f"<code>{cited.id}</code>" in html
+
+
+async def test_a_compact_row_clips_a_long_verdict_and_a_full_one_does_not(
+        user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    long = "pytest " + "--flag " * 40 + "END"
+    n = api.add(ctx, {"kind": "check", "target": {"type": "project", "name": None},
+                      "checked": long, "result": "ok"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada", compact=True)
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    short, full = sorted((e.text for e in user.find(marker="note-verdict").elements), key=len)
+    assert "END" not in short and "…" in short
+    assert full == f"checked: {long}   →   result: ok"
+
+
+async def test_icon_buttons_have_names_a_screen_reader_can_read(user: User, repo, tmp_path):
+    """An icon-only button reads as its icon's ligature ("star_outline")."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    for marker, name in (("note-star", "toggle priority"), ("note-resolve", "resolve"),
+                         ("note-edit", "edit")):
+        (b,) = user.find(marker=marker).elements
+        assert b.props.get("aria-label") == name, (marker, b.props)
+
+
+async def test_the_id_links_to_the_note_alone(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (link,) = user.find(marker="note-id").elements
+    assert link.props["href"] == f"/notes?id={n.id}"
 
 
 async def test_a_non_project_target_links_to_the_object_view(user: User, repo, tmp_path):

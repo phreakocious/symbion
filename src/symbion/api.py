@@ -10,6 +10,7 @@ writers at all (tests/test_gui_seam.py).
 """
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import subprocess
@@ -40,6 +41,12 @@ class Ctx:
     # (config.store_owner), so both roots are that project's. The CLI says
     # so on stderr: check state computed elsewhere must not read as local.
     followed_owner: bool = False
+    # The store the CWD's own tree names (config.tree_store), or None outside
+    # a repo. `store_dir != tree_default` means the store was named rather
+    # than stood in: two summaries read back to back in one session were
+    # otherwise identical, and neither said which project it was about
+    # (an adopter driving a satellite repo from a hub, 2026-09-28).
+    tree_default: Path | None = None
 
 
 def resolve(dir_value=None, follow_owner=True) -> Ctx:
@@ -80,6 +87,11 @@ def resolve(dir_value=None, follow_owner=True) -> Ctx:
     in_store = (dir_value is None and not from_env and store.is_store(root))
     store_dir = (Path(dir_value).resolve() if dir_value is not None
                  else root if in_store else config.store_dir(root))
+    # What the CWD's own tree names, before follow_owner moves `root` -- so a
+    # caller can say "this is not the store you get by standing here". The
+    # tree, not config.store_dir: SYMBION_DIR names a store too, and a reader
+    # who cannot see the environment is exactly who the label is for.
+    tree_default = None if root is None else config.tree_store(root)
     followed = False
     if (follow_owner and (dir_value is not None or from_env or in_store)
             and (root is None or config.tree_store(root) != store_dir)):
@@ -106,6 +118,7 @@ def resolve(dir_value=None, follow_owner=True) -> Ctx:
         kinds=K.read_kinds(store_dir),
         store_from_env=from_env,
         followed_owner=followed,
+        tree_default=tree_default,
     )
 
 
@@ -114,7 +127,7 @@ def _git_user_name() -> str:
     """Isolated so both author rules (and their tests) can vary the identity
     without spawning git."""
     # Keep this `subprocess.run` reached through the module: tests/test_cli.py
-    # (frozen) patches `cli.subprocess.run`, which is the same module object
+    # patches `cli.subprocess.run`, which is the same module object
     # only while this file says `import subprocess`. A `from subprocess import
     # run` edit here silently unhooks that patch point.
     r = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True)
@@ -154,6 +167,20 @@ def canon(cfg, target_type, name):
     return gitref.canon_name(cfg, target_type, name)
 
 
+def check_name(typ: str, name) -> None:
+    """A project target has no name and every other target has one. Every
+    writer of a target or ref name passes here: add, --from-json, --ref,
+    seed and rename. `project:foo` stored silently, and `context --target
+    project:` never showed it (measured 2026-09-26: six rows in one adopter
+    store, written for named subjects)."""
+    if typ == "project":
+        if name is not None:
+            raise ValueError(f"a project target takes no name (got {name!r}); "
+                             f"a named subject is item:{name}")
+    elif not isinstance(name, str) or not name.strip():
+        raise ValueError(f"target type {typ!r} needs a name: {typ}:NAME")
+
+
 def check_refs(target_types, refs) -> list[dict]:
     """Shape and type of row-shaped refs, name NFC'd; NO catalog runs, so a
     caller outside the lock can report a bad ref before locking. Resolution
@@ -165,6 +192,7 @@ def check_refs(target_types, refs) -> list[dict]:
         if r["type"] not in target_types:
             raise ValueError(f"unknown ref type {r['type']!r} (choose from "
                              f"{', '.join(sorted(target_types))})")
+        check_name(r["type"], r.get("name"))
         out.append({"type": r["type"], "name": catalog.nfc(r.get("name"))})
     return out
 
@@ -221,6 +249,7 @@ def rename_target(ctx: Ctx, target_type: str, old: str, new: str, *,
     name (the store call takes it as typed). Returns (re-targeted,
     re-pointed, the name stored), so the caller can print what `new`
     became."""
+    check_name(target_type, new)
     stored = [new]
 
     def canon(n):
@@ -279,16 +308,61 @@ def harvest_hashtags(body: str):
     return tags, out.strip()
 
 
-def _stamp(ctx: Ctx, kind: str, spec) -> dict | None:
+def _stamp(ctx: Ctx, kind: str, spec, external: bool = False) -> dict | None:
     """Provenance for a verdict kind -- or a refusal when there is no tree to
     stamp it from (the store was named from outside any git repository, see
     `resolve`). An unstamped check would read `unverifiable` forever and say
-    nothing about why; a write that cannot keep its promise refuses by name."""
+    nothing about why; a write that cannot keep its promise refuses by name.
+
+    An external check (DNS, a host's log, a live database) read nothing in
+    the tree, so HEAD and a dirty tree say nothing about it: it is stamped
+    with when it ran, which `supersede` inherits like a sha, and needs no
+    repo. Measured 2026-09-28: in a store whose checks mostly read the world,
+    most verdict rows were this shape, and every one read `behind N` or `unverifiable`."""
+    if spec.verdict and external:
+        return {"external": True, "at": store._now_iso()}
     if spec.verdict and ctx.cfg.work_root is None:
         raise ValueError(f"kind {kind!r} is stamped with provenance at write, and "
                          f"{os.getcwd()} is in no git repository to stamp it from; "
                          f"run from inside the project")
     return gitref.provenance_stamp(ctx.cfg, spec)
+
+
+_HINT_CAP = 8
+
+
+def no_arc(store_dir, arc_id: str) -> str:
+    """A bare miss stopped at the miss (2026-09-22). A near miss gets its
+    candidates, otherwise the legal values, and always the verb that lists
+    them. One helper, so every site agrees."""
+    ids = [a.id for a in store.load_arcs(store_dir)]
+    near = difflib.get_close_matches(arc_id, ids, n=3, cutoff=0.65)
+    if near:
+        what = f"did you mean {', '.join(near)}?"
+    elif ids:
+        shown = ", ".join(ids[:_HINT_CAP])
+        more = f", +{len(ids) - _HINT_CAP} more" if len(ids) > _HINT_CAP else ""
+        what = f"arcs: {shown}{more}"
+    else:
+        return f"no arc {arc_id!r}; no arcs yet (arc create)"
+    return f"no arc {arc_id!r}; {what} (arc list)"
+
+
+def check_arc(ctx: Ctx, arc_id):
+    """An `arc_id` naming no arc was stored at exit 0, on a row no arc's
+    progress line could reach (2026-09-26). An archived arc passes: a closing
+    note may be filed there, and summary lists its open rows outside arcs."""
+    if arc_id and arc_id not in {a.id for a in store.load_arcs(ctx.store_dir)}:
+        raise ValueError(no_arc(ctx.store_dir, arc_id))
+    return arc_id
+
+
+def check_arc_targets(ctx: Ctx, targets) -> None:
+    """An `arc:` target or ref names an arc, as `--arc-id` must: `--target
+    arc:nosuch` stored a row on nothing (2026-09-27)."""
+    for t in targets:
+        if t and t.get("type") == "arc":
+            check_arc(ctx, t.get("name"))
 
 
 def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
@@ -308,16 +382,26 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
     if t["type"] not in ctx.target_types:
         raise ValueError(f"unknown target type {t['type']!r} (choose from "
                          f"{', '.join(sorted(ctx.target_types))})")
+    check_name(t["type"], t.get("name"))
     store.check_fields(row["kind"], spec, row)
+    external = row.get("external", False)
+    if not isinstance(external, bool):
+        raise ValueError(f"external is true or false, not {external!r}")
+    if external and not spec.verdict:
+        raise ValueError(f"--external is not valid for kind {row['kind']!r}: it has no "
+                         f"verdict bit, so it carries no provenance to stamp "
+                         f"(`symbion schema` lists the verdict kinds)")
+    check_arc_targets(ctx, [t, *(row.get("refs") or ())])
     return dict(
         kind=row["kind"],
         target={"type": t["type"], "name": catalog.nfc(t.get("name"))},
         body=row.get("body") or "", status=row.get("status"),
         checked=row.get("checked"), result=row.get("result"),
-        arc_id=row.get("arc_id"), due=row.get("due"), tags=list(row.get("tags") or ()),
+        arc_id=check_arc(ctx, row.get("arc_id")), due=row.get("due"),
+        tags=list(row.get("tags") or ()),
         author=row.get("author") or author,
         refs=check_refs(ctx.target_types, row.get("refs")),
-        provenance=_stamp(ctx, row["kind"], spec),
+        provenance=_stamp(ctx, row["kind"], spec, external),
     )
 
 
@@ -332,6 +416,8 @@ def seed_names(ctx: Ctx, scope: str, names) -> list[str]:
 
     Raises ValueError where cli._seed_names raised SystemExit: an exit is a
     CLI concept, and a GUI caller needs something it can put in a dialog."""
+    for n in names or ():
+        check_name(scope, n)
     if scope == "item":
         if not names:
             raise ValueError(_ITEM_NEEDS_NAMES)
@@ -431,7 +517,7 @@ def add_many(ctx: Ctx, rows, *, author: str) -> list:
 
 
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
-              **fields) -> store.Note:
+              add_refs=None, **fields) -> store.Note:
     """Target and provenance are INHERITED from the superseded row and never
     re-resolved, so this needs no canonicalization -- a departed target stays
     editable. `refs`, if given, is new input: checked here, resolved under
@@ -463,11 +549,17 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
                 f"superseded row and never re-resolved (add a new note instead)")
     if "refs" in fields:
         fields["refs"] = check_refs(ctx.target_types, fields["refs"])
+    if add_refs:
+        add_refs = check_refs(ctx.target_types, add_refs)
+    check_arc_targets(ctx, [*(fields.get("refs") or ()), *(add_refs or ())])
+    check_arc(ctx, fields.get("arc_id"))
     if fields.get("status") == "resolved":
         tip = _chain_tip(store.load(ctx.store_dir), note_id)
         if tip.spec.status and tip.spec.verdict and store.read_status(tip) == "open":
-            fields["provenance"] = _stamp(ctx, tip.kind, tip.spec)
+            fields["provenance"] = _stamp(ctx, tip.kind, tip.spec,
+                                         bool((tip.provenance or {}).get("external")))
     return store.supersede(ctx.store_dir, note_id, author=author, append_body=append_body,
+                           add_refs=add_refs,
                            canonicalize=lambda f: canonicalize_rows(ctx, [f])[0], **fields)
 
 
@@ -477,6 +569,8 @@ def seed(ctx: Ctx, arc_id: str, target_type: str, names=None, *, author: str,
     error), resolver run zero times. Given → EXPLICIT: NFC'd here, resolved
     under the lock against the catalog plus the ones before them. `item`
     has no catalog and is never resolved."""
+    for n in names or ():
+        check_name(target_type, n)
     if target_type == "item":
         if not names:
             raise ValueError(_ITEM_NEEDS_NAMES)

@@ -39,6 +39,17 @@ class Palette:
 PALETTE = Palette()
 
 MONO_STACK = '"DejaVu Sans Mono", Menlo, Consolas, monospace'
+# Prose reads in the system's sans; mono is kept for what is code-shaped or
+# lines up in columns: ids, dates, chips, code, commit lists. Everything in
+# mono was the "monospace overload" the gui-theming arc asked to move past.
+SANS_STACK = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif'
+
+# Two overlapping rings, one per partner, in place of NiceGUI's own icon.
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    f'<circle cx="12" cy="16" r="8" fill="none" stroke="{PALETTE.accent}" stroke-width="3.5"/>'
+    f'<circle cx="20" cy="16" r="8" fill="none" stroke="{PALETTE.rare}" stroke-width="3.5"/>'
+    '</svg>')
 
 
 def quasar_colors() -> dict[str, str]:
@@ -60,8 +71,8 @@ def root_vars_css() -> str:
     post-connect. Underscores are normalized to hyphens to match the CSS vars
     that ui.colors() generates (e.g. dark_page -> --q-dark-page)."""
     decls = ";".join(f"--q-{k.replace('_', '-')}:{v}" for k, v in quasar_colors().items())
-    return (f"<style>:root{{{decls};--mono:{MONO_STACK}}}"
-            f"html,body{{background:var(--q-dark-page);font-family:var(--mono)}}</style>")
+    return (f"<style>:root{{{decls};--mono:{MONO_STACK};--sans:{SANS_STACK}}}"
+            f"html,body{{background:var(--q-dark-page);font-family:var(--sans)}}</style>")
 
 
 DARK_CSS = """
@@ -86,7 +97,8 @@ DARK_CSS = """
 /* header + breadcrumb */
 .sb-header { background: var(--q-panel) !important; border-bottom: 1px solid var(--q-border);
              box-shadow: none !important; min-height: 46px; }
-.sb-brand  { color: var(--q-emph); font-weight: 500; letter-spacing: 0.02em; }
+.sb-brand  { color: var(--q-emph); font-weight: 500; letter-spacing: 0.02em;
+             font-family: var(--mono); }
 .sb-crumbs { color: var(--q-dim); font-size: 12px; }
 .sb-crumbs a { color: var(--q-body); text-decoration: none; }
 .sb-crumbs a:hover { color: var(--q-primary); }
@@ -109,9 +121,12 @@ DARK_CSS = """
 /* notes layer -- chips/rows (colors via brand vars; hex-audit safe) */
 .sb-note { border-left: 2px solid var(--q-border); padding: 2px 0 6px 10px; }
 .sb-note-meta { color: var(--q-dim); font-family: var(--mono); font-size: 11px; }
+a.sb-id { text-decoration: none; }
+a.sb-id:hover { color: var(--q-primary); }
 .sb-chip { font-family: var(--mono); font-size: 10px; padding: 0 6px; border-radius: 3px;
            border: 1px solid var(--q-border); color: var(--q-muted); text-decoration: none; }
-.sb-chip:hover    { border-color: var(--q-primary); color: var(--q-primary); }
+/* Links only: a label chip lit up on hover and a click did nothing. */
+a.sb-chip:hover   { border-color: var(--q-primary); color: var(--q-primary); }
 .sb-chip-bug  { color: var(--q-bad); }
 .sb-chip-decision { color: var(--q-info); }
 .sb-chip-task { color: var(--q-notable); }
@@ -127,17 +142,33 @@ DARK_CSS = """
    low-contrast grey (measured 2026-09-08, the edit dialog's arc select). One
    rule per portal root, brand vars only so the hex audit stays clean. */
 .q-menu { background: var(--q-panel) !important; color: var(--q-body) !important;
-          border: 1px solid var(--q-border); font-family: var(--mono); }
+          border: 1px solid var(--q-border); font-family: var(--sans); }
 .q-menu .q-item { color: var(--q-body); }
 .q-menu .q-item--active, .q-menu .q-item.q-manual-focusable--focused,
 .q-menu .q-item:hover { color: var(--q-primary); }
 .q-tooltip { background: var(--q-panel) !important; color: var(--q-emph) !important;
-             border: 1px solid var(--q-border); font-family: var(--mono); font-size: 11px; }
+             border: 1px solid var(--q-border); font-family: var(--mono); font-size: 11px;
+             white-space: pre-line; }
+
+/* the header's search box, and the words a search found in a result */
+.sb-search { width: 260px; }
+.sb-snippet mark { background: transparent; color: var(--q-notable);
+                   box-shadow: inset 0 -1px var(--q-notable); }
+
+/* NiceGUI's "connection lost" popup (shown while `serve` restarts): black,
+   sans-serif and an emoji; the panel, the mono stack and a notable line here */
+.nicegui-error-popup { background: var(--q-panel) !important; color: var(--q-body);
+                       border-color: var(--q-border) !important; font-family: var(--mono);
+                       font-size: 12px; padding: 1em 1.5em !important; }
+.nicegui-error-popup > span:first-child { color: var(--q-notable); }
+.nicegui-error-popup > span:first-child::before { content: none !important; }
 
 /* markdown bodies sit inside a note row; keep them from inheriting page margins */
 .sb-note .nicegui-markdown > *:first-child { margin-top: 2px; }
 .sb-note .nicegui-markdown > *:last-child  { margin-bottom: 0; }
 .sb-note .nicegui-markdown code { font-family: var(--mono); font-size: 12px; }
+/* body links (a cited note id is one) took the browser's default blue */
+.sb-note .nicegui-markdown a { color: var(--q-primary); }
 /* A note is a paragraph, not a document. A real <h1> in a list of eighty rows
    dominates the board, and markdown eats a line-leading `#tag` into one -- the
    harvest strips those now, but a deliberate heading still has to sit down. */

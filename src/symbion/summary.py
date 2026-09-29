@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from datetime import datetime
+from itertools import zip_longest
 
 from . import gitref, kinds as K, store as S
 
@@ -11,6 +12,7 @@ ARC_CAP = 10
 PRIORITY_CAP = 10
 HEAD_CAP = 8
 PREREG_CAP = 10
+PEOPLE_CAP = 3
 DUE_CAP = 10
 DUE_DAYS = 7      # how far ahead the due block looks
 HEAD_CHARS = 100
@@ -63,6 +65,13 @@ def age_days(created_at: str, now: datetime | None = None) -> int:
     return max(0, ((now or datetime.now().astimezone()) - created).days)
 
 
+def age_phrase(stamp: str) -> str:
+    """`age_days` as words. Under a day is not "today": a check run late
+    last night is not today's."""
+    days = age_days(stamp)
+    return f"{days}d ago" if days else "<1d ago"
+
+
 def due_phrase(state) -> str:
     """`store.due_state`'s pair as words. Past due with 0 days left is a
     datetime that passed earlier today."""
@@ -70,6 +79,28 @@ def due_phrase(state) -> str:
     if past:
         return f"overdue {-days}d" if days < 0 else "overdue today"
     return "due today" if days == 0 else f"due in {days}d"
+
+
+def plain(text: str, role: str) -> str:
+    """The pipe's paint. Every text renderer takes a `paint(text, role)`
+    and a terminal passes term.painter()'s; `role` is a colour's name there
+    (`meta`, `body`, `warn`...) or `kind:<label>`. What a pipe prints must
+    not change, so plain returns the text untouched."""
+    return text
+
+
+def due_role(past: bool, days: int) -> str:
+    """The colour of a due phrase, in `list` and the summary alike."""
+    return "bad" if past else "warn" if days <= DUE_DAYS else "meta"
+
+
+def row_line(paint, kind: str, target: str, body: str, id_: str, label: str = "") -> str:
+    """`[kind] type:name  body  id`: one row as the summary and `arc todo`
+    print it. `label` fills the brackets when it says more than the kind."""
+    type_, colon, name = target.partition(":")
+    tgt = paint(type_ + colon, "meta") + paint(name, "text") if name else paint(target, "text")
+    return (f"{paint(f'[{label or kind}]', 'kind:' + kind)} {tgt}  "
+            f"{paint(body, 'body')}  {paint(id_, 'meta')}")
 
 
 def open_notes(notes, kind):
@@ -91,11 +122,32 @@ def no_status(notes):
     return [n for n in notes if n.spec.status and n.status is None]
 
 
-def open_outside_arcs(notes, kind):
-    """Open heads of one kind belonging to no arc -- an arc's rows, of every
-    kind, are tracked on its own checklist and reached through its progress
-    line, not here."""
-    return [n for n in open_notes(notes, kind) if n.arc_id is None]
+def open_outside_arcs(notes, kind, active):
+    """Open heads of one kind on no ACTIVE arc -- an active arc's rows, of
+    every kind, are tracked on its own checklist and reached through its
+    progress line, not here. `active` is the set of unarchived arc ids. A row
+    in an archived arc, or under an id that names no arc, has no progress
+    line to reach it, so it lists here; keyed on `arc_id is None` it showed
+    nowhere (2026-09-26)."""
+    return [n for n in open_notes(notes, kind) if n.arc_id not in active]
+
+
+def deal_by_kind(rows):
+    """`rows` re-ordered by dealing one kind at a time, each kind newest-first
+    and in the order the kinds first appear.
+
+    The header counts open rows per kind; the heads were one newest-first cap
+    over all of them, so a kind could be counted and never listed. Measured
+    2026-09-28 on an adopter store: a bootstrap wrote its two `question` rows
+    first -- the kind that exists for the owner to answer at session start --
+    and 13 newer rows pushed both into `+6 more open`. Dealing spends the cap
+    across the kinds instead, so the smallest kind is the one that survives it
+    whole. Keyed on the kinds present, not on any label: a store's [kinds]
+    table is its own."""
+    lists = {}
+    for n in rows:
+        lists.setdefault(n.kind, []).append(n)
+    return [n for turn in zip_longest(*lists.values()) for n in turn if n is not None]
 
 
 def due_soon(notes, now=None):
@@ -109,6 +161,13 @@ def due_soon(notes, now=None):
             out.append((n, state))
     out.sort(key=lambda p: (p[1][1], not p[1][0], p[0].id))
     return out
+
+
+def wrote_it(reader, author) -> bool:
+    """Is this row someone else's, from the reader's point of view? The
+    predicate the `from <author>` label uses wherever a row prints: at a
+    terminal the reader IS the person, so there is no other author to name."""
+    return reader is not None and author not in (reader, "unknown")
 
 
 def starred(notes):
@@ -132,18 +191,20 @@ FIRST_CONTACT = ('no notes yet: symbion add --kind task --type project --body ".
 
 
 def empty_summary() -> dict:
-    """The `--json` shape for a store that has never been created (spec:251).
-    The TEXT path printing nothing there is correct and depended on by the
-    SessionStart hook -- but a programmatic `--json` consumer needs valid
-    JSON, not an empty string, so this mirrors the zero-valued shape
-    `summary()` itself returns for an empty-but-initialized store."""
+    """The `--json` shape for a store that has never been created: the
+    zero-valued shape `summary()` returns for an empty store, with `store:
+    None`, the key a consumer gates on. The text path prints `no store at
+    <path>`; the SessionStart hook stays silent by its own check first."""
     return {
         "store": None,
         "open": {},
+        "open_in_arcs": 0,
         "arcs": [],
         "arcs_elided": 0,
         "priority": [],
         "priority_elided": 0,
+        "people": [],
+        "people_elided": 0,
         "heads": [],
         "heads_elided": 0,
         "due": [],
@@ -152,6 +213,8 @@ def empty_summary() -> dict:
         "registry_modified": False,
         "unreadable": 0,
         "unreadable_first": None,
+        "unreadable_arcs": 0,
+        "unreadable_arcs_first": None,
         "no_status": 0,
         "no_status_first": None,
         "full": False,
@@ -159,13 +222,15 @@ def empty_summary() -> dict:
     }
 
 
-def summary(store_dir, cfg, full=False, _now=None) -> dict:
+def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     loaded = S.load(store_dir)
     notes = S.heads(loaded)
     bad = S.load_malformed(store_dir)
+    bad_arcs = S.load_arcs_malformed(store_dir)
     acts = [a for a in S.load_arcs(store_dir) if not a.archived]
+    active = {a.id for a in acts}
     kinds = K.read_kinds(store_dir)
-    open_counts = {label: len(open_outside_arcs(notes, label))
+    open_counts = {label: len(open_outside_arcs(notes, label, active))
                    for label, k in kinds.items() if k.status and not k.parked}
     # Each row prints once: in the due block, else the priority block, else
     # the heads. Otherwise priority rows repeat among the heads.
@@ -175,15 +240,25 @@ def summary(store_dir, cfg, full=False, _now=None) -> dict:
     shown_above |= {n.id for n in priority}
     unstated = no_status(notes)
     heads = [n for label, k in kinds.items() if k.status and not k.parked
-             for n in open_outside_arcs(notes, label) if n.id not in shown_above]
-    heads.sort(key=lambda n: n.created_at, reverse=True)
+             for n in open_outside_arcs(notes, label, active) if n.id not in shown_above]
+    heads.sort(key=lambda n: (n.created_at, n.id), reverse=True)   # id: same-second ties
     # A pre-registration (status + verdict) has a deadline, and newest-first
     # under one cap pushed an open prediction off the list for many sessions
     # while its answer went into a handoff file (2026-09-24). Its own cap,
     # ahead of the rest, keeps the ceiling.
+    by_id = {n.id: n for n in loaded}
     prereg = [n for n in heads if n.spec.verdict]
-    rest = [n for n in heads if not n.spec.verdict]
+    rest = deal_by_kind([n for n in heads if not n.spec.verdict])
     shown = prereg + rest if full else prereg[:PREREG_CAP] + rest[:HEAD_CAP]
+    # Open rows by anyone but the reader, parked included, that no block above
+    # prints: an owner's `idea` went unseen by every agent session (measured
+    # 2026-09-24). None for a reader at a terminal, who is the person.
+    printed = shown_above | {n.id for n in shown}
+    people = sorted(
+        (n for n in notes if S.read_status(n) == "open" and n.id not in printed
+         and wrote_it(reader, n.author)),
+        key=lambda n: (n.created_at, n.id), reverse=True)
+    o_cap = len(people) if full else PEOPLE_CAP
 
     rows = []
     for a in acts:
@@ -205,6 +280,7 @@ def summary(store_dir, cfg, full=False, _now=None) -> dict:
         # is None; without it the two printed byte-identical JSON at exit 0.
         "store": str(store_dir),
         "open": open_counts,
+        "open_in_arcs": sum(r["open"] for r in rows),
         "arcs": rows[:a_cap],
         "arcs_elided": max(0, len(rows) - a_cap),
         "priority": [{"id": n.id,
@@ -213,9 +289,21 @@ def summary(store_dir, cfg, full=False, _now=None) -> dict:
                       "body": clip(n.body, BODY_CHARS)}
                      for n in priority[:p_cap]],
         "priority_elided": max(0, len(priority) - p_cap),
+        "people": [{"id": n.id, "kind": n.kind, "author": n.author,
+                    "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
+                    "body": clip(n.body, HEAD_CHARS)}
+                   for n in people[:o_cap]],
+        "people_elided": max(0, len(people) - o_cap),
         "heads": [{"id": n.id, "kind": n.kind,
                    "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
-                   "body": clip(n.body, HEAD_CHARS)}
+                   "body": clip(n.body, HEAD_CHARS),
+                   # The people block names an author only for the rows no
+                   # other block printed, so a person's row that fell INSIDE
+                   # the cap lost its attribution -- and which side of the cap
+                   # it falls on is not something a reader can reason about.
+                   **({"from": n.author} if wrote_it(reader, n.author) else {}),
+                   **({"registered": _root(by_id, n).created_at[:10]}
+                      if n.spec.status and n.spec.verdict else {})}
                   for n in shown],
         "heads_elided": len(heads) - len(shown),
         "due": [{"id": n.id, "kind": n.kind,
@@ -226,6 +314,10 @@ def summary(store_dir, cfg, full=False, _now=None) -> dict:
         "due_elided": max(0, len(due) - d_cap),
         "uncommitted_notes": notes_n,
         "registry_modified": registry,
+        "unreadable_arcs": len(bad_arcs),
+        "unreadable_arcs_first": (f"line {bad_arcs[0][0]}: "
+                                  f"{flatten(bad_arcs[0][2])[:ERROR_CHARS]}"
+                                  if bad_arcs else None),
         "unreadable": len(bad),
         "unreadable_first": (f"line {bad[0][0]}: {flatten(bad[0][2])[:ERROR_CHARS]}"
                              if bad else None),
@@ -236,67 +328,128 @@ def summary(store_dir, cfg, full=False, _now=None) -> dict:
     }
 
 
+def _root(by_id, n):
+    """The first row of n's supersede chain: a pre-registration's commitment.
+    An amendment is a new row, so the head's own date is not the
+    registration; 14 of 14 open prediction heads in three adopter stores
+    restated it in the body (measured 2026-09-26)."""
+    seen = {n.id}
+    while n.supersedes in by_id and n.supersedes not in seen:
+        n = by_id[n.supersedes]
+        seen.add(n.id)
+    return n
+
+
+_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def tag_key(t: str) -> str:
+    """The form two tags share when they are one subject: case, `_`/`-`, a
+    trailing s (`flaky-test` / `flaky-tests`). The CLI's new-tag notice and
+    the GUI's tags page both group by it."""
+    t = t.lower().replace("_", "-")
+    return t[:-1] if t.endswith("s") and len(t) > 3 else t
+
+
+def near_tags(counts: dict) -> list[list[str]]:
+    """Groups of two or more tags in use that share a tag_key, largest first."""
+    groups: dict = {}
+    for t in counts:
+        groups.setdefault(tag_key(t), []).append(t)
+    return sorted((sorted(g, key=lambda t: (-counts[t], t)) for g in groups.values() if len(g) > 1),
+                  key=lambda g: -sum(counts[t] for t in g))
+
+
+def ref_label(t) -> str:
+    """`type:name` for a ref or target, a full commit sha cut to 7: the CLI
+    list line and the GUI chip both print refs."""
+    name = t.name or ""
+    return f"{t.type}:{name[:7] if t.type == 'commit' and _SHA.fullmatch(name) else name}"
+
+
 def _count(n: int, noun: str) -> str:
     return f"{n} {noun}{'' if n == 1 else 's'}"
 
 
-def render_summary(d: dict) -> str:
-    counts = ", ".join(f"{label} {n}" for label, n in d["open"].items())
-    out = [f"symbion: open outside arcs: {counts or 'no status kinds declared'}"]
+def render_summary(d: dict, paint=plain) -> str:
+    counts = ", ".join(f"{paint(label, 'kind:' + label)} {n}" for label, n in d["open"].items())
+    # `bug 0` beside a bug filed in an arc read as bug-free (2026-09-27).
+    in_arcs = f"; {d['open_in_arcs']} open in arcs" if d.get("open_in_arcs") else ""
+    named = f" {d['named_store']}" if d.get("named_store") else ""
+    out = [f"symbion{named}: open outside arcs: "
+           f"{counts or 'no status kinds declared'}{in_arcs}"]
     for r in d.get("due", ()):
-        out.append(f"  {r['phrase']} [{r['kind']}] {r['target']}  {r['body']}  {r['id']}")
+        out.append(f"  {paint(r['phrase'], due_role(r['past'], r['days']))} "
+                   + row_line(paint, r["kind"], r["target"], r["body"], r["id"]))
     if d.get("due_elided"):
-        out.append(f"  +{d['due_elided']} more due (--full)")
+        out.append("  " + paint(f"+{d['due_elided']} more due (--full)", "meta"))
     w = max((len(r["id"]) for r in d["arcs"]), default=0)
     pw = max((len(f"{r['done']}/{r['total']}") for r in d["arcs"]), default=0)
     for r in d["arcs"]:
         prog = f"{r['done']}/{r['total']}"
         age = f"{r['age_days']}d" if "age_days" in r else ""
-        out.append(f"  {r['id']:{w}} {prog:<{pw}}  {age:>4}  {r['name']}")
+        out.append(f"  {paint(r['id'].ljust(w), 'text')} "
+                   f"{paint(prog.ljust(pw), 'good' if r['done'] == r['total'] else 'meta')}  "
+                   f"{paint(age.rjust(4), 'meta')}  {paint(r['name'], 'body')}")
     # Each elided line names the flag that lifts it, as list's header does
     # with `(--all)`: a bare `+21 more open` sent a reader off to
     # `list --status open --json` and back (reported 2026-09-22).
     if d["arcs_elided"]:
-        out.append(f"  +{d['arcs_elided']} more (--full)")
+        out.append("  " + paint(f"+{d['arcs_elided']} more (--full)", "meta"))
     # Labelled, not starred: the header counts open rows OUTSIDE arcs and
     # this block is every unresolved `priority` row, in an arc or not -- a
     # bare `*` beside a header that disagreed with it read as a bug in the
     # tool at first sight (measured 2026-09-20).
     for p in d["priority"]:
-        out.append(f"  priority [{p['kind']}] {p['target']}  {p['body']}  {p['id']}")
+        out.append(f"  {paint('priority', 'warn')} "
+                   + row_line(paint, p["kind"], p["target"], p["body"], p["id"]))
     if d["priority_elided"]:
-        out.append(f"  +{d['priority_elided']} more priority (--full)")
+        out.append("  " + paint(f"+{d['priority_elided']} more priority (--full)", "meta"))
+    for p in d.get("people", ()):
+        out.append(f"  from {p['author']} "
+                   + row_line(paint, p["kind"], p["target"], p["body"], p["id"]))
+    if d.get("people_elided"):
+        out.append("  " + paint(f"+{d['people_elided']} more from others (--full)", "meta"))
     for h in d.get("heads", ()):
-        out.append(f"  [{h['kind']}] {h['target']}  {h['body']}  {h['id']}")
+        reg = f", registered {h['registered']}" if h.get("registered") else ""
+        who = f"from {h['from']} " if h.get("from") else ""
+        out.append(f"  {who}" + row_line(paint, h["kind"], h["target"], h["body"], h["id"],
+                                         label=h["kind"] + reg))
     if d.get("heads_elided"):
-        out.append(f"  +{d['heads_elided']} more open (--full)")
+        out.append("  " + paint(f"+{d['heads_elided']} more open (--full)", "meta"))
     if d["uncommitted_notes"] or d["registry_modified"]:
+        # Saved on disk, not yet in git: "2 notes uncommitted" read as unsaved.
         bits = []
         if d["uncommitted_notes"]:
-            bits.append(f"{d['uncommitted_notes']} notes uncommitted")
+            bits.append(_count(d["uncommitted_notes"], "note"))
         if d["registry_modified"]:
-            bits.append("registry modified")
-        out.append("  " + ", ".join(bits))
+            bits.append("arc changes")
+        out.append("  " + paint(f"{' and '.join(bits)} not yet in the store's git "
+                                f"(symbion commit)", "warn"))
     if d.get("leftovers"):
         # Imported late: cli owns the paths, and imports this module.
         from .cli import _old_copies_line
-        out.append("  " + _old_copies_line(d["leftovers"]))
+        out.append("  " + paint(_old_copies_line(d["leftovers"]), "warn"))
     if d["unreadable"]:
-        out.append(f"  {_count(d['unreadable'], 'row')} unreadable, "
-                   f"first: {d['unreadable_first']}")
+        out.append("  " + paint(f"{_count(d['unreadable'], 'row')} unreadable, "
+                                f"first: {d['unreadable_first']}", "bad"))
+    if d.get("unreadable_arcs"):
+        out.append("  " + paint(f"{_count(d['unreadable_arcs'], 'arc line')} unreadable, "
+                                f"first: {d['unreadable_arcs_first']}", "bad"))
     if d.get("no_status"):
         # The first id and the verb, as the unreadable line does: a bare
         # count had no consumer and sat as furniture for a week.
         n = d["no_status"]
-        out.append(f"  {_count(n, 'row')} on a status kind {'carries' if n == 1 else 'carry'} "
-                   f"no status (a write that bypassed symbion): counted neither open nor "
-                   f"resolved; first {d.get('no_status_first')} -- "
-                   f"supersede <id> --status open|resolved")
+        out.append("  " + paint(f"{_count(n, 'row')} on a status kind "
+                                f"{'carries' if n == 1 else 'carry'} no status (a write that "
+                                f"bypassed symbion): counted neither open nor resolved; first "
+                                f"{d.get('no_status_first')} -- "
+                                f"supersede <id> --status open|resolved", "bad"))
     if d.get("full") and not (d["arcs_elided"] or d["priority_elided"] or d.get("heads_elided")
-                              or d.get("due_elided")):
+                              or d.get("due_elided") or d.get("people_elided")):
         # A --full that lifted nothing otherwise prints the default text
         # byte for byte, and the flag reads as dropped.
-        out.append("  (--full: nothing was elided)")
+        out.append("  " + paint("(--full: nothing was elided)", "meta"))
     if d.get("store") and d.get("rows") == 0:
         out.append("  " + FIRST_CONTACT)
     elif d.get("skill"):
@@ -364,19 +517,23 @@ def _bits(k: dict) -> str:
     return " ".join(b for b in K.BITS if k[b]) or "plain"
 
 
-def render_schema(d: dict) -> str:
+def render_schema(d: dict, paint=plain) -> str:
     src = "symbion.toml [kinds]" if d["declared"] else "symbion.toml [kinds]; absent = these defaults"
     out = [f"kinds  ({src})   rows"]
     w = max((len(k["label"]) for k in d["kinds"]), default=4)
     for k in d["kinds"]:
-        out.append(f"  {k['label']:<{w}}  {_bits(k):<15}{k['rows']:>5}  {flatten(k['when'])}")
+        out.append(f"  {paint(k['label'].ljust(w), 'kind:' + k['label'])}  "
+                   f"{paint(_bits(k).ljust(15), 'meta')}{k['rows']:>5}  "
+                   f"{paint(flatten(k['when']), 'body')}")
     out.append("targets  (--type; symbion.toml [catalogs])")
     builtin = " ".join(t["type"] for t in d["targets"] if t["catalog"] is None)
-    out.append(f"  {builtin:<{w + 22}}  built in")
+    out.append(f"  {builtin:<{w + 22}}  {paint('built in', 'meta')}")
     for t in d["targets"]:
         if t["catalog"] is not None:
-            line = f"  {t['type']:<{w + 22}}  catalog: {flatten(t['catalog'])}"
+            line = (f"  {t['type']:<{w + 22}}  {paint('catalog: ', 'meta')}"
+                    f"{paint(flatten(t['catalog']), 'body')}")
             if t.get("resolver"):
-                line += f"\n  {'':<{w + 22}}  resolver: {flatten(t['resolver'])}"
+                line += (f"\n  {'':<{w + 22}}  {paint('resolver: ', 'meta')}"
+                         f"{paint(flatten(t['resolver']), 'body')}")
             out.append(line)
     return "\n".join(out)

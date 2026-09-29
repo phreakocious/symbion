@@ -4,6 +4,8 @@ import pytest
 from symbion import store, catalog
 from symbion.config import Config
 
+pytestmark = pytest.mark.usefixtures("tmp_store")
+
 
 def test_reconcile_reports_all_four_states(tmp_path):
     """Asserting only that a departed target reports `stale` passes on code

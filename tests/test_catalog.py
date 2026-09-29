@@ -288,4 +288,4 @@ def test_match_announces_a_substring_pick_but_not_an_exact_one(tmp_path, capsys)
     out, err = capsys.readouterr()
     assert out == "" and err == "note: 'pars' resolved to 'src/parser.py' (unique substring in the t catalog)\n", err
     catalog.match(c, "t", "nothing", ["src/parser.py"])
-    assert "matches nothing in the t catalog; stored as typed" in capsys.readouterr().err
+    assert "matches nothing in the t catalog; taken as typed" in capsys.readouterr().err

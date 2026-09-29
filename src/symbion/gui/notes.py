@@ -7,6 +7,7 @@ touches a deleted client (RuntimeError 'client has been deleted').
 """
 from __future__ import annotations
 
+import html
 import re
 from urllib.parse import quote
 
@@ -21,6 +22,18 @@ from .filters import href
 # emphasis matches intra-word underscores and mangles them to <em>;
 # `code-friendly` keeps *asterisk* emphasis and disables underscore emphasis.
 NOTE_MD_EXTRAS = ["fenced-code-blocks", "tables", "code-friendly"]
+
+# store.new_id's shape. Bodies cite rows by id ("settled by <id>"), and the
+# GUI had no way to follow one but pasting it into the search.
+_NOTE_ID = re.compile(r"(?<![\w/=[-])(\d{8}-\d{6}-\d{6}-[0-9a-f]{3})(?![\w-])")
+_CODE = re.compile(r"(```.*?```|`[^`\n]*`)", re.S)
+
+
+def link_ids(body: str) -> str:
+    """Each full note id in `body` as a markdown link to that note, except
+    inside code, where a link would print as literal brackets."""
+    return "".join(p if i % 2 else _NOTE_ID.sub(r"[\1](/notes?id=\1)", p)
+                   for i, p in enumerate(_CODE.split(body)))
 
 
 def chip_class(spec) -> str:
@@ -58,14 +71,54 @@ def target_link(n) -> None:
         .classes("text-body").mark("note-target")
 
 
+TIP_COMMITS = 8
+
+
+def check_tip(cfg, prov, state, distance) -> str:
+    """What the badge was measured against. The chip lit up on hover and a
+    click did nothing (the owner, 2026-09-08); `behind N` asks the reader to
+    go and look at N commits, so the tip lists them."""
+    sha = (prov or {}).get("sha")
+    if not sha or state == "external":
+        return ""
+    at = f"stamped at {sha[:7]}"
+    if state == "current":
+        return f"{at}, this checkout's HEAD"
+    if state == "diverged":
+        return f"{at}, on another line of development than HEAD"
+    if state not in ("behind", "ahead"):
+        return at
+    lines = gitref.oneline(cfg, f"{sha}..HEAD" if state == "behind" else f"HEAD..{sha}",
+                           TIP_COMMITS)
+    more = f"\n+{distance - len(lines)} more" if distance > len(lines) else ""
+    since = (f"HEAD is {distance} commits past it" if state == "behind"
+             else f"it is {distance} commits past HEAD")
+    return f"{at}; {since}:\n" + "\n".join(lines) + more
+
+
 def _check_badge(ctx, n) -> None:
     state, distance = gitref.check_state(ctx.cfg, n.provenance)
-    text = f"{state} {distance}" if state == "behind" else state
+    text = f"{state} {distance}" if state in ("behind", "ahead") else state
     if state == "unverifiable":
         text = f"unverifiable — {api.why_unverifiable(n.provenance)}"
-    cls = {"current": "sb-chip-good", "behind": "sb-chip-notable",
+    elif state == "external":
+        text = f"external — {summ.age_phrase(n.provenance['at'])}"
+    cls = {"current": "sb-chip-good", "behind": "sb-chip-notable", "external": "",
+           "ahead": "sb-chip-notable",
            "diverged": "sb-chip-bad", "unverifiable": "sb-chip-bad"}[state]
-    ui.label(text).classes(f"sb-chip {cls}").mark("check-state")
+    chip = ui.label(text).classes(f"sb-chip {cls}").mark("check-state")
+    if not (n.provenance or {}).get("sha") or state == "external":
+        return
+    # Filled on first hover: a `git log` per badge at render time doubled
+    # the cost of a board of checks (45 badges: 1.5s to 2.9s).
+    with chip:
+        tip = ui.tooltip("")
+
+    def _fill():
+        if not tip.text:
+            tip.text = check_tip(ctx.cfg, n.provenance, state, distance)
+
+    chip.on("mouseenter", _fill)
 
 
 def _due_chip(n, status) -> None:
@@ -81,63 +134,114 @@ def _due_chip(n, status) -> None:
         .mark("note-due")
 
 
-def render_note(ctx, n, refresh, *, author: str, show_target: bool = False) -> None:
+def snippet(body: str, words, n: int = summ.BODY_CHARS) -> str:
+    """The clipped body, or when the clip holds none of `words`, a clip that
+    starts shortly before the first of them: a search result that cannot
+    show why it matched reads as a false hit."""
+    head = summ.clip(body, n)
+    low = [w.lower() for w in words]
+    if not low or any(w in head.lower() for w in low):
+        return head
+    text = summ.flatten(body)
+    at = min((i for i in (text.lower().find(w) for w in low) if i >= 0), default=-1)
+    if at < 0:                       # the hit is in the target, a ref or the verdict
+        return head
+    start = text.rfind(" ", 0, max(at - n // 4, 0)) + 1
+    return "…" + summ.clip(text[start:], n)
+
+
+def marked(text: str, words) -> str:
+    """`text` escaped for HTML, each of `words` wrapped in <mark>, any case."""
+    if not words:
+        return html.escape(text)
+    rx = re.compile("(" + "|".join(re.escape(w) for w in
+                                   sorted(set(words), key=len, reverse=True)) + ")", re.I)
+    return "".join(f"<mark>{html.escape(p)}</mark>" if i % 2 else html.escape(p)
+                   for i, p in enumerate(rx.split(text)))
+
+
+def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
+                base: dict | None = None, compact: bool = False, hit=(),
+                actions: bool = True) -> None:
     """One note row. Every chip is a link into the filtered view -- that is the
-    browse mechanism, not a decoration."""
+    browse mechanism, not a decoration. `base` is the filtered view's own
+    params: a chip there adds one to them, so a click narrows (the gui spec;
+    it dropped them, 2026-09-25). Off a filtered view a chip starts one.
+    `hit` is the search's words: a compact body then shows and marks them.
+    `actions=False` drops the buttons: an earlier version is history, and an
+    edit made from it would land on the current row."""
+    def narrow(**kv):
+        return href(**{**(base or {}), **kv})
+
     with ui.element("div").classes("sb-note w-full").mark("note-row"):
-        with ui.row().classes("items-center gap-2 flex-wrap"):
-            ui.link(n.kind, href(kind=n.kind)) \
-                .classes(f"sb-chip {chip_class(n.spec)}").mark("note-kind")
-            status = S.read_status(n)
-            if status:
-                ui.link(status, href(status=status)).classes(f"sb-chip sb-chip-{status}")
-            if n.due:
-                _due_chip(n, status)
-            if n.spec.verdict:
-                _check_badge(ctx, n)
-            ui.label(n.created_at.replace("T", " ")).classes("sb-note-meta")
-            ui.link(n.author, href(author=n.author)).classes("sb-note-meta")
-            if show_target:
-                target_link(n)
-            for t in n.tags:
-                ui.link(f"#{t}", href(tag=t)).classes("sb-chip").mark(f"tag-{t}")
-            for r in n.refs:
-                ui.link(f"↗ {r.type}:{r.name}",
-                        f"/object?type={quote(r.type)}&name={quote(r.name or '', safe='')}") \
-                    .classes("sb-chip").mark("note-ref")
-            ui.label(n.id).classes("sb-note-meta")
-            ui.space()
-            has_pri = "priority" in n.tags
-
-            def _star(n=n, has_pri=has_pri):
-                api.retag(ctx, n.id, add=() if has_pri else ("priority",),
-                          rm=("priority",) if has_pri else (), author=author)
-                refresh()
-
-            ui.button(icon="star" if has_pri else "star_outline", on_click=_star) \
-                .props("flat dense round" + (" color=warning" if has_pri else "")) \
-                .tooltip("toggle #priority").mark("note-star")
-
-            if n.spec.status and S.read_status(n) == "open":
+        # Chips wrap; the buttons stay one group on the right. In one
+        # wrapping row a long ref chip pushed the edit button onto a
+        # line of its own.
+        with ui.row(wrap=False).classes("items-start gap-2 w-full"):
+            with ui.row().classes("items-center gap-2 col"):
+                ui.link(n.kind, narrow(kind=n.kind)) \
+                    .classes(f"sb-chip {chip_class(n.spec)}").mark("note-kind")
+                status = S.read_status(n)
+                if status:
+                    ui.link(status, narrow(status=status)).classes(f"sb-chip sb-chip-{status}")
+                if n.due:
+                    _due_chip(n, status)
                 if n.spec.verdict:
-                    # A pre-registration closes with its verdict: the store
-                    # refuses a bare resolve, so the button opens the dialog
-                    # with the result field rather than showing the refusal.
-                    on_resolve = lambda n=n: edit_dialog(ctx, n, refresh, author=author,
-                                                         resolving=True)
-                else:
-                    on_resolve = lambda n=n: (api.supersede(ctx, n.id, author=author,
-                                                            status="resolved"),
-                                              refresh())
-                ui.button(icon="check", on_click=on_resolve) \
-                    .props("flat dense round").tooltip("resolve").mark("note-resolve")
+                    _check_badge(ctx, n)
+                ui.label(n.created_at.replace("T", " ")).classes("sb-note-meta")
+                ui.link(n.author, narrow(author=n.author)).classes("sb-note-meta")
+                if show_target:
+                    target_link(n)
+                if n.arc_id:
+                    ui.link(f"arc: {n.arc_id}", f"/arc?id={quote(n.arc_id)}") \
+                        .classes("sb-chip").mark("note-arc")
+                for t in n.tags:
+                    ui.link(f"#{t}", narrow(tag=t)).classes("sb-chip").mark(f"tag-{t}")
+                for r in n.refs:
+                    ui.link(f"↗ {summ.ref_label(r)}",
+                            f"/object?type={quote(r.type)}&name={quote(r.name or '', safe='')}") \
+                        .classes("sb-chip").mark("note-ref")
+                ui.link(n.id, href(id=n.id)).classes("sb-note-meta sb-id") \
+                    .mark("note-id").tooltip("this note alone")
+            if actions:
+                with ui.row(wrap=False).classes("items-center gap-0"):
+                    has_pri = "priority" in n.tags
 
-            ui.button(icon="edit", on_click=lambda n=n: edit_dialog(ctx, n, refresh,
-                                                                    author=author)) \
-                .props("flat dense round").tooltip("supersede / edit").mark("note-edit")
+                    def _star(n=n, has_pri=has_pri):
+                        api.retag(ctx, n.id, add=() if has_pri else ("priority",),
+                                  rm=("priority",) if has_pri else (), author=author)
+                        refresh()
+
+                    ui.button(icon="star" if has_pri else "star_outline", on_click=_star) \
+                        .props("flat dense round" + (" color=warning" if has_pri else "")
+                               + ' aria-label="toggle priority"') \
+                        .tooltip("toggle #priority").mark("note-star")
+
+                    if n.spec.status and S.read_status(n) == "open":
+                        if n.spec.verdict:
+                            # A pre-registration closes with its verdict: the store
+                            # refuses a bare resolve, so the button opens the dialog
+                            # with the result field rather than showing the refusal.
+                            on_resolve = lambda n=n: edit_dialog(ctx, n, refresh, author=author,
+                                                                 resolving=True)
+                        else:
+                            on_resolve = lambda n=n: (api.supersede(ctx, n.id, author=author,
+                                                                    status="resolved"),
+                                                      refresh())
+                        ui.button(icon="check", on_click=on_resolve) \
+                            .props('flat dense round aria-label="resolve"').tooltip("resolve") \
+                            .mark("note-resolve")
+
+                    ui.button(icon="edit", on_click=lambda n=n: edit_dialog(ctx, n, refresh,
+                                                                            author=author)) \
+                        .props('flat dense round aria-label="edit"').tooltip("supersede / edit") \
+                        .mark("note-edit")
         if n.spec.verdict:
-            ui.label(f"checked: {n.checked or '—'}   →   result: {n.result or '—'}") \
-                .classes("sb-note-meta")
+            # Clipped on a board like the body: a check's `checked` ran to
+            # three lines and pushed the next row off the screen.
+            fit = (lambda t: summ.clip(t, summ.HEAD_CHARS)) if compact else (lambda t: t)
+            ui.label(f"checked: {fit(n.checked) or '—'}   →   result: {fit(n.result) or '—'}") \
+                .classes("sb-note-meta").mark("note-verdict")
         if n.measurements:
             with ui.row().classes("gap-3 flex-wrap").mark("measurements"):
                 for k, v in n.measurements.items():
@@ -146,8 +250,21 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False) -> N
             # Text only. Serving store-relative paths over HTTP buys nothing a
             # file manager does not, and makes the store a static file host.
             ui.label("evidence: " + ", ".join(n.evidence)).classes("sb-note-meta")
-        if n.body:
-            ui.markdown(n.body, extras=NOTE_MD_EXTRAS)   # sanitize=True default
+        if n.body and compact and (hit or len(summ.flatten(n.body)) > summ.BODY_CHARS):
+            # A list to scan, not a page to read: one bug's four paragraphs
+            # filled the boards (seen in the browser, 2026-09-27). A search
+            # result is text too, even a short one, so every hit is marked.
+            text = snippet(n.body, hit)
+            if hit:
+                ui.html(marked(text, hit), sanitize=False) \
+                    .classes("text-body sb-snippet").mark("note-snippet")
+            else:
+                ui.label(text).classes("text-body")
+            if text != summ.flatten(n.body):
+                ui.link("full note", href(id=n.id)).classes("sb-note-meta") \
+                    .mark("note-full")
+        elif n.body:
+            ui.markdown(link_ids(n.body), extras=NOTE_MD_EXTRAS)   # sanitize=True default
 
 
 def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> None:

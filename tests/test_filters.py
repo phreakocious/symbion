@@ -67,3 +67,37 @@ def test_id_maps_through_so_a_single_note_has_a_url():
     object or a filter but never to a note, and a project-target note -- which
     has no object page -- was unreachable from the arc it was filed under."""
     assert filters.from_params({"id": "20260908-1-abc"}) == {"id": "20260908-1-abc"}
+
+
+def test_search_needs_every_word_in_any_order_and_case():
+    """A person types words, not a phrase: `reload serve` read as a phrase
+    missed a row holding both."""
+    p = filters.search_pattern("Serve reload")
+    assert p.search("the reload flag of serve")
+    assert not p.search("the reload flag")          # one word is not enough
+
+
+def test_search_takes_regex_characters_literally():
+    """`$HOME` as a regex is an end-of-line anchor and matched nothing."""
+    p = filters.search_pattern("$HOME")
+    assert p.search("runs from $HOME/.claude")
+    assert not p.search("runs from HOME")
+
+
+def test_a_blank_search_is_no_filter():
+    assert filters.search_pattern("  ") is None
+    assert filters.from_params({"q": " "}) == {}
+    assert "grep" in filters.from_params({"q": "x"})
+
+
+def test_an_id_or_its_printed_tail_is_a_hit():
+    nid = "20260101-120000-123456-a1b"
+    for q in (nid, "a1b", "…a1b", "...a1b", "123456-a1b"):
+        assert filters.id_hit(nid, q), q
+    for q in ("1b", "a1", "", "a1b x", "120000"):
+        assert not filters.id_hit(nid, q), q
+
+
+def test_describe_names_a_search_by_what_was_typed():
+    kw = filters.from_params({"q": "a  b", "kind": "bug"})
+    assert filters.describe(kw, "a  b") == 'search "a b" · kind=bug'

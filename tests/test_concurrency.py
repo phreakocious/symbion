@@ -4,7 +4,10 @@ These fail against an implementation that loads outside the lock.
 That is exactly why they are worth writing: the harness issues parallel tool
 calls, so several symbion processes in one message is the normal case."""
 import multiprocessing as mp
+import pytest
 from symbion import store
+
+pytestmark = pytest.mark.usefixtures("tmp_store")
 
 
 def _supersede(args):

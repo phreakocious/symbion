@@ -1,8 +1,9 @@
 """Note and Arc schema: dataclasses, serialization, kind/status invariants.
 
 Lifted from a working reference: the research notebook symbion was
-extracted from. Field names on disk are frozen — never rename one, even a
-legacy key, because existing rows depend on it.
+extracted from. Field names on disk are a contract with every store already
+written: renaming one takes a migration and a dated note in the specs, as
+the 2026-09-08 vocabulary change did for `activity_id` and `global`.
 
 This module holds the schema, the locked file I/O and the arc registry.
 """
@@ -13,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -130,6 +132,39 @@ def canon_due(value: str) -> str:
     return (dt if dt.tzinfo else dt.astimezone()).isoformat()
 
 
+SINCE_FORMAT = "a span back from now (30m, 2h, 3d, 1w), a date or an ISO datetime"
+_SPAN = re.compile(r"(\d+)([mhdw])")
+
+
+def since_cutoff(value: str, now: datetime | None = None) -> datetime:
+    """`list --since`: the instant a window opens, as `git log --since`
+    reads it. A span counts back from `now`, a date opens at its start in
+    local time, a datetime without an offset is local."""
+    from datetime import timedelta
+    now = now or datetime.now().astimezone()
+    s = value.strip()
+    m = _SPAN.fullmatch(s)
+    if m:
+        unit = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m[2]]
+        return now - timedelta(**{unit: int(m[1])})
+    try:
+        return datetime.combine(date.fromisoformat(s), datetime.min.time()).astimezone()
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError(f"--since {value!r}: use {SINCE_FORMAT}") from None
+    return dt if dt.tzinfo else dt.astimezone()
+
+
+def _written(n) -> datetime:
+    """A row's created_at as an instant. Rows from before offsets were
+    stamped are naive: local wall clock, which is what they were written in."""
+    dt = datetime.fromisoformat(n.created_at)
+    return dt if dt.tzinfo else dt.astimezone()
+
+
 def due_state(due: str, now: datetime | None = None) -> tuple[bool, int] | None:
     """(past due, calendar days from today to the due date), both at `now`'s
     offset. A date is due through the end of its day; a datetime is past due
@@ -155,6 +190,19 @@ def is_overdue(note, now: datetime | None = None) -> bool:
     return read_status(note) == "open" and state is not None and state[0]
 
 
+def check_self_ref(target: dict, refs) -> None:
+    """A ref to the row's own target adds nothing, and `context --target`
+    reported the row twice. Checked on RESOLVED names: `file:cli` and
+    `file:src/cli.py` are one object once the catalog has run."""
+    own = (target["type"], target.get("name"))
+    if any((r["type"], r.get("name")) == own for r in refs or ()):
+        raise ValueError(f"a ref to the row's own target ({own[0]}:{own[1] or ''}) "
+                         f"adds nothing; drop it")
+
+
+NULL_WORDS = ("None", "null")
+
+
 def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
     """The write-side invariants, determined by the kind's bits and shared by
     `add_many`, `_supersede_unlocked` and `api.fields_from_row` -- a
@@ -168,12 +216,19 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
        resulting row, so an inherited result satisfies it.
     4. `due` only on a kind with the status bit -- only an open row can be
        past due -- and only in a form `canon_due` reads.
+    5. No `checked`/`result` that is a null's spelling (`None`, `null`): the
+       word passed rule 3 as a verdict (measured 2026-09-26).
 
     The reader never calls this: a row already on disk loads as written."""
+    for key in ("checked", "result"):
+        if d.get(key) in NULL_WORDS:
+            raise ValueError(f"--{key} {d[key]!r} stores the word, not an absent {key}: "
+                             f"omit the flag, or say what it found")
     if d.get("status") is not None and not spec.status:
         raise ValueError(f"status is not valid for kind {kind!r}: it has no status bit, so "
-                         f"there is nothing to open or resolve; correct the row with "
-                         f"`supersede <id>` (`symbion schema` lists each kind's bits)")
+                         f"there is nothing to open or resolve. A plain row leaves the "
+                         f"default views with `supersede <id> --add-tag retired`; "
+                         f"`symbion schema` lists each kind's bits")
     if not spec.verdict and (d.get("checked") is not None or d.get("result") is not None):
         raise ValueError(f"--checked/--result are not valid for kind {kind!r}: "
                          f"it has no verdict bit; put the evidence in --body "
@@ -192,6 +247,18 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
 
 
 # ---- serialization ----
+# The vocabulary change of 2026-09-08. An error accepts nothing, so this is
+# not a compatibility surface; it is the one place an un-migrated store can
+# learn what happened.
+_VOCAB_HINT = ("the vocabulary changed on 2026-09-08 (followup->task, anomaly->bug, "
+               "audit->check, activity->arc, global->project) and this store has not "
+               "been migrated")
+# ponytail: refused unconditionally on load, where the catalogs are unknown;
+# a store that declares a catalog type named `global` or `activity` would need
+# load() to pass its target types.
+_RETIRED_TYPES = ("global", "activity")
+
+
 def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
     """`kinds` is the store's table (label -> Kind); None means the defaults.
     An undeclared label is refused with the declared set, and the three
@@ -202,14 +269,15 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
     if d["kind"] not in kinds:
         hint = ""
         if d["kind"] in ("followup", "anomaly", "audit"):
-            # An error accepts nothing, so this is not a compatibility surface;
-            # it is the one place an un-migrated store can learn what happened.
-            hint = (": the vocabulary changed on 2026-09-08 (followup->task, "
-                    "anomaly->bug, audit->check, activity->arc, global->project) "
-                    "and this store has not been migrated; rename them in "
-                    "notes.jsonl, or declare it under [kinds] in symbion.toml")
+            hint = (f": {_VOCAB_HINT}; rename them in notes.jsonl, or declare it "
+                    f"under [kinds] in symbion.toml")
         raise ValueError(f"unknown kind: {d['kind']!r}; this store's kinds are "
                          f"{', '.join(kinds)} (declared under [kinds] in symbion.toml){hint}")
+    retired = [x["type"] for x in (t, *(d.get("refs") or ()))
+               if isinstance(x, dict) and x.get("type") in _RETIRED_TYPES]
+    if retired or target.type in _RETIRED_TYPES:
+        raise ValueError(f"retired target type {(retired or [target.type])[0]!r}: "
+                         f"{_VOCAB_HINT}; rename it in notes.jsonl")
     if target_types is not None and target.type not in target_types:
         raise ValueError(f"unknown target type: {target.type!r}")
     return Note(
@@ -305,10 +373,11 @@ def notes_path(store) -> Path:
 
 
 def exists(store) -> bool:
-    """Whether a store has ever been bootstrapped (`ensure_store`/`add`/...
-    have run here). Used by `summary` to distinguish an absent store --
-    which spec:251 says must print nothing, exit 0 -- from an empty but
-    initialized one, which must still render its (zero) counts."""
+    """Whether a store has ever been bootstrapped (`symbion init` ran for
+    it, or an older symbion's first write created it). Tells an absent
+    store (`no store at <path>`; `summary --json` answers `store: null`)
+    from an empty one, which renders its zero counts. The hook's silence in a project without a store is
+    session_start.sh's own check, made before it runs `summary`."""
     return notes_path(store).exists()
 
 
@@ -329,7 +398,7 @@ def _lock(store):
 
     NEVER NEST — flock is per open-file-description, so a second LOCK_EX from
     this same process would deadlock. Acquire only at a top-level mutating entry
-    point, and after ensure_store so the directory exists."""
+    point, and after require_store so the directory exists."""
     p = Path(store) / LOCK_FILE
     p.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)
@@ -355,9 +424,20 @@ def _replace_atomically(path: Path, body: str) -> None:
             tmp.unlink()
 
 
+def require_store(store) -> None:
+    """Every write's first step: only `symbion init` creates a store. A write
+    that created one forked a renamed repo's, a mistyped --dir's or a stale
+    SYMBION_DIR's store, printing an ordinary id (2026-09-11). A store that
+    exists still gets any piece it lacks."""
+    if not exists(store):
+        raise ValueError(f"no store at {store}; run `symbion init`")
+    ensure_store(store)
+
+
 def ensure_store(store) -> bool:
     """Create the store dir + both empty files + `git init` if absent.
-    Idempotent. Returns True iff it had to bootstrap anything (the GUI banners on it)."""
+    Idempotent. Returns True iff it had to bootstrap anything. `init` is the
+    one caller that may create; writes go through require_store."""
     store = Path(store)
     created = not store.exists()
     store.mkdir(parents=True, exist_ok=True)
@@ -366,7 +446,13 @@ def ensure_store(store) -> bool:
             f.touch()
             created = True
     if not (store / ".git").exists():
-        subprocess.run(["git", "init", "-q", str(store)], check=False)
+        r = subprocess.run(["git", "init", "-q", str(store)], capture_output=True, text=True)
+        if r.returncode:
+            # git can fail after making `.git`, and a left `.git` makes every
+            # later call skip this init: remove the one this call made.
+            shutil.rmtree(store / ".git", ignore_errors=True)
+            said = (r.stderr + r.stdout).strip() or f"exit {r.returncode}, no output"
+            raise RuntimeError(f"git init failed in {store}; git said:\n{said}")
         created = True
     ignore = store / ".gitignore"
     if not ignore.exists():
@@ -445,13 +531,15 @@ def add_many(store, rows, target_types=None, canonicalize=None) -> list:
             raise ValueError(f"unknown kind {fields.get('kind')!r}; this store's kinds are "
                              f"{', '.join(kinds)} (declared under [kinds] in symbion.toml)")
         check_fields(fields["kind"], spec, fields)
-    ensure_store(store)
+    require_store(store)
     with _lock(store):                       # outer: covers canonicalize + mint + write
         # ponytail: lock held across canonicalize = rows x command_timeout worst
         # case; a per-row release would let a neighbour mint between rows, so
         # the ceiling stays until it hurts
         if canonicalize is not None:
             rows = canonicalize(rows)
+        for fields in rows:
+            check_self_ref(fields["target"], fields.get("refs"))
         used = {n.id for n in _load_unlocked(store)}
         notes = []
         for fields in rows:
@@ -488,7 +576,8 @@ def appended(body: str | None, more: str) -> str:
 
 
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
-                        kinds=None, append_body: str | None = None, **fields) -> Note:
+                        kinds=None, append_body: str | None = None, add_refs=None,
+                        **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
     multi-row aggregate (`rename_target`, `apply_reconciliation`) can hold
@@ -546,6 +635,13 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     base.update(fields)
     if append_body is not None:
         base["body"] = appended(old.body, append_body)
+    if add_refs:
+        # Onto the TIP's refs, as append_body is onto its body; the
+        # inherited ones are never re-resolved.
+        have = list(base.get("refs") or ())
+        base["refs"] = have + [r for r in add_refs if r not in have]
+    if "refs" in fields or add_refs:
+        check_self_ref(base["target"], base["refs"])
     if fields.get("due") is not None:
         base["due"] = canon_due(fields["due"])
     spec = kinds.get(base["kind"])
@@ -565,6 +661,9 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                            ("status", spec.status), ("due", spec.status)):
             if not legal and key not in fields:
                 base[key] = None
+    for key in ("checked", "result"):          # rule 5, on a legacy row
+        if key not in fields and base.get(key) in NULL_WORDS:
+            base[key] = None
     check_fields(base["kind"], spec, base)
     base["supersedes"] = old.id
     base["id"] = new_id()
@@ -579,7 +678,7 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
 
 
 def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
-              append_body: str | None = None, **fields) -> Note:
+              append_body: str | None = None, add_refs=None, **fields) -> Note:
     """Append a correction superseding old_id -- the single-row public entry
     point. One outer `_lock` spans load -> fast-forward -> mint -> write; see
     `_supersede_unlocked` for what happens inside it.
@@ -598,13 +697,15 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
     `canonicalize(fields) -> fields` runs inside the lock before the row is
     built: new refs resolve against the store as it is now; the inherited
     target is never in `fields` (api.supersede refuses it)."""
-    ensure_store(store)
+    require_store(store)
     with _lock(store):
         notes = _load_unlocked(store)
         if canonicalize is not None:
             fields = canonicalize(fields)
+            if add_refs:
+                add_refs = canonicalize({"refs": add_refs})["refs"]
         return _supersede_unlocked(store, notes, old_id, author=author,
-                                   append_body=append_body, **fields)
+                                   append_body=append_body, add_refs=add_refs, **fields)
 
 
 def heads(notes):
@@ -629,7 +730,7 @@ def heads_for(store, target_type, target_name=None):
 
 def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
           status=None, arc_id=None, tag=None, author=None, structured=None, grep=None,
-          overdue=None):
+          overdue=None, since=None):
     """Filter raw notes by any combination of fields. Callers compose heads()
     when they want current state (see data-flow in the spec).
 
@@ -638,9 +739,11 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
     could drift out of agreement with the data it describes, which is precisely
     the class of claim this layer exists to retract.
 
-    `grep` is a compiled pattern searched over body, target name, checked
-    and result -- the text a reader would otherwise pipe a paged list to grep
-    for, losing the page's header and reading the silence as absence.
+    `grep` is a compiled pattern searched over body, target name, checked,
+    result and each ref as `type:name` -- the text a reader would otherwise
+    pipe a paged list to grep for, losing the page's header and reading the
+    silence as absence. Refs are in because SKILL.md tells writers to put a
+    second object there instead of in prose.
 
     `id` is an exact match on the row, not a walk of its supersede chain: it
     filters whatever set it is handed, so pass raw notes to reach a superseded
@@ -666,9 +769,12 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
         out = [n for n in out if (n.measurements is not None) == structured]
     if grep is not None:
         out = [n for n in out if grep.search("\n".join(
-            f for f in (n.body, n.target.name, n.checked, n.result) if f))]
+            [f for f in (n.body, n.target.name, n.checked, n.result) if f]
+            + [f"{r.type}:{r.name or ''}" for r in n.refs]))]
     if overdue:
         out = [n for n in out if is_overdue(n)]
+    if since is not None:
+        out = [n for n in out if _written(n) >= since]
     return out
 
 
@@ -702,18 +808,25 @@ def _rename_unlocked(store, notes, kinds, target_type, old, new, author) -> tupl
     was, now = Target(target_type, old), Target(target_type, new)
     moved = repointed = 0
     for note in heads(notes):
+        if note.target != was and was not in note.refs:
+            continue        # the rename does not touch it, legacy self-edge or not
+        target = now if note.target == was else note.target
+        # dict.fromkeys: a row that already REF'd `new` keeps one entry. A ref
+        # equal to the row's target is dropped: a legacy self-edge, or one
+        # this rename would make (target old, ref new); either would trip
+        # check_self_ref partway through the sweep.
+        refs = tuple(r for r in dict.fromkeys(now if r == was else r for r in note.refs)
+                     if r != target)
         fields = {}
-        if note.target == was:
+        if target != note.target:
             fields["target"] = {"type": target_type, "name": new}
-        if was in note.refs:
-            # dict.fromkeys: a row that already REF'd `new` keeps one entry.
-            fields["refs"] = [{"type": r.type, "name": r.name} for r in
-                              dict.fromkeys(now if r == was else r for r in note.refs)]
+        if refs != note.refs:
+            fields["refs"] = [{"type": r.type, "name": r.name} for r in refs]
         if fields:
             notes.append(_supersede_unlocked(store, notes, note.id, author=author,
                                              kinds=kinds, **fields))
             moved += "target" in fields
-            repointed += "refs" in fields
+            repointed += was in note.refs
     return moved, repointed
 
 
@@ -746,7 +859,7 @@ def rename_target(store, target_type, old, new, author=None,
     without it `new` is stored as typed, and a short sha stays short.
     `old` is never resolved: it names a departed object, which a live
     catalog match would redirect."""
-    ensure_store(store)
+    require_store(store)
     with _lock(store):
         if canonicalize is not None:
             new = canonicalize(new)
@@ -757,18 +870,30 @@ def rename_target(store, target_type, old, new, author=None,
 def commit(store, message: str, cfg) -> bool:
     """git add -A + commit the store. Hermetic identity so it works in CI/tmp.
     The lock is here because `add -A` would otherwise stage whatever another
-    writer has half-written. Returns True on a successful commit (False e.g.
-    when nothing changed)."""
+    writer has half-written. Returns True on a commit, False when nothing
+    changed, and raises RuntimeError with git's words when git refuses: a
+    hook's refusal (a secret scanner's catch) once read as 'nothing to
+    commit', its output dropped (2026-09-28)."""
     store = Path(store)
-    ensure_store(store)
+    require_store(store)
+    git = ["git", "-C", str(store)]
     with _lock(store):
-        subprocess.run(["git", "-C", str(store), "add", "-A"], check=False)
-        r = subprocess.run(
-            ["git", "-C", str(store),
-             "-c", f"user.name={cfg.git_name}", "-c", f"user.email={cfg.git_email}",
-             "commit", "-q", "-m", message],
-            capture_output=True, text=True)
-    return r.returncode == 0
+        r = subprocess.run([*git, "add", "-A"], capture_output=True, text=True)
+        if r.returncode == 0:
+            r = subprocess.run([*git, "diff", "--cached", "--quiet"],
+                               capture_output=True, text=True)
+            if r.returncode == 0:                 # nothing staged
+                return False
+            if r.returncode == 1:                 # something staged
+                r = subprocess.run(
+                    [*git, "-c", f"user.name={cfg.git_name}",
+                     "-c", f"user.email={cfg.git_email}", "commit", "-q", "-m", message],
+                    capture_output=True, text=True)
+    if r.returncode:
+        said = (r.stderr + r.stdout).strip() or f"exit {r.returncode}, no output"
+        raise RuntimeError(f"git refused the commit; the notes are on disk, "
+                           f"not committed. git said:\n{said}")
+    return True
 
 
 # ==========================================================================
@@ -787,6 +912,8 @@ def commit(store, message: str, cfg) -> bool:
 # ==========================================================================
 
 def arc_from_dict(d: dict, legal_scopes=None) -> Arc:
+    if d["target_scope"] == "global":
+        raise ValueError(f"retired scope 'global': {_VOCAB_HINT}; rename it in arcs.jsonl")
     if legal_scopes is not None and d["target_scope"] not in legal_scopes:
         raise ValueError(f"unknown scope: {d['target_scope']!r}")
     return Arc(
@@ -807,28 +934,44 @@ def arc_to_dict(act: Arc) -> dict:
     }
 
 
-def load_arcs(store):
-    """All arcs, in file order. Skips malformed lines silently."""
+def _read_arcs(store) -> tuple[list, list]:
+    """(arcs, [(lineno, raw, error)]), in file order."""
     file = arcs_path(store)
     if not file.exists():
-        return []
-    out = []
-    for raw in file.read_text(encoding="utf-8").splitlines():
+        return [], []
+    good, bad = [], []
+    for i, raw in enumerate(file.read_text(encoding="utf-8").splitlines(), 1):
         if not raw.strip():
             continue
         try:
-            out.append(arc_from_dict(json.loads(raw)))
-        except Exception:
-            continue
-    return out
+            good.append(arc_from_dict(json.loads(raw)))
+        except Exception as e:
+            bad.append((i, raw, f"missing key {e}" if isinstance(e, KeyError) else str(e)))
+    return good, bad
+
+
+def load_arcs(store):
+    """Every readable arc, in file order. An unreadable line is counted by
+    `summary` (load_arcs_malformed) and kept by every rewrite."""
+    return _read_arcs(store)[0]
+
+
+def load_arcs_malformed(store):
+    """[(lineno, raw, error)] for arc lines that failed to read."""
+    return _read_arcs(store)[1]
 
 
 def _write_arcs_unlocked(store, acts) -> None:
     """Rewrite the whole registry (it's tiny; git tracks the diff). Atomic:
     this is the only file here with no supersede history to recover from, so
     a crash mid-write would truncate the one thing that cannot be
-    reconstructed. Caller must already hold `_lock`."""
-    body = "\n".join(_dumps(arc_to_dict(a)) for a in acts)
+    reconstructed. Caller must already hold `_lock`.
+
+    A line load_arcs could not read is written back verbatim: the rewrite
+    was built from what load_arcs returned, so the next `arc create` erased
+    a hand-edited line for good (reproduced 2026-09-27)."""
+    kept = [raw for _, raw, _ in _read_arcs(store)[1]]
+    body = "\n".join([*(_dumps(arc_to_dict(a)) for a in acts), *kept])
     _replace_atomically(arcs_path(store), body + ("\n" if body else ""))
 
 
@@ -841,7 +984,7 @@ def create_arc(store, name, description, target_scope, author="unknown",
                      legal_scopes=None) -> Arc:
     if legal_scopes is not None and target_scope not in legal_scopes:
         raise ValueError(f"unknown scope: {target_scope!r}")
-    ensure_store(store)
+    require_store(store)
     with _lock(store):                       # outer: load + mint slug + write
         acts = load_arcs(store)
         ids = {a.id for a in acts}
@@ -859,7 +1002,7 @@ def create_arc(store, name, description, target_scope, author="unknown",
 
 
 def rename_arc(store, id, new_name) -> Arc:
-    ensure_store(store)
+    require_store(store)
     with _lock(store):
         acts = load_arcs(store)
         found = None
@@ -878,7 +1021,7 @@ def rename_arc(store, id, new_name) -> Arc:
 
 def archive_arc(store, id, _clock=None) -> Arc:
     clock = _clock or datetime.now
-    ensure_store(store)
+    require_store(store)
     with _lock(store):
         acts = load_arcs(store)
         found = None
@@ -963,7 +1106,7 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
     if spec.verdict:
         raise ValueError(f"kind {kind!r} cannot be seeded: it has the verdict bit, "
                          f"and seed stamps no provenance and writes no falsifier")
-    ensure_store(store)
+    require_store(store)
     with _lock(store):                       # outer: load + mint + append
         notes = _load_unlocked(store)
         if canonicalize is not None:
@@ -1061,7 +1204,7 @@ def apply_reconciliation(store, rows, cfg, resolve_stale=False, author=None):
     Returns (retargeted, repointed, resolved): rows re-targeted and rows
     whose refs were re-pointed, across the store, and stale tasks closed."""
     retargeted = repointed = resolved = 0
-    ensure_store(store)
+    require_store(store)
     kinds = K.read_kinds(store)
     with _lock(store):
         notes = _load_unlocked(store)

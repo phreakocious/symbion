@@ -21,7 +21,10 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
 
 - `src/symbion/`: `store.py` (rows, invariants, the lock), `api.py` (the write path:
   `gui/` and `cli.py` write through it, and `tests/test_gui_seam.py` names the two
-  exceptions), `cli.py`, `summary.py` (the session-start text), `gui/` (`symbion serve`).
+  exceptions), `cli.py`, `summary.py` (the session-start text), `term.py` (what a
+  person sees at a terminal: `list`, `show` and `context` in columns, and the palette
+  every other command and `--help` print in), `gui/`
+  (`symbion serve`).
 - `src/symbion/data/skill/`: `SKILL.md`, `adoption.md` and `session_start.sh`, the agent
   surface. They ship in the package; `symbion init` links `~/.claude/skills/symbion` to
   the installed copy.
@@ -33,19 +36,28 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
 Python 3.11 or later:
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui,tty]'
+python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui]'
 .venv/bin/python -m pytest -q
 ```
 
 Run the tests with the venv's Python, not a bare `pytest`: `tests/test_hook.py` runs
 the `symbion` script installed beside the interpreter. With `.[test]` alone, the GUI
-and rich tests skip.
+tests skip.
 
-To try a change by hand, run `.venv/bin/symbion --dir "$(mktemp -d)" …`. SKILL.md's
-rule to run the installed `symbion` is for using symbion, not for developing it.
-Without `--dir`, the first write creates `../<repo>-notes` beside the current repo.
-Run `.venv/bin/symbion init` only when the user asks: it creates that store, and it can
-point the user-wide skill and hook at this checkout (README, "Adopt in a fresh repo").
+To try a change by hand, make a scratch store and name it with `--dir`:
+
+```bash
+d=$(mktemp -d)
+.venv/bin/python -c 'import sys; from symbion import store; store.ensure_store(sys.argv[1])' "$d"
+.venv/bin/symbion --dir "$d" …
+```
+
+SKILL.md's rule to run the installed `symbion` is for using symbion, not for
+developing it. A write refuses a store `init` never made, and without `--dir` a
+command uses `../<repo>-notes` beside the current repo. Run `.venv/bin/symbion init`
+only when the user asks: it creates that store, it can point the user-wide skill and
+hook at this checkout (README, "Adopt in a fresh repo"), and with `--dir` it writes a
+`.symbion` pointer into the checkout.
 
 ## If this checkout is your installed symbion
 

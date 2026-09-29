@@ -5,6 +5,8 @@ the real protocol (stdin, exit codes) and not a Python stand-in."""
 import sys
 from pathlib import Path
 
+from symbion.store import ensure_store
+
 READING_RESOLVER = r'''
 import sys
 lines = sys.stdin.read().splitlines()
@@ -33,7 +35,7 @@ def reading_store(tmp_path: Path, *, counter: bool = False) -> Path:
     resolved numerically. `counter=True` makes the resolver also append one
     line to <store>/resolver.calls per invocation."""
     store = tmp_path / "store"
-    store.mkdir(exist_ok=True)
+    ensure_store(store)
     (tmp_path / "resolve_reading.py").write_text(READING_RESOLVER)
     (tmp_path / "catalog_reading.py").write_text(STORE_CATALOG)
     py = sys.executable

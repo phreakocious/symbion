@@ -36,6 +36,23 @@ def canonical_commit(cfg, ref: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ref
 
 
+def only_on_default_branch(cfg, name) -> str | None:
+    """`cfg.default_branch` when `name` is a path THERE and not in this
+    worktree, else None.
+
+    A catalog runs in the checkout you are in (catalog.run_configured), so a
+    row about a file only the default branch holds missed the catalog with
+    nothing said, and a substring resolved against a different file set
+    (2026-09-28). "Not in this worktree" is the other half of the test: a
+    catalog that FILTERS (`git ls-files '*.py'`) misses plenty of paths that
+    are right there, and the note about one of those would be a lie."""
+    root = getattr(cfg, "work_root", None)
+    if not root or not name or Path(root, name).exists():
+        return None
+    b = cfg.default_branch
+    return b if _git(cfg, "cat-file", "-e", f"{b}:{name}").returncode == 0 else None
+
+
 def canon_name(cfg, target_type, name):
     """The stored/queried form of a target name -- shared by the write side
     (`add`) and the read side (`list --name`, `context --target`), so an
@@ -43,7 +60,7 @@ def canon_name(cfg, target_type, name):
 
     `commit` gets the one built-in exception: peeled to a full object id, so
     a symbolic ref (HEAD, a branch) is frozen at write time instead of
-    silently drifting as the ref advances (spec:132). This lives in gitref,
+    silently drifting as the ref advances (design spec, commit targets). This lives in gitref,
     not catalog, because it needs canonical_commit; catalog must not import
     gitref (that would invert the layering), but gitref already imports
     catalog, so this is the one place both sides can share it from."""
@@ -56,8 +73,11 @@ def canon_name(cfg, target_type, name):
     return catalog.canonical(cfg, target_type, name)
 
 
-def _dirty(cfg) -> bool:
-    return bool(_git(cfg, "status", "--porcelain").stdout.strip())
+def _dirty_paths(cfg) -> list[str]:
+    """`git status --porcelain` paths, a rename's new name."""
+    lines = _git(cfg, "status", "--porcelain").stdout.splitlines()
+    return [ln[3:].split(" -> ")[-1] for ln in lines if ln.strip()]
+
 
 
 def provenance_stamp(cfg, spec):
@@ -75,15 +95,32 @@ def provenance_stamp(cfg, spec):
         except Exception:
             return None
     head = _git(cfg, "rev-parse", "HEAD").stdout.strip()
-    return {"sha": head, "dirty": _dirty(cfg)} if head else None
+    if not head:
+        return None
+    # The paths, not only the flag: whether an uncommitted CLAUDE.md (no
+    # verdict depends on it) should make a stamp dirty cannot be measured
+    # from a boolean (2026-09-27: 26% of 536 adopter stamps dirty).
+    paths = _dirty_paths(cfg)
+    return {"sha": head, "dirty": bool(paths),
+            **({"dirty_count": len(paths), "dirty_paths": paths[:20]} if paths else {})}
 
 
 def check_state(cfg, prov):
     """(state, distance). `dirty` outranks every sha relationship.
 
+    `behind N` and `ahead N` are the two sides of one line of development:
+    the stamp is N commits back from this HEAD, or N commits past it.
+    `diverged` is kept for what it says -- neither is an ancestor of the
+    other.
+
     A check stamped dirty:true satisfies sha == HEAD — the common case, since
     the stamp records HEAD at write time — so without precedence it would read
-    `current`, contradicting the very thing the flag exists to record."""
+    `current`, contradicting the very thing the flag exists to record.
+
+    An external stamp (`add --external`) outranks both: the check read
+    something outside the tree, so no commit or edit bears on it."""
+    if prov and prov.get("external"):
+        return ("external", None)
     if not prov or not prov.get("sha"):
         return ("unverifiable", None)
     if prov.get("dirty"):
@@ -94,16 +131,37 @@ def check_state(cfg, prov):
     head = _git(cfg, "rev-parse", "HEAD").stdout.strip()
     if sha == head:
         return ("current", 0)
-    if _git(cfg, "merge-base", "--is-ancestor", sha, "HEAD").returncode != 0:
-        return ("diverged", None)              # another line of development
+    # `--is-ancestor` exits 1 for "no" and 128 when git cannot answer (a
+    # missing object between the two): only a 0 or a 1 is an answer.
+    up = _git(cfg, "merge-base", "--is-ancestor", sha, "HEAD").returncode
+    if up == 1:
+        down = _git(cfg, "merge-base", "--is-ancestor", head, sha).returncode
+        if down == 0:
+            # HEAD is an ancestor of the stamp: the SAME line, read from a
+            # checkout that lags it. A dated baseline stamped on the default
+            # branch read `diverged` -- "another line of development" -- from
+            # every worktree behind it (2026-09-28).
+            n = _git(cfg, "rev-list", "--count", f"HEAD..{sha}").stdout.strip()
+            return ("ahead", int(n))
+        if down == 1:
+            return ("diverged", None)          # another line of development
+    if up != 0:
+        return ("unverifiable", None)
     n = _git(cfg, "rev-list", "--count", f"{sha}..HEAD").stdout.strip()
     return ("behind", int(n))
 
 
 def branch_commits(cfg, ref: str, since: str | None = None) -> set:
+    """A range git cannot read is an error, not an empty set: `context
+    --branch no-such-ref`, or a branch in a repo whose default is not the
+    configured one, read `0 notes` at exit 0 (2026-09-27)."""
     base = since or cfg.default_branch
     r = _git(cfg, "rev-list", f"{base}..{ref}")
-    return set(r.stdout.split()) if r.returncode == 0 else set()
+    if r.returncode != 0:
+        why = (r.stderr.strip().splitlines() or ["rev-list failed"])[0]
+        raise ValueError(f"git cannot list {base}..{ref}: {why}; the base is --since REF, "
+                         f"else default_branch in symbion.toml ({cfg.default_branch!r})")
+    return set(r.stdout.split())
 
 
 def subjects(cfg, shas) -> dict:
@@ -127,6 +185,13 @@ def subjects(cfg, shas) -> dict:
             sha, subject = line.split("\0", 1)
             out[sha] = subject
     return out
+
+
+def oneline(cfg, rng: str, n: int) -> list[str]:
+    """`git log --oneline` of a range, newest first, at most `n` lines; []
+    when git cannot read the range."""
+    r = _git(cfg, "log", "--format=%h %s", f"-n{n}", rng)
+    return r.stdout.splitlines() if r.returncode == 0 else []
 
 
 def uncommitted(store) -> tuple[int, bool]:

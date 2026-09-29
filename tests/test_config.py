@@ -265,6 +265,31 @@ def test_a_pointer_naming_the_sibling_keeps_the_claim(repo, tmp_path):
     assert config.store_owner(tmp_path / "myproj-notes") == repo
 
 
+@pytest.mark.parametrize("store_name", ["archive", "proj-notes"])
+def test_a_store_a_pointer_names_is_owned_by_the_repo_that_points(repo, tmp_path, store_name):
+    """A store whose name does not match its project (reached through
+    `.symbion`) had no owner, so `--dir <store>` from another repo resolved
+    check state there: 100 of 100 measurements `unverifiable`, stderr empty
+    (measured 2026-09-24). The one sibling repo whose pointer names it owns it."""
+    (repo / ".symbion").write_text(f"../{store_name}\n")
+    assert config.store_owner(tmp_path / store_name) == repo
+
+
+def test_a_store_two_repos_point_at_has_no_owner(repo, tmp_path):
+    twin = tmp_path / "twin"
+    twin.mkdir()
+    subprocess.run(["git", "init", "-q", str(twin)], check=True)
+    for r in (repo, twin):
+        (r / ".symbion").write_text("../shared\n")
+    assert config.store_owner(tmp_path / "shared") is None
+
+
+def test_a_linked_worktree_pointer_claims_nothing(repo, tmp_path):
+    _git(repo, "worktree", "add", "-q", "-d", str(tmp_path / "wt"), "HEAD")
+    (tmp_path / "wt" / ".symbion").write_text("../archive\n")
+    assert config.store_owner(tmp_path / "archive") is None
+
+
 @pytest.mark.parametrize("shape", ["no -notes suffix", "no sibling", "plain dir",
                                    "subdir of a repo", "linked worktree", "pointer elsewhere"])
 def test_a_store_owner_is_none_unless_the_project_names_that_store(repo, tmp_path, shape):

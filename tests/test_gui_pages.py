@@ -6,8 +6,10 @@ pytest.importorskip("nicegui")
 
 from nicegui.testing import User        # noqa: E402
 
-from symbion import api                 # noqa: E402
+from symbion import api, store          # noqa: E402
 from symbion.gui.pages import build_page  # noqa: E402
+
+pytestmark = pytest.mark.usefixtures("tmp_store")
 
 
 @pytest.fixture
@@ -21,10 +23,101 @@ def ctx_with_notes(repo, tmp_path):
     return ctx
 
 
+def _count(user: User) -> str:
+    """The count line, whole: `should_see("1 note")` also passes on "21 notes"."""
+    (label,) = user.find(marker="result-count").elements
+    return label.text
+
+
 async def test_notes_filters_by_tag(user: User, ctx_with_notes):
     await user.open("/notes?tag=red")
     await user.should_see("alpha body")
     await user.should_not_see("beta body")
+
+
+async def test_the_commit_button_shows_a_hooks_refusal(user: User, ctx_with_notes,
+                                                        tmp_path, refusing_hook):
+    """The button notified 'nothing to commit' when a hook refused."""
+    words = refusing_hook(tmp_path)
+    await user.open("/notes")
+    user.find(marker="commit-button").click()
+    await user.should_see(words)
+    assert not user.notify.contains("nothing to commit")
+
+
+async def test_a_search_finds_rows_by_words_in_any_order(user: User, ctx_with_notes):
+    await user.open("/notes?q=BODY%20beta")
+    await user.should_see("beta")
+    await user.should_not_see("alpha")
+    assert _count(user).startswith("1 of 2 notes match")
+
+
+async def test_a_search_narrows_the_filters_in_view(user: User, ctx_with_notes):
+    """`keep` carries the page's filters into the search, and a search
+    carries into the chips: both directions narrow."""
+    await user.open("/notes?q=body&tag=blue")
+    await user.should_see("beta")          # the hit is marked: "beta <mark>body</mark>"
+    await user.should_not_see("alpha")
+    assert _count(user).startswith("1 of 1 note match")
+
+
+async def test_a_pasted_id_tail_finds_its_row(user: User, ctx_with_notes):
+    """Ids are not in the text a search reads; a pasted one read 0."""
+    nid = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
+    await user.open(f"/notes?q=%E2%80%A6{nid.rsplit('-', 1)[1]}")
+    await user.should_see("beta")
+    await user.should_not_see("alpha")
+
+
+async def test_a_superseded_id_opens_its_current_row(user: User, ctx_with_notes):
+    """Rows cite ids that were superseded since; /notes?id= read "0 notes"
+    for them, and so did a search for one."""
+    old = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
+    api.supersede(ctx_with_notes, old, author="ada", body="beta revised")
+    await user.open(f"/notes?id={old}")
+    await user.should_see("beta revised")
+    await user.should_see(f"{old} was superseded")
+    await user.open(f"/notes?q={old.rsplit('-', 1)[1]}")
+    await user.should_see("beta revised")
+    assert _count(user).startswith("1 of 2 notes match")
+
+
+async def test_a_notes_own_view_lists_its_earlier_versions(user: User, ctx_with_notes):
+    """Every version is kept; the GUI showed only the last one."""
+    first = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
+    mid = api.supersede(ctx_with_notes, first, author="ada", body="beta two").id
+    last = api.supersede(ctx_with_notes, mid, author="ada", body="beta three").id
+    await user.open(f"/notes?id={last}")
+    await user.should_see("earlier versions (2)")
+    user.find(marker="history").click()           # an expansion renders its body lazily
+    await user.should_see("beta two")
+    await user.should_see("beta body")
+    assert len(user.find(marker="note-edit").elements) == 1     # the current row's only
+
+
+async def test_a_note_never_superseded_has_no_history(user: User, ctx_with_notes):
+    nid = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
+    await user.open(f"/notes?id={nid}")
+    await user.should_see("beta body")
+    await user.should_not_see(marker="history")
+
+
+async def test_a_search_result_shows_and_marks_a_hit_past_the_clip(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "body": "filler words " * 40 + "the needle is here"}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/notes?q=needle")
+    (snip,) = user.find(marker="note-snippet").elements
+    assert snip.content.startswith("…")
+    assert "<mark>needle</mark>" in snip.content
+
+
+async def test_the_header_search_keeps_the_filters_in_view(user: User, ctx_with_notes):
+    await user.open("/notes?kind=bug")
+    user.find(marker="search").type("widget").trigger("keydown.enter")
+    await user.should_see('search "widget" · kind=bug')
+    assert _count(user).startswith("1 of 1 note match")
 
 
 async def test_notes_with_no_filters_shows_everything(user: User, ctx_with_notes):
@@ -35,7 +128,8 @@ async def test_notes_with_no_filters_shows_everything(user: User, ctx_with_notes
 
 async def test_a_stale_bookmark_renders_rather_than_erroring(user: User, ctx_with_notes):
     await user.open("/notes?tag=nonexistent&utm_source=x")
-    await user.should_see("0 notes")
+    await user.should_see(marker="result-count")
+    assert _count(user) == "0 notes"
 
 
 async def test_an_unknown_param_does_not_silently_widen_the_result(
@@ -44,7 +138,8 @@ async def test_an_unknown_param_does_not_silently_widen_the_result(
     not also drop the tag beside it -- that would render every note and read
     as success."""
     await user.open("/notes?tag=red&utm_source=x")
-    await user.should_see("1 notes")
+    await user.should_see(marker="result-count")
+    assert _count(user) == "1 note"
     await user.should_not_see("beta body")
 
 
@@ -144,11 +239,16 @@ async def test_arc_page_renders_the_seed_button_on_a_default_store(user: User, r
     assert user.find(marker="arc-seed").elements
 
 
-async def test_the_gui_serves_a_named_store_from_outside_any_git_repo(user: User, tmp_path, monkeypatch):
+async def test_the_gui_serves_a_named_store_from_outside_any_git_repo(user: User,
+                                                                     tmp_path_factory,
+                                                                     monkeypatch):
     """`symbion --dir ../x-notes serve` from a home directory: no project to
-    name, so the header falls back to the store's own name."""
-    store_dir = tmp_path / "x-notes"
-    monkeypatch.chdir(tmp_path)
+    name, so the header falls back to the store's own name. Not tmp_path:
+    tmp_store makes that a store, and so a git repo."""
+    home = tmp_path_factory.mktemp("home")
+    store_dir = home / "x-notes"
+    store.ensure_store(store_dir)
+    monkeypatch.chdir(home)
     ctx = api.resolve(str(store_dir))
     api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
                   "body": "from nowhere"}, author="ada")
@@ -156,3 +256,183 @@ async def test_the_gui_serves_a_named_store_from_outside_any_git_repo(user: User
     await user.open("/notes")
     await user.should_see("x-notes · symbion")
     await user.should_see("from nowhere")
+
+
+# ---- gui spec drift (audit 2026-09-25): chips narrow, arc chip, arc notes ----
+
+def _hrefs(user: User, marker: str) -> set:
+    return {e.props.get("href") for e in user.find(marker=marker).elements}
+
+
+async def test_a_chip_in_a_filtered_view_narrows_it(user: User, ctx_with_notes):
+    """A chip dropped the current filters instead of adding one (href() got
+    one param); the spec: clicking it from a filtered view narrows further.
+    Off the filtered view a chip starts a filter."""
+    await user.open("/notes?kind=note")
+    assert _hrefs(user, "tag-red") == {"/notes?kind=note&tag=red"}
+    await user.open("/")                       # the open bug sits on a board
+    assert _hrefs(user, "tag-blue") == {"/notes?tag=blue"}
+
+
+async def test_a_note_under_an_arc_links_to_it_and_the_arc_page_lists_its_notes(
+        user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    aid = api.create_arc(ctx, "Release", "", "mixed", author="ada").id
+    api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "tag it"},
+                  "arc_id": aid, "body": "a box"}, author="ada")
+    api.add(ctx, {"kind": "decision", "target": {"type": "arc", "name": aid},
+                  "body": "about the arc itself"}, author="ada")
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "refs": [{"type": "arc", "name": aid}], "body": "refs the arc"}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/notes?kind=task")
+    assert _hrefs(user, "note-arc") == {f"/arc?id={aid}"}
+    await user.open(f"/arc?id={aid}")
+    await user.should_see("about the arc itself")
+    await user.should_see("refs the arc")
+
+
+# ---- seen in the browser, 2026-09-27: what a human reads ----
+
+async def test_a_board_clips_a_long_body_and_links_the_full_note(user: User, repo, tmp_path):
+    """The boards printed every open row's body in full: one bug's four
+    paragraphs filled the screen. A board is a list to scan; the note's own
+    page is where it reads in full."""
+    ctx = api.resolve(str(tmp_path))
+    long = "Opening claim of the bug. " + "Detail sentence. " * 20 + "\n\nDEEP PARAGRAPH WORDS"
+    n = api.add(ctx, {"kind": "bug", "target": {"type": "item", "name": "x"}, "body": long},
+                author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    await user.should_see("Opening claim of the bug.")
+    await user.should_not_see("DEEP PARAGRAPH WORDS")
+    assert _hrefs(user, "note-full") == {f"/notes?id={n.id}"}
+    await user.open(f"/notes?id={n.id}")
+    await user.should_see("DEEP PARAGRAPH WORDS")
+
+
+async def test_a_checklist_row_says_which_box_it_is(user: User, repo, tmp_path):
+    """Six boxes on one file drew six identical target lines."""
+    ctx = api.resolve(str(tmp_path))
+    aid = api.create_arc(ctx, "A", "", "mixed", author="ada").id
+    for body in ("first box on the file", "second box on the file"):
+        api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "same"},
+                      "arc_id": aid, "body": body}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open(f"/arc?id={aid}")
+    await user.should_see("first box on the file")
+    await user.should_see("second box on the file")
+
+
+async def test_a_commit_ref_chip_is_a_short_sha(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}, "body": "b",
+                  "refs": [{"type": "commit", "name": "HEAD"}]}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    texts = {e.text for e in user.find(marker="note-ref").elements}
+    assert len(texts) == 1 and len(texts.pop().split(":", 1)[1]) == 7, texts
+
+
+async def test_an_archived_arc_says_so_and_is_reachable(user: User, repo, tmp_path):
+    """Its page offered `archive` and never said it was archived, and the
+    index listed archived arcs as labels, not links."""
+    ctx = api.resolve(str(tmp_path))
+    aid = api.create_arc(ctx, "Old", "", "mixed", author="ada").id
+    api.archive_arc(ctx, aid)
+    build_page(ctx, author="ada")
+    await user.open("/arcs")
+    assert f"/arc?id={aid}" in _hrefs(user, "archived-arc")
+    await user.open(f"/arc?id={aid}")
+    await user.should_see("archived")
+    await user.should_not_see(marker="arc-archive")
+
+
+async def test_an_object_page_leads_with_open_rows_and_clips_resolved_ones(
+        user: User, repo, tmp_path):
+    """One file's page held 50 rows in full, open work buried in history
+    (seen in the browser, 2026-09-27)."""
+    ctx = api.resolve(str(tmp_path))
+    done = api.add(ctx, {"kind": "bug", "target": {"type": "item", "name": "x"},
+                         "body": "Old fixed bug. " + "history " * 60 + "\n\nOLD DEEP WORDS"},
+                   author="ada")
+    api.supersede(ctx, done.id, author="ada", status="resolved")
+    api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "x"},
+                  "body": "Open work. " + "detail " * 60 + "\n\nOPEN DEEP WORDS"}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/object?type=item&name=x")
+    await user.should_see("OPEN DEEP WORDS")
+    await user.should_not_see("OLD DEEP WORDS")
+    rows = [e for e in user.find(marker="note-row").elements]
+    assert len(rows) == 2
+    # a parked idea is a shelved thought: clipped like history
+    api.add(ctx, {"kind": "idea", "target": {"type": "item", "name": "x"},
+                  "body": "Shelved. " + "later " * 60 + "\n\nIDEA DEEP WORDS"}, author="ada")
+    await user.open("/object?type=item&name=x")
+    await user.should_not_see("IDEA DEEP WORDS")
+
+
+async def test_the_tags_page_names_near_duplicates(user: User, repo, tmp_path):
+    """`flaky-test` beside `flaky-tests` split one subject in an adopter
+    store; the page said "near-synonyms are drift" and showed none."""
+    ctx = api.resolve(str(tmp_path))
+    for tags in (["flaky-test"], ["flaky-test"], ["flaky-tests"], ["other"]):
+        api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "b", "tags": tags}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/tags")
+    near = [e.text for e in user.find(marker="tag-near").elements]
+    assert near == ["flaky-test (2) · flaky-tests (1)"], near
+
+
+async def test_an_unknown_path_gets_symbions_404_not_niceguis(user: User, ctx_with_notes):
+    """NiceGUI's page is its sad-face art with no way back (a gui-theming
+    task). The replacement keeps the header and names the path. `user.open`
+    refuses any status but 200, so this reads the response itself."""
+    r = await user.http_client.get("/no/such/page")
+    assert r.status_code == 404
+    assert "nothing is served at /no/such/page" in r.text
+    assert "writing as ada" in r.text                # the header came with it
+    assert "sad_face" not in r.text and "<svg" not in r.text.split("<body")[1]
+
+
+async def test_a_page_that_fails_says_why_inside_symbions_chrome(user: User, ctx_with_notes,
+                                                                caplog):
+    from nicegui import ui
+
+    @ui.page("/boom")
+    def boom():
+        raise RuntimeError("kaput")
+
+    r = await user.http_client.get("/boom")
+    assert r.status_code == 500
+    assert "RuntimeError: kaput" in r.text
+    assert "writing as ada" in r.text
+    # NiceGUI logs the exception, and the `user` fixture fails a test that
+    # leaves an ERROR log behind: this one was expected.
+    assert "kaput" in caplog.text
+    caplog.clear()
+
+
+async def test_a_long_list_says_what_it_did_not_show(user: User, repo, tmp_path, monkeypatch):
+    """/notes renders a page of rows; the rest are named, never silently cut."""
+    # Through build_page's own globals, not `import pages`: the `user`
+    # fixture's teardown pops every module that defined a page from
+    # sys.modules, so after the first test an import gets a fresh copy that
+    # build_page (imported above) never reads, and the patch misses.
+    monkeypatch.setitem(build_page.__globals__, "PAGE_ROWS", 2)
+    ctx = api.resolve(str(tmp_path))
+    for i in range(3):
+        api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": f"row {i}", "tags": ["t"]}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/notes?tag=t")
+    await user.should_see("row 2")
+    await user.should_not_see("row 0")                     # the oldest is the one cut
+    assert _count(user) == "3 notes; newest 2 shown"       # named at the top too
+    (more,) = user.find(marker="show-all").elements
+    assert more.text == "+1 older not shown — show all"
+    assert more.props["href"] == "/notes?tag=t&all=1"      # the filters survive it
+    await user.open(more.props["href"])
+    await user.should_see("row 0")
+    await user.should_not_see(marker="show-all")

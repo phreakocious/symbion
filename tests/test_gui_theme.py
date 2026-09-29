@@ -67,3 +67,14 @@ def test_portaled_quasar_menus_and_tooltips_are_themed():
     css = (GUI_DIR / "theme.py").read_text(encoding="utf-8")
     for sel in (".q-menu", ".q-tooltip"):
         assert re.search(rf"{re.escape(sel)}\s*\{{", css), f"no rule for {sel}"
+
+
+def test_only_link_chips_light_up_on_hover():
+    """A label chip (the check badge) lit up like a link and a click did
+    nothing. The hover rule names `a.sb-chip` and nothing wider."""
+    import re
+    from symbion.gui.theme import DARK_CSS
+    css = re.sub(r"/\*.*?\*/", "", DARK_CSS, flags=re.S)
+    hover = [sel.strip() for block in re.findall(r"([^{}]+)\{", css)
+             for sel in block.split(",") if ".sb-chip:hover" in sel]
+    assert hover == ["a.sb-chip:hover"], hover

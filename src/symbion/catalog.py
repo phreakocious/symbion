@@ -158,18 +158,26 @@ def resolve_with(cfg, target_type: str, query: str, candidates) -> str:
 def match(cfg, target_type: str, query: str, candidates) -> str:
     """The one picker: the declared resolver, else the built-in rule.
 
-    A built-in miss is stored as typed, by design (a catalog disambiguates,
+    A built-in miss is taken as typed, by design (a catalog disambiguates,
     it does not whitelist) -- but silently, so a typo'd or deleted path
     minted a second target that `list --name` never joined to the first
     (measured 2026-09-20). Say so on stderr; stdout and
     the exit code are unchanged, so nothing scripted moves. A resolver's
-    miss is the resolver's business and gets no note."""
+    miss is the resolver's business and gets no note.
+
+    The note says "taken", not "stored": this is the one picker for reads and
+    writes both, and it does not know the verb, so a `list --name` miss used
+    to promise a write the read never made (adopter report, 2026-09-28). A
+    batch write, which does know, still says "stored" (cli's from-json note)."""
     if target_type in cfg.resolvers:
         return resolve_with(cfg, target_type, query, candidates)
     got = resolve(query, candidates)
     if got not in candidates:
-        print(f"note: {got!r} matches nothing in the {target_type} catalog; stored as typed",
-              file=sys.stderr)
+        from . import gitref            # late: gitref imports this module
+        b = gitref.only_on_default_branch(cfg, got)
+        where = f"; it is on {b}, not in this worktree" if b else ""
+        print(f"note: {got!r} matches nothing in the {target_type} catalog; "
+              f"taken as typed{where}", file=sys.stderr)
     elif got != nfc(query):
         # A non-exact pick is never silent:
         # `--name foo` landing on src/foo_test.py must be visible to undo.

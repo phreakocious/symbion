@@ -27,7 +27,9 @@ None of these is an agent's problem. An agent composes commands cheaply and read
 
 `init`, `rename` (a catalog migration) and `activity reconcile` (a maintenance sweep) stay CLI-only. Both are rare, both are destructive-adjacent, and neither is something you reach for mid-browse.
 
-**Non-goals (still):** auth, multi-user, sync/remote, full-text search, a link-graph view, evidence *serving*, activity deletion, auto-commit. No new note kinds (superseded 2026-09-08 by `2026-09-08-symbion-vocabulary-design.md`: `idea` and `question`; the GUI relabels wholesale and gains nothing else). The GUI adds no capability the CLI lacks — it is a second surface on one model, never a superset.
+**Non-goals (still):** auth, multi-user, sync/remote, full-text search (reversed 2026-09-29, see below), a link-graph view, evidence *serving*, activity deletion, auto-commit. No new note kinds (superseded 2026-09-08 by `2026-09-08-symbion-vocabulary-design.md`: `idea` and `question`; the GUI relabels wholesale and gains nothing else). The GUI adds no capability the CLI lacks — it is a second surface on one model, never a superset.
+
+*2026-09-29:* full-text search is no longer a non-goal. The CLI gained it first (`list --grep`, 3e3af17, 2026-09-24); the GUI's header box reads the same fields through the same `store.query(grep=...)`, from a `q` URL param, so Decision 3 holds. It differs in one way, on purpose: it is literal and needs every word, where `--grep` is a regex, because a person types words and pastes `$HOME`.
 
 **Non-goal explicitly reversed:** "a GUI" moves out of the v1 non-goals list. The v1 line stands as history; the list itself is amended (see **Spec amendments**).
 
@@ -86,6 +88,12 @@ The one read that is *not* a filter is `heads_for(store, type, name)` (`store.py
 README:19 is "Python 3.11+ and git. No dependencies." NiceGUI 3.12.1's transitive closure is **50 packages**, four of which are C-extension builds: `aiohttp`, `lxml`, `orjson`, `pydantic-core`. (`lxml>=6.1.0` and `lxml-html-clean>=0.4.4` are core requirements of NiceGUI 3.x, not extras-gated — a 2.x reading of the metadata says otherwise and is out of date.)
 
 So the GUI is `[project.optional-dependencies] gui`, and every nicegui-dependent test module opens with `pytest.importorskip("nicegui")` — the pattern the ancestor GUI's own conftest already uses, so the core suite runs green in a bare checkout. README:19 is amended to say the *core* has no dependencies.
+
+(Noted 2026-09-29: the core is no longer dependency-free. `rich`, pure Python, four
+packages with what it pulls in, became a core dependency so that a plain install gets the
+terminal view of `list`, `show` and `context`. `rich-argparse`, pure Python and needing
+only rich, joined it the same day so that `--help` prints in that view's colours. The
+reason above, 50 packages with C builds, still keeps the GUI an extra.)
 
 A separate `symbion-gui` distribution would keep the core cleaner still, at the cost of two repos to version in lockstep and an `api.py` that becomes a published interface. For a project this size that is the worse trade, and the v1 non-goals already rule out a plugin mechanism.
 
@@ -269,3 +277,4 @@ Each step names what it **produces** and what **consumes** it, so no step ships 
 ## Open questions
 
 - **Does the boards page need pagination?** The ancestor GUI caps recent audits at 25 and nothing else. Deferred until a store exists that makes it hurt.
+  *Answered 2026-09-29 for `/notes`:* a 312-row store took 3.7s and a 1 MB page there. `/notes` renders the newest 100, names the cut in its count line, and ends with a show-all link. The boards stay as they were: open rows, and the newest 25 checks.
