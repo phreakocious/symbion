@@ -3245,6 +3245,33 @@ def test_a_verdict_write_outside_any_git_repo_refuses_and_names_the_cwd(repo, tm
     assert len(store.load(store_dir)) == 3
 
 
+@pytest.mark.parametrize("shape", ["fresh repo", "orphan branch"])
+def test_a_verdict_write_on_an_unborn_branch_refuses_and_names_it(repo, tmp_path, monkeypatch,
+                                                                   capsys, shape):
+    """`git rev-parse HEAD` on a branch with no commits prints `HEAD` and exits
+    128. That string was stored as the sha: the row read `unverifiable`, then
+    `behind 0` for good once commits existed. Both shapes of an unborn
+    branch; an external check and a plain note need no commit."""
+    if shape == "fresh repo":
+        fresh = tmp_path / "fresh"
+        fresh.mkdir()
+        _git(fresh, "init", "-q", "-b", "new")
+        monkeypatch.chdir(fresh)
+    else:
+        _git(repo, "checkout", "-q", "--orphan", "new")
+    store_dir = tmp_path / "s"
+    assert run("add", "check", "--target", "project", "--checked", "x", "--result", "y",
+               store_dir=store_dir) == 1
+    err = capsys.readouterr().err
+    assert "no commits yet on new" in err and "--external" in err, err
+    assert store.load(store_dir) == [], "a refused write appends nothing"
+
+    assert run("add", "check", "--target", "item:dns", "--external", "--checked", "dig",
+               "--result", "ok", store_dir=store_dir) == 0
+    assert run("add", "note", "--target", "project", "--body", "b", store_dir=store_dir) == 0
+    assert len(store.load(store_dir)) == 2
+
+
 
 def test_an_external_check_needs_no_repo(repo, tmp_path, monkeypatch, capsys):
     """The refusal above is for a tree stamp. An external check has no tree
@@ -3306,6 +3333,27 @@ def test_init_says_whether_the_session_start_hook_is_registered(capsys):
     out = capsys.readouterr().out
     assert "unknown" in out and "cannot be read" in out, out
     assert "does not register" not in out, "unreadable is not the negative case"
+
+
+def test_the_printed_hook_entry_appends_beside_other_session_start_hooks(capsys):
+    """init printed a whole `{"hooks": {"SessionStart": [...]}}` object. Pasted
+    into a file that already has SessionStart hooks, it replaces them or is
+    not JSON. Do what the message says, and the hook is registered and the
+    other hook kept."""
+    settings = Path(os.environ["HOME"]) / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    other = {"matcher": "startup", "hooks": [{"type": "command", "command": "other-status"}]}
+    settings.write_text(json.dumps({"hooks": {"SessionStart": [other]}}))
+    cli._link_user_skill()
+    out = capsys.readouterr().out
+    assert "append" in out and "SessionStart" in out, out
+    entry, _ = json.JSONDecoder().raw_decode(out, out.index("{"))
+    data = json.loads(settings.read_text())
+    data["hooks"]["SessionStart"].append(entry)
+    settings.write_text(json.dumps(data))
+    cli._link_user_skill()
+    assert f"kept hook in {settings}" in capsys.readouterr().out
+    assert json.loads(settings.read_text())["hooks"]["SessionStart"][0] == other
 
 
 def test_init_outside_any_git_repo_refuses(tmp_path, monkeypatch, capsys):

@@ -77,8 +77,9 @@ directory inside the installed package (SKILL.md, adoption.md, catalogs.md
 and the SessionStart hook script), so an upgrade reaches every project with nothing
 to refresh, and registers the hook in `~/.claude/settings.json` when that file
 does not exist. If it exists, `init` reads its `hooks.SessionStart` and says
-which of the three it found: `kept hook in ...`, the block to add instead of
-merging, or that the file is not readable as JSON so neither answer holds. A `~/.claude/skills/symbion` that is not that link is left alone and
+which of the three it found: `kept hook in ...`, the entry to append to
+`hooks.SessionStart` (it merges nothing itself), or that the file is not
+readable as JSON so neither answer holds. A `~/.claude/skills/symbion` that is not that link is left alone and
 named. Nothing is written into the project except a `.symbion` pointer when
 the store is not the default sibling. The hook runs in every project and says
 nothing in one without a store.

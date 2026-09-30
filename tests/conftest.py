@@ -41,6 +41,19 @@ def _isolated_home(tmp_path_factory, monkeypatch):
         monkeypatch.setenv(k, "t@t")
 
 
+@pytest.fixture(autouse=True)
+def _pinned_terminal(monkeypatch):
+    """The same terminal for every test, whatever launched pytest. rich keeps
+    a style's codes from its first render on the style itself, and theme
+    styles are shared, so a test that faked a tty under an unset TERM (as
+    over ssh) rendered 16 colours, and a later truecolor test read those
+    codes back. It passed only where the launching shell set COLORTERM."""
+    for k, v in (("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("COLUMNS", "80")):
+        monkeypatch.setenv(k, v)
+    for k in ("NO_COLOR", "FORCE_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE"):
+        monkeypatch.delenv(k, raising=False)
+
+
 def _git(cwd, *a):
     subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True)
 

@@ -58,6 +58,18 @@ def test_dirty_check_at_head_is_never_current(repo):
     assert state == "unverifiable"
 
 
+def test_a_stamp_is_a_commit_id_never_a_ref(repo):
+    """An unborn branch once stamped the literal `HEAD`, and `cat-file -e`
+    resolves a ref as readily as a sha, so the row read `behind 0` for good.
+    An abbreviated id (a configured provenance command may print one) read
+    `behind 0` at HEAD for the same reason: it never equalled the full id."""
+    cfg = Config(project_root=repo)
+    for ref in ("HEAD", "main"):
+        assert gitref.check_state(cfg, {"sha": ref, "dirty": False}) == ("unverifiable", None)
+    head = _run(repo, "rev-parse", "HEAD")
+    assert gitref.check_state(cfg, {"sha": head[:12], "dirty": False}) == ("current", 0)
+
+
 def test_staleness_distance_is_exactly_one_after_one_commit(repo):
     """Asserting `> 0` after fifty commits passes on any non-zero
     implementation and catches no off-by-one."""
@@ -205,6 +217,18 @@ def test_provenance_override_runs_in_project_root(repo):
     (repo / "marker.json").write_text('{"sha": "deadbeef", "dirty": false}')
     cfg = Config(project_root=repo, provenance_command="cat marker.json")
     assert gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"]) == {"sha": "deadbeef", "dirty": False}
+
+
+@pytest.mark.parametrize("printed", ["not-json", "", "[]", '"a string"'])
+def test_a_provenance_override_that_prints_no_object_refuses(repo, printed):
+    """Output that was not JSON stamped `provenance: null` at exit 0, and the
+    row read `unverifiable` for good; a JSON non-object was stored as-is. An
+    object with no "sha" is a project's own schema (design spec): kept."""
+    cfg = Config(project_root=repo, provenance_command=f"echo '{printed}'")
+    with pytest.raises(ValueError, match=r"provenance command .* printed .*not a JSON object"):
+        gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])
+    cfg = Config(project_root=repo, provenance_command="""echo '{"schema": 7}'""")
+    assert gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"]) == {"schema": 7}
 
 
 def test_provenance_override_timeout_raises_catalog_error(repo):

@@ -91,12 +91,28 @@ def provenance_stamp(cfg, spec):
     if cfg.provenance_command:
         r = catalog.run_configured(cfg, cfg.provenance_command)
         try:
-            return json.loads(r.stdout)
-        except Exception:
-            return None
-    head = _git(cfg, "rev-parse", "HEAD").stdout.strip()
-    if not head:
-        return None
+            prov = json.loads(r.stdout)
+        except ValueError:
+            prov = None
+        # Unparsed output was stamped `provenance: null` at exit 0: the
+        # unstamped row api._stamp refuses to write. Any object is a stamp;
+        # one without a "sha" is a project's own schema (design spec) and
+        # reads `unverifiable` by choice.
+        if not isinstance(prov, dict):
+            first = (r.stdout.strip().splitlines() or [""])[0]
+            raise ValueError(f"provenance command {cfg.provenance_command!r} printed "
+                             f"{first!r}, not a JSON object; fix [provenance] command "
+                             f"in symbion.toml")
+        return prov
+    r = _git(cfg, "rev-parse", "--verify", "-q", "HEAD")
+    if r.returncode != 0:
+        # Plain `rev-parse HEAD` on an unborn branch prints `HEAD` and exits
+        # 128; stored as the sha, it read `behind 0` once commits existed.
+        branch = _git(cfg, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip() or "HEAD"
+        raise ValueError(f"no commits yet on {branch}: a verdict row is stamped with the "
+                         f"commit it ran at. Commit first, or add it with --external if "
+                         f"the check read nothing in the tree")
+    head = r.stdout.strip()
     # The paths, not only the flag: whether an uncommitted CLAUDE.md (no
     # verdict depends on it) should make a stamp dirty cannot be measured
     # from a boolean (2026-09-27: 26% of 536 adopter stamps dirty).
@@ -139,10 +155,13 @@ def check_state(cfg, prov):
         return ("unverifiable", None)
     if prov.get("dirty"):
         return ("unverifiable", None)
-    sha = prov["sha"]
-    if _git(cfg, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
-        return ("unverifiable", None)          # rebased away, squashed, shallow
-    head = _git(cfg, "rev-parse", "HEAD").stdout.strip()
+    # Peeled to the full id, which the stamp must begin: a ref resolves too,
+    # and the literal `HEAD` an unborn branch once stamped read `behind 0`.
+    sha = _git(cfg, "rev-parse", "--verify", "-q", "--end-of-options",
+               f"{prov['sha']}^{{commit}}").stdout.strip()
+    if not sha.startswith(prov["sha"]):
+        return ("unverifiable", None)          # rebased away, squashed, shallow; a ref
+    head = _git(cfg, "rev-parse", "--verify", "-q", "HEAD").stdout.strip()
     if sha == head:
         return ("current", 0)
     up = _is_ancestor(cfg, sha, "HEAD")

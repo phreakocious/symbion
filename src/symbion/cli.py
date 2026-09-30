@@ -43,10 +43,10 @@ def _resolved_author(args) -> str:
 # edit; a link into the install cannot drift.
 _SKILL_LINK = Path(".claude/skills/symbion")          # under $HOME
 _HOOK_COMMAND = 'bash "$HOME/.claude/skills/symbion/session_start.sh"'
-_HOOK_SETTINGS = {"hooks": {"SessionStart": [{
-    "matcher": "startup|resume|clear|compact",
-    "hooks": [{"type": "command", "command": _HOOK_COMMAND,
-               "timeout": 10, "statusMessage": "Reading symbion notes..."}]}]}}
+_HOOK_ENTRY = {"matcher": "startup|resume|clear|compact",
+               "hooks": [{"type": "command", "command": _HOOK_COMMAND,
+                          "timeout": 10, "statusMessage": "Reading symbion notes..."}]}
+_HOOK_SETTINGS = {"hooks": {"SessionStart": [_HOOK_ENTRY]}}
 # The script's path, not the command: JSON escapes the command's quotes, and a
 # hand-written entry may spell it `~/...`; either way it runs this file.
 _HOOK_SCRIPT = "skills/symbion/session_start.sh"
@@ -79,7 +79,10 @@ def _link_user_skill() -> None:
         print(f"wrote {settings}")
         return
     registered = _hook_registered(settings)
-    block = json.dumps(_HOOK_SETTINGS, indent=2)
+    # The entry, not a whole settings object: pasted over a file that has
+    # SessionStart hooks already, the object replaced them (adopter report).
+    add = ('append this entry to the "SessionStart" list under "hooks" '
+           f'(create either if missing):\n{json.dumps(_HOOK_ENTRY, indent=2)}')
     if registered:
         # Said out loud, as the skill link is: a re-run printed nothing here,
         # so "hook checked and present" read the same as "hook not checked"
@@ -87,9 +90,9 @@ def _link_user_skill() -> None:
         print(f"kept hook in {settings}")
     elif registered is None:
         print(f"note: {settings} cannot be read as a JSON object, so whether it "
-              f"registers the symbion SessionStart hook is unknown; it needs:\n{block}")
+              f"registers the symbion SessionStart hook is unknown; to register it, {add}")
     else:
-        print(f"{settings} does not register the symbion SessionStart hook; add:\n{block}")
+        print(f"{settings} does not register the symbion SessionStart hook; {add}")
 
 
 def _hook_registered(settings: Path) -> bool | None:
@@ -507,7 +510,28 @@ def _version(here: Path = Path(__file__).parent) -> str:
     return line
 
 
+def _metavar_once(formatter):
+    """`formatter`, printing an option's metavar once after its last alias
+    (`-m, --message MESSAGE`), as argparse does from Python 3.13. Older ones
+    print it per alias, while the terminal's rich_argparse prints it once on
+    every version: without this, --help at a terminal was not the pipe's text
+    on 3.11 and 3.12."""
+    if sys.version_info >= (3, 13):
+        return formatter
+
+    class Once(formatter):
+        def _format_action_invocation(self, action):
+            if not action.option_strings or action.nargs == 0:
+                return super()._format_action_invocation(action)
+            default = self._get_default_metavar_for_optional(action)
+            return ", ".join(action.option_strings) + " " + self._format_args(action, default)
+    return Once
+
+
 class _Parser(argparse.ArgumentParser):
+    def __init__(self, *args, formatter_class=argparse.HelpFormatter, **kwargs):
+        super().__init__(*args, formatter_class=_metavar_once(formatter_class), **kwargs)
+
     def format_help(self):
         return self._at_terminal(super().format_help)
 
@@ -679,8 +703,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
 
     init_says = ("create this project's store with a starter symbion.toml, and set up "
                  "Claude Code outside it: link the symbion skill into ~/.claude/skills "
-                 "and register a session-start hook in ~/.claude/settings.json; re-run "
-                 "to refresh them")
+                 "and register a session-start hook in ~/.claude/settings.json if that file "
+                 "is absent, else print the entry to add; re-run to refresh them")
     sub.add_parser("init", help=init_says, description=init_says)
 
     a = sub.add_parser("add", help="add a note of any kind, or many from --from-json")
