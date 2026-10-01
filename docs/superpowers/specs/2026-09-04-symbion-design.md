@@ -94,7 +94,7 @@ Three files in the store directory, auto-created on first write (`git init` + em
 
 ### Note schema
 
-Field names are **identical to what the reference already writes**, including the reader accepting the legacy `atlas` key as a synonym for `provenance`. The only schema change is `target.type` accepting `commit`. (Amended 2026-09-24: a row may carry `due`. The vocabulary spec retired `atlas` and renamed `activity_id` to `arc_id`. Noted 2026-09-25: `created_at` carries its UTC offset.)
+Field names are **identical to what the reference already writes**, including the reader accepting the legacy `atlas` key as a synonym for `provenance`. The only schema change is `target.type` accepting `commit`. (Amended 2026-09-24: a row may carry `due`. The vocabulary spec retired `atlas` and renamed `activity_id` to `arc_id`. Noted 2026-09-25: `created_at` carries its UTC offset. Changed 2026-09-30: `created_at` and ids are stamped in UTC, every order compares instants, and symbion prints UTC unless `TZ` is set. The local wall clock was kept because rows were only string-compared, so a cutover would sort wrong; a string sort misorders a store written from two zones.)
 
 ```json
 {"id": "20260904-141502-004311-a3f", "kind": "audit",

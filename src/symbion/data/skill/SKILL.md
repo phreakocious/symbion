@@ -56,7 +56,8 @@ retired` takes it out of the default `context` view.
 `--due DATE` (`YYYY-MM-DD` or an ISO datetime) goes on any status row. An open
 row past due or due within 7 days opens the session-start summary, parked or
 not, so it is also how an `idea` gets a revisit date. A date only in the body
-reaches nothing. `supersede <id> --due ''` clears it.
+reaches nothing. `supersede <id> --due ''` clears it. Dates and times are UTC,
+in what symbion prints and in what it reads, unless `TZ` is set.
 
 ## Writing
 
@@ -73,6 +74,9 @@ target, on stderr. If the new row settles or revises one, `resolve` or
 
 **Lead a status row with its claim or its ask.** Session start prints an open
 row's first 100 characters. Evidence and provenance follow the point.
+Text added with `--append` never reaches that line, which then reads `+1
+amendment`. To correct the lead of a row that is not a pre-registration,
+rewrite it with `supersede <id> --body`.
 
 `--body` is markdown. A body with backticks goes through `--body-file -` and a
 quoted heredoc (`<<'EOF'`): in `--body "…"` or an unquoted `<<EOF` the shell
@@ -91,8 +95,10 @@ store's). `--tag` is repeatable and matches exactly. `--ref TYPE:NAME`
 that object finds it: use it instead of naming the object in prose. `resolve
 <id> --ref commit:SHA` records the commit that closed a row.
 
-Many rows: `add --from-json -`, one JSON object per line in the `list --json`
-shape. Nothing is written unless every line passes.
+Many rows: `add --from-json -`, one JSON object per line. The keys are
+`list --json`'s, less the ones symbion mints (`id`, `created_at`,
+`provenance`) and the ones it computes; `add -h` lists them. Nothing is
+written unless every line passes.
 
 ```bash
 symbion add --from-json - <<'EOF'
@@ -106,6 +112,10 @@ on stdout: capture them (`nid=$(symbion add …)`). `show`, `list --id`,
 tail (`920030-8ca`); 3 characters are often shared.
 
 ## Reading
+
+**A row is what was true when it was written.** A `check` says how far HEAD
+has moved since (`behind N`); a plain row says nothing. Before you give the
+user a row's count or state as current, re-run the check it names.
 
 Use `--json` on `list`, `summary`, `context`, `arc list` and `arc todo`. A row
 has `id`, `kind`, `target: {type, name}` (`name` is `null` on a `project`
@@ -186,8 +196,8 @@ place for symbion reports, use that.
 ## Footguns
 
 - **A write is not in git history until `symbion commit`, and not off this
-  disk until a push.** `commit` never pushes; it names the push to run, or
-  says the store has no remote.
+  disk until `symbion push`.** `commit` never pushes; it says how many
+  commits are not on the remote, or that the store has none.
 - **A catalog miss stores your typed string.** A name that matches nothing
   becomes its own target, with only a note on stderr and exit 0.
 
@@ -213,6 +223,7 @@ made is refused, naming the path.
 | `resolve <id> [--body …] [--result …] [--ref T:N] [--add-tag …]` | close a row; `--body` goes below the current body, after a blank line it inserts |
 | `supersede <id> [--body …] [--append] [--add-tag …] [--rm-tag …] [--tag …] [--ref T:N] [--checked …] [--result …] [--due DATE]` | correct a row; `--tag` and `--ref` replace the inherited ones; `--append` adds the body after a blank line it inserts |
 | `commit [-m MSG]` | commit the store |
-| `rename <old> <new> --type T` | move every row and ref on a renamed object |
+| `push` | push the store's commits to its remote |
+| `rename <old> <new> --type T [--to-type T2]` | move every row and ref on a renamed object; `--to-type` changes its type too |
 | `summary`, `schema [--toml]`, `tags`, `context` | read |
 | `arc create`, `list`, `todo`, `archive`, `seed`, `reconcile` | campaigns (`catalogs.md` for the last two) |

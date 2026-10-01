@@ -10,7 +10,7 @@ from nicegui import ui
 from .. import api
 from .. import store as S
 from .. import summary as summ
-from .notes import target_link, edit_dialog
+from .notes import ago, edit_dialog, id_link, kind_class, target_link
 
 
 def seed_all_scopes(ctx) -> set:
@@ -36,10 +36,11 @@ def seedable(ctx, kind: str = "task") -> bool:
 def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
     """Head tasks for an arc, not-done first, then by target name, then in
     the order written. Each row carries its kind and clipped body: six boxes
-    on one file drew six identical target lines (2026-09-27)."""
+    on one file drew six identical target lines (2026-09-27). A row is the
+    notebook's card, its box the card's resolve box, ticked when done."""
     items = S.arc_items(S.load(ctx.store_dir), arc_id)
     items.sort(key=lambda n: (S.read_status(n) == "resolved",
-                              (n.target.name or "").lower(), n.created_at, n.id))
+                              (n.target.name or "").lower(), S.written_at(n), n.id))
     if not items:
         ui.label("no targets yet — seed a scope above").classes("text-muted")
         return
@@ -56,19 +57,26 @@ def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
                           status="open" if done else "resolved")
             refresh()
 
-        with ui.row().classes("items-center gap-2 w-full sb-note").mark("checklist-row"):
-            ui.button(icon="check_box" if done else "check_box_outline_blank",
-                      on_click=_toggle) \
-                .props("flat dense round" + (" color=positive" if done else "")
-                       + f' aria-label="{"reopen" if done else "resolve"}"') \
+        with ui.element("div").classes(f"sb-note w-full {kind_class(fu.kind)}"
+                                       + (" sb-done" if done else "")) \
+                .props(f"data-id={fu.id}").mark("checklist-row"):
+            ui.button(icon="check", on_click=_toggle) \
+                .props(f'flat round dense aria-label="{"reopen" if done else "resolve"}"') \
+                .classes("sb-resolve" + (" sb-resolved" if done else "")) \
+                .tooltip("reopen" if done else "resolve") \
                 .mark("checklist-toggle", f"toggle-{fu.id}")   # per-row: find() returns a SET
-            ui.label(fu.kind).classes("sb-chip")
-            target_link(fu)
-            ui.label(summ.clip(fu.body, summ.HEAD_CHARS)).classes("sb-note-meta") \
-                .mark("checklist-body")
-            ui.space()
-            if done:
-                ui.label(fu.created_at.replace("T", " ")).classes("sb-note-meta")
+            with ui.element("div").classes("sb-note-main"):
+                ui.label(summ.clip(fu.body, summ.HEAD_CHARS)).classes("sb-note-text") \
+                    .mark("checklist-body")
+                with ui.element("div").classes("sb-note-foot"):
+                    ui.label(fu.kind).classes(f"sb-chip sb-kindchip {kind_class(fu.kind)}")
+                    target_link(fu)
+                    with ui.element("span").classes("sb-note-by"):
+                        if done:      # the tick's row: its author ticked it, then
+                            ui.label(fu.author).classes("sb-note-meta")
+                            ui.label(ago(fu.created_at)).classes("sb-note-meta") \
+                                .tooltip(S.shown(fu.created_at))
+                        id_link(fu)
 
 
 def index(ctx, *, author: str) -> None:
@@ -77,14 +85,18 @@ def index(ctx, *, author: str) -> None:
     active = [a for a in acts if not a.archived]
     archived = [a for a in acts if a.archived]
 
-    with ui.element("div").classes("sb-card w-full gap-2"):
-        ui.label("new arc").classes("sb-stat-label")
+    with ui.element("div").classes("sb-composer"):
+        name = ui.input(placeholder="New arc") \
+            .props('borderless aria-label="name"').classes("w-full sb-compose-body") \
+            .mark("new-arc-name")
         with ui.row().classes("items-center gap-2 w-full"):
-            name = ui.input("name").props("dense outlined").mark("new-arc-name")
             scope = ui.select(sorted(ctx.arc_scopes), value="item",
-                              label="scope").props("dense outlined") \
-                .mark("new-arc-scope")
-        desc = ui.input("description").props("dense outlined").classes("w-full")
+                              label="scope").props("dense outlined options-dense") \
+                .classes("min-w-[120px]").mark("new-arc-scope")
+            desc = ui.input("description").props("dense outlined").classes("col") \
+                .style("min-width:160px")
+            create = ui.button("Create arc").props("unelevated color=primary") \
+                .mark("new-arc-create")
 
         def _create():
             if not (name.value or "").strip():
@@ -94,21 +106,20 @@ def index(ctx, *, author: str) -> None:
                                       scope.value, author=author)
             ui.navigate.to(f"/arc?id={quote(act.id)}")
 
-        ui.button("create", on_click=_create).props("unelevated dense color=primary") \
-            .mark("new-arc-create")
+        create.on_click(_create)
 
     for a in active:
         done, total = S.arc_progress(notes, a.id)
-        with ui.element("div").classes("sb-card w-full gap-1").mark("arc-card"):
-            with ui.row().classes("items-center gap-2 w-full"):
-                ui.link(a.name, f"/arc?id={quote(a.id)}").classes("text-body")
-                ui.label(a.target_scope).classes("sb-chip")
+        with ui.element("div").classes("sb-card sb-arc w-full").mark("arc-card"):
+            with ui.row().classes("items-baseline gap-2 w-full"):
+                ui.link(a.name, f"/arc?id={quote(a.id)}").classes("sb-arc-name")
+                ui.label(a.target_scope).classes("sb-chip sb-target")
                 ui.space()
-                ui.label(f"{done}/{total}").classes("sb-note-meta")
+                ui.label(f"{done}/{total}").classes("sb-count")
             ui.linear_progress(value=(done / total if total else 0.0),
                                show_value=False).props("rounded")
             if a.description:
-                ui.label(a.description).classes("sb-note-meta")
+                ui.label(a.description).classes("sb-subtitle")
 
     if archived:
         with ui.expansion(f"archived ({len(archived)})").classes("w-full sb-card"):
@@ -116,4 +127,4 @@ def index(ctx, *, author: str) -> None:
                 with ui.row().classes("items-center gap-2"):
                     ui.link(a.name, f"/arc?id={quote(a.id)}").classes("text-body") \
                         .mark("archived-arc")
-                    ui.label(f"archived {a.archived_at or '—'}").classes("sb-note-meta")
+                    ui.label(f"archived {S.shown(a.archived_at) if a.archived_at else '—'}").classes("sb-note-meta")

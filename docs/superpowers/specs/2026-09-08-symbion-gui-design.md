@@ -68,6 +68,8 @@ api.gui_author():  SYMBION_AUTHOR  >  git user.name  >  "user"
 
 This **extends** the ancestor GUI's `gui_author()`, which is `git user.name > "user"` with no env override; the reasoning transfers exactly: the explorer *is* the human's interface, so the identity is a property of the surface, not of the environment. `serve --author NAME` overrides. The resolved name renders in the top bar on every page, so a misattribution is visible before it is permanent rather than discovered in a `list` months later.
 
+*2026-10-01:* the name sits at the foot of a sidebar on a wide window, and in the top bar while the sidebar hides behind its menu button (900px and narrower). It is still on every page, before every write.
+
 Both author rules live in `api.py` side by side — `author_default()` for the CLI, `gui_author()` for the GUI — so the difference is one file's worth of reading, not an undocumented divergence.
 
 ### 3. The URL is already `store.query()`

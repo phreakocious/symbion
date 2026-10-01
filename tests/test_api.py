@@ -373,7 +373,8 @@ def test_arc_passthroughs_round_trip(repo, tmp_path):
     assert [a.name for a in store.load_arcs(tmp_path)] == ["camp2"]
 
     api.archive_arc(ctx, act.id)
-    assert store.load_arcs(tmp_path)[0].archived is True
+    gone = store.load_arcs(tmp_path)[0]
+    assert gone.archived is True and gone.archived_at.endswith("+00:00"), gone   # UTC
 
 
 def test_commit_reports_nothing_to_commit_when_clean(repo, tmp_path):
@@ -524,6 +525,15 @@ def test_harvest_of_a_body_with_no_hashtags_changes_nothing():
     assert api.harvest_hashtags(body) == ([], body)
     assert api.harvest_hashtags("") == ([], "")
     assert api.harvest_hashtags(None) == ([], "")
+
+
+def test_a_bang_names_the_kind_only_for_a_declared_kind():
+    kinds = ("note", "task", "bug")
+    assert api.harvest_kind("!task fix the header", kinds) == ("task", "fix the header")
+    assert api.harvest_kind("fix it !bug !task", kinds) == ("bug", "fix it")
+    # prose, code, a markdown image and a word with a bang inside stay put
+    for body in ("this is !important", "run `!task` here", "![alt](x.png)", "wow!task"):
+        assert api.harvest_kind(body, kinds) == (None, body)
 
 
 from symbion import kinds as K

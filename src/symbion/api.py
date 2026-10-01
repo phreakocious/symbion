@@ -181,7 +181,17 @@ def check_name(typ: str, name) -> None:
         raise ValueError(f"target type {typ!r} needs a name: {typ}:NAME")
 
 
-def check_refs(target_types, refs) -> list[dict]:
+def kind_as_type(typ, kinds, what: str) -> str:
+    """The tail of a refusal for a kind typed as a ref or target type:
+    `--ref check:<id>` meant a row (reported 2026-09-30). Rows join
+    through the object they share, and an id in the body is the pointer."""
+    if typ not in kinds:
+        return ""
+    return (f"; {typ!r} is a kind: a {what} names an object, never a row. Give this "
+            f"row that row's target, and cite its id in the body")
+
+
+def check_refs(target_types, refs, kinds=()) -> list[dict]:
     """Shape and type of row-shaped refs, name NFC'd; NO catalog runs, so a
     caller outside the lock can report a bad ref before locking. Resolution
     is `canonicalize_rows`', under the lock."""
@@ -191,7 +201,8 @@ def check_refs(target_types, refs) -> list[dict]:
             raise ValueError("refs must be [{type, name}]")
         if r["type"] not in target_types:
             raise ValueError(f"unknown ref type {r['type']!r} (choose from "
-                             f"{', '.join(sorted(target_types))})")
+                             f"{', '.join(sorted(target_types))})"
+                             + kind_as_type(r["type"], kinds, "ref"))
         check_name(r["type"], r.get("name"))
         out.append({"type": r["type"], "name": catalog.nfc(r.get("name"))})
     return out
@@ -244,19 +255,23 @@ def canonicalize_rows(ctx: Ctx, rows) -> list[dict]:
 
 
 def rename_target(ctx: Ctx, target_type: str, old: str, new: str, *,
-                  author: str) -> tuple[int, int, str]:
+                  author: str, to_type: str | None = None) -> tuple[int, int, str]:
     """`store.rename_target` with `new` resolved the way `add` resolves a
     name (the store call takes it as typed). Returns (re-targeted,
     re-pointed, the name stored), so the caller can print what `new`
-    became."""
-    check_name(target_type, new)
+    became. `to_type` moves the object to another type: a 0.1.0 store holds
+    `project:NAME` rows, which `check_name` now refuses, and they move to
+    `item:NAME`."""
+    to_type = to_type or target_type
+    check_name(to_type, new)
     stored = [new]
 
     def canon(n):
-        stored[0] = canonicalize_names(ctx, target_type, [n])[0]
+        stored[0] = canonicalize_names(ctx, to_type, [n])[0]
         return stored[0]
     moved, refs = store.rename_target(ctx.store_dir, target_type, old, new,
-                                      author=author, canonicalize=canon)
+                                      author=author, canonicalize=canon,
+                                      new_type=to_type)
     return moved, refs, stored[0]
 
 
@@ -291,12 +306,30 @@ def harvest_hashtags(body: str):
     harvest in an editable field, so a wrong one is visible and removable
     rather than silent; tighten only if that proves annoying in practice.
     """
+    return _harvest(body, _HASHTAG, lambda tag: not _HEX6.match(tag))   # a hex is a colour
+
+
+# `!task` names the row's kind as `#gui` names a tag, with the same guards.
+# Only a declared kind is taken, so `!important` in prose stays prose.
+_BANG = re.compile(r"(?<![\w/&!])!([A-Za-z][\w-]*)")
+
+
+def harvest_kind(body: str, kinds):
+    """`("!task fix it", kinds)` -> `("task", "fix it")`: the first kind of
+    `kinds` the body names, or None, and the body without every one."""
+    found, out = _harvest(body, _BANG, lambda k: k in kinds)
+    return (found[0] if found else None), out
+
+
+def _harvest(body, rx, take):
+    """Each distinct name `rx` finds outside code and `take` accepts, and the
+    body without them."""
     masked = _CODE.sub(lambda m: " " * len(m.group(0)), body or "")
     spans, tags = [], []
-    for m in _HASHTAG.finditer(masked):
+    for m in rx.finditer(masked):
         tag = m.group(1)
-        if _HEX6.match(tag):
-            continue                       # a colour, not a tag
+        if not take(tag):
+            continue
         spans.append(m.span())
         if tag not in tags:
             tags.append(tag)
@@ -381,7 +414,8 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
         raise ValueError("target must be {type, name}")
     if t["type"] not in ctx.target_types:
         raise ValueError(f"unknown target type {t['type']!r} (choose from "
-                         f"{', '.join(sorted(ctx.target_types))})")
+                         f"{', '.join(sorted(ctx.target_types))})"
+                         + kind_as_type(t["type"], ctx.kinds, "target"))
     check_name(t["type"], t.get("name"))
     store.check_fields(row["kind"], spec, row)
     external = row.get("external", False)
@@ -400,7 +434,7 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
         arc_id=check_arc(ctx, row.get("arc_id")), due=row.get("due"),
         tags=list(row.get("tags") or ()),
         author=row.get("author") or author,
-        refs=check_refs(ctx.target_types, row.get("refs")),
+        refs=check_refs(ctx.target_types, row.get("refs"), ctx.kinds),
         provenance=_stamp(ctx, row["kind"], spec, external),
     )
 
@@ -561,9 +595,9 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
                 f"supersede cannot set {key!r}: it is inherited from the "
                 f"superseded row and never re-resolved (add a new note instead)")
     if "refs" in fields:
-        fields["refs"] = check_refs(ctx.target_types, fields["refs"])
+        fields["refs"] = check_refs(ctx.target_types, fields["refs"], ctx.kinds)
     if add_refs:
-        add_refs = check_refs(ctx.target_types, add_refs)
+        add_refs = check_refs(ctx.target_types, add_refs, ctx.kinds)
     check_arc_targets(ctx, [*(fields.get("refs") or ()), *(add_refs or ())])
     check_arc(ctx, fields.get("arc_id"))
     if fields.get("status") == "resolved":

@@ -15,7 +15,7 @@ from rich.syntax import SyntaxTheme
 from rich.text import Text
 from rich.theme import Theme
 
-from . import api
+from . import api, store
 from . import summary as summ
 
 # Catppuccin Mocha: pastels made for a dark background. rich maps each hex to
@@ -221,7 +221,7 @@ def _details(n, head, state) -> list[Text]:
         t.append(label, META)
         t.append(value, BODY)
         return t
-    who = Text(f"    {n.id} · written {n.created_at.replace('T', ' ')} by {n.author}", META)
+    who = Text(f"    {n.id} · written {store.shown(n.created_at)} by {n.author}", META)
     if n.supersedes:
         who.append(f" · revises {n.supersedes}", META)
     out = [who]

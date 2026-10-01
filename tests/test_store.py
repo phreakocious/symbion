@@ -652,3 +652,36 @@ def test_rename_of_a_name_carried_only_by_refs_is_not_a_miss(tmp_path):
     store.add(tmp_path, kind="note", target=_ref("project", None), refs=[_ref("item", "old")])
     assert store.rename_target(tmp_path, "item", "old", "new") == (0, 1)
     assert store.rename_target(tmp_path, "item", "old", "new") == (0, 0)
+
+
+def test_time_is_utc_unless_tz_is_set(monkeypatch):
+    """Everything UTC unless the user asks, and TZ is the ask (ruled
+    2026-09-30): stamps, ids, printed times, and an offset-less input. A
+    stored stamp keeps the zone it was written in."""
+    from datetime import timezone
+    utc = timezone.utc
+    assert store.zone() is utc
+    monkeypatch.setattr(store, "_utcnow", lambda: datetime(2026, 9, 30, 23, 58, 29, tzinfo=utc))
+    assert store._now_iso() == "2026-09-30T23:58:29+00:00"
+    assert store.new_id(_rand=lambda: 0) == "20260930-235829-000000-000"
+    assert store.since_cutoff("2026-09-03T11:00") == datetime(2026, 9, 3, 11, tzinfo=utc)
+    assert store.since_cutoff("2026-09-03") == datetime(2026, 9, 3, tzinfo=utc)
+    assert store.canon_due("2026-10-01T09:00") == "2026-10-01T09:00:00+00:00"
+    assert store.shown("2026-10-01T09:00:00+09:00") == "2026-10-01 00:00:00Z"
+    assert store.shown("2026-10-01") == "2026-10-01"
+    monkeypatch.setenv("TZ", "set")
+    assert store.zone() is None
+    assert store.since_cutoff("2026-09-03T11:00") == datetime(2026, 9, 3, 11).astimezone()
+    assert store.canon_due("2026-10-01T09:00") == datetime(2026, 10, 1, 9).astimezone().isoformat()
+
+
+def test_rows_from_two_zones_list_in_the_order_they_were_written(tmp_path):
+    """A string sort put `10-01T05:00+09:00` after `09-30T22:00+00:00`, though
+    it is two hours earlier: a store written from two zones listed out of order."""
+    for when, body in (("2026-09-30T22:00:00+00:00", "later"),
+                       ("2026-10-01T05:00:00+09:00", "earlier"),
+                       ("not a stamp", "unreadable")):
+        store.add(tmp_path, kind="note", target={"type": "item", "name": "x"},
+                  body=body, created_at=when)
+    assert [n.body for n in store.heads_for(tmp_path, "item", "x")] == \
+        ["later", "earlier", "unreadable"]

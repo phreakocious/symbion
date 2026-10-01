@@ -23,8 +23,8 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
   `gui/` and `cli.py` write through it, and `tests/test_gui_seam.py` names the two
   exceptions), `cli.py`, `summary.py` (the session-start text), `term.py` (what a
   person sees at a terminal: `list`, `show` and `context` in columns, and the palette
-  every other command and `--help` print in), `gui/`
-  (`symbion serve`).
+  every other command, `--help` and the GUI print in), `gui/` (`symbion serve`;
+  `gui/theme.py` adds only its surfaces to that palette).
 - `src/symbion/data/skill/`: `SKILL.md`, `adoption.md`, `catalogs.md` and
   `session_start.sh`, the agent surface. They ship in the package; `symbion init` links
   `~/.claude/skills/symbion` to the installed copy.

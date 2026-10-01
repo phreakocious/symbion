@@ -6,3 +6,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# Claude Design writes its screenshots here
+Claude outputs/

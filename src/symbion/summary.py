@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from datetime import datetime
-from itertools import zip_longest
+from itertools import pairwise, zip_longest
 
 from . import gitref, kinds as K, store as S
 
@@ -241,7 +241,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     unstated = no_status(notes)
     heads = [n for label, k in kinds.items() if k.status and not k.parked
              for n in open_outside_arcs(notes, label, active) if n.id not in shown_above]
-    heads.sort(key=lambda n: (n.created_at, n.id), reverse=True)   # id: same-second ties
+    heads = S.newest_first(heads)
     # A pre-registration (status + verdict) has a deadline, and newest-first
     # under one cap pushed an open prediction off the list for many sessions
     # while its answer went into a handoff file (2026-09-24). Its own cap,
@@ -256,8 +256,9 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
                 "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
                 "body": clip(n.body, chars),
                 **({"from": n.author} if wrote_it(reader, n.author) else {}),
-                **({"registered": _root(by_id, n).created_at[:10]}
-                   if n.spec.status and n.spec.verdict else {})}
+                **({"registered": S.shown(_root(by_id, n).created_at)[:10]}
+                   if n.spec.status and n.spec.verdict else {}),
+                **({"amendments": k} if (k := _amendments(by_id, n)) else {})}
 
     prereg = [n for n in heads if n.spec.verdict]
     rest = deal_by_kind([n for n in heads if not n.spec.verdict])
@@ -266,10 +267,9 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     # prints: an owner's `idea` went unseen by every agent session (measured
     # 2026-09-24). None for a reader at a terminal, who is the person.
     printed = shown_above | {n.id for n in shown}
-    people = sorted(
-        (n for n in notes if S.read_status(n) == "open" and n.id not in printed
-         and wrote_it(reader, n.author)),
-        key=lambda n: (n.created_at, n.id), reverse=True)
+    people = S.newest_first(
+        n for n in notes if S.read_status(n) == "open" and n.id not in printed
+        and wrote_it(reader, n.author))
     o_cap = len(people) if full else PEOPLE_CAP
 
     rows = []
@@ -325,16 +325,31 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     }
 
 
+def _chain(by_id, n):
+    """n, then each row it superseded, back to the first; a cycle ends it."""
+    seen = set()
+    while n is not None and n.id not in seen:
+        seen.add(n.id)
+        yield n
+        n = by_id.get(n.supersedes)
+
+
 def _root(by_id, n):
     """The first row of n's supersede chain: a pre-registration's commitment.
     An amendment is a new row, so the head's own date is not the
     registration; 14 of 14 open prediction heads in three adopter stores
     restated it in the body (measured 2026-09-26)."""
-    seen = {n.id}
-    while n.supersedes in by_id and n.supersedes not in seen:
-        n = by_id[n.supersedes]
-        seen.add(n.id)
-    return n
+    return list(_chain(by_id, n))[-1]
+
+
+def _amendments(by_id, n) -> int:
+    """Links of n's chain that added text after a body (`supersede --append`,
+    or a rewrite that kept the old body as its prefix). A digest prints the
+    body's start, so an amendment never reaches it: a prediction's corrected
+    time printed its typo until it resolved (dogfood, 2026-09-30)."""
+    return sum(bool(old.body) and len(new.body) > len(old.body)
+               and new.body.startswith(old.body)
+               for new, old in pairwise(_chain(by_id, n)))
 
 
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -369,12 +384,14 @@ def _count(n: int, noun: str) -> str:
 
 
 def _labelled(paint, r) -> str:
-    """A summary row with its own labels: `from <author>` and, on a
-    pre-registration, its registration date, in whichever block it prints."""
+    """A summary row with its own labels: `from <author>`, on a
+    pre-registration its registration date, and its amendment count, in
+    whichever block it prints."""
     who = f"from {r['from']} " if r.get("from") else ""
     reg = f", registered {r['registered']}" if r.get("registered") else ""
+    amd = f", +{_count(r['amendments'], 'amendment')}" if r.get("amendments") else ""
     return who + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
-                          label=r["kind"] + reg)
+                          label=r["kind"] + reg + amd)
 
 
 def render_summary(d: dict, paint=plain) -> str:

@@ -155,7 +155,8 @@ async def test_header_brand_names_the_project(user: User, ctx_with_notes):
     """Several stores can be open at once; a bare 'symbion' in the corner
     says nothing about which one this is."""
     await user.open("/")
-    await user.should_see(f"{ctx_with_notes.cfg.project_root.name} · symbion")
+    (brand,) = user.find(marker="brand").elements
+    assert brand.text == ctx_with_notes.cfg.project_root.name
 
 
 async def test_tags_page_lists_the_vocabulary_with_counts(user: User, ctx_with_notes):
@@ -203,12 +204,10 @@ async def test_home_renders_one_board_per_visible_status_kind_and_per_verdict_ki
                   "body": "anomaly body"}, author="ada")
     build_page(ctx, author="ada")
     await user.open("/")
-    await user.should_see("open anomaly (1)")
-    await user.should_see("recent audit (0)")
-    await user.should_see("priority (0)")
-    await user.should_not_see("open bug")
-    await user.should_not_see("open shelf")
-    await user.should_not_see("open fact")
+    # a heading's title and count, read as a pair: `find` returns a set
+    boards = {e.text: e.parent_slot.parent.default_slot.children[1].text
+              for e in user.find(marker="board-title").elements}
+    assert boards == {"open anomaly": "1", "priority": "0", "recent audit": "0"}, boards
 
 
 async def test_arc_page_hides_the_seed_button_without_an_eligible_task(user: User, repo, tmp_path):
@@ -254,7 +253,8 @@ async def test_the_gui_serves_a_named_store_from_outside_any_git_repo(user: User
                   "body": "from nowhere"}, author="ada")
     build_page(ctx, author="ada")
     await user.open("/notes")
-    await user.should_see("x-notes · symbion")
+    (brand,) = user.find(marker="brand").elements
+    assert brand.text == "x-notes"
     await user.should_see("from nowhere")
 
 
@@ -306,7 +306,8 @@ async def test_a_board_clips_a_long_body_and_links_the_full_note(user: User, rep
     await user.open("/")
     await user.should_see("Opening claim of the bug.")
     await user.should_not_see("DEEP PARAGRAPH WORDS")
-    assert _hrefs(user, "note-full") == {f"/notes?id={n.id}"}
+    assert _hrefs(user, "note-full") == {f"/notes?id={n.id}"}   # the clipped text itself
+    await user.should_not_see("full note")
     await user.open(f"/notes?id={n.id}")
     await user.should_see("DEEP PARAGRAPH WORDS")
 
@@ -370,6 +371,18 @@ async def test_an_object_page_leads_with_open_rows_and_clips_resolved_ones(
                   "body": "Shelved. " + "later " * 60 + "\n\nIDEA DEEP WORDS"}, author="ada")
     await user.open("/object?type=item&name=x")
     await user.should_not_see("IDEA DEEP WORDS")
+
+
+async def test_a_row_carries_its_kinds_class(user: User, repo, tmp_path):
+    """A row's left edge takes its kind's colour, as its chip does: the list
+    read as one grey sheet (2026-10-01)."""
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "bug", "target": {"type": "item", "name": "x"}, "body": "b"},
+            author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    row, = user.find(marker="note-row").elements
+    assert "sb-kind-bug" in row.classes
 
 
 async def test_the_tags_page_names_near_duplicates(user: User, repo, tmp_path):
@@ -436,3 +449,117 @@ async def test_a_long_list_says_what_it_did_not_show(user: User, repo, tmp_path,
     await user.open(more.props["href"])
     await user.should_see("row 0")
     await user.should_not_see(marker="show-all")
+
+
+# ---- the card layout's gaps, measured in the browser 2026-10-01 ----
+
+async def test_a_board_names_the_open_rows_an_arc_holds(user: User, repo, tmp_path):
+    """The sidebar counts every open row of a kind; a home board lists those
+    on no active arc. Side by side, the two counts read as a miscount."""
+    ctx = api.resolve(str(tmp_path))
+    aid = api.create_arc(ctx, "Release", "", "mixed", author="ada").id
+    for name, arc in (("loose", None), ("boxed", aid), ("boxed too", aid)):
+        api.add(ctx, {"kind": "task", "target": {"type": "item", "name": name},
+                      "arc_id": arc, "body": name}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    (aside,) = user.find(marker="board-in-arcs").elements    # no other kind has one
+    assert aside.text == "· 2 in arcs"
+    assert aside.props["href"] == "/notes?kind=task&status=open"
+    (side,) = user.find(marker="open-task").elements
+    assert side.default_slot.children[-1].text == "3"        # 1 on the board + 2
+
+
+async def test_the_top_bar_names_the_writer_while_the_sidebar_hides(user: User, ctx_with_notes):
+    """Below the drawer's breakpoint the sidebar and its badge sit behind the
+    menu button, and the page still writes: the top bar names who, first."""
+    await user.open("/")
+    (name,) = user.find(marker="author-badge-top").elements
+    assert name.text == "ada"
+    assert "sb-narrow" in name.parent_slot.parent.classes
+
+
+async def test_the_fonts_ship_in_the_package_and_load_from_the_gui(user: User, ctx_with_notes):
+    """From Google Fonts, every page load reached a third party."""
+    import re
+    import tomllib
+    from pathlib import Path
+
+    from nicegui import app
+
+    from symbion.gui.theme import DARK_CSS, FONTS_DIR, FONTS_HTML, FONTS_URL, root_vars_css
+    files = re.findall(rf"url\({FONTS_URL}/([^)]+)\)", FONTS_HTML)
+    assert files and all((FONTS_DIR / f).is_file() for f in files), files
+    assert not re.search(r"https?://", FONTS_HTML + DARK_CSS + root_vars_css())
+    assert FONTS_URL + "/{path:path}" in {getattr(r, "path", None) for r in app.routes}
+    meta = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    assert "data/fonts/*" in meta["tool"]["setuptools"]["package-data"]["symbion"]
+
+
+# ---- the owner's GUI rows of 2026-10-01 ----
+
+async def test_the_top_bar_ends_in_the_pages_title(user: User, ctx_with_notes):
+    """A title under the bar left a band of nothing above it."""
+    for path, title in (("/", "Notebook"), ("/tags", "Tags"), ("/arcs", "Arcs"),
+                        ("/object?type=item&name=widget", "item: widget"),
+                        ("/notes?kind=bug", "kind=bug")):
+        await user.open(path)
+        (here,) = user.find(marker="page-title").elements
+        assert here.text == title, path
+
+
+async def test_new_note_opens_on_the_pages_object(user: User, ctx_with_notes, tmp_path):
+    """The composer sat on two pages; now every page opens it, on its object."""
+    await user.open("/object?type=item&name=widget")
+    user.find(marker="new-note").click()
+    await user.should_see(marker="note-body")
+    assert user.find(marker="new-note-on").elements.pop().text == "item: widget"
+    user.find(marker="note-body").type("from the dialog")
+    user.find(marker="note-add").click()
+    (row,) = [n for n in store.heads(store.load(tmp_path)) if n.body == "from the dialog"]
+    assert (row.target.type, row.target.name) == ("item", "widget")
+
+
+async def test_new_note_on_an_arc_page_starts_in_that_arc(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    aid = api.create_arc(ctx, "Release", "", "mixed", author="ada").id
+    build_page(ctx, author="ada")
+    await user.open(f"/arc?id={aid}")
+    (here,) = user.find(marker="page-title").elements
+    assert here.text == "Release"
+    user.find(marker="new-note").click()
+    await user.should_see(marker="note-arc-select")
+    assert user.find(marker="note-arc-select").elements.pop().value == aid
+
+
+async def test_the_keys_list_names_the_shortcuts_and_the_kinds(user: User, ctx_with_notes):
+    await user.open("/")
+    user.find(marker="keys").click()
+    await user.should_see(marker="keys-list")
+    await user.should_see("!kind")
+    await user.should_see("in a note: sets its kind, one of note, decision, bug, task, "
+                          "question, idea, check")
+
+
+async def test_the_sidebar_links_the_source(user: User, ctx_with_notes):
+    await user.open("/")
+    (link,) = user.find(marker="source").elements
+    assert link.props["href"] == "https://github.com/phreakocious/symbion"
+    assert link.props["target"] == "_blank"
+
+
+async def test_a_card_carries_its_whole_id_for_the_page_filter(user: User, ctx_with_notes):
+    """The filter reads the card's text, which prints only the id's tail."""
+    await user.open("/notes")
+    ids = {e.props.get("data-id") for e in user.find(marker="note-row").elements}
+    assert ids == {n.id for n in store.heads(store.load(ctx_with_notes.store_dir))}
+
+
+async def test_typing_in_the_search_box_does_not_leave_the_page(user: User, ctx_with_notes):
+    """Typing filters the page in the browser; only Enter searches the store."""
+    await user.open("/tags")
+    user.find(marker="search").type("beta")
+    await user.should_not_see(marker="result-count")
+    user.find(marker="search").trigger("keydown.enter")
+    await user.should_see(marker="result-count")
+    assert _count(user).startswith("1 of 2 notes match")

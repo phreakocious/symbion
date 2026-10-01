@@ -18,7 +18,7 @@ import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 from . import catalog  # for nfc() only -- catalog does not import store, so
@@ -118,7 +118,7 @@ DUE_FORMAT = "YYYY-MM-DD, or an ISO 8601 datetime like 2026-10-01T22:30Z"
 
 def canon_due(value: str) -> str:
     """A `due` value as stored: a date stays a date; a datetime gets an offset,
-    the writer's own when it has none, so a reader in another zone does not
+    the display zone's when it has none, so a reader in another zone does not
     move it. Raises ValueError naming the format on anything else."""
     s = value.strip()
     try:
@@ -129,7 +129,7 @@ def canon_due(value: str) -> str:
         dt = datetime.fromisoformat(s)
     except ValueError:
         raise ValueError(f"due {value!r} is not a date: use {DUE_FORMAT}") from None
-    return (dt if dt.tzinfo else dt.astimezone()).isoformat()
+    return typed(dt).isoformat()
 
 
 SINCE_FORMAT = "a span back from now (30m, 2h, 3d, 1w), a date or an ISO datetime"
@@ -138,39 +138,52 @@ _SPAN = re.compile(r"(\d+)([mhdw])")
 
 def since_cutoff(value: str, now: datetime | None = None) -> datetime:
     """`list --since`: the instant a window opens, as `git log --since`
-    reads it. A span counts back from `now`, a date opens at its start in
-    local time, a datetime without an offset is local."""
+    reads it. A span counts back from `now`, a date opens at its start in the
+    display zone, a datetime without an offset is in the display zone."""
     from datetime import timedelta
-    now = now or datetime.now().astimezone()
+    now = now or now_shown()
     s = value.strip()
     m = _SPAN.fullmatch(s)
     if m:
         unit = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m[2]]
         return now - timedelta(**{unit: int(m[1])})
     try:
-        return datetime.combine(date.fromisoformat(s), datetime.min.time()).astimezone()
+        return typed(datetime.combine(date.fromisoformat(s), time.min))
     except ValueError:
         pass
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
         raise ValueError(f"--since {value!r}: use {SINCE_FORMAT}") from None
+    return typed(dt)
+
+
+def written_at(n) -> datetime:
+    """A row's created_at as an instant: what every order sorts on. A string
+    sort put `10-01T05:00+09:00` after `09-30T22:00+00:00`, though it is two
+    hours earlier, so a store written from two zones listed out of order. Rows from before
+    offsets were stamped are naive: local wall clock, which is what they
+    were written in. A hand-edited stamp that is not ISO sorts oldest
+    rather than stopping every read."""
+    try:
+        dt = datetime.fromisoformat(n.created_at)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
     return dt if dt.tzinfo else dt.astimezone()
 
 
-def _written(n) -> datetime:
-    """A row's created_at as an instant. Rows from before offsets were
-    stamped are naive: local wall clock, which is what they were written in."""
-    dt = datetime.fromisoformat(n.created_at)
-    return dt if dt.tzinfo else dt.astimezone()
+def newest_first(rows) -> list:
+    """Rows by when they were written, newest first; id breaks a same-second tie."""
+    return sorted(rows, key=lambda n: (written_at(n), n.id), reverse=True)
 
 
 def due_state(due: str, now: datetime | None = None) -> tuple[bool, int] | None:
     """(past due, calendar days from today to the due date), both at `now`'s
-    offset. A date is due through the end of its day; a datetime is past due
-    from that instant, so it can be past due with 0 days left. None for a
-    value the writer would refuse -- a hand-edited row still loads."""
-    now = now or datetime.now().astimezone()
+    offset, the display zone's by default. A date is due through the end of
+    its day; a datetime is past due from that instant, so it can be past due
+    with 0 days left. None for a value the writer would refuse -- a
+    hand-edited row still loads."""
+    now = now or now_shown()
     try:
         d = date.fromisoformat(due)
         return now.date() > d, (d - now.date()).days
@@ -354,21 +367,57 @@ LOCK_FILE = ".lock"
 
 
 # ---- ids & timestamps ----
+# Stored in UTC; shown in UTC unless TZ is set (ruled 2026-09-30, reversing
+# 2026-09-05's local wall clock): a local date beside a UTC one in the same
+# view read as a day's disagreement. Rows stamped before keep their offset or,
+# older still, none; `written_at` orders all three as instants.
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def zone():
+    """The zone symbion prints in and reads an offset-less input in: UTC,
+    or the local zone when TZ is set, which is how a user asks for one.
+    None means local, as `astimezone` takes it."""
+    return None if os.environ.get("TZ") else timezone.utc
+
+
+def now_shown() -> datetime:
+    return _utcnow().astimezone(zone())
+
+
+def typed(dt: datetime) -> datetime:
+    """An input datetime, offset-less read in the display zone."""
+    if dt.tzinfo:
+        return dt
+    return dt.replace(tzinfo=zone()) if zone() else dt.astimezone()
+
+
+def shown(stamp: str) -> str:
+    """A stored stamp in the display zone, for a reader: `2026-09-30
+    23:58:29Z`. A bare date has no zone, and it and a stamp that will not
+    parse print as stored."""
+    try:
+        date.fromisoformat(stamp)
+        return stamp
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return str(stamp)
+    s = (dt if dt.tzinfo else dt.astimezone()).astimezone(zone()).isoformat(sep=" ")
+    return s.removesuffix("+00:00") + "Z" if s.endswith("+00:00") else s
+
+
 def _now_iso() -> str:
-    """Local wall clock WITH its offset. Naive local reads as a lie beside any
-    UTC stamp written by other tooling -- a handoff file stamped just after
-    midnight UTC, over rows stamped the same evening in local time, looks like
-    a day's disagreement. The offset is appended, not converted: existing
-    naive rows keep sorting against new ones (created_at is only ever
-    string-compared and printed, never parsed), and ids stay local wall clock
-    by design."""
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return _utcnow().isoformat(timespec="seconds")
 
 
 def new_id(_clock=None, _rand=None) -> str:
-    """Microsecond-resolution, lexically-sortable id: YYYYMMDD-HHMMSS-ffffff-xxx.
-    _clock/_rand are injectable for deterministic tests."""
-    clock = _clock or datetime.now
+    """Microsecond-resolution, lexically-sortable id: YYYYMMDD-HHMMSS-ffffff-xxx,
+    in UTC. _clock/_rand are injectable for deterministic tests."""
+    clock = _clock or _utcnow
     rand = _rand or (lambda: secrets.randbelow(4096))
     now = clock()
     return f"{now.strftime('%Y%m%d-%H%M%S-%f')}-{rand():03x}"
@@ -732,7 +781,7 @@ def heads_for(store, target_type, target_name=None):
         seen = {n.id for n in rows}
         rows = rows + [n for n in allheads if n.id not in seen
                        and any(r.type == target_type and r.name == target_name for r in n.refs)]
-    return sorted(rows, key=lambda n: (n.created_at, n.id), reverse=True)
+    return newest_first(rows)
 
 
 def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
@@ -781,7 +830,7 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
     if overdue:
         out = [n for n in out if is_overdue(n)]
     if since is not None:
-        out = [n for n in out if _written(n) >= since]
+        out = [n for n in out if written_at(n) >= since]
     return out
 
 
@@ -803,16 +852,18 @@ nfc = catalog.nfc  # was defined identically here and in catalog.py; catalog
                     # keeping two copies to drift out of sync.
 
 
-def _rename_unlocked(store, notes, kinds, target_type, old, new, author) -> tuple[int, int]:
+def _rename_unlocked(store, notes, kinds, target_type, old, new, author,
+                     new_type=None) -> tuple[int, int]:
     """Move every HEAD off (target_type, old): its target, and each ref naming
-    it, onto `new`, one supersede per row. The other refs keep their place.
+    it, onto (new_type, new), one supersede per row; `new_type` defaults to
+    `target_type`. The other refs keep their place.
     Returns (re-targeted, re-pointed) row counts; a row carrying both counts in
     each. The caller holds the lock and passes `notes` loaded under it; the new
     rows are appended to that list.
 
     Refs are half the name: `context --target` reads them, so a sweep over
     targets alone left every `--ref` on a name nothing else carried."""
-    was, now = Target(target_type, old), Target(target_type, new)
+    was, now = Target(target_type, old), Target(new_type or target_type, new)
     moved = repointed = 0
     for note in heads(notes):
         if note.target != was and was not in note.refs:
@@ -826,7 +877,7 @@ def _rename_unlocked(store, notes, kinds, target_type, old, new, author) -> tupl
                      if r != target)
         fields = {}
         if target != note.target:
-            fields["target"] = {"type": target_type, "name": new}
+            fields["target"] = {"type": now.type, "name": new}
         if refs != note.refs:
             fields["refs"] = [{"type": r.type, "name": r.name} for r in refs]
         if fields:
@@ -838,9 +889,9 @@ def _rename_unlocked(store, notes, kinds, target_type, old, new, author) -> tupl
 
 
 def rename_target(store, target_type, old, new, author=None,
-                  canonicalize=None) -> tuple[int, int]:
-    """Re-target every HEAD note for (target_type, old) onto (target_type, new),
-    and re-point every ref to it, via supersede so the old rows remain as
+                  canonicalize=None, new_type=None) -> tuple[int, int]:
+    """Re-target every HEAD note for (target_type, old) onto (new_type or
+    target_type, new), and re-point every ref to it, via supersede so the old rows remain as
     history. Projects rename catalog objects; notes key on the name string, so a rename orphans them without
     this. Returns (re-targeted, re-pointed) -- (0, 0) means the old name
     matched nothing, which the CLI treats as a user error, not a no-op
@@ -871,7 +922,7 @@ def rename_target(store, target_type, old, new, author=None,
         if canonicalize is not None:
             new = canonicalize(new)
         return _rename_unlocked(store, _load_unlocked(store), K.read_kinds(store),
-                                target_type, old, new, author)
+                                target_type, old, new, author, new_type)
 
 
 def commit(store, message: str, cfg) -> bool:
@@ -1027,7 +1078,7 @@ def rename_arc(store, id, new_name) -> Arc:
 
 
 def archive_arc(store, id, _clock=None) -> Arc:
-    clock = _clock or datetime.now
+    clock = _clock or _utcnow
     require_store(store)
     with _lock(store):
         acts = load_arcs(store)

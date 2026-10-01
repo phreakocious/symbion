@@ -187,6 +187,9 @@ async def test_a_compact_row_clips_a_long_verdict_and_a_full_one_does_not(
     short, full = sorted((e.text for e in user.find(marker="note-verdict").elements), key=len)
     assert "END" not in short and "…" in short
     assert full == f"checked: {long}   →   result: ok"
+    # A check's verdict is its content, not metadata: one with no body
+    # showed only this line, dim, beside bodies in Text (owner, 2026-10-01).
+    assert all("sb-verdict" in e.classes for e in user.find(marker="note-verdict").elements)
 
 
 async def test_icon_buttons_have_names_a_screen_reader_can_read(user: User, repo, tmp_path):
@@ -500,14 +503,13 @@ def _declare(store_dir, text):
     (store_dir / "symbion.toml").write_text(text)
 
 
-def test_chip_class_is_by_bits():
-    from symbion import kinds as K
-    from symbion.gui.notes import chip_class
-    assert chip_class(K.Kind(verdict=True)) == "sb-chip-check"
-    assert chip_class(K.Kind(status=True, verdict=True)) == "sb-chip-check"
-    assert chip_class(K.Kind(status=True)) == "sb-chip-task"
-    assert chip_class(K.Kind(status=True, parked=True)) == ""
-    assert chip_class(K.Kind()) == ""
+def test_kind_class_is_by_label_as_in_the_terminal():
+    """A kind the store declares has no colour of its own: it takes the one
+    every declared kind shares, as a `list` row prints it."""
+    from symbion.gui.notes import kind_class
+    assert kind_class("bug") == "sb-kind-bug"
+    assert kind_class("decision") == "sb-kind-decision"
+    assert kind_class("measurement") == "sb-kind-own"
 
 
 async def test_add_form_lists_exactly_the_declared_kinds(user: User, repo, tmp_path):
@@ -683,3 +685,111 @@ async def test_add_form_takes_due_on_a_status_kind(user: User, repo, tmp_path):
     assert store.load(tmp_path)[0].due == "2026-10-01"
     sel.set_value("note")
     assert not due.visible
+
+
+# ---- the card layout (2026-10-01): age, short id ----
+
+def test_a_rows_age_is_one_unit():
+    """A row's stamp to the second, with its zone, was the widest thing on
+    its line; the full stamp is the tooltip now."""
+    from datetime import datetime, timedelta, timezone
+    from symbion.gui.notes import ago
+    now = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+    at = lambda **kw: (now - timedelta(**kw)).isoformat()   # noqa: E731
+    assert [ago(at(seconds=5), now), ago(at(minutes=17), now), ago(at(hours=4), now),
+            ago(at(days=3), now)] == ["now", "17m", "4h", "3d"]
+    assert ago(at(days=90), now) == "2026-07-03"
+    assert ago("not a stamp", now) == "not a stamp"
+    # a stamp with no offset reads as local, as `store.written_at` reads it;
+    # stores written before stamps carried one hold thousands of them
+    naive = (now - timedelta(hours=4)).astimezone().replace(tzinfo=None).isoformat()
+    assert ago(naive, now) == "4h"
+
+
+def test_a_rows_id_shows_its_last_two_parts():
+    """As rows cite one another: the date and time are the row's age."""
+    from symbion.gui.notes import short_id
+    assert short_id("20260102-030405-735180-a9c") == "735180-a9c"
+
+
+# ---- the owner's GUI rows of 2026-10-01 ----
+
+async def test_the_resolve_box_comes_after_the_text(user: User, repo, tmp_path):
+    """On the left it pushed an open row's text in past a closed row's."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "bug", "target": {"type": "project", "name": None},
+                      "body": "broken"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (row,) = user.find(marker="note-row").elements
+    kids = list(row.default_slot.children)
+    (box,) = user.find(marker="note-resolve").elements
+    assert "sb-resolvable" in row.classes
+    assert "sb-note-main" in kids[0].classes and kids.index(box) > 0
+
+
+async def test_the_copy_button_puts_the_whole_id_on_the_clipboard(user: User, repo, tmp_path,
+                                                                 monkeypatch):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "cite me"}, author="ada")
+    copied = []
+    monkeypatch.setattr(ui.clipboard, "write", copied.append)
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-copy-id").click()
+    await user.should_see(f"copied {n.id}")
+    assert copied == [n.id]
+
+
+async def test_a_tags_field_drops_its_hashes_when_left(user: User, repo, tmp_path):
+    from symbion.gui.notes import add_form
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    tags = user.find(marker="note-tags")
+    tags.type("#ux, ##gui").trigger("blur")
+    assert tags.elements.pop().value == "ux, gui"
+
+
+async def test_a_bang_in_the_body_picks_the_kind_and_leaves_the_body(user: User, repo, tmp_path):
+    from symbion.gui.notes import add_form
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-body").type("!task fix the header #gui")
+    assert user.find(marker="note-kind-select").elements.pop().value == "task"   # as typed
+    user.find(marker="note-add").click()
+    (row,) = store.heads(store.load(tmp_path))
+    assert (row.kind, row.body, list(row.tags)) == ("task", "fix the header", ["gui"])
+
+
+async def test_a_bang_alone_is_an_empty_note(user: User, repo, tmp_path):
+    from symbion.gui.notes import add_form
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-body").type("!task")
+    user.find(marker="note-add").click()
+    await user.should_see("empty note")
+    assert not store.heads(store.load(tmp_path))

@@ -50,6 +50,9 @@ def _pinned_terminal(monkeypatch):
     codes back. It passed only where the launching shell set COLORTERM."""
     for k, v in (("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("COLUMNS", "80")):
         monkeypatch.setenv(k, v)
+    # symbion prints UTC unless TZ is set: a developer's TZ must not change
+    # what a test reads.
+    monkeypatch.delenv("TZ", raising=False)
     for k in ("NO_COLOR", "FORCE_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE"):
         monkeypatch.delenv(k, raising=False)
 

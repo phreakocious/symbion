@@ -12,7 +12,8 @@ from .. import store as S
 from .. import summary as summ
 from . import arcs, filters
 from .chrome import shell
-from .notes import add_form, render_note
+from .notes import render_note
+from .theme import FONTS_DIR, FONTS_URL
 
 # /notes renders this many rows before "show all": every row is a few dozen
 # elements and a check a few git calls, and all 312 of one store's rows took
@@ -20,11 +21,20 @@ from .notes import add_form, render_note
 PAGE_ROWS = 100
 
 
-def _board(ctx, title, rows, author) -> None:
-    with ui.element("div").classes("sb-card w-full gap-1"):
-        ui.label(f"{title} ({len(rows)})").classes("sb-stat-label")
-        if not rows:
-            ui.label("none").classes("text-muted")
+def _board(ctx, title, rows, author, *, in_arcs: int = 0, more: str = "") -> None:
+    """A heading and its cards. An empty board is its heading alone, quieter:
+    a box saying "none" took a card's room to say nothing. `in_arcs` counts
+    the rows of this kind an active arc's checklist holds instead, `more` the
+    view with them all: beside the sidebar's count of every open row, a
+    heading of the others alone read as a miscount."""
+    with ui.element("section").classes("sb-board" + ("" if rows else " sb-board-empty")) \
+            .mark("board"):
+        with ui.element("div").classes("sb-board-head"):
+            ui.label(title).classes("sb-board-title").mark("board-title")
+            ui.label(str(len(rows))).classes("sb-count").mark("board-count")
+            if in_arcs:
+                ui.link(f"· {in_arcs} in arcs", more).classes("sb-board-aside") \
+                    .mark("board-in-arcs")
         for n in rows:
             render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
                         show_target=True, compact=True)
@@ -34,10 +44,9 @@ def _error_pages(ctx, author: str) -> None:
     """NiceGUI's own error pages: its sad-face art, and no header to get
     back from. These keep symbion's chrome and say what went wrong."""
     def body(code: int, what: str) -> None:
-        shell(ctx, author, [("home", "/"), (str(code), None)])
-        with ui.column().classes("sb-main w-full gap-2"):
-            ui.label("no such page" if code == 404 else "this page failed") \
-                .classes("sb-title").mark("error-title")
+        shell(ctx, author, [("Notebook", "/"),
+                            ("no such page" if code == 404 else "this page failed", None)])
+        with ui.column().classes("sb-main gap-2"):
             ui.label(what).classes("sb-subtitle text-bad").mark("error-detail")
             ui.link("back to the notebook", "/").classes("text-body")
 
@@ -75,19 +84,16 @@ def _history(ctx, every, head, author: str) -> None:
 
 def build_page(ctx, *, author: str) -> None:
     _error_pages(ctx, author)
+    app.add_static_files(FONTS_URL, FONTS_DIR)
 
     @ui.page("/")
     def home():
-        shell(ctx, author, [("home", None)])
+        shell(ctx, author, [("Notebook", None)], here="/")
         heads = S.heads(S.load(ctx.store_dir))
-        newest = sorted(heads, key=lambda n: n.created_at, reverse=True)
-        with ui.column().classes("sb-main w-full gap-4"):
-            ui.label("Notebook").classes("sb-title")
-            ui.label(f"{len(heads)} notes · {ctx.store_dir}").classes("sb-subtitle")
-            with ui.element("div").classes("sb-card w-full gap-1"):
-                ui.label("new project note").classes("sb-stat-label")
-                add_form(ctx, "project", None, lambda: ui.navigate.reload(),
-                         author=author)
+        newest = S.newest_first(heads)
+        with ui.column().classes("sb-main gap-5"):
+            ui.label(f"{summ._count(len(heads), 'note')} · {ctx.store_dir}") \
+                .classes("sb-subtitle sb-mono")
             bad = S.load_malformed(ctx.store_dir)
             if bad:
                 ui.label(f"⚠ {len(bad)} malformed line(s) skipped — "
@@ -95,8 +101,10 @@ def build_page(ctx, *, author: str) -> None:
             active = {a.id for a in S.load_arcs(ctx.store_dir) if not a.archived}
             for label, k in ctx.kinds.items():
                 if k.status and not k.parked:
-                    _board(ctx, f"open {label}",
-                           summ.open_outside_arcs(newest, label, active), author)
+                    rows = summ.open_outside_arcs(newest, label, active)
+                    _board(ctx, f"open {label}", rows, author,
+                           in_arcs=len(summ.open_notes(newest, label)) - len(rows),
+                           more=filters.href(kind=label, status="open"))
             _board(ctx, "priority", summ.starred(newest), author)
             for label, k in ctx.kinds.items():
                 if k.verdict:
@@ -112,7 +120,6 @@ def build_page(ctx, *, author: str) -> None:
         kwargs = filters.from_params(params)
         q = (params.get("q") or "").strip()
         base = {k: v for k, v in params.items() if k in filters.FILTER_KEYS and v}
-        shell(ctx, author, [("home", "/"), ("notes", None)], q=q, keep=base)
         every = S.load(ctx.store_dir)
         heads = S.heads(every)
         old = kwargs.get("id")
@@ -128,9 +135,10 @@ def build_page(ctx, *, author: str) -> None:
             tips = {api._chain_tip(every, n.id).id for n in every if filters.id_hit(n.id, q)}
             got = {n.id for n in rows}
             rows += [n for n in rest if n.id not in got and n.id in tips]
-        rows.sort(key=lambda n: (n.created_at, n.id), reverse=True)
-        with ui.column().classes("sb-main w-full gap-4"):
-            ui.label(filters.describe(kwargs, q)).classes("sb-title")
+        rows = S.newest_first(rows)
+        shell(ctx, author, [("Notebook", "/"), (filters.describe(kwargs, q), None)], q=q,
+              keep=base, here="" if base else "/notes")
+        with ui.column().classes("sb-main gap-4"):
             if kwargs.get("id", old) != old:
                 ui.label(f"{old} was superseded; this is its current row") \
                     .classes("text-notable").mark("superseded-by")
@@ -159,10 +167,9 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/tags")
     def tags_page():
-        shell(ctx, author, [("home", "/"), ("tags", None)])
+        shell(ctx, author, [("Notebook", "/"), ("Tags", None)], here="/tags")
         counts = S.tag_counts(S.load(ctx.store_dir))
-        with ui.column().classes("sb-main w-full gap-2"):
-            ui.label("Tags").classes("sb-title")
+        with ui.column().classes("sb-main gap-2"):
             ui.label(f"{len(counts)} in use — near-synonyms are drift, not vocabulary") \
                 .classes("sb-subtitle")
             # Name the drift the subtitle warns of: `--tag` matches exactly,
@@ -182,29 +189,24 @@ def build_page(ctx, *, author: str) -> None:
         if not type or not name:
             ui.navigate.to("/notes")
             return
-        shell(ctx, author, [("home", "/"), (f"{type}: {name}", None)])
+        shell(ctx, author, [("Notebook", "/"), (f"{type}: {name}", None)],
+              new=(type, name, None))
         # Open work first, then the newest; a resolved row is history and
         # reads clipped (one file's page held 50 rows in full, 2026-09-27).
-        rows = sorted(S.heads_for(ctx.store_dir, type, name),
-                      key=lambda n: (n.created_at, n.id), reverse=True)
+        rows = S.heads_for(ctx.store_dir, type, name)
         live = lambda n: S.read_status(n) == "open" and not n.spec.parked   # noqa: E731
         rows.sort(key=lambda n: not live(n))      # stable: newest within each
-        with ui.column().classes("sb-main w-full gap-4"):
-            ui.label(f"{type}: {name}").classes("sb-title")
+        with ui.column().classes("sb-main gap-4"):
             ui.label(f"{len(rows)} notes on or referencing this object") \
                 .classes("sb-subtitle")
-            with ui.element("div").classes("sb-card w-full gap-1"):
-                ui.label(f"new note on {type}: {name}").classes("sb-stat-label")
-                add_form(ctx, type, name, lambda: ui.navigate.reload(), author=author)
             for n in rows:
                 render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
                             compact=not live(n) and bool(n.spec.status))
 
     @ui.page("/arcs")
     def arcs_page():
-        shell(ctx, author, [("home", "/"), ("arcs", None)])
-        with ui.column().classes("sb-main w-full gap-4"):
-            ui.label("Arcs").classes("sb-title")
+        shell(ctx, author, [("Notebook", "/"), ("Arcs", None)], here="/arcs")
+        with ui.column().classes("sb-main gap-4"):
             arcs.index(ctx, author=author)
 
     @ui.page("/arc")
@@ -212,13 +214,14 @@ def build_page(ctx, *, author: str) -> None:
         if not id:
             ui.navigate.to("/arcs")
             return
-        shell(ctx, author, [("home", "/"), ("arcs", "/arcs"), (id, None)])
         act = next((a for a in S.load_arcs(ctx.store_dir) if a.id == id), None)
+        shell(ctx, author, [("Notebook", "/"), ("Arcs", "/arcs"), (act.name if act else id, None)],
+              here="/arcs", new=("project", None, id))
         if act is None:
             ui.label(f"no arc '{id}'").classes("sb-main text-bad")
             return
 
-        with ui.column().classes("sb-main w-full gap-4"):
+        with ui.column().classes("sb-main gap-4"):
             @ui.refreshable
             def body():
                 a = next((x for x in S.load_arcs(ctx.store_dir) if x.id == id), None)
@@ -226,9 +229,9 @@ def build_page(ctx, *, author: str) -> None:
                     ui.navigate.to("/arcs")
                     return
                 done, total = S.arc_progress(S.load(ctx.store_dir), id)
-                with ui.row().classes("items-center gap-3 w-full"):
-                    ui.label(a.name).classes("sb-title").mark("arc-title")
-                    ui.label(f"{a.target_scope} · {done}/{total}").classes("sb-subtitle")
+                with ui.row().classes("items-baseline gap-3 w-full"):
+                    ui.label(a.target_scope).classes("sb-chip sb-target")
+                    ui.label(f"{done}/{total}").classes("sb-count")
                 ui.linear_progress(value=(done / total if total else 0.0),
                                    show_value=False).props("rounded")
 
@@ -238,9 +241,9 @@ def build_page(ctx, *, author: str) -> None:
                     def _rename():
                         if (rename.value or "").strip():
                             api.rename_arc(ctx, id, rename.value)
-                            body.refresh()
+                            ui.navigate.reload()        # the name is in the top bar
 
-                    ui.button("save", on_click=_rename).props("flat dense")
+                    ui.button("Save", on_click=_rename).props("flat dense")
                     ui.space()
 
                     def _archive():
@@ -248,9 +251,9 @@ def build_page(ctx, *, author: str) -> None:
                         ui.navigate.to("/arcs")
 
                     if a.archived:
-                        ui.label(f"archived {a.archived_at or ''}").classes("sb-chip")
+                        ui.label(f"archived {S.shown(a.archived_at) if a.archived_at else ''}").classes("sb-chip")
                     else:
-                        ui.button("archive", icon="archive", on_click=_archive) \
+                        ui.button("Archive", icon="archive", on_click=_archive) \
                             .props("flat dense color=warning").mark("arc-archive")
 
                     if a.target_scope in arcs.seed_all_scopes(ctx) and arcs.seedable(ctx):
@@ -265,17 +268,16 @@ def build_page(ctx, *, author: str) -> None:
                             ui.notify(f"seeded {len(made)} new target(s)")
                             body.refresh()
 
-                        ui.button(f"seed all {a.target_scope}s", icon="playlist_add",
+                        ui.button(f"Seed all {a.target_scope}s", icon="playlist_add",
                                   on_click=_seed).props("flat dense").mark("arc-seed")
 
                 arcs.checklist(ctx, id, body.refresh, author=author)
 
                 # Notes ABOUT the arc (its target or a ref), not its boxes:
                 # the page showed only the checklist (the gui spec).
-                about = sorted(S.heads_for(ctx.store_dir, "arc", id),
-                               key=lambda n: (n.created_at, n.id), reverse=True)
+                about = S.heads_for(ctx.store_dir, "arc", id)
                 if about:
-                    ui.label("notes about this arc").classes("sb-subtitle")
+                    ui.label("notes about this arc").classes("sb-board-title")
                     for n in about:
                         render_note(ctx, n, body.refresh, author=author)
 

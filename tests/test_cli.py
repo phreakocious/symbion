@@ -379,7 +379,7 @@ def test_rename_reports_refs_and_a_ref_only_name_exits_0(tmp_path, capsys):
     capsys.readouterr()
     assert run("rename", "old", "new", "--type", "item", store_dir=tmp_path) == 0
     assert capsys.readouterr().out == \
-        "re-targeted 0 note(s), re-pointed 1 ref(s): item:old -> new\n"
+        "re-targeted 0 note(s), re-pointed 1 ref(s): item:old -> item:new\n"
 
 
 def test_rename_miss_names_the_stored_names_it_nearly_matched(tmp_path, capsys):
@@ -420,7 +420,7 @@ def test_rename_resolves_the_new_name_the_way_add_does(repo, tmp_path, capsys):
         store_dir=s)
     capsys.readouterr()
     assert run("rename", old, new[:7], "--type", "commit", store_dir=s) == 0
-    assert capsys.readouterr().out.endswith(f" -> {new}\n")
+    assert capsys.readouterr().out.endswith(f" -> commit:{new}\n")
     hs = store.heads(store.load(s))
     assert [n.target.name for n in hs if n.target.type == "commit"] == [new]
     assert [r.name for n in hs for r in n.refs] == [new]
@@ -1193,6 +1193,22 @@ def test_main_reports_a_clean_error_when_cwd_is_not_a_git_repo(tmp_path, monkeyp
     assert "Traceback" not in err
 
 
+@pytest.mark.parametrize("argv", [["schema"], ["list", "--json"]])
+def test_a_reader_that_closes_the_pipe_early_gets_no_python_error(argv, tmp_path):
+    """`symbion list | head -1`. A short output fails at the interpreter's
+    last flush ("Exception ignored", exit 120); one past stdout's buffer
+    fails inside print (a traceback, exit 1). Either way the reader asked
+    for less, so stderr stays empty and the exit is SIGPIPE's 141, as for
+    any Unix tool. A real process: the last flush happens after main()."""
+    run("add", "note", "--target", "project", "--body", "x" * 200_000, store_dir=tmp_path)
+    r, w = os.pipe()
+    os.close(r)
+    p = subprocess.run([str(Path(sys.executable).parent / "symbion"), "--dir", str(tmp_path),
+                        *argv], stdout=w, stderr=subprocess.PIPE, text=True)
+    os.close(w)
+    assert (p.returncode, p.stderr) == (141, "")
+
+
 @pytest.mark.parametrize("argv", [["--help"], ["init", "--help"], ["add", "-h"]])
 def test_help_answers_outside_a_git_repo(argv, tmp_path, monkeypatch, capsys):
     """Help needs no store, but argparse reaches `-h` only after the store
@@ -1636,6 +1652,24 @@ def test_add_from_json_reads_stdin_and_a_bad_row_writes_nothing(tmp_path, capsys
     assert store.load(tmp_path) == []
 
 
+def test_add_from_json_fed_list_json_says_what_it_reads(tmp_path, capsys, monkeypatch):
+    """The help said 'in the `list --json` shape', and a reader took the line
+    format from it. `list --json` prints one array, and its rows carry keys
+    symbion mints. Fed either, the error names the difference."""
+    run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=tmp_path)
+    capsys.readouterr()
+    run("list", "--json", store_dir=tmp_path)
+    listed = capsys.readouterr().out
+    monkeypatch.setattr("sys.stdin", io.StringIO(listed))
+    assert run("add", "--from-json", "-", store_dir=tmp_path) == 1
+    assert "line 1 is a JSON array" in capsys.readouterr().err
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(json.loads(listed)[0]) + "\n"))
+    assert run("add", "--from-json", "-", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert "'created_at'" in err and "a row takes only kind, target, body" in err, err
+    assert len(store.load(tmp_path)) == 1
+
+
 def test_add_from_json_names_the_line_of_a_bad_status(tmp_path, capsys):
     src = tmp_path / "rows.jsonl"
     src.write_text('{"kind": "decision", "target": {"type": "project"}, "status": "open"}\n')
@@ -1803,6 +1837,60 @@ def test_the_target_name_rule_covers_supersede_seed_and_rename(tmp_path, capsys)
         assert run(*argv, store_dir=tmp_path) == 1, argv
         assert "needs a name" in capsys.readouterr().err, argv
     assert len(store.load(tmp_path)) == 1
+
+
+def test_rows_filed_on_a_named_project_move_to_an_item(tmp_path, capsys):
+    """A store from 0.1.0 holds `project:NAME` rows, which the name rule now
+    refuses, so a follow-up could not share its predecessor's target and
+    `rename` kept the type (2026-09-30). The refusal names the stored rows
+    and the command that moves them; `--to-type` moves target and ref alike,
+    each check keeping its stamp."""
+    store.ensure_store(tmp_path)
+    legacy = [store.note_from_dict({
+        "id": store.new_id(), "kind": kind, "created_at": "2026-09-22T00:00:00Z",
+        "target": target, "refs": refs, "provenance": {"sha": "a" * 40},
+        **({"checked": "count", "result": "7"} if kind == "check" else {})})
+        for kind, target, refs in (
+            ("check", {"type": "project", "name": "cluster"}, []),
+            ("note", {"type": "project", "name": None}, [{"type": "project", "name": "cluster"}]))]
+    for n in legacy:
+        store._append_note_unlocked(tmp_path, n)
+
+    for argv in (["--target", "project:cluster"], ["--target", "item:x", "--ref", "project:cluster"]):
+        assert run("add", "note", *argv, store_dir=tmp_path) == 1
+        err = capsys.readouterr().err
+        assert "this store holds 2 rows on project:cluster" in err, argv
+        assert " rename cluster cluster --type project --to-type item` moves them" in err, argv
+    assert run("add", "note", "--target", "project:other", store_dir=tmp_path) == 1
+    assert "moves them" not in capsys.readouterr().err, "no rows, no migration"
+
+    assert run("rename", "cluster", "cluster", "--type", "project", "--to-type", "item",
+               store_dir=tmp_path) == 0
+    assert capsys.readouterr().out == \
+        "re-targeted 1 note(s), re-pointed 1 ref(s): project:cluster -> item:cluster\n"
+    hs = {n.supersedes: n for n in store.heads(store.load(tmp_path))}
+    moved, repointed = hs[legacy[0].id], hs[legacy[1].id]
+    assert moved.target == store.Target("item", "cluster")
+    assert moved.provenance == legacy[0].provenance, "a re-target is not a re-run"
+    assert repointed.refs == (store.Target("item", "cluster"),)
+    assert run("add", "note", "--target", "project:cluster", store_dir=tmp_path) == 1
+    assert "moves them" not in capsys.readouterr().err, "moved rows are not counted"
+
+
+def test_rename_to_another_type_resolves_the_name_as_that_type(repo, tmp_path, capsys):
+    """`new` is resolved as the type it moves to: an item named by a short sha
+    moved onto `commit` lands on the full sha, as `add` would store it."""
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+         "--allow-empty", "-m", "c1")
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                         capture_output=True, text=True).stdout.strip()
+    s = tmp_path / "s"
+    run("add", "note", "--target", "item:the fix", store_dir=s)
+    capsys.readouterr()
+    assert run("rename", "the fix", sha[:7], "--type", "item", "--to-type", "commit",
+               store_dir=s) == 0
+    assert capsys.readouterr().out.endswith(f"item:the fix -> commit:{sha}\n")
+    assert [n.target for n in store.heads(store.load(s))] == [store.Target("commit", sha)]
 
 
 def test_arc_list_aligns_the_progress_column_on_the_longest_id(tmp_path, capsys):
@@ -2235,6 +2323,22 @@ def test_from_json_unknown_target_type_names_the_types(tmp_path, capsys):
             in capsys.readouterr().err)
 
 
+@pytest.mark.parametrize("argv, what", [
+    (["add", "task", "--target", "item:x", "--ref", "check:1"], "ref"),
+    (["add", "task", "--target", "check:1"], "target"),
+    (["add", "--from-json", "{rows}"], "target"),
+])
+def test_a_kind_typed_as_a_type_is_told_rows_join_through_objects(tmp_path, capsys, argv, what):
+    """`--ref check:<id>` meant a row, and the refusal named only the
+    types (dogfood, 2026-09-30)."""
+    p = tmp_path / "rows.jsonl"
+    p.write_text('{"kind": "note", "target": {"type": "check", "name": "1"}}\n')
+    assert run(*[a.format(rows=p) for a in argv], store_dir=tmp_path) in (1, 2)
+    assert (f"'check' is a kind: a {what} names an object, never a row. Give this row "
+            f"that row's target, and cite its id in the body") in capsys.readouterr().err
+    assert store.load(tmp_path) == []
+
+
 def test_show_is_list_id(tmp_path, capsys):
     """Agents typed `symbion show <id>` from CLI habit and read the
     invalid-choice error as "no such command"."""
@@ -2459,6 +2563,31 @@ def test_a_bare_verb_prints_its_help_not_an_internal_name(tmp_path, capsys, argv
     assert "required" not in err and all(n in err for n in names), err
 
 
+@pytest.mark.parametrize("alias, status", [("--open", "open"), ("--resolved", "resolved"),
+                                           ("--closed", "resolved")])
+def test_list_takes_an_obvious_status_flag_as_the_status(alias, status, tmp_path, capsys):
+    """`list --open` was the guess agents made most, in three projects (field,
+    2026-09-21..29); the hint answered it, and the next call was the same list.
+    It reads as `--status open` now, and its two opposites as `resolved`."""
+    run("add", "task", "--target", "item:a", "--body", "stays open", store_dir=tmp_path)
+    run("add", "task", "--target", "item:b", "--body", "gets done", store_dir=tmp_path)
+    done = capsys.readouterr().out.split()[-1]
+    run("resolve", done, store_dir=tmp_path)
+    capsys.readouterr()
+    run("list", "--status", status, "--json", store_dir=tmp_path)
+    want = capsys.readouterr().out
+    assert len(json.loads(want)) == 1
+    assert run("list", alias, "--json", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out == want
+
+
+def test_the_status_aliases_stay_out_of_list_help(tmp_path, capsys):
+    """`-h` is what agents read: it teaches one form, `--status`."""
+    run("list", "-h", store_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "--status" in out and not any(f in out for f in ("--open", "--resolved", "--closed"))
+
+
 @pytest.mark.parametrize("argv, says", [
     (["delete", "x"], "append-only: `resolve ID` closes"),
     (["undo"], "append-only"),
@@ -2471,7 +2600,16 @@ def test_a_bare_verb_prints_its_help_not_an_internal_name(tmp_path, capsys, argv
     # its author to --body when the target lacked quotes)
     (["add", "task", "--target", "item:leak", "list", "coverage"],
      'a value with spaces needs quotes: --target "item:a b"'),
-    (["list", "--open"], "--status open"),
+    # the split value's next word fills the optional KIND, whose error listed
+    # the kinds (dogfood, 2026-09-29: with --kind already given)
+    (["add", "--kind", "note", "--target", "project", "--ref", "item:login", "page", "timeout"],
+     'a value with spaces needs quotes: --target "item:a b"'),
+    (["add", "--kind", "note", "--target", "project", "--ref", "item:login", "page"],
+     'a value with spaces needs quotes: --target "item:a b"'),
+    (["add", "--target", "item:login", "page", "timeout"],
+     'a value with spaces needs quotes: --target "item:a b"'),
+    (["add", "bgu", "--target", "item:x"], "invalid kind 'bgu' (choose from"),
+    (["context", "--target", "item:x", "--open"], "--status open"),   # `list` takes it
     (["add", "--type", "bug", "--body", "x"], "'bug' is a kind: `add bug --target TYPE:NAME`"),
     (["list", "--type", "task"], "'task' is a kind: `list --kind task`"),
     (["add", "bug", "--target", "login page"], "--target 'item:login page'"),
@@ -2678,7 +2816,38 @@ def test_an_open_pre_registration_names_its_registration_date(tmp_path, capsys):
     capsys.readouterr()
     run("summary", store_dir=tmp_path)
     line = next(ln for ln in capsys.readouterr().out.splitlines() if "item:p" in ln)
-    assert line.startswith("  [prediction, registered 2026-09-20] item:p  falsified if X"), line
+    assert line.startswith("  [prediction, registered 2026-09-20, +1 amendment] "
+                           "item:p  falsified if X"), line
+
+
+def test_the_summary_counts_the_amendments_its_line_cannot_show(tmp_path, capsys):
+    """A digest prints a body's start, so `--append` never reaches it: a
+    prediction's corrected registration time printed its typo until the row
+    resolved (dogfood, 2026-09-30). An appended body counts; a rewrite (whose
+    new start is printed), a tag change and a first body do not."""
+    def add(name, body):
+        run("add", "task", "--target", f"item:{name}", *(["--body", body] if body else []),
+            store_dir=tmp_path)
+        return capsys.readouterr().out.strip()
+    two, other = add("two", "at ~10:00Z"), add("other", "v1")
+    first = add("first", "")
+    for argv in (["supersede", two, "--append", "--body", "no, 09:41Z"],
+                 ["supersede", two, "--add-tag", "x"],
+                 ["supersede", two, "--append", "--body", "and again"],
+                 ["supersede", other, "--body", "v2, rewritten longer"],
+                 ["supersede", other, "--add-tag", "x"],
+                 ["supersede", first, "--append", "--body", "a first body"]):
+        assert run(*argv, store_dir=tmp_path) == 0
+    capsys.readouterr()
+    run("summary", store_dir=tmp_path)
+    lines = capsys.readouterr().out.splitlines()
+    assert next(ln for ln in lines if "item:two" in ln).startswith(
+        "  [task, +2 amendments] item:two  at ~10:00Z"), lines
+    assert all("amendment" not in ln for ln in lines if "item:two" not in ln), lines
+    run("summary", "--json", store_dir=tmp_path)
+    heads = json.loads(capsys.readouterr().out)["heads"]
+    assert {h["target"]: h.get("amendments") for h in heads} == \
+        {"item:two": 2, "item:other": None, "item:first": None}
 
 
 def test_a_row_keeps_its_labels_in_every_summary_block(tmp_path, capsys, monkeypatch):
@@ -2689,7 +2858,7 @@ def test_a_row_keeps_its_labels_in_every_summary_block(tmp_path, capsys, monkeyp
     import datetime as dt
     monkeypatch.setenv("SYMBION_AUTHOR", "claude")
     _declare(tmp_path, PREREG)
-    soon = (dt.date.today() + dt.timedelta(days=2)).isoformat()
+    soon = (dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=2)).isoformat()
     kw = dict(kind="prediction", status="open", checked="the sweep", author="ada",
               created_at="2026-09-20T12:00:00+00:00")
     store.add(tmp_path, target={"type": "item", "name": "starred"}, body="s",
@@ -2723,7 +2892,8 @@ def test_a_full_row_says_when_and_by_whom_and_what_it_revises(tmp_path, capsys):
     head = store.heads(store.load(tmp_path))[0]
     run("show", new[-3:], store_dir=tmp_path)
     lines = capsys.readouterr().out.splitlines()
-    assert lines[1] == f"    written {head.created_at.replace('T', ' ')} by sam; revises {old}", lines
+    utc = head.created_at.replace("T", " ").replace("+00:00", "Z")
+    assert lines[1] == f"    written {utc} by sam; revises {old}", lines
     run("list", store_dir=tmp_path)
     assert "written" not in capsys.readouterr().out, "a page stays one line per row"
 
@@ -2733,7 +2903,7 @@ def test_list_since_keeps_the_rows_written_in_a_window(tmp_store, tmp_path, caps
     last hours wrote, and got `unrecognized arguments` (measured 2026-09-25).
     `git log --since` is the convention: a span back from now, a date, or a
     datetime. Rows written before offsets were stamped are naive: local."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     now = datetime.now().astimezone()
     def add(when, body):
         store.add(tmp_path, kind="note", target={"type": "item", "name": body},
@@ -2748,8 +2918,10 @@ def test_list_since_keeps_the_rows_written_in_a_window(tmp_store, tmp_path, caps
     assert bodies("--since", "2h") == {"half an hour ago"}
     assert bodies("--since", "90m") == {"half an hour ago"}
     assert bodies("--since", "1d") == {"half an hour ago", "three hours ago"}
-    assert bodies("--since", "2026-09-02") >= {"naive, early September"}
-    assert "naive, early September" not in bodies("--since", "2026-09-02T11:00")
+    assert bodies("--since", "2026-09-01") >= {"naive, early September"}
+    legacy = datetime(2026, 9, 2, 10).astimezone()       # naive: the writer's local time
+    after = (legacy + timedelta(hours=1)).astimezone(timezone.utc).isoformat()
+    assert "naive, early September" not in bodies("--since", after)
     assert run("list", "--since", "yesterday", store_dir=tmp_path) == 2
     assert "30m, 2h, 3d, 1w" in capsys.readouterr().err
     run("list", "--since", "2h", store_dir=tmp_path)
@@ -3134,8 +3306,31 @@ def test_commit_reports_the_unpushed_count_when_the_store_has_a_remote(tmp_path,
     capsys.readouterr()
     assert run("commit", store_dir=store_dir) == 0
     out = capsys.readouterr().out
-    assert "1 commit" in out and f"git -C {store_dir} push" in out, out
+    assert "1 commit" in out and f"symbion --dir {store_dir} push" in out, out
     assert "no remote" not in out
+
+
+def test_push_sends_the_store_to_origin_and_names_what_it_leaves(tmp_path, capfd):
+    """commit's hint was `git -C <store> push`: a path to paste, where the
+    store is one symbion already resolves. A note written after the commit
+    is not in that push, so push names it."""
+    store_dir = _store_with_origin(tmp_path)
+    run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=store_dir)
+    run("commit", store_dir=store_dir)
+    run("add", "--kind", "note", "--type", "project", "--body", "y", store_dir=store_dir)
+    capfd.readouterr()
+    assert run("push", store_dir=store_dir) == 0
+    err = capfd.readouterr().err
+    assert gitref.unpushed(store_dir) == 0
+    assert "not pushed: 1 note not yet in the store's git (symbion commit)" in err, err
+
+
+def test_push_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capfd):
+    run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=tmp_path)
+    run("commit", store_dir=tmp_path)
+    capfd.readouterr()
+    assert run("push", store_dir=tmp_path) == 1
+    assert "no remote: this store exists on one disk" in capfd.readouterr().err
 
 
 def test_commit_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capsys):
@@ -3921,24 +4116,40 @@ _DOCS = [Path(cli.__file__).parent / "data" / "skill" / f for f in ("SKILL.md", 
 
 def _doc_flags(text):
     """(command, --flag) for each flag a code span names after a verb: the
-    words `symbion <verb> [<arc verb>] … --flag`, or a table row's `<verb> …`."""
+    words `symbion <verb> [<arc verb>] … --flag`, or a table row's `<verb> …`.
+    A fenced block is read line by line. An inline span may wrap within its
+    paragraph, so it is read as one line; a table row is its own paragraph."""
     verbs = {"init", "add", "list", "show", "resolve", "supersede", "commit", "rename",
              "tags", "summary", "schema", "context", "arc"}
     arcverbs = {"create", "seed", "list", "todo", "rename", "archive", "reconcile"}
+    lines = [ln for f in re.findall(r"```.*?```", text, re.S) for ln in f.strip("`").splitlines()]
+    for para in re.split(r"\n\s*\n", re.sub(r"```.*?```", "\n\n", text, flags=re.S)):
+        rows = [ln for ln in para.splitlines() if ln.lstrip().startswith("|")]
+        for unit in rows + ["\n".join(ln for ln in para.splitlines() if ln not in rows)]:
+            lines += re.findall(r"`([^`]+)`", unit)
     pairs = set()
-    for span in re.findall(r"```.*?```|`[^`\n]+`", text, re.S):
-        for line in span.strip("`").splitlines():
-            words = line.replace("|", " ").split()
-            for i, w in enumerate(words):
-                if w not in verbs or (i and words[i - 1] != "symbion"):
-                    continue
-                cmd = (w, words[i + 1]) if w == "arc" and words[i + 1:i + 2] and \
-                    words[i + 1] in arcverbs else (w,)
-                for f in words[i + 1:]:
-                    m = re.match(r"\[?(--[a-z][a-z-]*)", f)
-                    if m:
-                        pairs.add((cmd, m.group(1)))
+    for line in lines:
+        words = line.replace("|", " ").split()
+        for i, w in enumerate(words):
+            if w not in verbs or (i and words[i - 1] != "symbion"):
+                continue
+            cmd = (w, words[i + 1]) if w == "arc" and words[i + 1:i + 2] and \
+                words[i + 1] in arcverbs else (w,)
+            for f in words[i + 1:]:
+                m = re.match(r"\[?(--[a-z][a-z-]*)", f)
+                if m:
+                    pairs.add((cmd, m.group(1)))
     return pairs
+
+
+def test_the_doc_scan_reads_a_code_span_that_wraps_across_lines():
+    """A rewrap that breaks a span across lines left its flag unchecked, and
+    its two backticks paired with the wrong neighbours, so the next span in
+    the paragraph went unread too (2026-09-29)."""
+    assert _doc_flags("Close it with `resolve <id>\n--bogus`, then `list --all`.") == \
+        {(("resolve",), "--bogus"), (("list",), "--all")}
+    # A table row never wraps: an odd backtick in one must not pair with the next row.
+    assert _doc_flags("| `a` ` | odd |\n| `list --all` | x |") == {(("list",), "--all")}
 
 
 @pytest.mark.parametrize("doc", _DOCS, ids=lambda p: p.name)
