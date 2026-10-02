@@ -2,7 +2,7 @@
 
 A per-project notebook and ticket registry for small projects, driven by a
 person and a coding agent through one CLI. The CLI stands alone; the agent side
-(a skill and a SessionStart hook) is written for Claude Code.
+(a shared skill and a SessionStart hook) supports Claude Code and Codex.
 
 A note is dated, attributed, retractable, and attached to something stable: a
 commit, a file, a free-form item, or the whole project. Seven kinds by default:
@@ -16,7 +16,8 @@ never time-travels your tickets.
 
 Design and rationale: [`docs/superpowers/specs/2026-09-04-symbion-design.md`](https://github.com/phreakocious/symbion/blob/main/docs/superpowers/specs/2026-09-04-symbion-design.md).
 The best command reference is the agent's: `src/symbion/data/skill/SKILL.md`
-(linked at `~/.claude/skills/symbion`).
+(linked at `~/.claude/skills/symbion` for Claude Code or
+`~/.agents/skills/symbion` for Codex).
 
 ## Install
 
@@ -43,9 +44,8 @@ ln -s "$PWD/.venv/bin/symbion" ~/.local/bin/symbion   # any directory on PATH
 
 Then run `command -v symbion` from another directory. The SessionStart hook
 finds `symbion` through PATH. Without it, the hook prints only
-`symbion: store exists at … but 'symbion' is not on PATH` where a store
-exists, and nothing where none does, which reads like a project that never
-adopted symbion.
+`symbion: cannot read store at … because 'symbion' is not on PATH` in a
+project that adopted symbion, and nothing elsewhere.
 
 **TAB completion.** Add your shell's line to its rc file:
 
@@ -72,18 +72,37 @@ From the repo's root:
 **1. Create the store and link the agent files.**
 
 ```bash
-symbion init
+symbion init          # lists each change and makes none (exit 1 if there are any)
+symbion init --yes    # makes them
 ```
 
+That sets up Claude Code; `--agent codex` sets up Codex instead, and
+`--agent both` sets up both.
+
 This creates `../<repo>-notes`, a git repo with no remote, holding a commented
-`symbion.toml` whose every value has a default. The first `init` on a machine
-also links `~/.claude/skills/symbion` to the skill directory in the installed
+`symbion.toml` whose every value has a default. For Claude Code, the first
+`init` on a machine also links `~/.claude/skills/symbion` to the skill directory in the installed
 package (SKILL.md, adoption.md, catalogs.md and the hook script), so an upgrade
 reaches every project. It registers the hook in `~/.claude/settings.json` when
 that file does not exist. When it does, `init` says the hook is already there,
 or prints the entry to append to `hooks.SessionStart` (it merges nothing), or
 says the file is not valid JSON. A `~/.claude/skills/symbion` that is not the
 link is left alone and named.
+
+For Codex, `init --agent codex` links `~/.agents/skills/symbion` to the same
+skill directory and registers the same hook script in `$CODEX_HOME/hooks.json`
+(default `~/.codex/hooks.json`), on the same terms: it writes that file only
+when it is absent, and counts a registration inline in `config.toml`. Codex
+skips a new hook until you trust it in `/hooks`. See the
+[Codex hook documentation](https://learn.chatgpt.com/docs/hooks). The hooks
+need bash, so on Windows use WSL.
+
+**Give Codex access to the store.** Codex's sandbox writes only inside the
+project, and the store sits beside it. Launch `codex --add-dir
+../<repo>-notes`, or add the store to `sandbox_workspace_write.writable_roots`
+in Codex's `config.toml`; `init` prints the path. A `.symbion` pointer grants
+no access, and `symbion commit` may still ask for approval. A linked worktree
+uses the main checkout's store, so grant that one.
 
 The only file `init` writes into the project is a `.symbion` pointer, when the
 store is not the default sibling. It marks the pointer `(git: ignored)` or
@@ -94,6 +113,7 @@ The hook runs in every project and says nothing where there is no store.
 
 ```bash
 CLAUDE_PROJECT_DIR=$PWD bash ~/.claude/skills/symbion/session_start.sh
+bash ~/.agents/skills/symbion/session_start.sh     # the same, with only Codex set up
 ```
 
 | output | meaning |
@@ -102,17 +122,18 @@ CLAUDE_PROJECT_DIR=$PWD bash ~/.claude/skills/symbion/session_start.sh
 | `symbion --dir ../other-notes: open outside arcs: …` | working, on a store this repo's tree does not name (`--dir`, `SYMBION_DIR`, or a cwd inside a store); the header names it, so two summaries in one session can be told apart |
 | either, then `  N notes not yet in the store's git (symbion commit)` | working; run `symbion commit` at session end |
 | either, then `  N per-project symbion copies from an older init: …` | an old `init` left the skill, hook or registration in this project; remove them (the link replaces them) |
-| `symbion: store exists at … but 'symbion' is not on PATH` | see Install |
+| `symbion: cannot read store at … because 'symbion' is not on PATH` | see Install |
 | `symbion: no store at …; run \`symbion init\`` | no store yet, or `.symbion`/`SYMBION_DIR` names a missing path |
-| nothing | no store, no `.symbion` and no `SYMBION_DIR`, or the hook is not registered in `~/.claude/settings.json` |
+| nothing | no store, no `.symbion` and no `SYMBION_DIR`, or the hook is not registered (or not trusted in Codex) |
 
-**3. Tell the agent.** One line in `CLAUDE.md`:
+**3. Tell the agent.** One line in `CLAUDE.md` (Claude Code) or `AGENTS.md`
+(Codex):
 
 ```
 - We use symbion for durable notes and tickets. Surface friction with it so it can be addressed.
 ```
 
-If that `CLAUDE.md` is gitignored or its owner reviews every change to it,
+If that instruction file is gitignored or its owner reviews every change to it,
 propose the line to the owner instead of writing it.
 
 ## First session
@@ -122,9 +143,10 @@ A repo with history (known issues, TODOs, docs, a handoff file) starts with
 and what to bring in; its rows go in as one `symbion add --from-json -`,
 validated together before any is written. Either way:
 
-**The first note is a check, written now.** It pays first: dated, re-checkable,
-and visibly stale once HEAD moves. A check stamps HEAD and whether the tree is
-dirty, untracked files included, so on a dirty tree (the `CLAUDE.md` line from
+**The first note is a check, written now:** the state the store began at,
+which no commit message records. It pays first: dated, re-checkable, and
+visibly stale once HEAD moves. A check stamps HEAD and whether the tree is
+dirty, untracked files included, so on a dirty tree (the instruction line from
 step 3) it reads `unverifiable (dirty tree)`. Commit, write it again, and it
 reads `current`. Files the checked command writes count too, so git-ignore
 `__pycache__/` before checking `pytest`. A check on something outside the repo
@@ -162,17 +184,32 @@ symbion push         # when the store has a remote
 symbion serve        # the one command that needs the gui extra
 ```
 
-A local page at `http://127.0.0.1:43210` (or another free port; `serve` prints
-it, `--port` picks one): boards; a note list where every tag, kind, author and
-target is a filter link; a search box (`/` focuses it) whose text filters the
-page as you type, and Enter searches the whole store (every word, literally and
-in any case, or a pasted note id); a
-new note from any page (`n`; `#tag` and `!kind` in its body set its tags and
-kind); a page per note with its earlier versions; a tag index; and arc
-checklists you tick. `?` lists the keys. It writes as
-**you**, never as `claude`: `SYMBION_AUTHOR`, else git `user.name`, shown at
-the foot of the sidebar, or in the top bar on a window too narrow for one.
-`--author NAME` overrides.
+A local page at `http://127.0.0.1:43210` (or another free port: `serve` prints
+it, and `--port` picks one). It has:
+
+- boards: by kind on the notebook, by target on the targets page;
+- a note list where every tag, kind, author and target is a filter link;
+- a search box (`/`): its text filters the page as you type, and Enter
+  searches the whole store (every word, literally, in any case, or a pasted
+  note id);
+- a new note from any page (`n`), on that page's object or any other: `#tag`
+  and `!kind` in its body set its tags and kind, and Shift Enter adds it and
+  starts the next;
+- a page per note with its earlier versions, a tag index, and arc checklists
+  you tick;
+- commit and push buttons, shown while there is something to commit or push.
+
+`?` lists the keys. It writes as **you**: `SYMBION_AUTHOR`, else git
+`user.name`, shown at the foot of the sidebar, or in the top bar on a window
+too narrow for one. `--author NAME` overrides.
+
+One `serve` per store: run it in each project, and each one's sidebar links
+the other stores a `serve` is running on, on this machine. Each running
+`serve` keeps a small record in `~/.cache/symbion/serve/` (or under
+`$XDG_CACHE_HOME`). A second `serve` on one store warns: the sidebars link the
+first until it stops, then the second. While a `serve` runs on a store, each id
+that `list`, `show` and `context` print at a terminal links to its row's page
+(cmd-click in iTerm2), and `summary` names the URL.
 
 ## Catalogs, when a homogeneous set exists
 
@@ -241,8 +278,7 @@ where two separate adds would store both.
   and prints in `summary` only when its `--due` date is near or past, or when
   someone other than the reader wrote it (`from <author>`). Close one with
   `resolve <id> --add-tag adopted --body "why"` or `--add-tag retired`.
-  `list --kind idea` is the shelf; `list --tag idea` finds rows written before
-  `idea` was a kind.
+  `list --kind idea` is the shelf.
 - **Kinds are the project's.** Add or rename labels under `[kinds]` in
   `symbion.toml`; renaming one that has rows also takes a one-line `sed` over
   `notes.jsonl`, which `init` writes into the toml. A kind with both `status`
@@ -256,14 +292,16 @@ where two separate adds would store both.
   `supersede <id> --due ''` clears one.
 - **Time is UTC.** Rows are stamped in UTC, and symbion prints times and reads
   a bare date in UTC. Set `TZ` to print and read them in that zone instead.
-- **Author.** `claude` inside a Claude Code session, else git `user.name`;
-  `--author` or `SYMBION_AUTHOR` overrides. A person typing `! symbion add …`
-  in a session is recorded as `claude` unless they pass one. Session start
-  lists open rows a person wrote, parked ones included, as `from <author>`, so
-  the owner's word reaches the agent.
+- **Author.** `claude` inside a Claude Code session, `codex` inside a Codex
+  one, else git `user.name`; `--author` or `SYMBION_AUTHOR` overrides. A
+  person typing `! symbion add …` in a session is recorded as the agent
+  unless they pass one. Session start lists the open rows someone other than
+  the reader raised or amended, parked ones included, so the owner's word
+  reaches the agent: `from <author>` names who raised a row, and `last by
+  <author>` who wrote its newest version when that is someone else.
 - **Record finished work as a resolved task**:
-  `add task --status resolved --body "done: …"` for work done before it had a
-  ticket.
+  `add task --target … --status resolved --body "done: …"` for work done
+  before it had a ticket.
 
 ## Where things live
 
@@ -274,13 +312,16 @@ where two separate adds would store both.
   `init` inside a store refuses.
 - **A store not named after its repo:** put its path in a `.symbion` file in
   the repo root (first non-blank line; relative to the repo, or absolute).
-  `symbion --dir ../other-notes init` writes it. Commit it; a relative path
+  `symbion --dir ../other-notes init --yes` writes it. If the repo already
+  reads a store that exists, init creates the new store and leaves the
+  pointer alone; `--repoint` changes it. Commit it; a relative path
   survives a clone. It cannot live in `symbion.toml`, which is inside the store
   it has to find. Set it whenever the names differ: after a repo directory is
   renamed, every command, writes included, reports
   `no store at ../<new-name>-notes` until a `.symbion` names the old store.
-- **Files:** `notes.jsonl` (append-only: a correction is a new row that
-  supersedes the old one), `arcs.jsonl`, `symbion.toml`.
+- **Files:** `notes.jsonl` (append-only once committed: a correction is a
+  new row that supersedes the old one; before `symbion commit`, an edit to
+  your own row rewrites it), `arcs.jsonl`, `symbion.toml`.
 - **Reading:** `symbion summary` (what the hook prints),
   `symbion context --target TYPE:NAME`, `symbion context --branch REF`,
   `symbion list --json`.
@@ -297,6 +338,7 @@ The specs in `docs/superpowers/specs/` are dated design records: why each
 decision was made. `SKILL.md` (in `src/symbion/data/skill/`, beside
 `adoption.md` and the hook) is what an agent reads; keep it short and its
 footgun list honest. If this clone is your installed symbion (an editable
-install, then `symbion init`), `~/.claude/skills/symbion` links to that
-directory, so an edit there reaches every session on the machine at once, as
-an edit to `src/` reaches every `symbion` call.
+install, then `symbion init --yes`), `~/.claude/skills/symbion` and, with
+`--agent codex`, `~/.agents/skills/symbion` link to that directory, so an edit
+there reaches every session on the machine at once, as an edit to `src/`
+reaches every `symbion` call.

@@ -32,13 +32,18 @@ def _isolated_home(tmp_path_factory, monkeypatch):
     for the same reason: a fresh HOME has no ~/.gitconfig. The ceiling stops
     git's repo search at pytest's temp root: with TMPDIR inside a repo, an
     "outside any git repo" test otherwise found that repo, and `init` wrote a
-    `.symbion` into its root."""
+    `.symbion` into its root. The cache goes with HOME: `summary` and a
+    terminal's ids read the running serves' records from it."""
     monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path_factory.getbasetemp()))
     for k in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
         monkeypatch.setenv(k, "t")
     for k in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
         monkeypatch.setenv(k, "t@t")
+    # The agent running pytest must not be the author a test reads.
+    for k in ("SYMBION_AUTHOR", "CLAUDECODE", "CODEX_THREAD_ID"):
+        monkeypatch.delenv(k, raising=False)
 
 
 @pytest.fixture(autouse=True)

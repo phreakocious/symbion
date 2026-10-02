@@ -28,8 +28,8 @@ write to it.
    committed. Without it every row is `item` or `project`.
 2. **Sources, in order.** Gitignored scratch (`TODO.md`, `IDEAS.md`,
    `NEXT_SESSION.md`, `.superpowers/`) first: it is the only copy and it is
-   about to go away. Tracked docs (`CLAUDE.md`, `NOTES.md`, `docs/audits/`)
-   get a pointer, never a copy. `~/.claude` memory only when no tracked file
+   about to go away. Tracked docs (`AGENTS.md`, `CLAUDE.md`, `NOTES.md`, `docs/audits/`)
+   get a pointer, never a copy. Claude Code memory, when present, only when no tracked file
    already says it. Other stores on the machine (`../*-notes`, and any a
    `.symbion` file names): before this project had a store, a session
    elsewhere wrote its findings about it into the store at hand. Sweep them
@@ -68,7 +68,7 @@ write to it.
    git and no store, every sweep above missed it, and the copy lagged its
    source.
 
-   A `CLAUDE.md` that is gitignored, or whose owner reviews
+   An agent instruction file (`AGENTS.md` or `CLAUDE.md`) that is gitignored, or whose owner reviews
    every change to it, is the owner's: propose, do not write. Several candidate rules go in as one
    arc, one `question` per rule, so each is accepted or
    declined on its own. Retros and handoffs: their
@@ -121,7 +121,8 @@ write to it.
      its prose stays. Edit it now, by hand: left to a tool that rewrites the
      file at session end, the migrated threads stayed in it, and the next
      session was briefed from them (2026-09-23).
-   - **Auto-memory** (`~/.claude/projects/<slug>/memory/`). Copy the migrated
+   - **Claude Code auto-memory, if present** (`~/.claude/projects/<slug>/memory/`).
+     Skip this source in projects that do not use it. Copy the migrated
      topic files verbatim to `<store>/archive/claude-memory/`, delete them
      and their `MEMORY.md` lines, and make `MEMORY.md` state the split: memory
      keeps how to work with the owner and context that attaches to no object;

@@ -32,7 +32,7 @@ GUI_DIR = Path(__file__).resolve().parent.parent / "src" / "symbion" / "gui"
 ALLOWED_STORE_READS = {
     "load", "load_malformed", "load_arcs", "heads", "heads_for", "query",
     "tag_counts", "arc_items", "arc_progress", "read_status", "due_state", "since_cutoff",
-    "exists", "newest_first", "written_at", "shown",
+    "exists", "newest_first", "written_at", "shown", "appended", "stamp_sha",
     "notes_path", "arcs_path", "Note", "Arc", "Target",
     "STATUSES", "BUILTIN_TARGET_TYPES",
 }
@@ -199,14 +199,17 @@ def test_a_broken_gui_import_is_not_reported_as_a_missing_extra(
         cli.main(["--dir", str(tmp_path), "serve"])
 
 
-def test_serve_listens_on_loopback_only(monkeypatch):
+def test_serve_listens_on_loopback_only(monkeypatch, tmp_path):
     """The GUI writes rows with no authentication, so it must not be reachable
     from the network. NiceGUI's ui.run() defaults to host 0.0.0.0 outside
     native mode; serve has to pass the loopback address itself."""
     pytest.importorskip("nicegui")
+    from symbion import api, store
     from symbion.gui import serve
     seen = {}
     monkeypatch.setattr(serve, "build_page", lambda ctx, author: None)
     monkeypatch.setattr(serve.ui, "run", lambda **kw: seen.update(kw))
-    serve.main(None, author="t", port=1, show=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))   # not the user's records
+    store.ensure_store(tmp_path)
+    serve.main(api.resolve(str(tmp_path)), author="t", port=1, show=False)
     assert seen["host"] == "127.0.0.1"

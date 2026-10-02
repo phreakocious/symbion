@@ -223,6 +223,15 @@ def has_result(value) -> bool:
     return bool((value or "").strip()) and value not in NULL_WORDS
 
 
+def stamp_sha(prov) -> str | None:
+    """A provenance stamp's commit, or None. A configured provenance command's
+    object is stored as printed, so its `sha` can be any JSON value, and
+    `{"sha": 123}` crashed every reader that sliced it (review, 2026-10-02).
+    The one door for reading it."""
+    sha = prov.get("sha") if isinstance(prov, dict) else None
+    return sha if isinstance(sha, str) and sha else None
+
+
 def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
     """The write-side invariants, determined by the kind's bits and shared by
     `add_many`, `_supersede_unlocked` and `api.fields_from_row` -- a
@@ -633,7 +642,7 @@ def appended(body: str | None, more: str) -> str:
 
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
-                        **fields) -> Note:
+                        in_place=None, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
     multi-row aggregate (`rename_target`, `apply_reconciliation`) can hold
@@ -660,7 +669,11 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     does not mutate the list it was given.
 
     `append_body` adds to the TIP's body, read here under the caller's lock,
-    so a revision that landed after the caller read the row is kept."""
+    so a revision that landed after the caller read the row is kept.
+
+    `in_place(tip) -> bool`, when given, may turn the append into a rewrite
+    of the tip's own line; `supersede` passes `rewritable`. A sweep passes
+    none and always appends."""
     if append_body is not None:
         if "body" in fields:
             raise ValueError("append_body and body are two sources for one field")
@@ -721,6 +734,12 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         if key not in fields and base.get(key) in NULL_WORDS:
             base[key] = None
     check_fields(base["kind"], spec, base)
+    if in_place is not None and base.get("status") == old.status and in_place(old):
+        # Keeps the id, the time and the row it revised: see `rewritable`.
+        # A status change never comes here: a resolve's time is when it closed.
+        note = note_from_dict(base, kinds=kinds)
+        _rewrite_note_unlocked(store, note)
+        return note
     base["supersedes"] = old.id
     base["id"] = new_id()
     base["created_at"] = _now_iso()
@@ -761,7 +780,55 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
             if add_refs:
                 add_refs = canonicalize({"refs": add_refs})["refs"]
         return _supersede_unlocked(store, notes, old_id, author=author,
-                                   append_body=append_body, add_refs=add_refs, **fields)
+                                   append_body=append_body, add_refs=add_refs,
+                                   in_place=lambda tip: rewritable(store, notes, tip, author),
+                                   **fields)
+
+
+def rewritable(store, notes, tip: Note, author: str | None) -> bool:
+    """Whether an edit by `author` rewrites `tip` in place instead of
+    appending a revision. A wording fix 54 s after the row left two rows
+    for one thought (2026-10-01): the window for an edit is the time before
+    `symbion commit`. Append-only keeps a conclusion's history, and a row
+    git never saw has none. So: git has not seen the row, its author is the
+    editor, no other row's body cites it, and it is no pre-registration,
+    whose registered text is the point. The caller also keeps the status:
+    a resolve's time is when the row closed."""
+    if not author or author != tip.author or (tip.spec.status and tip.spec.verdict):
+        return False
+    if any(n.id != tip.id and n.body and (tip.id in n.body or tip.id[-10:] in n.body)
+           for n in notes):
+        return False
+    committed = _committed_ids(store)
+    return committed is not None and tip.id not in committed
+
+
+def _committed_ids(store) -> set | None:
+    """The row ids in the store's last commit: none before the first one.
+    None when git cannot say, so the edit appends, as every edit once did."""
+    git = ["git", "-C", str(store)]
+    if subprocess.run([*git, "rev-parse", "-q", "--verify", "HEAD"],
+                      capture_output=True).returncode:
+        return set()
+    r = subprocess.run([*git, "show", f"HEAD:{NOTES_FILE}"], capture_output=True, text=True)
+    return {_line_id(raw) for raw in r.stdout.splitlines()} if r.returncode == 0 else None
+
+
+def _line_id(raw: str):
+    try:
+        return json.loads(raw).get("id")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _rewrite_note_unlocked(store, note: Note) -> None:
+    """Replace the line holding note.id, whole-file and atomically: a reader
+    without the lock sees the old file or the new one, never half."""
+    path = notes_path(store)
+    line = _dumps(note_to_dict(note))
+    rows = [line if _line_id(raw) == note.id else raw
+            for raw in path.read_text(encoding="utf-8").splitlines()]
+    _replace_atomically(path, "\n".join(rows) + "\n")
 
 
 def heads(notes):
@@ -796,10 +863,11 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
     the class of claim this layer exists to retract.
 
     `grep` is a compiled pattern searched over body, target name, checked,
-    result and each ref as `type:name` -- the text a reader would otherwise
-    pipe a paged list to grep for, losing the page's header and reading the
-    silence as absence. Refs are in because SKILL.md tells writers to put a
-    second object there instead of in prose.
+    result, each ref as `type:name` and each tag as `#tag` -- the text a
+    reader would otherwise pipe a paged list to grep for, losing the page's
+    header and reading the silence as absence. Refs are in because SKILL.md
+    tells writers to put a second object there instead of in prose. Tags
+    are in because a writer tags a subject the text never names.
 
     `id` is an exact match on the row, not a walk of its supersede chain: it
     filters whatever set it is handed, so pass raw notes to reach a superseded
@@ -826,7 +894,7 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
     if grep is not None:
         out = [n for n in out if grep.search("\n".join(
             [f for f in (n.body, n.target.name, n.checked, n.result) if f]
-            + [f"{r.type}:{r.name or ''}" for r in n.refs]))]
+            + [f"{r.type}:{r.name or ''}" for r in n.refs] + [f"#{t}" for t in n.tags]))]
     if overdue:
         out = [n for n in out if is_overdue(n)]
     if since is not None:
@@ -943,9 +1011,24 @@ def commit(store, message: str, cfg) -> bool:
             if r.returncode == 0:                 # nothing staged
                 return False
             if r.returncode == 1:                 # something staged
+                # Every pending row goes in, whoever wrote it, so a commit
+                # once named another agent's rows as its own work (2026-10-02).
+                # The trailer says whose they are.
+                diff = subprocess.run([*git, "diff", "--cached", "-U0", "--", NOTES_FILE],
+                                      capture_output=True, text=True).stdout
+                by: dict[str, int] = {}
+                for line in diff.splitlines():
+                    if line.startswith("+{"):
+                        try:                      # a hand edit must not block a commit
+                            a = json.loads(line[1:]).get("author") or "?"
+                        except ValueError:
+                            a = "?"
+                        by[a] = by.get(a, 0) + 1
+                rows = ", ".join(f"{a} {n}" for a, n in sorted(by.items()))
                 r = subprocess.run(
                     [*git, "-c", f"user.name={cfg.git_name}",
-                     "-c", f"user.email={cfg.git_email}", "commit", "-q", "-m", message],
+                     "-c", f"user.email={cfg.git_email}", "commit", "-q", "-m", message,
+                     *(["-m", f"Rows: {rows}"] if rows else [])],
                     capture_output=True, text=True)
     if r.returncode:
         said = (r.stderr + r.stdout).strip() or f"exit {r.returncode}, no output"

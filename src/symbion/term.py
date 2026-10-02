@@ -145,13 +145,17 @@ def _state(n, state) -> tuple[str, str]:
     return (st if dist is None else f"{st} {dist}"), WARN
 
 
-def _head(n, *, status, state, due, subject, head, width) -> tuple[Text, int]:
+def _head(n, *, status, state, due, subject, head, width, gui) -> tuple[Text, int]:
     """The row's first line, and the column its target starts at. With a
     `width`, a line too long for it gives up the refs count first, then the
-    end of its tags, then the end of its target."""
+    end of its tags, then the end of its target. With `gui`, a running
+    serve's URL, the id opens the row's page there."""
     faded = status == "resolved" or head is not None
     ink = (lambda c: FADED) if faded else (lambda c: c)
-    line = Text(n.id[-ID_TAIL:], ink(META))
+    # The link on the id's span only: a Text's own style reaches every span
+    # appended to it, and the whole line linked (2026-10-01).
+    line = Text(style=ink(META))
+    line.append(n.id[-ID_TAIL:], Style(color=ink(META), link=gui and f"{gui}/notes?id={n.id}"))
     line.append(f"  {age(n.created_at):>4}  ", ink(META))
     mark, color = {"open": ("○", ink(TEXT)), "resolved": ("✓", GOOD)}.get(status, (" ", ""))
     line.append(mark + " ", color)
@@ -228,7 +232,7 @@ def _details(n, head, state) -> list[Text]:
     if n.refs:
         out.append(labelled("refs  ", ", ".join(summ.ref_label(r) for r in n.refs)))
     if n.spec.verdict:
-        sha = (n.provenance or {}).get("sha")
+        sha = store.stamp_sha(n.provenance)
         at = f" at {sha[:7]}" if sha else ""
         if state and state[0] == "pending":
             out.append(labelled(f"to check, registered{at}: ", summ.flatten(n.checked)))
@@ -239,14 +243,15 @@ def _details(n, head, state) -> list[Text]:
     return out
 
 
-def print_note(n, *, status, state, due, subject, head, full) -> None:
+def print_note(n, *, status, state, due, subject, head, full, gui=None) -> None:
     """`status` is the chain head's, `state` api.verdict_state's pair and
     `due` store.due_state's pair for an open row, all computed by the caller
-    the same way for the pipe line."""
+    the same way for the pipe line. `gui` is the URL of a serve on the row's
+    store."""
     con = Console(highlight=False, markup=False, emoji=False, theme=MARKDOWN)
     width = None if full else con.width
     line, indent = _head(n, status=status, state=state, due=due, subject=subject,
-                         head=head, width=width)
+                         head=head, width=width, gui=gui)
     if not full:
         con.print(line, no_wrap=True, overflow="ellipsis", crop=True)
         teaser = _teaser(n, status == "resolved" or head is not None, indent, width)

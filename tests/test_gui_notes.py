@@ -171,6 +171,39 @@ async def test_an_id_cited_in_a_body_links_to_that_note(user: User, repo, tmp_pa
     assert f"<code>{cited.id}</code>" in html
 
 
+async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
+    """The owner, 2026-10-01: rows cite the 10-character tail, and only a
+    full id linked. A tail links only to a row this store has: rows cite
+    other stores' rows too."""
+    ctx = api.resolve(str(tmp_path))
+    cited = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                          "body": "the cited row"}, author="ada")
+    tail = cited.id[-10:]
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": f"see {tail} and 999999-fff; the code `{tail}` stays text"},
+                author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    html = md.props["innerHTML"]
+    assert html.count(f'href="/notes?id={cited.id}"') == 1, html
+    assert "999999-fff" in html and "id=999999-fff" not in html, html
+    assert f"<code>{tail}</code>" in html, html
+
+    # A row written while the server runs: its tail links on the next render.
+    later = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                          "body": "written later"}, author="ada")
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": f"see {later.id[-10:]}"}, author="ada")
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    assert f'href="/notes?id={later.id}"' in md.props["innerHTML"]
+
+
 async def test_a_compact_row_clips_a_long_verdict_and_a_full_one_does_not(
         user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
@@ -634,6 +667,86 @@ async def test_edit_dialog_keeps_an_untouched_datetime_due(user: User, repo, tmp
     assert (head.body, head.due) == ("fixed", "2026-10-01T22:30:00+00:00")
 
 
+async def _append_in_dialog(user: User, ctx, n, text: str, *, body: str | None = None,
+                            meanwhile=None, keys: bool = False):
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-append")
+    if body is not None:
+        user.find(marker="edit-body").elements.pop().set_value(body)
+    user.find(marker="edit-append").type(text)
+    if meanwhile:
+        meanwhile()
+    if keys:
+        user.find(marker="edit-append").trigger("keydown.meta.enter")
+    else:
+        user.find(marker="edit-save").click()
+    return store.heads(store.load(ctx.store_dir))[0]
+
+
+async def test_the_edit_dialog_adds_text_after_the_body(user: User, repo, tmp_path):
+    """Most edits add to a row, and the body's end was a scroll away (the
+    owner, 2026-10-01). A #tag in the added text is a tag, as in the body.
+    ⌘ Enter saves, as it adds a note in the composer."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "first"}, author="ada")
+    head = await _append_in_dialog(user, ctx, n, "more #ux", keys=True)
+    assert (head.body, list(head.tags)) == ("first\n\nmore", ["ux"])
+
+
+async def test_the_added_text_lands_after_a_revision_made_meanwhile(user: User, repo,
+                                                                     tmp_path):
+    """The text goes after the current row's body, read under the lock, as
+    `supersede --append` does: a body written from this dialog's copy lost
+    a revision made since it opened."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "first"}, author="ada")
+    head = await _append_in_dialog(
+        user, ctx, n, "more",
+        meanwhile=lambda: api.supersede(ctx, n.id, author="sam", body="second"))
+    assert head.body == "second\n\nmore"
+
+
+async def test_an_edited_body_takes_the_added_text_after_it(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "frist"}, author="ada")
+    head = await _append_in_dialog(user, ctx, n, "more", body="first")
+    assert head.body == "first\n\nmore"
+
+
+async def test_the_edit_dialog_stars_a_row_in_the_same_write(user: User, repo, tmp_path):
+    """The owner, 2026-10-02: "supersede should include a priority toggle
+    for a single op". The switch holds `priority`, the tags field the rest."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "first", "tags": ["ux"]}, author="ada")
+    api.commit(ctx, "notes")                  # an edit after a commit adds a row
+    flip = lambda: user.find(marker="edit-priority").click()     # noqa: E731
+    head = await _append_in_dialog(user, ctx, n, "more", meanwhile=flip)
+    assert (head.body, list(head.tags)) == ("first\n\nmore", ["ux", "priority"])
+    assert len(store.load(tmp_path)) == 2     # one write: the row and its edit
+
+
+async def test_the_edit_dialog_unstars_a_row(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "first", "tags": ["priority", "ux"]}, author="ada")
+
+    def flip():
+        assert user.find(marker="edit-tags").elements.pop().value == "ux"
+        user.find(marker="edit-priority").click()
+
+    head = await _append_in_dialog(user, ctx, n, "more", meanwhile=flip)
+    assert list(head.tags) == ["ux"]
+
+
 async def test_edit_dialog_sets_and_clears_due(user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
@@ -760,8 +873,34 @@ async def test_a_tags_field_drops_its_hashes_when_left(user: User, repo, tmp_pat
 
     await user.open("/t")
     tags = user.find(marker="note-tags")
-    tags.type("#ux, ##gui").trigger("blur")
-    assert tags.elements.pop().value == "ux, gui"
+    (field,) = tags.elements
+    field.set_value("#ux, ##gui")           # type() takes NiceGUI's own inputs only
+    tags.trigger("blur")
+    assert field.value == "ux, gui"
+
+
+async def test_the_tags_fields_offer_the_stores_tags_most_used_first(user: User, repo,
+                                                                     tmp_path):
+    """Tags should offer the ones in use as you type (the owner, 2026-10-01).
+    `tokens`: the menu completes the field's last word, not the whole text."""
+    from symbion.gui.notes import add_form
+    ctx = api.resolve(str(tmp_path))
+    for tags in (["ux"], ["gui", "ux"], ["perf"]):
+        n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                          "body": "b", "tags": tags}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (tags,) = user.find(marker="note-tags").elements
+    assert (tags.props["options"], tags.props["tokens"]) == (["ux", "gui", "perf"], True)
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-tags")
+    (tags,) = user.find(marker="edit-tags").elements
+    assert (tags.props["options"], tags.props["tokens"]) == (["ux", "gui", "perf"], True)
 
 
 async def test_a_bang_in_the_body_picks_the_kind_and_leaves_the_body(user: User, repo, tmp_path):
@@ -773,8 +912,13 @@ async def test_a_bang_in_the_body_picks_the_kind_and_leaves_the_body(user: User,
         add_form(ctx, "project", None, lambda: None, author="ada")
 
     await user.open("/t")
+    (add,) = user.find(marker="note-add").elements
+    assert add.text == "Add note"
     user.find(marker="note-body").type("!task fix the header #gui")
     assert user.find(marker="note-kind-select").elements.pop().value == "task"   # as typed
+    # The button names the kind, so a request is not filed as a note unseen
+    # (the owner's row, 2026-10-02): a `note` reaches no open view.
+    assert add.text == "Add task"
     user.find(marker="note-add").click()
     (row,) = store.heads(store.load(tmp_path))
     assert (row.kind, row.body, list(row.tags)) == ("task", "fix the header", ["gui"])
@@ -793,3 +937,21 @@ async def test_a_bang_alone_is_an_empty_note(user: User, repo, tmp_path):
     user.find(marker="note-add").click()
     await user.should_see("empty note")
     assert not store.heads(store.load(tmp_path))
+
+
+async def test_the_edit_dialog_says_whether_the_row_itself_changes(user: User, repo, tmp_path):
+    """It said "the old row is kept" over an edit that rewrites the row: one
+    by its own author before `symbion commit` (store.rewritable)."""
+    ctx = api.resolve(str(tmp_path))
+    rows = {who: api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                               "body": f"by {who}"}, author=who) for who in ("ada", "sam")}
+
+    @ui.page("/t/{who}")
+    def page(who: str):
+        render_note(ctx, rows[who], lambda: None, author="ada")
+
+    for who, words in (("ada", "not yet committed, so the row itself changes"),
+                       ("sam", "the old row is kept")):
+        await user.open(f"/t/{who}")
+        user.find(marker="note-edit").click()
+        await user.should_see(words)

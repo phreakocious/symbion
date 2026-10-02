@@ -280,3 +280,4 @@ Each step names what it **produces** and what **consumes** it, so no step ships 
 
 - **Does the boards page need pagination?** The ancestor GUI caps recent audits at 25 and nothing else. Deferred until a store exists that makes it hurt.
   *Answered 2026-09-29 for `/notes`:* a 312-row store took 3.7s and a 1 MB page there. `/notes` renders the newest 100, names the cut in its count line, and ends with a show-all link. The boards stay as they were: open rows, and the newest 25 checks.
+  *Changed 2026-10-02:* a "recent <kind>" board holds the rows of the last 14 days and older ones still `current` at HEAD, at most 25, and links the rest. The newest 25 of any age were suite runs from weeks back, nearly all `behind`.

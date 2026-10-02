@@ -25,6 +25,7 @@ from pathlib import Path
 
 from nicegui import ui
 
+from . import servers
 from .pages import build_page
 from .theme import FAVICON_SVG
 
@@ -55,17 +56,32 @@ def main(ctx, *, author: str, port=None, show: bool = True,
         os.execv(sys.executable, [sys.executable, "-m", __name__, *argv])
     build_page(ctx, author=author)
     port = port if port is not None else pick_free_port()
+    url = f"http://127.0.0.1:{port}"
+    mine = None
     if top:
-        print(f"symbion → http://127.0.0.1:{port}  (writing as {author})", flush=True)
-    # Loopback only: the GUI writes rows with no authentication, and
-    # ui.run() defaults to 0.0.0.0 outside native mode.
-    ui.run(
-        host="127.0.0.1", port=port, show=show, reload=reload,
-        uvicorn_reload_dirs=str(Path(__file__).resolve().parent),
-        uvicorn_reload_includes="*.py",
-        title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON_SVG,
-        reconnect_timeout=30.0,
-    )
+        print(f"symbion → {url}  (writing as {author})", flush=True)
+        # For the other serves' sidebars. The first serve on a store stays
+        # the one they link while it runs; a second records too, and its
+        # links take over when the first stops.
+        first = servers.serving(ctx.store_dir)
+        if first:
+            print(f"warning: another symbion serve runs on this store: {first['url']} "
+                  f"(pid {first['pid']}). The other stores' sidebars link that one "
+                  "until it stops, then this one.", file=sys.stderr, flush=True)
+        mine = servers.record(url, ctx.store_dir)
+    try:
+        # Loopback only: the GUI writes rows with no authentication, and
+        # ui.run() defaults to 0.0.0.0 outside native mode.
+        ui.run(
+            host="127.0.0.1", port=port, show=show, reload=reload,
+            uvicorn_reload_dirs=str(Path(__file__).resolve().parent),
+            uvicorn_reload_includes="*.py",
+            title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON_SVG,
+            reconnect_timeout=30.0,
+        )
+    finally:
+        if mine:
+            mine.unlink(missing_ok=True)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

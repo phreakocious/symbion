@@ -54,10 +54,10 @@ d=$(mktemp -d)
 
 SKILL.md's rule to run the installed `symbion` is for using symbion, not for
 developing it. A write refuses a store `init` never made, and without `--dir` a
-command uses `../<repo>-notes` beside the current repo. Run `.venv/bin/symbion init`
-only when the user asks: it creates that store, it can point the user-wide skill and
-hook at this checkout (README, "Adopt in a fresh repo"), and with `--dir` it writes a
-`.symbion` pointer into the checkout.
+command uses `../<repo>-notes` beside the current repo. Run `.venv/bin/symbion init
+--yes` only when the user asks: it creates that store, it can point the user-wide skill
+and hook at this checkout (README, "Adopt in a fresh repo"), and with `--dir` it can
+write a `.symbion` pointer into the checkout. Without `--yes` it only lists them.
 
 ## If this checkout is your installed symbion
 

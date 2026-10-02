@@ -685,3 +685,48 @@ def test_rows_from_two_zones_list_in_the_order_they_were_written(tmp_path):
                   body=body, created_at=when)
     assert [n.body for n in store.heads_for(tmp_path, "item", "x")] == \
         ["later", "earlier", "unreadable"]
+
+
+# ---- an edit before `symbion commit` ----
+
+def _commit(store_dir):
+    import subprocess
+    subprocess.run(["git", "-C", str(store_dir), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(store_dir), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "c"], check=True)
+
+
+def test_an_edit_git_never_saw_rewrites_the_row_in_place(tmp_path):
+    """A wording fix 54 s after the row (2026-10-01) left two rows for one
+    thought. The edit window is the time before `symbion commit`: the row
+    keeps its id, its time and the row it revised; the text is the edit's."""
+    a = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
+                  body="v1", author="ann")
+    _commit(tmp_path)
+    b = store.supersede(tmp_path, a.id, author="ann", body="v2")         # a is in git
+    c = store.supersede(tmp_path, a.id, author="ann", body="v3", tags=["x"])
+    assert (c.id, c.created_at, c.supersedes) == (b.id, b.created_at, a.id)
+    on_disk = store.load(tmp_path)
+    assert [(n.id, n.body, n.tags) for n in on_disk] == [(a.id, "v1", ()), (b.id, "v3", ("x",))]
+
+
+@pytest.mark.parametrize("case", ["committed", "other author", "cited", "resolve",
+                                  "pre-registration"])
+def test_an_edit_keeps_the_old_row_where_its_history_matters(tmp_path, case):
+    """A resolve's own time is when the row closed; a pre-registration's
+    registered text is the point; a cited row's text is what its citer read;
+    another author's row and a committed row are history."""
+    _declare(tmp_path, PREREG)
+    kind = "prediction" if case == "pre-registration" else "task"
+    a = store.add(tmp_path, kind=kind, target={"type": "project", "name": None},
+                  body="v1", author="ann", checked="the run" if kind == "prediction" else None)
+    if case == "committed":
+        _commit(tmp_path)
+    if case == "cited":
+        store.add(tmp_path, kind="note", target={"type": "project", "name": None},
+                  body=f"see {a.id[-10:]}", author="bob")
+    edit = {"status": "resolved"} if case == "resolve" else {"body": "v2"}
+    b = store.supersede(tmp_path, a.id, author="bob" if case == "other author" else "ann",
+                        **edit)
+    assert b.id != a.id and b.supersedes == a.id
+    assert next(n for n in store.load(tmp_path) if n.id == a.id).body == "v1"

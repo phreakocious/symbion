@@ -98,9 +98,11 @@ def root_vars_css() -> str:
     """Emit the --q-* brand vars in :root so borders/surfaces resolve to dark on
     the FIRST paint -- kills the light-border flash before ui.colors() runs
     post-connect. Underscores are normalized to hyphens to match the CSS vars
-    that ui.colors() generates (e.g. dark_page -> --q-dark-page)."""
+    that ui.colors() generates (e.g. dark_page -> --q-dark-page).
+    `color-scheme` darkens what the browser draws itself: a datalist's
+    dropdown, scrollbars, autofill."""
     decls = ";".join(f"--q-{k.replace('_', '-')}:{v}" for k, v in quasar_colors().items())
-    return (f"<style>:root{{{decls};--mono:{MONO_STACK};--sans:{SANS_STACK}}}"
+    return (f"<style>:root{{color-scheme:dark;{decls};--mono:{MONO_STACK};--sans:{SANS_STACK}}}"
             f"html,body{{background:var(--q-dark-page);font-family:var(--sans)}}</style>")
 
 
@@ -140,14 +142,16 @@ body.body--dark { color: var(--q-emph) !important; font-size: 14px; }
 /* Links set no underline of their own; a row of them read as a ransom note. */
 a { text-decoration: none; }
 
-/* the sidebar: places, open counts, who is writing */
+/* the sidebar: places, open counts, recently closed, who is writing */
 .q-drawer { background: var(--q-panel) !important; border-right: 1px solid var(--q-border); }
 /* NiceGUI pads its drawer 16px too: under .sb-side-inner's own, a place's
    icon sat 40px in (measured 2026-10-01, the owner's "a lot of border space").
    The 11px top centres the 35px brand on the 56px top bar's line. */
 .sb-side { padding: 0; }
+/* The drawer aligns its content flex-start, so the inner box took its
+   content's width: a closed row's one line made it 800px (2026-10-01). */
 .sb-side-inner { display: flex; flex-direction: column; gap: 24px; padding: 11px 14px 18px;
-                 min-height: 100%; box-sizing: border-box; }
+                 min-height: 100%; width: 100%; box-sizing: border-box; }
 .sb-brand  { display: flex; align-items: center; gap: 10px; padding: 0 8px; color: var(--q-emph); }
 .sb-brand-name { font-weight: 600; font-size: 15px; line-height: 1.2; color: var(--q-emph);
                  overflow-wrap: anywhere; }
@@ -163,6 +167,11 @@ a { text-decoration: none; }
 .sb-nav-item.sb-on .q-icon { color: var(--q-emph); }
 .sb-nav-n  { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--q-muted); }
 .sb-nav-item.sb-zero { color: var(--q-muted); }
+/* a closed row: its text cut to one line, quieter than the open counts */
+.sb-nav-item.sb-closed { height: 28px; font-size: 13px; color: var(--q-muted); }
+.sb-nav-item.sb-closed:hover, a.sb-nav-head:hover { color: var(--q-emph); }
+.sb-closed-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                  white-space: nowrap; }
 .sb-dot    { width: 8px; height: 8px; border-radius: 50%; background: var(--kind); flex: none; }
 .sb-who    { display: flex; align-items: center; gap: 10px; padding: 12px 10px 0;
              margin-top: auto; border-top: 1px solid var(--q-border); }
@@ -209,6 +218,25 @@ a { text-decoration: none; }
 /* the composer's dialog, and the list `?` opens */
 .sb-new-card { width: min(680px, 94vw); max-width: none !important; }
 .sb-new-card .sb-composer { border: 0; padding: 0; }
+/* a markdown file read in a dialog: a document, so its headings stand, at
+   sizes that fit a dialog (NiceGUI's h1 is 3rem) */
+.sb-md-card { width: min(860px, 94vw); max-width: none !important; }
+/* the card's width, not its widest code line's: a long line scrolls in its block */
+.sb-md-card .nicegui-markdown { color: var(--q-emph); font-size: 14.5px; line-height: 1.6;
+                                width: 100%; min-width: 0; overflow-wrap: anywhere; }
+.sb-md-card .nicegui-markdown a { color: var(--q-primary); }
+.sb-md-card .nicegui-markdown h1 { font-size: 22px; line-height: 1.3; margin: 18px 0 8px; }
+.sb-md-card .nicegui-markdown h2 { font-size: 18px; line-height: 1.3; margin: 16px 0 6px; }
+.sb-md-card .nicegui-markdown :is(h3, h4, h5, h6) { font-size: 15px; line-height: 1.3;
+                                                    margin: 12px 0 4px; }
+.sb-md-card .nicegui-markdown > *:first-child { margin-top: 0; }
+.sb-md-card code { font-family: var(--mono); font-size: 12.5px; padding: 1px 5px;
+                   border-radius: 4px; background: var(--q-raise); }
+.sb-md-card pre { background: var(--q-raise); padding: 8px 12px; border-radius: 6px;
+                  overflow-x: auto; }
+.sb-md-card pre code { padding: 0; background: none; }
+.sb-md-card :is(th, td) { border: 1px solid var(--q-border); padding: 4px 8px; }
+.sb-md-card table { border-collapse: collapse; }
 .sb-keys-list { display: grid; grid-template-columns: auto 1fr; gap: 8px 14px;
                 align-items: center; color: var(--q-body); font-size: 13px; }
 .sb-keys-list .sb-chip { justify-self: start; color: var(--q-emph); }
@@ -429,8 +457,8 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   .sb-btn-word, .sb-crumbs > :not(.sb-here) { display: none; }
   .sb-topbar { column-gap: 8px; }
 }
-.sb-commit .q-btn__content, .sb-new .q-btn__content { flex-wrap: nowrap; white-space: nowrap;
-                                                      gap: 6px; }
+.sb-commit .q-btn__content, .sb-push .q-btn__content, .sb-new .q-btn__content {
+  flex-wrap: nowrap; white-space: nowrap; gap: 6px; }
 @media (max-width: 600px) {
   /* a phone's top bar: the title alone says where you are, and there is
      no key to press `/` with */
@@ -445,7 +473,7 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   .sb-topbar > .sb-who-top { order: 2; }
   .sb-topbar::after { content: ""; order: 3; flex-basis: 100%; margin-top: 8px; }
   .sb-topbar > .sb-new { order: 4; }
-  .sb-topbar > .sb-commit { order: 5; }
+  .sb-topbar > .sb-commit, .sb-topbar > .sb-push { order: 5; }
   .sb-topbar > .sb-search { order: 6; flex: 1; min-width: 0; max-width: none; }
 }
 """.replace("@WIDE@", str(NARROW + 1)).replace("@NARROW@", str(NARROW)).replace("@TRAILW@", str(_TRAIL_W)) \

@@ -2,17 +2,19 @@
 snapshot, so a page is stale only in the browser and any navigation fixes it."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from fastapi import Request
 from fastapi.exception_handlers import http_exception_handler
 from nicegui import Client, app, ui
 from starlette.exceptions import HTTPException
 
-from .. import api
+from .. import api, gitref
 from .. import store as S
 from .. import summary as summ
 from . import arcs, filters
 from .chrome import shell
-from .notes import render_note
+from .notes import md_button, render_note, target_href
 from .theme import FONTS_DIR, FONTS_URL
 
 # /notes renders this many rows before "show all": every row is a few dozen
@@ -20,24 +22,41 @@ from .theme import FONTS_DIR, FONTS_URL
 # 3.7s and a 1 MB page.
 PAGE_ROWS = 100
 
+# A "recent <kind>" board holds verdict rows this young, and older ones still
+# current at HEAD. It held the 25 newest of any age: suite runs from weeks
+# back, nearly all `behind`, filled it (the owner, 2026-10-02).
+RECENT_DAYS = 14
 
-def _board(ctx, title, rows, author, *, in_arcs: int = 0, more: str = "") -> None:
+
+def _board(ctx, title, rows, author, *, aside: str = "", more: str = "", tip: str = "",
+           git_head=None, to: str = "", show_target: bool = True) -> None:
     """A heading and its cards. An empty board is its heading alone, quieter:
-    a box saying "none" took a card's room to say nothing. `in_arcs` counts
-    the rows of this kind an active arc's checklist holds instead, `more` the
-    view with them all: beside the sidebar's count of every open row, a
-    heading of the others alone read as a miscount."""
+    a box saying "none" took a card's room to say nothing. `aside` names the
+    rows of this kind the board leaves out, and `more` links the view with
+    them all: beside the sidebar's count of every open row, a heading of the
+    others alone read as a miscount. `to` makes the title a link."""
     with ui.element("section").classes("sb-board" + ("" if rows else " sb-board-empty")) \
             .mark("board"):
         with ui.element("div").classes("sb-board-head"):
-            ui.label(title).classes("sb-board-title").mark("board-title")
+            (ui.link(title, to) if to else ui.label(title)).classes("sb-board-title") \
+                .mark("board-title")
             ui.label(str(len(rows))).classes("sb-count").mark("board-count")
-            if in_arcs:
-                ui.link(f"· {in_arcs} in arcs", more).classes("sb-board-aside") \
-                    .mark("board-in-arcs")
+            if aside:
+                link = ui.link(aside, more).classes("sb-board-aside").mark("board-aside")
+                if tip:
+                    link.tooltip(tip)
         for n in rows:
             render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
-                        show_target=True, compact=True)
+                        show_target=show_target, compact=True, git_head=git_head)
+
+
+def _recent(ctx, n, since, git_head) -> bool:
+    """Written since `since`, or current at HEAD. Only a row stamped at HEAD
+    can be current, so the rest cost no git call."""
+    sha = S.stamp_sha(n.provenance)
+    return S.written_at(n) >= since or bool(
+        sha and git_head and git_head.startswith(sha)
+        and api.verdict_state(ctx.cfg, n, git_head)[0] == "current")
 
 
 def _error_pages(ctx, author: str) -> None:
@@ -65,7 +84,7 @@ def _error_pages(ctx, author: str) -> None:
         return client.build_response(request, 404)
 
 
-def _history(ctx, every, head, author: str) -> None:
+def _history(ctx, every, head, author: str, git_head=None) -> None:
     """The rows `head` superseded, newest first: the store keeps every
     version, and the GUI showed only the last. Read-only: an edit made from
     an old version lands on the current row."""
@@ -79,7 +98,8 @@ def _history(ctx, every, head, author: str) -> None:
     with ui.expansion(f"earlier versions ({len(chain)})").classes("w-full sb-card") \
             .mark("history"):
         for old in chain:
-            render_note(ctx, old, lambda: None, author=author, actions=False)
+            render_note(ctx, old, lambda: None, author=author, actions=False,
+                        git_head=git_head)
 
 
 def build_page(ctx, *, author: str) -> None:
@@ -89,6 +109,8 @@ def build_page(ctx, *, author: str) -> None:
     @ui.page("/")
     def home():
         shell(ctx, author, [("Notebook", None)], here="/")
+        # One HEAD for the page: each check badge read it again (2026-10-01).
+        git_head = gitref.head_sha(ctx.cfg)
         heads = S.heads(S.load(ctx.store_dir))
         newest = S.newest_first(heads)
         with ui.column().classes("sb-main gap-5"):
@@ -102,14 +124,22 @@ def build_page(ctx, *, author: str) -> None:
             for label, k in ctx.kinds.items():
                 if k.status and not k.parked:
                     rows = summ.open_outside_arcs(newest, label, active)
+                    in_arcs = len(summ.open_notes(newest, label)) - len(rows)
                     _board(ctx, f"open {label}", rows, author,
-                           in_arcs=len(summ.open_notes(newest, label)) - len(rows),
-                           more=filters.href(kind=label, status="open"))
-            _board(ctx, "priority", summ.starred(newest), author)
+                           aside=f"· {in_arcs} in arcs" if in_arcs else "",
+                           more=filters.href(kind=label, status="open"), git_head=git_head)
+            _board(ctx, "priority", summ.starred(newest), author, git_head=git_head)
+            since = datetime.now().astimezone() - timedelta(days=RECENT_DAYS)
             for label, k in ctx.kinds.items():
                 if k.verdict:
-                    _board(ctx, f"recent {label}",
-                           [n for n in newest if n.kind == label][:25], author)
+                    every = [n for n in newest if n.kind == label]
+                    rows = [n for n in every if _recent(ctx, n, since, git_head)][:25]
+                    left = len(every) - len(rows)
+                    _board(ctx, f"recent {label}", rows, author,
+                           aside=f"· {left} more" if left else "",
+                           more=filters.href(kind=label),
+                           tip=f"every {label}: this board holds the last {RECENT_DAYS} days "
+                               f"and any still current at HEAD", git_head=git_head)
 
     @ui.page("/notes")
     def notes_page(request: Request):
@@ -123,11 +153,21 @@ def build_page(ctx, *, author: str) -> None:
         every = S.load(ctx.store_dir)
         heads = S.heads(every)
         old = kwargs.get("id")
+        # A tail, as rows and agents cite one, read "0 notes": take it as
+        # `symbion show` does, and never pick one of several.
+        hits = [n.id for n in every if filters.id_hit(n.id, old)] if old else []
+        if len(hits) == 1:
+            old = kwargs["id"] = hits[0]
         if old and not S.query(heads, id=old) and S.query(every, id=old):
             # A superseded id, as other rows cite them, read "0 notes": show
             # the row that replaced it, as `symbion show` does.
             kwargs["id"] = api._chain_tip(every, old).id
-        rows = S.query(heads, **kwargs)
+        if len(hits) > 1:
+            tips = {api._chain_tip(every, h).id for h in hits}
+            del kwargs["id"]
+            rows = [n for n in S.query(heads, **kwargs) if n.id in tips]
+        else:
+            rows = S.query(heads, **kwargs)
         if q:
             # An id is not text the pattern reads: a pasted one joins the
             # hits, and a superseded one brings its current row.
@@ -136,10 +176,14 @@ def build_page(ctx, *, author: str) -> None:
             got = {n.id for n in rows}
             rows += [n for n in rest if n.id not in got and n.id in tips]
         rows = S.newest_first(rows)
+        git_head = gitref.head_sha(ctx.cfg)
         shell(ctx, author, [("Notebook", "/"), (filters.describe(kwargs, q), None)], q=q,
               keep=base, here="" if base else "/notes")
         with ui.column().classes("sb-main gap-4"):
-            if kwargs.get("id", old) != old:
+            if len(hits) > 1:
+                ui.label(f"{len(hits)} rows end in -{old}; open the one you mean") \
+                    .classes("text-notable").mark("ambiguous-id")
+            elif kwargs.get("id", old) != old:
                 ui.label(f"{old} was superseded; this is its current row") \
                     .classes("text-notable").mark("superseded-by")
             shown = rows if params.get("all") else rows[:PAGE_ROWS]
@@ -148,7 +192,7 @@ def build_page(ctx, *, author: str) -> None:
             if q:
                 # Name what was read, so a 0 is not taken for "never filed".
                 ui.label(f"{len(rows)} of {summ._count(len(rest), 'note')} match{cut} — "
-                         f"searched body, target, checked, result, refs and ids of "
+                         f"searched body, target, checked, result, refs, tags and ids of "
                          f"current rows").classes("sb-subtitle").mark("result-count")
             else:
                 ui.label(summ._count(len(rows), "note") + cut).classes("sb-subtitle") \
@@ -158,12 +202,49 @@ def build_page(ctx, *, author: str) -> None:
             for n in shown:
                 render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
                             show_target=True, base=base, compact="id" not in kwargs,
-                            hit=q.split())
+                            hit=q.split(), git_head=git_head)
             if len(shown) < len(rows):
                 ui.link(f"+{len(rows) - len(shown)} older not shown — show all",
                         filters.href(**base, all="1")).classes("text-body").mark("show-all")
             if "id" in kwargs and len(rows) == 1:
-                _history(ctx, every, rows[0], author)
+                _history(ctx, every, rows[0], author, git_head)
+
+    @ui.page("/targets")
+    def targets_page():
+        shell(ctx, author, [("Notebook", "/"), ("Targets", None)], here="/targets")
+        git_head = gitref.head_sha(ctx.cfg)
+        newest = S.newest_first(S.heads(S.load(ctx.store_dir)))
+        # Each target with every row on or referencing it, as /object counts
+        # them; first seen is newest, so the dict is in order of activity.
+        on: dict[tuple, list] = {}
+        for n in newest:
+            for t in dict.fromkeys([(n.target.type, n.target.name),
+                                    *((r.type, r.name) for r in n.refs)]):
+                on.setdefault(t, []).append(n)
+        # The cards are open rows on the target itself: a ref's row is
+        # counted, and is a card on its own target's board.
+        live = {t: [n for n in rows if (n.target.type, n.target.name) == t
+                    and S.read_status(n) == "open" and not n.spec.parked]
+                for t, rows in on.items()}
+        # A board for each target a row is ON. One only referenced is a chip
+        # on the rows that cite it: a board each was 165 bare commit shas.
+        on_it = {(n.target.type, n.target.name) for n in newest}
+        own = [t for t in on if t in on_it]
+        subj = gitref.subjects(ctx.cfg, [name for typ, name in own if typ == "commit"])
+
+        def title(typ, name):
+            if typ == "commit" and name in subj:
+                return f"commit: {name[:7]} {summ.clip(subj[name], 60)}"
+            return f"{typ}: {name}" if name else typ
+
+        with ui.column().classes("sb-main gap-5"):
+            ui.label(f"{summ._count(len(own), 'target')} with notes on them, open work first") \
+                .classes("sb-subtitle")
+            for t in sorted(own, key=lambda t: not live[t]):     # stable: newest within
+                to = target_href(*t)
+                _board(ctx, title(*t), live[t], author,
+                       to=to, aside=f"· {summ._count(len(on[t]), 'note')}", more=to,
+                       git_head=git_head, show_target=False)
 
     @ui.page("/tags")
     def tags_page():
@@ -196,12 +277,15 @@ def build_page(ctx, *, author: str) -> None:
         rows = S.heads_for(ctx.store_dir, type, name)
         live = lambda n: S.read_status(n) == "open" and not n.spec.parked   # noqa: E731
         rows.sort(key=lambda n: not live(n))      # stable: newest within each
+        git_head = gitref.head_sha(ctx.cfg)
         with ui.column().classes("sb-main gap-4"):
-            ui.label(f"{len(rows)} notes on or referencing this object") \
-                .classes("sb-subtitle")
+            with ui.row().classes("items-center gap-3"):
+                ui.label(f"{len(rows)} notes on or referencing this object") \
+                    .classes("sb-subtitle")
+                md_button(ctx, name, "read the file")
             for n in rows:
                 render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
-                            compact=not live(n) and bool(n.spec.status))
+                            compact=not live(n) and bool(n.spec.status), git_head=git_head)
 
     @ui.page("/arcs")
     def arcs_page():
@@ -278,7 +362,8 @@ def build_page(ctx, *, author: str) -> None:
                 about = S.heads_for(ctx.store_dir, "arc", id)
                 if about:
                     ui.label("notes about this arc").classes("sb-board-title")
+                    git_head = gitref.head_sha(ctx.cfg)
                     for n in about:
-                        render_note(ctx, n, body.refresh, author=author)
+                        render_note(ctx, n, body.refresh, author=author, git_head=git_head)
 
             body()

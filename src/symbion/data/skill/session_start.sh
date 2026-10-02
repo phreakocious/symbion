@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SessionStart: surface the symbion summary, and never fail a session doing it.
 # An absent store or a broken config is NAMED on stdout, never fatal. An uninstalled symbion
-# prints nothing too -- unless this project's store already exists, where
+# prints nothing too -- unless this project has adopted symbion, where
 # silence would hide exactly the failure this hook is meant to surface.
 # PATH may be empty here, so the store check uses bash builtins only.
 #
@@ -12,35 +12,42 @@
 # symbion project and CLAUDE_PROJECT_DIR naming another, the hook checked one
 # store for existence and printed the OTHER one's summary. A wrong answer that
 # reads as a right one; nothing in the output says which project it is.
-root="${CLAUDE_PROJECT_DIR:-$PWD}"
+root="${SYMBION_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
+# The store belongs to the MAIN worktree, as in config.project_root(): a
+# linked worktree shares it. Deriving it from $root made a session in a linked
+# worktree check `<linked-name>-notes` and exit silent (found 2026-10-02).
+# With no git on PATH, or no repo at $root, it stays $root. `summary` still
+# runs in $root, where HEAD and check state are this worktree's.
+main=$(git -C "$root" worktree list --porcelain 2>/dev/null) && main="${main%%$'\n'*}" && main="${main#worktree }"
+[ -n "$main" ] || main="$root"
 # Same precedence as config.store_dir: SYMBION_DIR, then the `.symbion`
 # pointer beside the project, then the sibling the name implies. `read -r`
 # with the default IFS already trims, and `|| [ -n "$line" ]` catches a file
 # with no trailing newline. A blank pointer must fall through, never resolve
-# to $root itself.
+# to $main itself.
 store="$SYMBION_DIR"
-if [ -z "$store" ] && [ -r "$root/.symbion" ]; then
+if [ -z "$store" ] && [ -r "$main/.symbion" ]; then
   while read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
     case "$line" in
       "~/"*) store="$HOME/${line#"~/"}" ;;
       /*)    store="$line" ;;
-      *)     store="$root/$line" ;;
+      *)     store="$main/$line" ;;
     esac
     break
-  done < "$root/.symbion"
+  done < "$main/.symbion"
 fi
-[ -n "$store" ] || store="$root/../${root##*/}-notes"
 # User-level since 2026-09-24 (registered in ~/.claude/settings.json), so
-# this runs in EVERY project. A store, a `.symbion` pointer or SYMBION_DIR
+# this runs in EVERY project. A store, a nonblank `.symbion` pointer or SYMBION_DIR
 # marks a project that adopted symbion; with none of them it never did and
 # hears nothing. A pointer or SYMBION_DIR naming a store that is not there
 # still reaches `summary`, which names the absence.
-if [ ! -e "$store/notes.jsonl" ] && [ ! -r "$root/.symbion" ] && [ -z "$SYMBION_DIR" ]; then
-  exit 0
+if [ -z "$store" ]; then
+  store="$main/../${main##*/}-notes"
+  [ -e "$store/notes.jsonl" ] || exit 0
 fi
 if ! command -v symbion >/dev/null 2>&1; then
-  [ -e "$store/notes.jsonl" ] && echo "symbion: store exists at $store but 'symbion' is not on PATH -- see Install at https://github.com/phreakocious/symbion"
+  echo "symbion: cannot read store at $store because 'symbion' is not on PATH -- see Install at https://github.com/phreakocious/symbion"
   exit 0
 fi
 cd "$root" 2>/dev/null || true   # a failed cd falls back to cwd; the hook never fails a session

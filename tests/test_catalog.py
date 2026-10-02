@@ -1,4 +1,7 @@
 import os
+import shlex
+import sys
+import time
 
 import pytest
 from symbion import catalog
@@ -64,6 +67,19 @@ def test_command_exceeding_timeout_raises_catalog_error(tmp_path):
     with pytest.raises(catalog.CatalogError):
         catalog.names(c, "thing")
 
+
+def test_a_timeout_kills_the_commands_children_too(tmp_path):
+    """subprocess.run's timeout kills the shell, not what it forked: the child
+    wrote its marker after symbion reported the command killed. The trailing
+    `; true` makes the shell fork rather than exec the child; `sleep 5`
+    above cannot see the difference."""
+    marker = tmp_path / "marker"
+    child = f"import time; time.sleep(0.5); open({str(marker)!r}, 'w')"
+    c = Config(project_root=tmp_path, command_timeout=0.1)
+    with pytest.raises(catalog.CatalogError, match="killed"):
+        catalog.run_configured(c, f"{shlex.quote(sys.executable)} -c {shlex.quote(child)}; true")
+    time.sleep(0.8)
+    assert not marker.exists(), "a child of the timed-out command ran on"
 
 def test_command_under_timeout_still_succeeds(tmp_path):
     """A timeout that only ever fires is not a timeout: prove it does not

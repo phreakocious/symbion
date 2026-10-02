@@ -7,6 +7,7 @@ from datetime import datetime
 from itertools import pairwise, zip_longest
 
 from . import gitref, kinds as K, store as S
+from .gui import servers
 
 ARC_CAP = 10
 PRIORITY_CAP = 10
@@ -170,6 +171,19 @@ def wrote_it(reader, author) -> bool:
     return reader is not None and author not in (reader, "unknown")
 
 
+def who(reader, raised, last) -> dict:
+    """The labels a row prints with: `from` who raised it, and `last` who
+    wrote its newest version when that is someone else. Labelled by the head
+    alone, an amendment relabelled a request: the owner's task, amended by
+    Codex, printed `from codex`, and one the reader amended lost its label
+    (the owner's call, 2026-10-02: name both). A row only the reader touched
+    has no label: `last by` the reader on a row of no one else's is noise."""
+    by = {"from": raised} if wrote_it(reader, raised) else {}
+    if last not in (raised, "unknown") and (by or wrote_it(reader, last)):
+        by["last"] = last
+    return by
+
+
 def starred(notes):
     """#priority notes that have not been explicitly closed.
 
@@ -186,8 +200,8 @@ def starred(notes):
 # The empty state is the onboarding surface:
 # it prints while the store holds zero rows and never again, so it is bounded
 # by store state, not by a session the tool does not keep.
-FIRST_CONTACT = ('no notes yet: symbion add --kind task --type project --body "..."  '
-                 '(agent surface: the symbion skill, ~/.claude/skills/symbion/SKILL.md)')
+FIRST_CONTACT = ('no notes yet: symbion add task --target project --body "..."  '
+                 '(before a write, an agent loads the symbion skill, SKILL.md)')
 
 
 def empty_summary() -> dict:
@@ -219,6 +233,7 @@ def empty_summary() -> dict:
         "no_status_first": None,
         "full": False,
         "rows": 0,
+        "gui": None,
     }
 
 
@@ -252,11 +267,12 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         """One row's fields, the same in every block: a star or a near due
         date moved a row to a block that dropped its `from` and its
         registration date (2026-09-29). The labels are the row's."""
+        root = _root(by_id, n)
         return {"id": n.id, "kind": n.kind,
                 "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
                 "body": clip(n.body, chars),
-                **({"from": n.author} if wrote_it(reader, n.author) else {}),
-                **({"registered": S.shown(_root(by_id, n).created_at)[:10]}
+                **who(reader, root.author, n.author),
+                **({"registered": S.shown(root.created_at)[:10]}
                    if n.spec.status and n.spec.verdict else {}),
                 **({"amendments": k} if (k := _amendments(by_id, n)) else {})}
 
@@ -269,7 +285,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     printed = shown_above | {n.id for n in shown}
     people = S.newest_first(
         n for n in notes if S.read_status(n) == "open" and n.id not in printed
-        and wrote_it(reader, n.author))
+        and (wrote_it(reader, n.author) or wrote_it(reader, _root(by_id, n).author)))
     o_cap = len(people) if full else PEOPLE_CAP
 
     rows = []
@@ -291,6 +307,9 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         # see which one. An absent store answers `empty_summary()`, where this
         # is None; without it the two printed byte-identical JSON at exit 0.
         "store": str(store_dir),
+        # A running `serve`'s URL, so an agent can hand the person a row's
+        # page (the owner, 2026-10-01).
+        "gui": (r := servers.serving(store_dir)) and r["url"],
         "open": open_counts,
         "open_in_arcs": sum(r["open"] for r in rows),
         "arcs": rows[:a_cap],
@@ -387,10 +406,11 @@ def _labelled(paint, r) -> str:
     """A summary row with its own labels: `from <author>`, on a
     pre-registration its registration date, and its amendment count, in
     whichever block it prints."""
-    who = f"from {r['from']} " if r.get("from") else ""
+    by = ", ".join(f"{label} {r[k]}" for label, k in (("from", "from"), ("last by", "last"))
+                   if r.get(k))
     reg = f", registered {r['registered']}" if r.get("registered") else ""
     amd = f", +{_count(r['amendments'], 'amendment')}" if r.get("amendments") else ""
-    return who + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
+    return (by and by + " ") + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
                           label=r["kind"] + reg + amd)
 
 
@@ -428,7 +448,7 @@ def render_summary(d: dict, paint=plain) -> str:
     if d["priority_elided"]:
         out.append("  " + paint(f"+{d['priority_elided']} more priority (--full)", "meta"))
     for p in d.get("people", ()):
-        out.append("  " + _labelled(paint, {**p, "from": p["author"]}))
+        out.append("  " + _labelled(paint, p))
     if d.get("people_elided"):
         out.append("  " + paint(f"+{d['people_elided']} more from others (--full)", "meta"))
     for h in d.get("heads", ()):
@@ -468,6 +488,9 @@ def render_summary(d: dict, paint=plain) -> str:
         # A --full that lifted nothing otherwise prints the default text
         # byte for byte, and the flag reads as dropped.
         out.append("  " + paint("(--full: nothing was elided)", "meta"))
+    if d.get("gui"):
+        out.append(f"  symbion serve: {d['gui']}; when you point the user at a row, "
+                   f"link it: {d['gui']}/notes?id=<id>")
     if d.get("store") and d.get("rows") == 0:
         out.append("  " + FIRST_CONTACT)
     elif d.get("skill"):

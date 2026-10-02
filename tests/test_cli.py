@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -16,6 +17,13 @@ from symbion import summary as summ
 
 _WRITES = {"add", "resolve", "supersede", "commit", "rename"}
 _ARC_WRITES = {("arc", v) for v in ("create", "seed", "rename", "archive")}
+
+
+def _commit(store_dir, capsys):
+    """Commit the store, so the edits after it append: before a commit, an
+    edit by the row's own author rewrites the row (store.rewritable)."""
+    assert run("commit", store_dir=store_dir) == 0
+    capsys.readouterr()
 
 
 def run(*args, store_dir):
@@ -165,6 +173,7 @@ def test_list_grep_searches_whole_bodies_and_names_what_it_hid(tmp_path, capsys)
     old = capsys.readouterr().out.split()[-1]
     run("add", "note", "--target", "project", "--body", "SMTP host in a body", store_dir=tmp_path)
     hid = capsys.readouterr().out.strip()
+    _commit(tmp_path, capsys)
     run("supersede", hid, "--body", "gone", store_dir=tmp_path)
     capsys.readouterr()
 
@@ -180,6 +189,19 @@ def test_list_grep_searches_whole_bodies_and_names_what_it_hid(tmp_path, capsys)
 
     assert run("list", "--grep", "(", store_dir=tmp_path) == 2
     assert "--grep" in capsys.readouterr().err
+
+
+def test_list_grep_reads_tags(tmp_path, capsys):
+    """`--grep gui` missed a row tagged gui whose text never said gui (the
+    owner, 2026-10-02): a writer tags a subject the text does not name."""
+    run("add", "note", "--target", "project", "--body", "the drawer slides over",
+        "--tag", "gui", store_dir=tmp_path)
+    run("add", "note", "--target", "project", "--body", "nothing", store_dir=tmp_path)
+    capsys.readouterr()
+    for pattern in (["gui"], ["#gui", "-F"]):
+        run("list", "--grep", *pattern, "--json", store_dir=tmp_path)
+        got = json.loads(capsys.readouterr().out)
+        assert [r["body"] for r in got] == ["the drawer slides over"], pattern
 
 
 def test_list_grep_takes_a_literal_and_names_a_regex_zero(tmp_path, capsys):
@@ -325,10 +347,16 @@ def test_a_status_write_shows_the_head_session_start_will_print(tmp_path, capsys
              ("add", "idea", "--target", "item:z", "--body", long),
              ("add", "task", "--target", "item:z", "--arc-id", "a", "--body", long),
              ("supersede", c.out.strip(), "--add-tag", "t"),
+             # --append never moves a lead it keeps (fired 3 times, 2026-10-01)
+             ("supersede", c.out.strip(), "--append", "--body", long),
              ("resolve", nid, "--body", long))
     for argv in quiet:
         assert run(*argv, store_dir=tmp_path) == 0, argv
         assert "session start" not in capsys.readouterr().err, argv
+    run("add", "task", "--target", "item:bare", store_dir=tmp_path)
+    bare = capsys.readouterr().out.strip()
+    assert run("supersede", bare, "--append", "--body", long, store_dir=tmp_path) == 0
+    assert head in capsys.readouterr().err, "appended to no body, the text is the lead"
 
     rows = tmp_path / "rows.jsonl"
     rows.write_text("".join(json.dumps({"kind": "task", "body": long,
@@ -624,7 +652,7 @@ def test_reconcile_without_flags_mutates_nothing(tmp_path):
 
 
 def test_init_writes_symbion_toml(repo, tmp_path):
-    assert run("init", store_dir=tmp_path) == 0
+    assert run("init", "--yes", store_dir=tmp_path) == 0
     assert (tmp_path / "symbion.toml").exists()
 
 
@@ -638,12 +666,12 @@ def test_init_that_git_cannot_init_fails_and_leaves_no_partial_git(repo, tmp_pat
            "GIT_CONFIG_VALUE_0": "a..b"}
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    assert run("init", store_dir=s) == 1
+    assert run("init", "--yes", store_dir=s) == 1
     assert "invalid branch name" in capsys.readouterr().err
     assert not (s / ".git").exists()
     for k in env:
         monkeypatch.delenv(k)
-    assert run("init", store_dir=s) == 0                       # a re-run recovers
+    assert run("init", "--yes", store_dir=s) == 0                       # a re-run recovers
     assert subprocess.run(["git", "-C", str(s), "rev-parse", "--git-dir"],
                           capture_output=True, text=True).stdout.strip() == ".git"
 
@@ -1047,6 +1075,23 @@ def test_a_tty_check_row_leads_with_its_result(repo, tmp_path, capsys, tty):
     days = summ.age_days("2026-01-01T00:00:00+00:00")
     head = next(ln for ln in _screen(capsys.readouterr().out) if ln.startswith(old.id[-10:]))
     assert f"item:old  external ({days}d ago)" in head, head
+
+
+def test_a_check_stamped_with_a_non_string_sha_prints(repo, tmp_path, capsys, tty):
+    """A provenance command's object is stored as printed, and `{"sha": 123}`
+    crashed `check_state`, then each reader that sliced the sha: `list`
+    printed a traceback (review, 2026-10-02)."""
+    store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
+    n = store.add(store_dir, kind="check", target={"type": "item", "name": "x"},
+                  checked="c", result="r", provenance={"sha": 123})
+    for argv in (("list",), ("show", n.id)):
+        assert run(*argv, store_dir=store_dir) == 0, argv
+        assert "unverifiable" in capsys.readouterr().out, argv
+    tty()
+    for argv in (("list",), ("show", n.id)):
+        assert run(*argv, store_dir=store_dir) == 0, argv
+        assert "unverifiable" in capsys.readouterr().out, argv
 
 
 def test_show_on_a_tty_prints_the_whole_id_and_every_ref(repo, tmp_path, capsys, tty):
@@ -1795,6 +1840,28 @@ def test_supersede_ref_empty_clears_the_refs(tmp_path, capsys):
     assert store.heads(store.load(tmp_path))[0].refs == ()
 
 
+def test_supersede_add_ref_keeps_the_refs_and_a_replace_names_what_it_dropped(
+        tmp_path, capsys):
+    """`resolve --ref` adds and `supersede --ref` replaces: a session that
+    meant to add a fixing commit with supersede dropped the row's only ref,
+    and nothing said so (2026-10-01). `--add-ref` adds, as `--add-tag` does,
+    and a `--ref` or `--tag` that drops an inherited value names it."""
+    run("add", "--kind", "note", "--type", "item", "--name", "x", "--ref", "item:a",
+        "--tag", "keep", "--tag", "star", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    assert run("supersede", nid, "--add-ref", "item:b", "--add-tag", "new",
+               store_dir=tmp_path) == 0
+    assert "dropping" not in capsys.readouterr().err
+    head = store.heads(store.load(tmp_path))[0]
+    assert [(r.type, r.name) for r in head.refs] == [("item", "a"), ("item", "b")]
+    assert head.tags == ("keep", "new", "star")
+    assert run("supersede", head.id, "--ref", "item:b", "--tag", "keep", "--tag", "new",
+               store_dir=tmp_path) == 0
+    err = capsys.readouterr().err
+    assert "--ref replaced the refs, dropping item:a; --add-ref" in err
+    assert "--tag replaced the tags, dropping 'star'; --add-tag" in err
+
+
 @pytest.mark.parametrize("argv", [
     ["add", "--kind", "note", "--type", "item", "--name", "x", "--ref", "item:x"],
     ["add", "--kind", "note", "--type", "project", "--ref", "project:"],
@@ -2020,6 +2087,7 @@ def test_list_id_resolves_a_superseded_row_and_reports_a_miss(tmp_path, capsys):
     run("add", "--kind", "note", "--type", "project", "--body", "first",
         store_dir=tmp_path)
     nid = capsys.readouterr().out.strip()
+    _commit(tmp_path, capsys)
     run("supersede", nid, "--body", "second", store_dir=tmp_path)
     capsys.readouterr()
 
@@ -2047,6 +2115,7 @@ def test_a_superseded_row_names_the_head_of_its_chain(tmp_path, capsys):
     run("add", "--kind", "bug", "--type", "project", "--body", "b",
         "--due", "2020-01-01", store_dir=tmp_path)
     first = capsys.readouterr().out.strip()
+    _commit(tmp_path, capsys)
     run("supersede", first, "--body", "c", store_dir=tmp_path)
     mid = capsys.readouterr().out.strip()
 
@@ -2353,7 +2422,22 @@ def test_show_is_list_id(tmp_path, capsys):
     assert run("show", "nope", store_dir=tmp_path) == 1
     capsys.readouterr()
     assert run("show", "-h", store_dir=tmp_path) == 0, "was `list --id -h`: an error"
-    assert capsys.readouterr().out.startswith("usage: symbion show [-h] [--json] id")
+    assert capsys.readouterr().out.startswith("usage: symbion show [-h] [--json] id [id ...]")
+
+
+def test_show_takes_several_ids(tmp_path, capsys):
+    """`show A B` failed with `symbion list: error: unrecognized arguments: B`
+    and printed the usage of a verb the caller never typed."""
+    store.ensure_store(tmp_path)
+    ids = []
+    for body in ("a", "b", "c"):
+        run("add", "--kind", "note", "--type", "project", "--body", body, store_dir=tmp_path)
+        ids.append(capsys.readouterr().out.strip())
+    assert run("show", ids[0], ids[2][-10:], "--json", store_dir=tmp_path) == 0
+    assert {r["id"] for r in json.loads(capsys.readouterr().out)} == {ids[0], ids[2]}
+    assert run("show", ids[0], "nope", store_dir=tmp_path) == 1
+    out, err = capsys.readouterr()
+    assert "no note found: nope" in err and "list" not in err.split("(")[0]
 
 
 def test_a_unique_id_tail_stands_for_the_id_on_every_verb_that_takes_one(tmp_store, tmp_path, capsys):
@@ -2592,6 +2676,7 @@ def test_the_status_aliases_stay_out_of_list_help(tmp_path, capsys):
     (["delete", "x"], "append-only: `resolve ID` closes"),
     (["undo"], "append-only"),
     (["edit", "x"], "`supersede ID --body"),
+    (["append", "x"], "`supersede ID --append --body"),   # dogfood, 2026-10-01
     (["close", "x"], "`resolve ID`"),
     (["search", "x"], "`list --grep TEXT`"),
     (["due", "--help"], "`list --overdue`"),         # an adopter's agent, 2026-09-25
@@ -2624,6 +2709,28 @@ def test_a_first_guess_that_fails_names_the_command_that_works(tmp_path, capsys,
     assert says in err, err
 
 
+def test_a_body_that_cites_no_row_says_so(tmp_path, capsys):
+    """Bodies cited rows that did not exist yet, as placeholders
+    (`20990101-123xxx`, a full id of zeros), four times in five days, and
+    each was found only by reading the row back. Never a refusal."""
+    run("add", "task", "--target", "project", "--body", "x", store_dir=tmp_path)
+    real = capsys.readouterr().out.strip()
+    bad = ("20990101-123xxx", "20990102-000000-000000-000", "123456-abc")
+    body = (f"see {real} and …{real[-10:]}, not {bad[0]}, {bad[1]} or `{bad[2]}`; "
+            f"2026-09-27 is a date, {real[:15]} a prefix, 20990101-000000Z a stamp and "
+            f"50000000-byte a size")
+    assert run("add", "note", "--target", "project", "--body", body, store_dir=tmp_path) == 0
+    err = capsys.readouterr().err
+    assert [ln for ln in err.splitlines() if "matches" in ln] == \
+        [f"note: no row in this store matches {b}, cited in the body" for b in bad], err
+    assert run("resolve", real, "--body", "see 654321-fed", store_dir=tmp_path) == 0
+    assert "matches 654321-fed" in capsys.readouterr().err
+    assert run("supersede", real, "--append", "--body", "and 654321-fee",
+               store_dir=tmp_path) == 0
+    err = capsys.readouterr().err
+    assert "matches 654321-fee" in err and "654321-fed" not in err, "only the new text"
+
+
 def test_a_write_to_an_old_id_names_the_row_it_changed(tmp_path, capsys):
     """`supersede b3d --body again` after b3d was superseded replaced the
     newer row's text, and `resolve` on a resolved row replaced its
@@ -2631,6 +2738,7 @@ def test_a_write_to_an_old_id_names_the_row_it_changed(tmp_path, capsys):
     2026-09-26). The fast-forward stays: it is what closes the race."""
     run("add", "bug", "--target", "item:x", "--body", "v1", store_dir=tmp_path)
     old = capsys.readouterr().out.strip()
+    _commit(tmp_path, capsys)
     run("supersede", old, "--body", "v2", store_dir=tmp_path)
     tip = capsys.readouterr().out.strip()
     assert run("supersede", old, "--body", "v3", store_dir=tmp_path) == 0
@@ -2837,6 +2945,7 @@ def test_the_summary_counts_the_amendments_its_line_cannot_show(tmp_path, capsys
                  ["supersede", other, "--body", "v2, rewritten longer"],
                  ["supersede", other, "--add-tag", "x"],
                  ["supersede", first, "--append", "--body", "a first body"]):
+        _commit(tmp_path, capsys)            # each edit its own row
         assert run(*argv, store_dir=tmp_path) == 0
     capsys.readouterr()
     run("summary", store_dir=tmp_path)
@@ -2848,6 +2957,37 @@ def test_the_summary_counts_the_amendments_its_line_cannot_show(tmp_path, capsys
     heads = json.loads(capsys.readouterr().out)["heads"]
     assert {h["target"]: h.get("amendments") for h in heads} == \
         {"item:two": 2, "item:other": None, "item:first": None}
+
+
+def test_from_names_who_raised_a_row_and_last_who_wrote_its_head(tmp_path, capsys,
+                                                                 monkeypatch):
+    """`from <author>` named the head's author, so an amendment relabelled a
+    request: the owner's task, amended by Codex, printed `from codex`, and one
+    the reader amended lost its label, left the block of rows by others, and
+    read as the agent's own (the owner's call, 2026-10-02: name both)."""
+    monkeypatch.setenv("SYMBION_AUTHOR", "claude")
+
+    def add(kind, name, author):
+        run("add", kind, "--target", f"item:{name}", "--body", name, "--author", author,
+            store_dir=tmp_path)
+        return capsys.readouterr().out.strip()
+
+    def append(nid, author):
+        assert run("supersede", nid, "--append", "--body", "more", "--author", author,
+                   store_dir=tmp_path) == 0
+        capsys.readouterr()
+    append(add("task", "relabelled", "alice"), "codex")
+    append(add("idea", "amended-by-me", "alice"), "claude")
+    append(add("idea", "mine-amended", "claude"), "alice")
+    capsys.readouterr()
+    run("summary", store_dir=tmp_path)
+    out = capsys.readouterr().out
+
+    def line(name):
+        return next((ln.strip() for ln in out.splitlines() if f"item:{name} " in ln), "")
+    assert line("relabelled").startswith("from alice, last by codex [task, +1 amendment] "), out
+    assert line("amended-by-me").startswith("from alice, last by claude [idea, +1 amendment] "), out
+    assert line("mine-amended").startswith("last by alice [idea, +1 amendment] "), out
 
 
 def test_a_row_keeps_its_labels_in_every_summary_block(tmp_path, capsys, monkeypatch):
@@ -3253,6 +3393,10 @@ def test_add_says_when_a_catalog_name_is_stored_as_typed(tmp_path, capsys):
                store_dir=tmp_path) == 0
     out, err = capsys.readouterr()
     assert "'src/parsre.py' matches nothing in the file catalog; taken as typed" in err
+    # the likely fix on the same line, as `rename` and arc misses give it
+    assert err.rstrip().endswith("; did you mean 'src/parser.py'?"), err
+    run("list", "--type", "file", "--name", "src/lexer.py", store_dir=tmp_path)    # 0.72
+    assert "did you mean" not in capsys.readouterr().err, "a new file is no typo"
     assert out.strip() == store.load(tmp_path)[-1].id, "stdout is still just the id"
     assert run("add", "--kind", "bug", "--type", "file", "--name", "src/parser.py",
                store_dir=tmp_path) == 0
@@ -3332,6 +3476,22 @@ def test_push_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capfd):
     assert run("push", store_dir=tmp_path) == 1
     assert "no remote: this store exists on one disk" in capfd.readouterr().err
 
+
+def test_commit_counts_its_rows_by_author(tmp_path, capsys):
+    """`commit` takes every pending row under the caller's message, so with
+    two agents on one store a commit named work it did not do (2026-10-02).
+    A `Rows:` trailer says whose rows it holds, and so does the CLI."""
+    run("add", "--kind", "note", "--type", "project", "--body", "x", "--author", "codex",
+        store_dir=tmp_path)
+    for b in ("y", "z"):
+        run("add", "--kind", "note", "--type", "project", "--body", b, "--author", "ada",
+            store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("commit", "-m", "ada's work", store_dir=tmp_path) == 0
+    assert "committed: rows ada 2, codex 1" in capsys.readouterr().out
+    msg = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%B"],
+                         capture_output=True, text=True).stdout
+    assert msg.strip() == "ada's work\n\nRows: ada 2, codex 1", msg
 
 def test_commit_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capsys):
     """The other direction, which printed only `committed` -- the same as a
@@ -3555,7 +3715,7 @@ def test_init_outside_any_git_repo_refuses(tmp_path, monkeypatch, capsys):
     """init installs files beside the project, and there is no project here
     to put them beside."""
     monkeypatch.chdir(tmp_path)
-    assert run("init", store_dir=tmp_path / "s") == 1
+    assert run("init", "--yes", store_dir=tmp_path / "s") == 1
     assert "git repository" in capsys.readouterr().err
     assert not (tmp_path / "s" / "symbion.toml").exists()
 
@@ -3615,6 +3775,7 @@ def test_list_names_what_the_view_hides(tmp_path, capsys):
     for i in range(3):
         run("add", "--kind", "bug", "--type", "item", "--name", f"b{i}", store_dir=tmp_path)
     ids = capsys.readouterr().out.split()
+    _commit(tmp_path, capsys)
     run("resolve", ids[0], store_dir=tmp_path)
     run("supersede", ids[1], "--body", "edited", store_dir=tmp_path)
     capsys.readouterr()
@@ -3840,7 +4001,7 @@ def test_init_with_a_foreign_store_installs_in_the_cwd_and_points_there(two_proj
     """`--dir X init` is how a project is pointed at a store it shares, so
     init never follows the store to its owner."""
     own, other, s = two_projects
-    assert run("init", store_dir=s) == 0
+    assert run("init", "--yes", store_dir=s) == 0
     assert not (other / ".claude").exists(), "init writes no agent files into a project"
     assert not (own / ".claude").exists()
     assert (other / ".symbion").read_text().strip() == "../own-notes"
@@ -3848,12 +4009,14 @@ def test_init_with_a_foreign_store_installs_in_the_cwd_and_points_there(two_proj
 
 def test_init_that_repoints_a_project_says_what_it_replaced(two_projects, capsys):
     """Re-pointing a project's `.symbion` leaves the old store unread from
-    there; the line said `wrote .symbion -> X` and not what X replaced."""
+    there; the line said `wrote .symbion -> X` and not what X replaced. A
+    pointer to a store that is gone is broken already, so no --repoint."""
     own, other, s = two_projects
     (other / ".symbion").write_text("../elsewhere-notes\n")
-    assert run("init", store_dir=s) == 0
-    assert "(was '../elsewhere-notes': that store is no longer read from here)" in \
-        capsys.readouterr().out
+    assert run("init", "--yes", store_dir=s) == 0
+    gone = other.parent.resolve() / "elsewhere-notes"
+    assert f"(was {gone}, where no store is)" in capsys.readouterr().out
+    assert (other / ".symbion").read_text() == "../own-notes\n"
 
 
 @pytest.mark.parametrize("argv", [["list"], ["schema"], ["arc", "list"], ["tags"],
@@ -4054,7 +4217,7 @@ def test_init_inside_a_store_refuses_and_writes_nothing(two_projects, monkeypatc
     monkeypatch.delenv("SYMBION_DIR", raising=False)
     monkeypatch.chdir(s)
     before = sorted(p.name for p in s.iterdir())
-    assert _bare("init") != 0
+    assert _bare("init", "--yes") != 0
     assert sorted(p.name for p in s.iterdir()) == before
     assert not (s.parent / "own-notes-notes").exists()
 
@@ -4118,7 +4281,11 @@ def _doc_flags(text):
     """(command, --flag) for each flag a code span names after a verb: the
     words `symbion <verb> [<arc verb>] … --flag`, or a table row's `<verb> …`.
     A fenced block is read line by line. An inline span may wrap within its
-    paragraph, so it is read as one line; a table row is its own paragraph."""
+    paragraph, so it is read as one line; a table row is its own paragraph.
+    A quoted argument is one word, and is read again as a line of its own:
+    `--checked "pytest --count 50"` names no `--count`, and a toml string
+    that runs `symbion list --json` names its flag. A span whose quotes do
+    not pair is split on spaces."""
     verbs = {"init", "add", "list", "show", "resolve", "supersede", "commit", "rename",
              "tags", "summary", "schema", "context", "arc"}
     arcverbs = {"create", "seed", "list", "todo", "rename", "archive", "reconcile"}
@@ -4128,8 +4295,13 @@ def _doc_flags(text):
         for unit in rows + ["\n".join(ln for ln in para.splitlines() if ln not in rows)]:
             lines += re.findall(r"`([^`]+)`", unit)
     pairs = set()
-    for line in lines:
-        words = line.replace("|", " ").split()
+    while lines:
+        line = lines.pop()
+        try:
+            words = shlex.split(line.replace("|", " "))
+        except ValueError:
+            words = line.replace("|", " ").split()
+        lines += [w for w in words if " " in w]
         for i, w in enumerate(words):
             if w not in verbs or (i and words[i - 1] != "symbion"):
                 continue
@@ -4150,6 +4322,12 @@ def test_the_doc_scan_reads_a_code_span_that_wraps_across_lines():
         {(("resolve",), "--bogus"), (("list",), "--all")}
     # A table row never wraps: an odd backtick in one must not pair with the next row.
     assert _doc_flags("| `a` ` | odd |\n| `list --all` | x |") == {(("list",), "--all")}
+
+
+def test_the_doc_scan_reads_a_quoted_argument_as_one_word():
+    assert _doc_flags('`symbion add check --checked "pytest --count 50"`') == \
+        {(("add",), "--checked")}
+    assert _doc_flags("""`x = "set -e; symbion list --json | jq"`""") == {(("list",), "--json")}
 
 
 @pytest.mark.parametrize("doc", _DOCS, ids=lambda p: p.name)
@@ -4206,3 +4384,61 @@ def test_version_names_the_commit_only_of_a_tracked_checkout(tmp_path):
     venv.mkdir()
     (venv / "cli.py").write_text("x")
     assert "(git" not in cli._version(venv)
+
+
+def test_an_edit_before_a_commit_says_it_changed_the_row_itself(tmp_path, capsys):
+    """An edit by the row's author before `symbion commit` keeps the id
+    (store.rewritable), and the id alone on stdout read as a no-op. The
+    replace note looked up the superseded row, which an edit in place of a
+    first version does not have: StopIteration."""
+    run("add", "task", "--target", "project", "--body", "v1", "--tag", "a", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    assert run("supersede", nid, "--body", "v2", "--tag", "b", store_dir=tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert out.strip() == nid
+    assert f"note: {nid} was not yet committed, so it was edited in place" in err
+    assert "--tag replaced the tags, dropping 'a'" in err
+    _commit(tmp_path, capsys)
+    assert run("supersede", nid, "--body", "v3", store_dir=tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert out.strip() != nid and "edited in place" not in err
+
+
+def test_a_serve_on_the_store_links_ids_at_a_terminal_and_summary_names_it(tmp_path, capsys,
+                                                                           tty):
+    """The owner, 2026-10-01: a running GUI gives links, for the person and
+    for an agent to hand them. At a terminal each id `list`, `show` and
+    `context` print opens its row's page (OSC 8); `summary` names the URL
+    and a row's page. Only the serve on this store counts, and a pipe's
+    line never changes."""
+    import os
+    from symbion.gui import servers
+    store_dir = tmp_path / "store"
+    nid = _add(store_dir, capsys, "task", "--target", "project", "--body", "b")
+    url, page = "http://127.0.0.1:1111", f"http://127.0.0.1:1111/notes?id={nid}"
+    # An imperative: as a URL alone, a briefing agent never linked a row.
+    line = f"  symbion serve: {url}; when you point the user at a row, link it: {url}/notes?id=<id>"
+
+    assert run("summary", store_dir=store_dir) == 0               # no serve yet
+    assert "symbion serve" not in capsys.readouterr().out
+    assert run("summary", "--json", store_dir=store_dir) == 0
+    assert json.loads(capsys.readouterr().out)["gui"] is None
+
+    servers.record(url, store_dir)
+    other = servers._dir() / "other.json"                         # started earlier, elsewhere
+    other.write_text(json.dumps({"pid": os.getpid(), "url": "http://127.0.0.1:2222",
+                                 "store": str(tmp_path.resolve()), "started": 0}))
+    assert run("summary", store_dir=store_dir) == 0
+    assert line in capsys.readouterr().out.splitlines()
+    assert run("summary", "--json", store_dir=store_dir) == 0
+    assert json.loads(capsys.readouterr().out)["gui"] == url
+    assert run("list", store_dir=store_dir) == 0                  # a pipe: no link
+    assert url not in capsys.readouterr().out
+
+    tty()
+    for verb in (("list",), ("show", nid), ("context", "--target", "project")):
+        assert run(*verb, store_dir=store_dir) == 0
+        raw = _ANSI.sub("", capsys.readouterr().out)              # the OSC 8 link stays
+        assert f";{page}\x1b\\{nid[-10:]}\x1b]8;;\x1b\\" in raw, (verb, raw)
+        assert raw.count(page) == 1, ("the id alone, not its whole line", verb, raw)
+        assert "2222" not in raw, (verb, raw)

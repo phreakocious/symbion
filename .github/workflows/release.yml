@@ -1,6 +1,7 @@
 # Publishing a GitHub release builds the sdist and wheel from the tagged tree
 # and uploads them to PyPI through trusted publishing: PyPI trusts this
 # workflow in this repo, in the `pypi` environment, so no token is stored.
+# Nothing builds until the suite passes (test.yml).
 name: release
 
 on:
@@ -8,7 +9,11 @@ on:
     types: [published]
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

@@ -87,6 +87,15 @@ def test_missing_commit_is_unverifiable(repo):
         == ("unverifiable", None)
 
 
+def test_a_stamp_sha_that_is_not_a_string_is_unverifiable(repo):
+    """A provenance command's object is the project's schema, stored as
+    printed: `{"sha": 123}` made the hex check raise TypeError, and every
+    `list` showing that row printed a traceback."""
+    cfg = Config(project_root=repo)
+    for sha in (123, 1.5, True, ["abc1234"], {"a": 1}):
+        assert gitref.check_state(cfg, {"sha": sha}) == ("unverifiable", None), sha
+
+
 def test_commit_that_exists_but_is_not_an_ancestor_of_head_is_diverged(repo):
     """A commit reachable in the repo (so cat-file -e succeeds) with neither
     it nor HEAD an ancestor of the other — a branch tip never merged back,
@@ -141,39 +150,36 @@ def test_a_git_error_reads_unverifiable_not_diverged(repo):
     prov = {"sha": stamp, "dirty": False}
     assert gitref.check_state(cfg, prov) == ("behind", 2)      # the path is reached
     (repo / ".git" / "objects" / mid[:2] / mid[2:]).unlink()
+    # This process keeps what git answered: the two commits still relate so.
+    assert gitref.check_state(cfg, prov) == ("behind", 2)
+    gitref._RELATIONS.clear()                                  # a fresh process
     assert gitref.check_state(cfg, prov) == ("unverifiable", None)
 
 
-def test_an_older_git_that_exits_1_with_an_error_still_reads_unverifiable(repo, monkeypatch):
-    """The test above runs whatever git is installed. git 2.39 (macOS's own)
-    exits 1, not 128, when it cannot read the history, and says `error:` on
-    stderr; read as "no", the missing object showed `diverged` again (found
-    running the suite from the sdist on the system git, 2026-09-29). This
-    replays that contract on the same broken repo: real git, its 128 turned
-    into 1 with the stderr kept. A warning on a real "no" stays a "no"."""
+def test_rows_read_against_one_head_ask_git_once_per_stamp(repo, monkeypatch):
+    """A GUI page of 75 check badges ran about 93 git calls, three quarters
+    of its render (2026-10-01): four a row, HEAD among them every time. Read
+    against one HEAD, each distinct stamp costs one call, and a second read
+    at that HEAD costs none."""
     cfg = Config(project_root=repo)
-    stamp, mid = _run(repo, "rev-parse", "HEAD~1"), _run(repo, "rev-parse", "HEAD")
-    (repo / "f2").write_text("x")
-    _run(repo, "add", "-A")
-    _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c2")
+    first = _run(repo, "rev-parse", "HEAD")
+    for i in (2, 3):
+        (repo / f"f{i}").write_text("x")
+        _run(repo, "add", "-A")
+        _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", f"c{i}")
+    second = _run(repo, "rev-parse", "HEAD~1")
+    calls = []
     real = gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda c, *a: calls.append(a[0]) or real(c, *a))
+    provs = [{"sha": s, "dirty": False} for s in (first, second, first, second, first)]
+    head = gitref.head_sha(cfg)
+    assert [gitref.check_state(cfg, p, head) for p in provs] == \
+        [("behind", 2), ("behind", 1), ("behind", 2), ("behind", 1), ("behind", 2)]
+    assert calls == ["rev-parse", "rev-list", "rev-list"], calls
+    calls.clear()
+    assert gitref.check_state(cfg, provs[0], gitref.head_sha(cfg)) == ("behind", 2)
+    assert calls == ["rev-parse"], calls
 
-    def old_git(c, *args):
-        r = real(c, *args)
-        if args[:2] == ("merge-base", "--is-ancestor") and r.returncode == 128:
-            return subprocess.CompletedProcess(r.args, 1, r.stdout, r.stderr)
-        return r
-    monkeypatch.setattr(gitref, "_git", old_git)
-    (repo / ".git" / "objects" / mid[:2] / mid[2:]).unlink()
-    assert gitref.check_state(cfg, {"sha": stamp, "dirty": False}) == ("unverifiable", None)
-
-    def warns(c, *args):
-        r = real(c, *args)
-        if args[:2] == ("merge-base", "--is-ancestor"):
-            return subprocess.CompletedProcess(r.args, 1, "", "warning: unable to access x\n")
-        return r
-    monkeypatch.setattr(gitref, "_git", warns)          # both directions answer "no"
-    assert gitref.check_state(cfg, {"sha": stamp, "dirty": False}) == ("diverged", None)
 
 def test_a_catalog_miss_says_when_the_path_is_on_the_default_branch(repo, capsys):
     """A catalog runs in the checkout you are in, so a row about a file only
@@ -306,6 +312,25 @@ def test_uncommitted_is_zero_on_a_clean_store(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t",
                     "-c", "user.email=t@t", "commit", "-q", "-m", "base"], check=True)
     assert gitref.uncommitted(tmp_path) == (0, False)
+
+
+def test_a_stash_is_not_an_unpushed_commit(tmp_path):
+    """`--all` counts refs/stash: one stash read as 2 unpushed, and the GUI's
+    push button stayed after every push, which sent nothing."""
+    from symbion import store
+    store.ensure_store(tmp_path)
+    bare = tmp_path / "origin.git"
+    git = lambda *a, cwd=tmp_path: subprocess.run(                     # noqa: E731
+        ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+        check=True, capture_output=True)
+    git("init", "-q", "--bare", str(bare))
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    git("remote", "add", "origin", str(bare))
+    git("push", "-q", "origin", "HEAD")
+    store.add(tmp_path, kind="note", target={"type": "project", "name": None})
+    git("stash", "-q")
+    assert gitref.unpushed(tmp_path) == 0
 
 
 def test_uncommitted_counts_untracked_notes_file(tmp_path):

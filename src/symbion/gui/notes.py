@@ -7,6 +7,7 @@ touches a deleted client (RuntimeError 'client has been deleted').
 """
 from __future__ import annotations
 
+import functools
 import html
 import re
 from contextlib import nullcontext
@@ -14,8 +15,9 @@ from datetime import datetime
 from urllib.parse import quote
 
 from nicegui import ui
+from nicegui.elements.mixins.value_element import ValueElement
 
-from .. import api, gitref, term
+from .. import api, catalog, gitref, term
 from .. import summary as summ
 from .. import store as S
 from .filters import href
@@ -25,16 +27,38 @@ from .filters import href
 # `code-friendly` keeps *asterisk* emphasis and disables underscore emphasis.
 NOTE_MD_EXTRAS = ["fenced-code-blocks", "tables", "code-friendly"]
 
-# store.new_id's shape. Bodies cite rows by id ("settled by <id>"), and the
-# GUI had no way to follow one but pasting it into the search.
-_NOTE_ID = re.compile(r"(?<![\w/=[-])(\d{8}-\d{6}-\d{6}-[0-9a-f]{3})(?![\w-])")
+# store.new_id's shape, or the 10-character tail SKILL.md says to cite.
+# Bodies cite rows by id ("settled by <id>"), and the GUI had no way to
+# follow one but pasting it into the search.
+_NOTE_ID = re.compile(r"(?<![\w/=[-])(\d{8}-\d{6}-\d{6}-[0-9a-f]{3}|\d{6}-[0-9a-f]{3})(?![\w-])")
 _CODE = re.compile(r"(```.*?```|`[^`\n]*`)", re.S)
 
 
-def link_ids(body: str) -> str:
-    """Each full note id in `body` as a markdown link to that note, except
-    inside code, where a link would print as literal brackets."""
-    return "".join(p if i % 2 else _NOTE_ID.sub(r"[\1](/notes?id=\1)", p)
+@functools.lru_cache(maxsize=8)
+def _tails(store_dir: str, _stamp) -> dict:
+    """Each 10-character tail -> the one id in the store that ends in it, or
+    None when several do. `_stamp` is the notes file's mtime and size, so a
+    row written while the server runs is seen on the next render."""
+    out = {}
+    for n in S.load(store_dir):
+        out[n.id[-10:]] = None if n.id[-10:] in out else n.id
+    return out
+
+
+def link_ids(body: str, store_dir) -> str:
+    """Each full note id in `body`, and each tail of a row in this store, as
+    a markdown link to that note, except inside code, where a link would
+    print as literal brackets. A tail of no row here stays text: rows cite
+    other stores' rows too."""
+    def link(m):
+        nid = m[1] if len(m[1]) > 10 else tails().get(m[1])
+        return f"[{m[1]}](/notes?id={nid})" if nid else m[1]
+
+    def tails():
+        st = S.notes_path(store_dir).stat()
+        return _tails(str(store_dir), (st.st_mtime_ns, st.st_size))
+
+    return "".join(p if i % 2 else _NOTE_ID.sub(link, p)
                    for i, p in enumerate(_CODE.split(body)))
 
 
@@ -43,6 +67,16 @@ def kind_class(kind: str) -> str:
     a kind the store declares shares one (2026-10-01; chips by bits before,
     which left `decision` and `idea` uncoloured)."""
     return f"sb-kind-{kind}" if kind in term.KIND else "sb-kind-own"
+
+
+def target_href(type: str, name: str | None) -> str:
+    """A target's own page: an arc's checklist, else the ref-aware object
+    view. `project` has none, so it gets its rows in the filtered view."""
+    if not name:
+        return href(type=type)
+    if type == "arc":
+        return f"/arc?id={quote(name)}"
+    return f"/object?type={quote(type)}&name={quote(name, safe='')}"
 
 
 def target_link(n) -> None:
@@ -56,13 +90,7 @@ def target_link(n) -> None:
         ui.link("project", href(id=n.id)).classes("sb-chip sb-target") \
             .mark("note-target")
         return
-    if n.target.type == "arc":
-        ui.link(f"arc: {n.target.name}",
-                f"/arc?id={quote(n.target.name)}").classes("sb-chip sb-target") \
-            .mark("note-target")
-        return
-    ui.link(f"{n.target.type}: {n.target.name}",
-            f"/object?type={quote(n.target.type)}&name={quote(n.target.name, safe='')}") \
+    ui.link(f"{n.target.type}: {n.target.name}", target_href(n.target.type, n.target.name)) \
         .classes("sb-chip sb-target").mark("note-target")
 
 
@@ -73,7 +101,7 @@ def check_tip(cfg, prov, state, distance) -> str:
     """What the badge was measured against. The chip lit up on hover and a
     click did nothing (the owner, 2026-09-08); `behind N` asks the reader to
     go and look at N commits, so the tip lists them."""
-    sha = (prov or {}).get("sha")
+    sha = S.stamp_sha(prov)
     if not sha or state == "external":
         return ""
     at = f"stamped at {sha[:7]}"
@@ -91,8 +119,8 @@ def check_tip(cfg, prov, state, distance) -> str:
     return f"{at}; {since}:\n" + "\n".join(lines) + more
 
 
-def _check_badge(ctx, n) -> None:
-    state, distance = api.verdict_state(ctx.cfg, n)
+def _check_badge(ctx, n, git_head=None) -> None:
+    state, distance = api.verdict_state(ctx.cfg, n, git_head)
     text = f"{state} {distance}" if state in ("behind", "ahead") else state
     if state == "unverifiable":
         text = f"unverifiable — {api.why_unverifiable(n.provenance)}"
@@ -103,7 +131,7 @@ def _check_badge(ctx, n) -> None:
            "ahead": "sb-chip-notable",
            "diverged": "sb-chip-bad", "unverifiable": "sb-chip-bad"}[state]
     chip = ui.label(text).classes(f"sb-chip {cls}").mark("check-state")
-    if not (n.provenance or {}).get("sha") or state in ("external", "pending"):
+    if not S.stamp_sha(n.provenance) or state in ("external", "pending"):
         return
     # Filled on first hover: a `git log` per badge at render time doubled
     # the cost of a board of checks (45 badges: 1.5s to 2.9s).
@@ -199,9 +227,52 @@ def id_link(n) -> None:
         .tooltip("copy the full id").mark("note-copy-id")
 
 
+def md_path(ctx, name):
+    """The checkout's markdown file `name` names, or None. A target name is
+    typed text, so the file must resolve inside the checkout: `..` and a
+    symlink out of it read nothing."""
+    root = ctx.cfg.work_root
+    if not root or not name or not name.lower().endswith(".md"):
+        return None
+    root = root.resolve()
+    path = (root / name).resolve()
+    return path if path.is_relative_to(root) and path.is_file() else None
+
+
+def md_button(ctx, name, label: str = ""):
+    """A button that shows the markdown file `name` rendered, in a dialog
+    (the owner, 2026-10-02); None when `name` is not one. Read on the click,
+    so the dialog shows the file as it is then."""
+    if md_path(ctx, name) is None:
+        return None
+
+    def _open():
+        path = md_path(ctx, name)
+        try:
+            text = path.read_text(errors="replace") if path else None
+        except OSError:
+            text = None
+        if text is None:
+            ui.notify(f"cannot read {name}", type="warning")
+            return
+        with ui.dialog() as dialog, ui.card().classes("bg-panel sb-md-card"):
+            with ui.row(wrap=False).classes("items-center w-full"):
+                ui.label(name).classes("sb-subtitle sb-mono")     # a path: its case is its name
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close) \
+                    .props('flat dense round size=sm aria-label="close"')
+            ui.markdown(text, extras=NOTE_MD_EXTRAS).mark("md-view")
+        dialog.open()
+
+    return ui.button(label, icon="article", on_click=_open) \
+        .props("flat dense no-caps color=muted aria-label=read"
+               + ("" if label else " round size=xs")) \
+        .tooltip(f"read {name}").mark("md-open")
+
+
 def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                 base: dict | None = None, compact: bool = False, hit=(),
-                actions: bool = True) -> None:
+                actions: bool = True, git_head: str | None = None) -> None:
     """One note row: a card. What it says first, then one line of where it
     points and what it is, the resolve ring on its left and star and edit
     over its corner. Every chip is a link into the filtered view -- that is
@@ -210,7 +281,8 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     it dropped them, 2026-09-25). Off a filtered view a chip starts one.
     `hit` is the search's words: a compact body then shows and marks them.
     `actions=False` drops the buttons: an earlier version is history, and an
-    edit made from it would land on the current row."""
+    edit made from it would land on the current row. `git_head` is
+    gitref.head_sha's, read once by a page of many check badges."""
     def narrow(**kv):
         return href(**{**(base or {}), **kv})
 
@@ -224,8 +296,8 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     with ui.element("div").classes(cls + (" sb-resolvable" if resolvable else "")) \
             .props(f"data-id={n.id}").mark("note-row"):
         with ui.element("div").classes("sb-note-main"):
-            _note_content(n, compact, hit)
-            _note_foot(ctx, n, status, narrow, show_target)
+            _note_content(ctx, n, compact, hit)
+            _note_foot(ctx, n, status, narrow, show_target, git_head)
         # On the right, after the text: on the left it pushed an open row's
         # text in past a closed row's (the owner, 2026-10-01).
         if resolvable:
@@ -259,7 +331,7 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                     .tooltip("supersede / edit").mark("note-edit")
 
 
-def _note_content(n, compact: bool, hit) -> None:
+def _note_content(ctx, n, compact: bool, hit) -> None:
     """The body, the verdict, measurements and evidence: what the row says."""
     if n.spec.verdict:
         # Clipped on a board like the body: a check's `checked` ran to
@@ -282,7 +354,7 @@ def _note_content(n, compact: bool, hit) -> None:
             else:
                 ui.label(text).classes("sb-note-text")
     elif n.body:
-        ui.markdown(link_ids(n.body), extras=NOTE_MD_EXTRAS)   # sanitize=True default
+        ui.markdown(link_ids(n.body, ctx.store_dir), extras=NOTE_MD_EXTRAS)   # sanitize=True default
     if n.measurements:
         with ui.row().classes("gap-3 flex-wrap").mark("measurements"):
             for k, v in n.measurements.items():
@@ -293,7 +365,7 @@ def _note_content(n, compact: bool, hit) -> None:
         ui.label("evidence: " + ", ".join(n.evidence)).classes("sb-note-meta")
 
 
-def _note_foot(ctx, n, status, narrow, show_target: bool) -> None:
+def _note_foot(ctx, n, status, narrow, show_target: bool, git_head) -> None:
     """One wrapping line: what kind and state the row is and where it points
     on the left; who wrote it, when, and its id on the right."""
     with ui.element("div").classes("sb-note-foot"):
@@ -304,9 +376,10 @@ def _note_foot(ctx, n, status, narrow, show_target: bool) -> None:
         if status:
             ui.link(status, narrow(status=status)).classes(f"sb-chip sb-chip-{status}")
         if n.spec.verdict:
-            _check_badge(ctx, n)
+            _check_badge(ctx, n, git_head)
         if show_target:
             target_link(n)
+            md_button(ctx, n.target.name)
         if n.arc_id:
             ui.link(f"arc: {n.arc_id}", f"/arc?id={quote(n.arc_id)}") \
                 .classes("sb-chip sb-target").mark("note-arc")
@@ -314,6 +387,7 @@ def _note_foot(ctx, n, status, narrow, show_target: bool) -> None:
             ui.link(f"↗ {summ.ref_label(r)}",
                     f"/object?type={quote(r.type)}&name={quote(r.name or '', safe='')}") \
                 .classes("sb-chip sb-ref").mark("note-ref")
+            md_button(ctx, r.name)
         for t in n.tags:
             ui.link(f"#{t}", narrow(tag=t)).classes("sb-tag").mark(f"tag-{t}")
         with ui.element("span").classes("sb-note-by"):
@@ -328,12 +402,23 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
     status+verdict row: the result is required and the row closes on save."""
     with ui.dialog() as dialog, ui.card().classes("bg-panel"):
         ui.label("resolve — the result is the verdict" if resolving
+                 else "edit — not yet committed, so the row itself changes"
+                 if api.rewritable(ctx, n.id, author=author)
                  else "supersede — the old row is kept").classes("sb-stat-label")
         body = ui.textarea("body", value=n.body).props("outlined") \
             .classes("min-w-[420px]").mark("edit-body")
-        tags = ui.input("tags", value=", ".join(n.tags)).props("dense outlined") \
-            .classes("w-full").mark("edit-tags")
-        tidy_tags(tags)
+        # Most edits add to a row, and the body's end was a scroll away (the
+        # owner, 2026-10-01). A resolve's field is the result: no focus here.
+        more = ui.textarea("add after the body").props(
+            "outlined autogrow" + ("" if resolving else " autofocus")) \
+            .classes("w-full").mark("edit-append")
+        # The star beside the tags, so an edit and a star are one write, not
+        # two (the owner, 2026-10-02). The switch holds `priority`; the field
+        # the rest, and a `priority` typed there still counts.
+        with ui.row(wrap=False).classes("items-center gap-2 w-full"):
+            tags = tags_field(ctx, ", ".join(t for t in n.tags if t != "priority")) \
+                .classes("col").mark("edit-tags")
+            pri = ui.switch("priority", value="priority" in n.tags).mark("edit-priority")
         # Attaching an EXISTING note to an arc has no other route: seeding
         # mints new tasks, and target/provenance are the only two fields
         # supersede refuses. This is the one.
@@ -362,13 +447,25 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                 ui.notify("a result is required to resolve this kind", type="warning")
                 return
             harvested, cleaned = api.harvest_hashtags(body.value or "")
+            more_tags, added = api.harvest_hashtags(more.value or "")
+            if not added.strip():
+                text = {"body": cleaned}
+            elif body.value == n.body:
+                # After the CURRENT row's body, read under the lock, as
+                # `supersede --append` does: a revision made since this
+                # dialog opened is kept.
+                text = {"append_body": added}
+            else:
+                text = {"body": S.appended(cleaned, added)}
             verdict = {"checked": checked.value or None,
                        "result": res.value or None} if checked is not None else {}
             closing = {"status": "resolved"} if resolving else {}
             dated = {"due": (due.value or "").strip() or None} if due is not None else {}
             try:
-                api.supersede(ctx, n.id, author=author, body=cleaned,
-                              tags=list(dict.fromkeys(split_tags(tags.value) + harvested)),
+                api.supersede(ctx, n.id, author=author, **text,
+                              tags=list(dict.fromkeys(split_tags(tags.value) + harvested
+                                                      + more_tags
+                                                      + (["priority"] if pri.value else []))),
                               arc_id=arc.value or None, **verdict, **closing, **dated)
             except ValueError as e:
                 ui.notify(str(e), type="negative")
@@ -376,6 +473,9 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             dialog.close()
             refresh()
 
+        for field in (body, more):
+            field.on("keydown.meta.enter", _save)
+            field.on("keydown.ctrl.enter", _save)
         with ui.row():
             ui.button("save", on_click=_save).props("unelevated color=primary") \
                 .mark("edit-save")
@@ -391,8 +491,11 @@ def split_tags(value: str) -> list:
 
 def tidy_tags(field) -> None:
     """On blur, the field shows the list it will store: a `#` typed there
-    stayed on screen though the save dropped it (the owner, 2026-10-01)."""
+    stayed on screen though the save dropped it (the owner, 2026-10-01).
+    A `#` key never lands at all: until the blur, a person could not tell
+    whether it would be part of the tag (the owner, again)."""
     field.on("blur", lambda: field.set_value(", ".join(split_tags(field.value))))
+    field.on("keydown", js_handler="(e) => { if (e.key === '#') e.preventDefault(); }")
 
 
 def arc_options(ctx) -> dict:
@@ -405,13 +508,79 @@ def arc_options(ctx) -> dict:
     return opts
 
 
+class Suggest(ValueElement, component="suggest.js"):
+    """Free text with `options` offered as you type (suggest.js). The value
+    is what was typed, or the option picked. With `tokens` the text is a
+    list, and the menu completes its last word."""
+    VALUE_PROP = "value"            # as NiceGUI's input: see suggest.js
+    LOOPBACK = False                # the browser holds the text; no echo
+
+    def __init__(self, value: str, options: list, *, tokens: bool = False) -> None:
+        super().__init__(value=value, on_value_change=None)
+        self._props["options"] = options
+        self._props["tokens"] = tokens
+
+    def set_options(self, options: list) -> None:
+        self._props["options"] = options
+        self.update()
+
+
+def tags_field(ctx, value: str = ""):
+    """A tags field that offers the store's tags as a word is typed, the
+    most used first (the owner, 2026-10-01)."""
+    counts = S.tag_counts(S.load(ctx.store_dir))
+    field = Suggest(value, sorted(counts, key=lambda t: (-counts[t], t)), tokens=True) \
+        .props("dense outlined options-dense label=tags")
+    tidy_tags(field)
+    return field
+
+
+def target_names(ctx, typ: str) -> list:
+    """What the name field offers for `typ`: the catalog's names for a catalog
+    type, else the names this store's rows have used for it, newest first. A
+    catalog that fails offers the store's names: the write reports its error."""
+    # ponytail: runs the catalog on the event loop, as api.add does at every
+    # GUI write: 22 ms for `git ls-files`, 170 ms for the slowest adopter
+    # catalog (2026-10-02). If one is slow, run both under `run.io_bound`.
+    if typ in ctx.cfg.catalogs:
+        try:
+            return catalog.names(ctx.cfg, typ, allow_empty=True)
+        except catalog.CatalogError:
+            pass
+    used = [o for n in S.newest_first(S.load(ctx.store_dir)) for o in (n.target, *n.refs)
+            if o.type == typ and o.name]
+    return list(dict.fromkeys(o.name for o in used))
+
+
 def add_form(ctx, target_type, target_name, refresh, *, author: str,
-             arc_id: str | None = None) -> None:
+             arc_id: str | None = None, another=None) -> None:
     """Writes go through api.add, which canonicalizes the target name, stamps
     provenance on checks, and takes author keyword-only. `arc_id` is the arc
-    the form starts on."""
+    the form starts on. With `another`, Shift Enter adds the note and keeps
+    the form, cleared, for the next one, and calls `another` in place of
+    `refresh`. The target starts on (target_type, target_name), and the
+    header changes it: the GUI put a note only on the project or on the page's
+    object (the owner, 2026-10-01). Not an arc: the arc select puts a note in one."""
     kinds = ctx.kinds
     labels = list(kinds)
+    types = ["project", *sorted(ctx.target_types - {"project", "arc"})]
+    if target_type not in types:
+        types.append(target_type)
+    with ui.row().classes("items-center gap-2 w-full"):
+        ui.label("new note on").classes("sb-stat-label")
+        on_type = ui.select(types, value=target_type) \
+            .props('dense outlined options-dense aria-label="target type"').mark("note-on-type")
+        # The name in its own case: a label's capitals rewrote a path. Any
+        # part of a name matches, and a new one is typed freely.
+        offer = lambda typ: target_names(ctx, typ) if typ != "project" else []   # noqa: E731
+        on_name = Suggest(target_name or "", offer(target_type)) \
+            .props('dense outlined options-dense placeholder=name aria-label="target name"') \
+            .classes("col").style("min-width:160px").mark("note-on-name")
+        on_name.bind_visibility_from(on_type, "value", backward=lambda v: v != "project")
+        on_type.on_value_change(lambda e: on_name.set_options(offer(e.value)))
+        ui.space()
+        ui.label("⌘/Ctrl Enter adds it" + (" · Shift Enter adds another" if another else "")
+                 + " · Esc closes").classes("sb-subtitle")
     # The body first, then one toolbar: what the note says is the field a
     # person came to type in, and the rest are settings on it.
     with ui.element("div").classes("sb-composer"):
@@ -436,10 +605,10 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
             due = ui.input("due", placeholder="YYYY-MM-DD").props("dense outlined") \
                 .classes("w-[130px]").mark("note-due")
             due.bind_visibility_from(kind, "value", backward=lambda v: kinds[v].status)
-            tags = ui.input("tags").props("dense outlined").classes("col sb-compose-tags") \
+            tags = tags_field(ctx).classes("col sb-compose-tags") \
                 .style("min-width:120px").mark("note-tags")
-            tidy_tags(tags)
-            add = ui.button("Add note").props("unelevated color=primary").mark("note-add")
+            add = ui.button().props("unelevated color=primary").mark("note-add")
+            add.bind_text_from(kind, "value", backward=lambda v: f"Add {v}")
 
         # Harvested tags are ADDED to the field, never silently replace what was
         # typed there; `seen` is what the last harvest contributed, so a tag the
@@ -457,15 +626,19 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
 
         body.on_value_change(lambda _: _sync())
 
-        def _submit():
+        def _submit(next_one=False):
             named, cleaned = api.harvest_kind(body.value or "", kinds)
             kind.value = named or kind.value
             harvested, cleaned = api.harvest_hashtags(cleaned)
             if not cleaned and not kinds[kind.value].verdict:   # `!task` alone says nothing
                 ui.notify("empty note", type="warning")
                 return
+            name = (on_name.value or "").strip() if on_type.value != "project" else None
+            if name == "":
+                ui.notify(f"name the {on_type.value} this note is on", type="warning")
+                return
             row = {"kind": kind.value,
-                   "target": {"type": target_type, "name": target_name},
+                   "target": {"type": on_type.value, "name": name},
                    "body": cleaned,
                    "arc_id": arc.value or None,
                    "tags": list(dict.fromkeys(split_tags(tags.value) + harvested))}
@@ -475,15 +648,22 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
             if kinds[kind.value].status:
                 row["due"] = (due.value or "").strip() or None
             try:
-                api.add(ctx, row, author=author)
+                added = api.add(ctx, row, author=author)
             except ValueError as e:            # ambiguous name, bad ref type
                 ui.notify(str(e), type="negative")
                 return
             body.value = checked.value = result.value = tags.value = due.value = ""
             seen.clear()
-            refresh()
+            if next_one:
+                ui.notify(f"added {short_id(added.id)}; write the next", type="positive")
+                another()
+            else:
+                refresh()
 
         add.on_click(_submit)
-        add.tooltip("or ⌘/Ctrl + Enter in the body")
         body.on("keydown.meta.enter", _submit)
         body.on("keydown.ctrl.enter", _submit)
+        if another:
+            # `prevent` last: Vue runs the guards in order, and before
+            # `shift` it would take the newline from a plain Enter too.
+            body.on("keydown.shift.enter.exact.prevent", lambda: _submit(next_one=True))

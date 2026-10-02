@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
-from . import catalog
+from . import catalog, store
 
 
 def _git(cfg_or_path, *args):
@@ -14,8 +15,7 @@ def _git(cfg_or_path, *args):
     is deliberately the MAIN checkout -- see config.project_root). A bare
     path (as `uncommitted(store)` passes) has neither attribute and is used
     as-is."""
-    root = getattr(cfg_or_path, "work_root", None) or \
-        getattr(cfg_or_path, "project_root", cfg_or_path)
+    root = _root(cfg_or_path)
     if root is None:
         # A store named from outside any repository (api.resolve): every git
         # question answers as it does for a departed sha -- a failed run --
@@ -23,6 +23,11 @@ def _git(cfg_or_path, *args):
         return subprocess.CompletedProcess(["git", *args], 128, "", "not a git repository")
     return subprocess.run(["git", "-C", str(root), *args],
                           capture_output=True, text=True)
+
+
+def _root(cfg_or_path):
+    return getattr(cfg_or_path, "work_root", None) or \
+        getattr(cfg_or_path, "project_root", cfg_or_path)
 
 
 def canonical_commit(cfg, ref: str) -> str:
@@ -121,22 +126,23 @@ def provenance_stamp(cfg, spec):
             **({"dirty_count": len(paths), "dirty_paths": paths[:20]} if paths else {})}
 
 
-def _is_ancestor(cfg, a, b):
-    """True, False, or None when git cannot answer (a missing object between
-    the two). `--is-ancestor` exits 1 for "no" and 128 when it cannot read
-    the history, but git 2.39 exits 1 for both and says so on stderr: only
-    a 1 with no `error:` or `fatal:` line is a "no"."""
-    r = _git(cfg, "merge-base", "--is-ancestor", a, b)
-    if r.returncode == 0:
-        return True
-    if r.returncode == 1 and not any(ln.startswith(("error:", "fatal:"))
-                                     for ln in r.stderr.splitlines()):
-        return False
-    return None
+_HEX = re.compile(r"[0-9a-fA-F]{4,64}")
+# (repo, stamp, HEAD) -> (state, distance). Two commits relate the same way
+# for good, so a long-running `serve` asks git once per stamp per HEAD. A
+# failure is not kept: a fetch can bring the missing object.
+# ponytail: grows by one entry per stamp per HEAD a process sees; bound it if
+# a serve's memory ever shows it.
+_RELATIONS: dict = {}
 
 
-def check_state(cfg, prov):
-    """(state, distance). `dirty` outranks every sha relationship.
+def head_sha(cfg) -> str:
+    """HEAD's full id; "" on an unborn branch or outside a repository."""
+    return _git(cfg, "rev-parse", "--verify", "-q", "HEAD").stdout.strip()
+
+
+def check_state(cfg, prov, head: str | None = None):
+    """(state, distance). `dirty` outranks every sha relationship. `head` is
+    head_sha(cfg), passed by a caller that reads many rows against one HEAD.
 
     `behind N` and `ahead N` are the two sides of one line of development:
     the stamp is N commits back from this HEAD, or N commits past it.
@@ -151,35 +157,44 @@ def check_state(cfg, prov):
     something outside the tree, so no commit or edit bears on it."""
     if prov and prov.get("external"):
         return ("external", None)
-    if not prov or not prov.get("sha"):
+    if not store.stamp_sha(prov):
         return ("unverifiable", None)
     if prov.get("dirty"):
         return ("unverifiable", None)
-    # Peeled to the full id, which the stamp must begin: a ref resolves too,
-    # and the literal `HEAD` an unborn branch once stamped read `behind 0`.
-    sha = _git(cfg, "rev-parse", "--verify", "-q", "--end-of-options",
-               f"{prov['sha']}^{{commit}}").stdout.strip()
-    if not sha.startswith(prov["sha"]):
-        return ("unverifiable", None)          # rebased away, squashed, shallow; a ref
-    head = _git(cfg, "rev-parse", "--verify", "-q", "HEAD").stdout.strip()
-    if sha == head:
-        return ("current", 0)
-    up = _is_ancestor(cfg, sha, "HEAD")
-    if up is False:
-        down = _is_ancestor(cfg, head, sha)
-        if down:
-            # HEAD is an ancestor of the stamp: the SAME line, read from a
-            # checkout that lags it. A dated baseline stamped on the default
-            # branch read `diverged` -- "another line of development" -- from
-            # every worktree behind it (2026-09-28).
-            n = _git(cfg, "rev-list", "--count", f"HEAD..{sha}").stdout.strip()
-            return ("ahead", int(n))
-        if down is False:
-            return ("diverged", None)          # another line of development
-    if up is not True:
+    # A commit id, never a ref: the literal `HEAD` an unborn branch once
+    # stamped read `behind 0` for good.
+    stamp = prov["sha"]
+    if not _HEX.fullmatch(stamp):
         return ("unverifiable", None)
-    n = _git(cfg, "rev-list", "--count", f"{sha}..HEAD").stdout.strip()
-    return ("behind", int(n))
+    head = head_sha(cfg) if head is None else head
+    if not head:
+        return ("unverifiable", None)
+    key = (str(_root(cfg)), stamp, head)
+    if key in _RELATIONS:
+        return _RELATIONS[key]
+    # One walk answers every state: the commits only the stamp reaches, and
+    # those only HEAD reaches. It took four git calls a row, three quarters
+    # of a GUI page's render (2026-10-01).
+    r = _git(cfg, "rev-list", "--left-right", "--count", f"{stamp}^{{commit}}...{head}", "--")
+    try:
+        only_stamp, only_head = map(int, r.stdout.split())
+    except ValueError:
+        only_stamp = only_head = None
+    if r.returncode or only_stamp is None:
+        # Rebased away, squashed, shallow; an object missing between the two.
+        return ("unverifiable", None)
+    if only_stamp and only_head:
+        state = ("diverged", None)             # another line of development
+    elif only_stamp:
+        # HEAD is an ancestor of the stamp: the SAME line, read from a
+        # checkout that lags it. A dated baseline stamped on the default
+        # branch read `diverged` -- "another line of development" -- from
+        # every worktree behind it (2026-09-28).
+        state = ("ahead", only_stamp)
+    else:
+        state = ("behind", only_head) if only_head else ("current", 0)
+    _RELATIONS[key] = state
+    return state
 
 
 def branch_commits(cfg, ref: str, since: str | None = None) -> set:
@@ -259,31 +274,34 @@ def unpushed(store) -> int | None:
     """Local commits on no remote-tracking ref, or None when the store has
     no remote at all.
 
-    `--all --not --remotes`, never `@{u}..`: a branch with NO upstream makes
-    the latter error and print nothing, which piped to a count reads as
-    "0 unpushed" (measured 2026-09-17: local-only commits read as 0).
-    With no remote the negation is empty and every commit would count, so
-    that case is None -- "nowhere to push", not a number."""
+    `--branches --not --remotes`, never `@{u}..`: a branch with NO upstream
+    makes the latter error and print nothing, which piped to a count reads as
+    "0 unpushed" (measured 2026-09-17: local-only commits read as 0). Not
+    `--all`: it counts refs/stash, and one stash read as 2 unpushed that no
+    push could send. With no remote the negation is empty and every commit
+    would count, so that case is None -- "nowhere to push", not a number."""
     store = Path(store)
     if not _git(store, "remote").stdout.strip():
         return None
-    out = _git(store, "rev-list", "--count", "--all", "--not", "--remotes").stdout.strip()
+    out = _git(store, "rev-list", "--count", "--branches", "--not", "--remotes").stdout.strip()
     return int(out) if out.isdigit() else None
 
 
-def set_upstream(store) -> str | None:
+def set_upstream(store, write: bool = True) -> str | None:
     """Point the store's branch at origin/<branch> when it tracks nothing and
     an `origin` exists, so a bare `git push` works. `git push origin --all`
     sets no upstream (measured 2026-09-22: a later bare push did nothing),
     and `--set-upstream-to` refuses until the remote branch has been fetched,
     so this writes the two config keys `push -u` writes. Returns the
-    upstream it set, else None."""
+    upstream it set (or, with `write=False`, would set), else None."""
     store = Path(store)
     if "origin" not in _git(store, "remote").stdout.split():
         return None
     branch = _git(store, "symbolic-ref", "--short", "HEAD").stdout.strip()
     if not branch or _git(store, "config", "--get", f"branch.{branch}.remote").returncode == 0:
         return None
+    if not write:
+        return f"origin/{branch}"
     _git(store, "config", f"branch.{branch}.remote", "origin")
     _git(store, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
     return f"origin/{branch}"

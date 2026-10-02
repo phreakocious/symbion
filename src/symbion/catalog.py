@@ -2,7 +2,10 @@
 it. A resolver is a command too: it replaces the match rule for one type."""
 from __future__ import annotations
 
+import contextlib
+import difflib
 import os
+import signal
 import subprocess
 import sys
 import unicodedata
@@ -50,19 +53,30 @@ def run_configured(cfg, cmd: str, input: str | None = None):
         raise CatalogError(
             f"no git repository at {os.getcwd()}: a configured command runs in the "
             f"project's worktree, and this store was named from outside one: {cmd}")
-    io = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
     env = dict(os.environ)
     if getattr(cfg, "store", None) is not None:
         env["SYMBION_DIR"] = str(cfg.store)
-    try:
-        return subprocess.run(
-            cmd, shell=True, cwd=str(cfg.work_root), env=env,
-            capture_output=True, text=True, **io,
-            timeout=getattr(cfg, "command_timeout", None) or DEFAULT_COMMAND_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        raise CatalogError(
-            f"command exceeded its timeout and was killed: {cmd}") from None
+    # Its own session, so a timeout kills what the shell forked too:
+    # subprocess.run's timeout kills only the shell, and its children ran on
+    # after the error said killed (found 2026-10-02). Out of the terminal's
+    # process group, the command no longer sees a Ctrl-C, so any exit kills it.
+    # ponytail: a child that calls setsid() itself escapes; a cgroup would not.
+    with subprocess.Popen(
+            cmd, shell=True, cwd=str(cfg.work_root), env=env, text=True,
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as p:
+        try:
+            out, err = p.communicate(
+                input, timeout=getattr(cfg, "command_timeout", None) or DEFAULT_COMMAND_TIMEOUT)
+        except BaseException as e:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            if isinstance(e, subprocess.TimeoutExpired):
+                raise CatalogError(
+                    f"command exceeded its timeout and was killed: {cmd}") from None
+            raise
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
 
 def _lines(stdout: str) -> list[str]:
@@ -176,8 +190,12 @@ def match(cfg, target_type: str, query: str, candidates) -> str:
         from . import gitref            # late: gitref imports this module
         b = gitref.only_on_default_branch(cfg, got)
         where = f"; it is on {b}, not in this worktree" if b else ""
+        # 0.9: a typo scored 0.97 to 0.98 against its file in this repo, and a
+        # new file 0.84 against its siblings, which share its directory.
+        near = difflib.get_close_matches(got, candidates, n=3, cutoff=0.9)
+        guess = f"; did you mean {', '.join(map(repr, near))}?" if near else ""
         print(f"note: {got!r} matches nothing in the {target_type} catalog; "
-              f"taken as typed{where}", file=sys.stderr)
+              f"taken as typed{where}{guess}", file=sys.stderr)
     elif got != nfc(query):
         # A non-exact pick is never silent:
         # `--name foo` landing on src/foo_test.py must be visible to undo.

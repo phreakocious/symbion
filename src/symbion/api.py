@@ -135,19 +135,23 @@ def _git_user_name() -> str:
 
 
 def author_default() -> str:
-    """The CLI rule: SYMBION_AUTHOR > "claude" if CLAUDECODE > git user.name >
-    "user". CLAUDECODE=1 is set in the agent's shell, which makes CLI
-    attribution self-configuring."""
+    """The CLI rule: SYMBION_AUTHOR > "codex" if CODEX_THREAD_ID > "claude" if
+    CLAUDECODE > git user.name > "user". Each agent sets its marker in the
+    shell it runs commands in, which makes CLI attribution self-configuring.
+    Codex comes first: a Codex launched from a Claude Code session inherits
+    CLAUDECODE, and the innermost agent is the one writing."""
     if os.environ.get("SYMBION_AUTHOR"):
         return os.environ["SYMBION_AUTHOR"]
+    if os.environ.get("CODEX_THREAD_ID"):
+        return "codex"
     if os.environ.get("CLAUDECODE"):
         return "claude"
     return _git_user_name() or "user"
 
 
 def gui_author() -> str:
-    """The GUI rule: SYMBION_AUTHOR > git user.name > "user", CLAUDECODE
-    deliberately NOT consulted.
+    """The GUI rule: SYMBION_AUTHOR > git user.name > "user", the agent
+    markers (CLAUDECODE, CODEX_THREAD_ID) deliberately NOT consulted.
 
     The explorer is the human's interface, so the identity is a property of
     the surface, not of the environment. `symbion serve` is launched from the
@@ -306,7 +310,7 @@ def harvest_hashtags(body: str):
     harvest in an editable field, so a wrong one is visible and removable
     rather than silent; tighten only if that proves annoying in practice.
     """
-    return _harvest(body, _HASHTAG, lambda tag: not _HEX6.match(tag))   # a hex is a colour
+    return _harvest(body, _HASHTAG, lambda tag: None if _HEX6.match(tag) else tag)  # a colour
 
 
 # `!task` names the row's kind as `#gui` names a tag, with the same guards.
@@ -316,19 +320,26 @@ _BANG = re.compile(r"(?<![\w/&!])!([A-Za-z][\w-]*)")
 
 def harvest_kind(body: str, kinds):
     """`("!task fix it", kinds)` -> `("task", "fix it")`: the first kind of
-    `kinds` the body names, or None, and the body without every one."""
-    found, out = _harvest(body, _BANG, lambda k: k in kinds)
+    `kinds` the body names, or None, and the body without every one. A name
+    cut short counts while it starts one kind alone: `!b` is `bug`, and with
+    `task` and `tame` declared, `!ta` is prose."""
+    def kind(name):
+        if name in kinds:
+            return name
+        hits = [k for k in kinds if k.startswith(name)]
+        return hits[0] if len(hits) == 1 else None
+    found, out = _harvest(body, _BANG, kind)
     return (found[0] if found else None), out
 
 
-def _harvest(body, rx, take):
-    """Each distinct name `rx` finds outside code and `take` accepts, and the
-    body without them."""
+def _harvest(body, rx, name_of):
+    """Each distinct name `rx` finds outside code that `name_of` maps to a
+    name (None skips it), and the body without them."""
     masked = _CODE.sub(lambda m: " " * len(m.group(0)), body or "")
     spans, tags = [], []
     for m in rx.finditer(masked):
-        tag = m.group(1)
-        if not take(tag):
+        tag = name_of(m.group(1))
+        if not tag:
             continue
         spans.append(m.span())
         if tag not in tags:
@@ -462,17 +473,18 @@ def seed_names(ctx: Ctx, scope: str, names) -> list[str]:
 
 
 # ---- provenance reporting ----
-def verdict_state(cfg, n) -> tuple[str, int | None]:
+def verdict_state(cfg, n, head: str | None = None) -> tuple[str, int | None]:
     """A verdict row's (state, distance). An open status+verdict row with
     no result is `pending`: its stamp is where it was registered, before the
     run, and `current` against that stamp read as run (2026-09-29). The
     result, not the open status, is the evidence of a run: two adopter
     stores keep finished verifications open under a two-bit kind, and those
     ran at their stamp. `resolve` restamps a pre-registration, and from then
-    on it reads as any check does."""
+    on it reads as any check does. `head` is gitref.head_sha's, for a
+    caller that reads many rows against one HEAD."""
     if n.spec.status and store.read_status(n) == "open" and not store.has_result(n.result):
         return ("pending", None)
-    return gitref.check_state(cfg, n.provenance)
+    return gitref.check_state(cfg, n.provenance, head)
 
 
 def why_unverifiable(prov) -> str:
@@ -481,7 +493,7 @@ def why_unverifiable(prov) -> str:
     this the GUI badge cannot say WHY, and a dirty stamp -- the check's own
     claim made against a tree nobody can reconstruct -- reads identically to
     a squashed sha."""
-    if not prov or not prov.get("sha"):
+    if not store.stamp_sha(prov):
         return "no provenance"
     if prov.get("dirty"):
         return "dirty tree"
@@ -510,6 +522,14 @@ def _chain_tip(notes, note_id: str) -> store.Note:
         seen.add(nxt.id)
         cur = nxt
     return cur
+
+
+def rewritable(ctx: Ctx, note_id: str, *, author: str) -> bool:
+    """Whether `author`'s edit of note_id's chain changes its tip in place
+    (store.rewritable). Read outside the lock: for words shown before a
+    write, never to decide one."""
+    notes = store.load(ctx.store_dir)
+    return store.rewritable(ctx.store_dir, notes, _chain_tip(notes, note_id), author)
 
 
 def retag(ctx: Ctx, note_id: str, *, add=(), rm=(), author) -> store.Note:
@@ -657,3 +677,14 @@ def commit(ctx: Ctx, message: str) -> bool:
     ok = store.commit(ctx.store_dir, message, ctx.cfg)
     gitref.set_upstream(ctx.store_dir)
     return ok
+
+
+def push(ctx: Ctx, *, capture: bool = False) -> subprocess.CompletedProcess:
+    """`git push` the store; a bare push needs an upstream, so it is set
+    first. At a terminal git's progress, prompts and refusals are its own
+    words. `capture` is for a caller with no terminal (the GUI): they come
+    back as text, and git may not prompt, which would wait forever."""
+    gitref.set_upstream(ctx.store_dir)
+    kw = dict(capture_output=True, text=True, stdin=subprocess.DEVNULL,
+              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}) if capture else {}
+    return subprocess.run(["git", "-C", str(ctx.store_dir), "push"], **kw)

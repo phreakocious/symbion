@@ -215,6 +215,21 @@ def test_hook_finds_a_pointed_store_with_no_symbion_on_path(git_repo, tmp_path):
     assert "elsewhere-store" in r.stdout
 
 
+@pytest.mark.parametrize("via", ["pointer", "SYMBION_DIR"])
+def test_hook_names_a_selected_store_that_is_missing_with_no_symbion_on_path(git_repo, tmp_path, via):
+    """A pointer or SYMBION_DIR marks a project that adopted symbion, so with
+    symbion off PATH a store they name that is gone must not read as "never
+    adopted" either."""
+    env = {**SRC_ENV, "PATH": "/nonexistent", "HOME": str(tmp_path)}
+    if via == "pointer":
+        (git_repo / ".symbion").write_text("../gone-store\n")
+    else:
+        env["SYMBION_DIR"] = str(tmp_path / "gone-store")
+    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env)
+    assert r.returncode == 0 and r.stderr == ""
+    assert "not on PATH" in r.stdout and "gone-store" in r.stdout
+
+
 def test_hook_is_silent_on_the_same_tree_without_the_pointer(git_repo, tmp_path):
     """The other direction: identical tree and identical store, pointer
     removed. Without this the test above passes on a hook that prints the
@@ -259,3 +274,29 @@ def test_hook_names_a_malformed_kinds_table_instead_of_reading_as_no_store(git_r
     assert r.returncode == 0
     assert r.stderr == ""
     assert "[kinds]" in r.stdout and "'note'" in r.stdout, f"silent: {r.stdout!r}"
+
+
+@pytest.mark.parametrize("layout", ["sibling", "pointer", "none"])
+def test_hook_in_a_linked_worktree_reads_the_main_checkouts_store(git_repo, tmp_path, layout):
+    """config.project_root() is the MAIN worktree, so every linked worktree
+    shares its store. The hook derived `<linked-name>-notes` and exited 0
+    before the CLI ran: a session started in a linked worktree heard nothing.
+    The worktree sits under another parent and the pointer is untracked, so
+    neither the worktree's name nor its own `.symbion` can reach the store.
+    `none` is the other direction: a project that never adopted stays silent."""
+    wt = tmp_path / "wt" / "feature"
+    _git(git_repo, "worktree", "add", "-q", "--detach", str(wt))
+    s = {"sibling": tmp_path / "proj-notes", "pointer": tmp_path / "elsewhere-store"}.get(layout)
+    if s:
+        store.ensure_store(s)
+        store.add(s, kind="bug", target={"type": "project", "name": None}, status="open")
+    if layout == "pointer":
+        (git_repo / ".symbion").write_text("../elsewhere-store\n")
+    r = subprocess.run([BASH, str(HOOK)], cwd=wt, capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin",
+                            "CLAUDE_PROJECT_DIR": str(wt)})
+    assert r.returncode == 0 and r.stderr == ""
+    if s:
+        assert "bug 1" in r.stdout, f"skipped the main checkout's store: {r.stdout!r}"
+    else:
+        assert r.stdout == ""

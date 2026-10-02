@@ -5,14 +5,16 @@ misattribution visible BEFORE it is permanent in an append-only file."""
 from __future__ import annotations
 
 from importlib import metadata
+from pathlib import Path
 
-from nicegui import ui
+from nicegui import run, ui
 
 from .. import api, gitref
 from .. import store as S
 from .. import summary as summ
+from . import servers
 from .filters import href
-from .notes import add_form, kind_class
+from .notes import add_form, ago, kind_class
 from .theme import DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, quasar_colors, root_vars_css
 
 # From anywhere but a field being typed in or an open dialog: `/` focuses the
@@ -45,7 +47,8 @@ function sbFilter(text) {
 # What `?` lists. The kinds are the store's, read at render.
 _KEYS = (("/", "filter this page"), ("Enter", "in the filter: search the whole store"),
          ("n", "new note"), ("?", "this list"), ("Esc", "close a dialog"),
-         ("⌘/Ctrl Enter", "add the note being written"),
+         ("⌘/Ctrl Enter", "add the note being written, or save an edit"),
+         ("Shift Enter", "add it and write another"),
          ("#tag", "in a note: adds the tag"))
 
 
@@ -65,8 +68,15 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     ui.add_head_html(root_vars_css())          # no border flash on first paint
     ui.add_head_html(FONTS_HTML)
     # Dark Reader applies its theme at once and detects a dark page only after
-    # the body has content; this meta stops it before it paints anything.
-    ui.add_head_html('<meta name="darkreader-lock">')
+    # the body has content; this meta stops its theme. Its fallback style does
+    # not wait for the theme: at document_start, before this head is parsed,
+    # it sets every border a light brown !important, and only the lock check takes
+    # it off, once Dark Reader's background answers. A slow answer showed every
+    # card in a bright full border (Dark Reader 4.9.133, 2026-10-01). The
+    # script takes it off first.
+    ui.add_head_html('<meta name="darkreader-lock"><script>'
+                     'document.querySelectorAll(".darkreader--fallback").forEach(e => e.remove())'
+                     '</script>')
     ui.add_head_html(f"<style>{DARK_CSS}</style>")
     ui.add_head_html(_KEYS_JS)
     heads = S.heads(S.load(ctx.store_dir))
@@ -87,8 +97,10 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                     last = ui.link(label, to) if to else ui.label(label)
                 last.classes("sb-here").mark("page-title")
             ui.space()
+            # Left of New note, so that button stays put as these come and go
+            # (the owner, 2026-10-02).
+            _git_buttons(ctx)
             _new_note_button(ctx, author, *new)
-            _commit_button(ctx)
             _search_box(q, keep or {})
             with ui.element("div").classes("sb-who-top sb-narrow") \
                     .tooltip(f"writing as {author}: identity stamped on every write made here"):
@@ -115,14 +127,11 @@ def _new_note_button(ctx, author: str, target_type, target_name, arc_id) -> None
     """The composer, from every page: on the page's object, or the project
     where a page has none. It sat on two pages, as the page's top."""
     def build():
+        added = []                  # by Shift Enter: the page shows them on close
         with ui.dialog() as dialog, ui.card().classes("bg-panel sb-new-card"):
-            # The name in its own case: the label's capitals rewrote a path.
-            with ui.row().classes("items-center gap-2"):
-                ui.label("new note on").classes("sb-stat-label")
-                ui.label(f"{target_type}: {target_name}" if target_name else "project") \
-                    .classes("sb-chip sb-target").mark("new-note-on")
             add_form(ctx, target_type, target_name, lambda: ui.navigate.reload(),
-                     author=author, arc_id=arc_id)
+                     author=author, arc_id=arc_id, another=lambda: added.append(1))
+        dialog.on_value_change(lambda e: added and not e.value and ui.navigate.reload())
         return dialog
 
     with ui.button(icon="add", on_click=_once(build)) \
@@ -136,7 +145,9 @@ def _keys_dialog(ctx):
         ui.label("keyboard").classes("sb-stat-label")
         with ui.element("div").classes("sb-keys-list").mark("keys-list"):
             for key, what in _KEYS + (("!kind", "in a note: sets its kind, one of "
-                                       + ", ".join(ctx.kinds)),):
+                                       + ", ".join(ctx.kinds)
+                                       + "; its first letters do, while one kind "
+                                         "alone starts with them"),):
                 ui.label(key).classes("sb-chip")
                 ui.label(what)
     return dialog
@@ -146,12 +157,15 @@ SOURCE = "https://github.com/phreakocious/symbion"
 
 # The sidebar's places: (label, path, Material icon).
 _PLACES = (("Notebook", "/", "menu_book"), ("All notes", "/notes", "notes"),
-           ("Tags", "/tags", "tag"), ("Arcs", "/arcs", "linear_scale"))
+           ("Targets", "/targets", "my_location"), ("Tags", "/tags", "tag"),
+           ("Arcs", "/arcs", "linear_scale"))
 
 
 def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
-    """Brand, places, an open count per kind that has a status, and who is
-    writing. The badge is not decoration: see the module docstring."""
+    """Brand, places, an open count per kind that has a status, the parked
+    ones under their own head (an open idea showed nowhere: the owner,
+    2026-10-02), and who is writing. The badge is not decoration: see the
+    module docstring."""
     with ui.element("div").classes("sb-side-inner"):
         with ui.link(target="/").classes("sb-brand").mark("brand-link"):
             ui.html(LOGO_SVG, sanitize=False)
@@ -165,10 +179,12 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
                         .mark(f"place-{path.strip('/') or 'home'}"):
                     ui.icon(icon)
                     ui.label(label)
-        kinds = [k for k, spec in ctx.kinds.items() if spec.status and not spec.parked]
-        if kinds:
+        for head, parked in (("open", False), ("parked", True)):
+            kinds = [k for k, spec in ctx.kinds.items() if spec.status and spec.parked == parked]
+            if not kinds:
+                continue
             with ui.element("div").classes("sb-nav"):
-                ui.label("open").classes("sb-nav-head")
+                ui.label(head).classes("sb-nav-head")
                 for k in kinds:
                     n = len(summ.open_notes(heads, k))
                     with ui.link(target=href(kind=k, status="open")).classes(
@@ -177,6 +193,8 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
                         ui.element("span").classes("sb-dot")
                         ui.label(k)
                         ui.label(str(n)).classes("sb-nav-n")
+        _closed(heads)
+        _other_stores(ctx)
         with ui.element("div").classes("sb-who"):
             ui.label((author or "?")[:1]).classes("sb-avatar")
             ui.label(f"writing as {author}").classes("sb-badge").mark("author-badge") \
@@ -186,6 +204,44 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
                 .classes("sb-keys").mark("keys").tooltip("keyboard shortcuts (?)")
         ui.link(f"symbion {metadata.version('symbion')}", SOURCE, new_tab=True) \
             .classes("sb-source").mark("source").tooltip("source on GitHub")
+
+
+def _closed(heads, n: int = 5) -> None:
+    """The newest rows resolved, each a link to itself: a resolve writes a
+    new head, so its stamp is when the row closed."""
+    rows = [h for h in S.newest_first(heads) if S.read_status(h) == "resolved"][:n]
+    if not rows:
+        return
+    with ui.element("div").classes("sb-nav"):
+        ui.link("recently closed", href(status="resolved")).classes("sb-nav-head") \
+            .mark("closed-all").tooltip("every resolved row")
+        for r in rows:
+            text = r.body or (f"{r.target.type}: {r.target.name}"
+                              if r.target.name else r.target.type)
+            with ui.link(target=href(id=r.id)) \
+                    .classes(f"sb-nav-item sb-closed {kind_class(r.kind)}") \
+                    .mark("closed-item").tooltip(summ.clip(text, summ.BODY_CHARS)):
+                ui.element("span").classes("sb-dot")
+                ui.label(summ.clip(text, 120)).classes("sb-closed-text")
+                ui.label(ago(r.created_at)).classes("sb-nav-n")
+
+
+def _other_stores(ctx) -> None:
+    """Every other store a `serve` runs on here, a link to its notebook: a
+    click switches, a cmd-click opens it beside this one. Named by the
+    store's directory, `<repo>-notes` less its suffix: the repo a serve was
+    started from need not be the store's (`--dir`), and two read the same."""
+    here = str(ctx.store_dir.resolve())
+    others = {r["store"]: r for r in servers.running() if r["store"] != here}
+    if not others:
+        return
+    with ui.element("div").classes("sb-nav"):
+        ui.label("other stores").classes("sb-nav-head")
+        for path, r in sorted(others.items()):
+            with ui.link(target=r["url"]).classes("sb-nav-item").mark("store-item") \
+                    .tooltip(f"{path}\n{r['url']}"):
+                ui.icon("swap_horiz")
+                ui.label(Path(path).name.removesuffix("-notes"))
 
 
 def _search_box(q: str, keep: dict) -> None:
@@ -207,13 +263,40 @@ def _search_box(q: str, keep: dict) -> None:
     box.on("update:value", js_handler="(v) => sbFilter(v)")
     box.on("keydown.enter", _go, js_handler="(e) => emit(e.target.value)")
     box.tooltip("typing filters this page; Enter searches the store: every word, "
-                "in any case, in body, target, checked, result or refs; or a note id")
+                "in any case, in body, target, checked, result, refs or tags; or a note id")
 
 
-def _commit_button(ctx) -> None:
+# Seconds between reads of the store's git state for the two buttons.
+_GIT_EVERY = 5
+
+
+def _git_buttons(ctx) -> None:
+    """Commit and push, read again every `_GIT_EVERY` seconds and redrawn
+    when a count moves: a commit or push made at a terminal left them on the
+    page, and rows written there never showed the commit button (the owner,
+    2026-10-01)."""
+    def read():
+        return (*gitref.uncommitted(ctx.store_dir), gitref.unpushed(ctx.store_dir))
+
+    @ui.refreshable
+    def buttons(state):
+        _commit_button(ctx, *state[:2])
+        _push_button(ctx, state[2])
+
+    shown = [read()]
+    buttons(shown[0])
+
+    async def tick():
+        state = await run.io_bound(read)      # git, off the event loop
+        if state is not None and state != shown[0]:    # None: the app is stopping
+            shown[0] = state
+            buttons.refresh(state)
+    ui.timer(_GIT_EVERY, tick, immediate=False)    # the page has just read it
+
+
+def _commit_button(ctx, n: int, registry: bool) -> None:
     """The store is a sibling git repo. A GUI that writes but cannot commit
     only grows the number the SessionStart hook nags about."""
-    n, registry = gitref.uncommitted(ctx.store_dir)
     if not n and not registry:
         return
 
@@ -233,3 +316,27 @@ def _commit_button(ctx) -> None:
             .tooltip("git commit the note store"):
         ui.label("commit").classes("sb-btn-word")
         ui.label(str(n) if n else "registry")
+
+
+def _push_button(ctx, n: int | None) -> None:
+    """Committed is not off this disk. Quieter than commit: nothing here is
+    at risk of being lost by a crash, only by the disk."""
+    if not n:                       # None: no remote, nowhere to push
+        return
+
+    async def _do():
+        # A thread: a push waits on the network, and the event loop serves
+        # every open page.
+        r = await run.io_bound(api.push, ctx, capture=True)
+        if r.returncode:
+            ui.notify(r.stderr.strip() or f"git push exited {r.returncode}", type="negative",
+                      multi_line=True, close_button="dismiss", timeout=0)
+            return
+        ui.notify("pushed")
+        ui.navigate.reload()
+
+    with ui.button(icon="cloud_upload", on_click=_do).props("flat dense no-caps color=muted") \
+            .classes("px-2 sb-push").mark("push-button") \
+            .tooltip(f"git push the note store: {summ._count(n, 'commit')} not on its remote"):
+        ui.label("push").classes("sb-btn-word")
+        ui.label(str(n))

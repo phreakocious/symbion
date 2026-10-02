@@ -45,6 +45,17 @@ def test_author_rules_differ_on_claudecode(monkeypatch):
     assert api.gui_author() == "ada"
 
 
+def test_a_codex_shell_writes_as_codex_and_its_gui_as_the_person(monkeypatch):
+    """CODEX_THREAD_ID is Codex's CLAUDECODE (measured in a Codex 0.160 shell,
+    2026-10-02). A Codex launched from a Claude Code session carries both."""
+    monkeypatch.setenv("CODEX_THREAD_ID", "thread-1")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+
+    assert api.author_default() == "codex"
+    assert api.gui_author() == "ada"
+
+
 def test_symbion_author_wins_for_both(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("SYMBION_AUTHOR", "sam")
@@ -171,6 +182,7 @@ def test_retag_reads_tags_from_the_chain_TIP_not_the_named_row(repo, tmp_path):
     first = store.add(tmp_path, kind="note", target={"type": "project", "name": None},
                       body="b", tags=["a"])
     tip = store.supersede(tmp_path, first.id, author="t", tags=["a", "b"])
+    api.commit(ctx, "c")                     # so the retag appends (store.rewritable)
 
     out = api.retag(ctx, first.id, add=["c"], author="t")
 
@@ -259,6 +271,7 @@ _NON_WRITERS = {
     "canonicalize_names",  # pure: resolves names; seed_arc appends
     "check_arc",           # pure: refuses an arc id that names no arc
     "check_arc_targets",   # pure: the same, for arc: targets and refs
+    "rewritable",          # a read: whether an edit by `author` would rewrite
     "add_fields",   # takes fields, not a row -- no single keyword-only author
                     # for this audit to see; it demands one per row itself
                     # (raises ValueError, not TypeError) -- see
@@ -266,6 +279,7 @@ _NON_WRITERS = {
     "rename_arc",   # writes, but to the arc record -- no note row
     "archive_arc",  # ditto
     "commit",            # writes git, not a note
+    "push",              # ditto
 }
 
 
@@ -534,6 +548,17 @@ def test_a_bang_names_the_kind_only_for_a_declared_kind():
     # prose, code, a markdown image and a word with a bang inside stay put
     for body in ("this is !important", "run `!task` here", "![alt](x.png)", "wow!task"):
         assert api.harvest_kind(body, kinds) == (None, body)
+
+
+def test_a_bang_takes_a_kind_cut_short_while_it_names_one():
+    """The owner, 2026-10-01: `!b` is enough, and with task and tame both
+    declared, nothing until `!tas` or `!tam`."""
+    kinds = ("note", "notebook", "task", "tame", "bug")
+    assert api.harvest_kind("!b login fails", kinds) == ("bug", "login fails")
+    assert api.harvest_kind("!tas fix it", kinds) == ("task", "fix it")
+    assert api.harvest_kind("!ta fix it", kinds) == (None, "!ta fix it")
+    assert api.harvest_kind("!note x", kinds) == ("note", "x")     # whole beats prefix
+    assert api.harvest_kind("!bugs x", kinds) == (None, "!bugs x")
 
 
 from symbion import kinds as K

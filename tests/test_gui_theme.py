@@ -138,3 +138,12 @@ def test_a_row_marks_its_kind_on_one_corner_not_its_whole_left_edge():
     trail = [body for sel, body in rules if sel.strip() == '.sb-note[class*="sb-kind-"]::after']
     # nine dashes, each a colour stop at either end, fading as they go
     assert trail and trail[0].count("color-mix(in srgb, var(--kind)") == 18
+
+
+def test_the_browsers_own_widgets_are_dark():
+    """The browser draws a datalist's dropdown (the composer's names), the
+    scrollbars and autofill itself, outside any CSS but `color-scheme`; with
+    none declared they came out light on the dark page (the owner,
+    2026-10-01). Declared in the first-paint style, so no light frame."""
+    from symbion.gui.theme import root_vars_css
+    assert re.search(r":root\{[^}]*color-scheme:dark", root_vars_css())

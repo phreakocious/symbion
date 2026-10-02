@@ -652,7 +652,8 @@ def test_summary_on_an_empty_store_names_the_first_verb(tmp_path):
     store.ensure_store(tmp_path)
     text = summary.render_summary(summary.summary(tmp_path, cfg))
     assert text.splitlines()[-1] == "  " + summary.FIRST_CONTACT
-    assert "symbion add --kind" in summary.FIRST_CONTACT and "SKILL.md" in summary.FIRST_CONTACT
+    assert "symbion add task --target project" in summary.FIRST_CONTACT \
+        and "SKILL.md" in summary.FIRST_CONTACT
     store.add(tmp_path, kind="task", target={"type": "project", "name": None}, body="x")
     assert "no notes yet" not in summary.render_summary(summary.summary(tmp_path, cfg))
     assert "no notes yet" not in summary.render_summary(summary.empty_summary())
