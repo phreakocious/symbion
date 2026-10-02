@@ -87,7 +87,8 @@ async def test_the_push_button_shows_unpushed_commits_and_pushes_them(
     (button,) = user.find(marker="push-button").elements
     assert str(n) in [e.text for e in button.default_slot.children]
     user.find(marker="push-button").click()
-    await user.should_see("pushed")
+    # The push runs in a thread: 0.3 s, the default wait, failed on a CI runner.
+    await user.should_see("pushed", retries=40)
     assert gitref.unpushed(tmp_path) == 0
     await user.open("/notes")
     await user.should_not_see(marker="push-button")
@@ -119,7 +120,7 @@ async def test_the_push_button_shows_gits_refusal(user: User, ctx_with_notes, tm
     hook.chmod(0o755)
     await user.open("/notes")
     user.find(marker="push-button").click()
-    await user.should_see("hook: push refused")
+    await user.should_see("hook: push refused", retries=40)
     assert not user.notify.contains("pushed")
 
 
