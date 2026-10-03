@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from markdown_it import MarkdownIt
 from rich.console import COLOR_SYSTEMS, Console
 from rich.markdown import Markdown
 from rich.padding import Padding
@@ -43,8 +44,33 @@ MARKDOWN = Theme({
     "markdown.table.border": HUE["cyan"], "markdown.table.header": f"not bold {HUE['cyan']}",
     "markdown.block_quote": HUE["magenta"], "markdown.h2": f"underline {HUE['magenta']}",
     "markdown.h3": f"bold {HUE['magenta']}", "markdown.h4": f"italic {HUE['magenta']}",
-    "markdown.link": HUE["blue"], "markdown.link_url": f"underline {HUE['blue']}",
-    "markdown.kbd": f"bold {HUE['yellow']}"})
+    "markdown.link": HUE["blue"], "markdown.link_url": f"underline {HUE['blue']}"})
+
+
+def _underscore(state, silent: bool) -> bool:
+    """`_` is text: bodies name `__init__.py` and `snake_case`, and
+    CommonMark bolds the `init`. `*` still makes emphasis."""
+    if state.src[state.pos] != "_":
+        return False
+    if not silent:
+        state.pending += "_"
+    state.pos += 1
+    return True
+
+
+def body_parser(highlight=None) -> MarkdownIt:
+    """The markdown a row body is read in, at a terminal and in the GUI, so
+    both read one text alike (2026-10-02; the GUI's markdown2 ran a list
+    under a line of prose into it). CommonMark with tables and
+    strikethrough. HTML is off: rich dropped a `<pre>` named in prose, and
+    the GUI rendered one. `highlight` colours a fenced block in HTML."""
+    md = MarkdownIt("commonmark", {"html": False, "highlight": highlight})
+    md.enable(["strikethrough", "table"])
+    md.inline.ruler.before("emphasis", "underscore", _underscore)
+    return md
+
+
+BODY_MD = body_parser()
 # --help: what you type in code's colour, prose as a row body, headings and
 # the program in the hues argparse 3.14 gives them.
 HELP = {"argparse.args": HUE["cyan"], "argparse.syntax": HUE["cyan"],
@@ -262,4 +288,8 @@ def print_note(n, *, status, state, due, subject, head, full, gui=None) -> None:
     for t in _details(n, head, state):
         con.print(t)
     if n.body:
-        con.print(Padding(Markdown(n.body, code_theme=_CodeTheme()), (0, 0, 0, 4)))
+        md = Markdown(n.body, code_theme=_CodeTheme())
+        # ponytail: sets rich's own attribute; test_a_tag_in_a_body_prints_on_a_tty
+        # fails if rich renames it.
+        md.parsed = BODY_MD.parse(n.body)
+        con.print(Padding(md, (0, 0, 0, 4)))

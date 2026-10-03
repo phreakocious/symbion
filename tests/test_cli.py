@@ -912,6 +912,32 @@ def test_list_on_a_tty_renders_the_markdown_body(repo, tmp_path, capsys, monkeyp
     assert "shipped" in out and "raw stays" in out, "the words must survive rendering"
 
 
+def test_a_tag_in_a_body_prints_on_a_tty(repo, tmp_path, capsys, monkeypatch):
+    """rich's parser reads `<pre>` as inline HTML and drops it, so a body
+    that names a tag lost the word; the pipe prints it."""
+    store_dir = tmp_path / "store"
+    run("add", "--kind", "note", "--type", "project",
+        "--body", "wrap it in <pre> tags; ../<repo>-notes", store_dir=store_dir)
+    capsys.readouterr()
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    run("list", "--full", store_dir=store_dir)
+    out = _ANSI.sub("", capsys.readouterr().out)
+    assert "wrap it in <pre> tags" in out and "../<repo>-notes" in out, out
+
+
+def test_underscores_in_a_body_stay_on_a_tty(repo, tmp_path, capsys, monkeypatch):
+    """CommonMark bolds `init` in `__init__.py`, and bodies name files and
+    dunders: `_` makes no emphasis, at a terminal as in the GUI. `*` does."""
+    store_dir = tmp_path / "store"
+    run("add", "--kind", "note", "--type", "project",
+        "--body", "edit __init__.py and *really* __main__", store_dir=store_dir)
+    capsys.readouterr()
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    run("list", "--full", store_dir=store_dir)
+    out = _ANSI.sub("", capsys.readouterr().out)
+    assert "edit __init__.py and really __main__" in out, out
+
+
 _RICH_PROBE = """
 import io, sys
 from symbion import cli

@@ -29,19 +29,30 @@ from . import servers
 from .pages import build_page
 from .theme import FAVICON_SVG
 
-_DEFAULT_PORT = 43210
+
+def _binds(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+        return True
+    except OSError:
+        return False
 
 
-def pick_free_port(preferred: int = _DEFAULT_PORT) -> int:
-    """Try `preferred`; if busy, ask the kernel for any free port (bind 0)."""
-    for candidate in (preferred, 0):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("", candidate))
-                return s.getsockname()[1]
-        except OSError:
-            continue
-    raise RuntimeError("no free TCP port available")
+def pick_free_port(preferred: int) -> int:
+    """`preferred` if it is free, else any free port. Two test binds, both
+    with SO_REUSEADDR, as uvicorn binds: without it, the last serve's
+    connections in TIME_WAIT refuse the port, and the serve moves at each
+    restart. On macOS each bind alone misses a holder: one on 127.0.0.1
+    passes the any-address bind, and one on every address passes the
+    127.0.0.1 bind, where uvicorn would then take its loopback traffic
+    (measured 2026-10-02)."""
+    if _binds("127.0.0.1", preferred) and _binds("", preferred):
+        return preferred
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def main(ctx, *, author: str, port=None, show: bool = True,
@@ -55,7 +66,10 @@ def main(ctx, *, author: str, port=None, show: bool = True,
     if reload and top and getattr(sys.modules["__main__"].__spec__, "name", None) != __name__:
         os.execv(sys.executable, [sys.executable, "-m", __name__, *argv])
     build_page(ctx, author=author)
-    port = port if port is not None else pick_free_port()
+    # The store's own port, so a link to it outlives a restart (the owner,
+    # 2026-10-02). `--port` overrides it and is never warned about.
+    want = servers.port(ctx.store_dir) if port is None else None
+    port = port if port is not None else pick_free_port(want)
     url = f"http://127.0.0.1:{port}"
     mine = None
     if top:
@@ -68,6 +82,15 @@ def main(ctx, *, author: str, port=None, show: bool = True,
             print(f"warning: another symbion serve runs on this store: {first['url']} "
                   f"(pid {first['pid']}). The other stores' sidebars link that one "
                   "until it stops, then this one.", file=sys.stderr, flush=True)
+        elif want is not None and port != want:
+            # Two names can give one port: say whose serve holds it.
+            held = next((r for r in servers.running()
+                         if r["url"] == f"http://127.0.0.1:{want}"), None)
+            who = (f"the serve on {held['store']}, a store whose name gives the same port"
+                   if held else "a process that is not a symbion serve")
+            print(f"warning: this store's port, {want}, is held by {who}. This serve "
+                  f"takes {port}, which changes at each restart; --port picks a fixed one.",
+                  file=sys.stderr, flush=True)
         mine = servers.record(url, ctx.store_dir)
     try:
         # Loopback only: the GUI writes rows with no authentication, and
@@ -79,6 +102,10 @@ def main(ctx, *, author: str, port=None, show: bool = True,
             title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON_SVG,
             reconnect_timeout=30.0,
         )
+    except KeyboardInterrupt:
+        # Ctrl-C: uvicorn has already shut down, then re-raised the SIGINT
+        # it caught. A stop, not a crash; --reload's supervisor exits 0 too.
+        pass
     finally:
         if mine:
             mine.unlink(missing_ok=True)

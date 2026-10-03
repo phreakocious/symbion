@@ -147,3 +147,99 @@ def test_the_browsers_own_widgets_are_dark():
     2026-10-01). Declared in the first-paint style, so no light frame."""
     from symbion.gui.theme import root_vars_css
     assert re.search(r":root\{[^}]*color-scheme:dark", root_vars_css())
+
+
+def _ratio(a: str, b: str) -> float:
+    """WCAG 2 contrast ratio of two #rrggbb colours."""
+    def lum(h):
+        c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _bodies(selector: str) -> list[str]:
+    """The bodies of every DARK_CSS rule whose selector list holds `selector`."""
+    from symbion.gui.theme import DARK_CSS
+    css = re.sub(r"/\*.*?\*/", "", DARK_CSS, flags=re.S)
+    return [body for sels, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+            if selector in (" ".join(s.split()) for s in sels.split(","))]
+
+
+def test_the_contrast_ratio_is_wcags():
+    """...and the failing pair the ring test below guards against still fails,
+    so that test is not vacuous."""
+    from symbion.gui.theme import PALETTE
+    assert round(_ratio("#ffffff", "#000000"), 2) == 21
+    assert round(_ratio(PALETTE.text_muted, PALETTE.bg_panel), 2) == 4.75
+    assert _ratio(PALETTE.border_hi, PALETTE.bg_panel) < 3
+
+
+def test_the_empty_resolve_ring_is_a_control_a_reader_can_see():
+    """A control's border needs 3:1 on its ground (WCAG 2, 1.4.11): the ring
+    was `border_hi`, 1.92:1 on the card (measured 2026-10-02)."""
+    from symbion.gui.theme import PALETTE, quasar_colors
+    (slot,) = [m[1] for b in _bodies(".q-btn.sb-resolve")
+               if (m := re.search(r"border:[^;]*var\(--q-([a-z-]+)\)", b))]
+    ring = quasar_colors()[slot.replace("-", "_")]
+    assert _ratio(ring, PALETTE.bg_panel) >= 3, (slot, ring)
+
+
+def test_a_focused_link_or_button_shows_a_ring():
+    """Quasar's `no-outline` is `outline: 0 !important` on every button, in
+    NiceGUI's last layer: keyboard focus showed Quasar's faint tint, and a card
+    moved its border to `border_hi`, 1.92:1 (2026-10-02). The ring sits in
+    `overrides`, the one layer whose `!important` beats it, and reads 3:1 or
+    more on every ground it can land on."""
+    from symbion.gui.theme import DARK_CSS, PALETTE, quasar_colors
+    layer = re.search(r"@layer overrides\s*\{(.*?)\}\s*\}", DARK_CSS, re.S)
+    ring = layer and re.search(r":is\(([^)]*)\):focus-visible\s*\{[^}]*"
+                               r"outline:\s*2px solid var\(--q-([a-z-]+)\) !important", layer[1])
+    assert ring, "no focus ring in @layer overrides"
+    assert {"a", ".q-btn"} <= {s.strip() for s in ring[1].split(",")}
+    colour = quasar_colors()[ring[2].replace("-", "_")]
+    for ground in (PALETTE.bg_page, PALETTE.bg_panel, PALETTE.bg_raise, PALETTE.border):
+        assert _ratio(colour, ground) >= 3, (ring[2], ground)
+
+
+def test_a_fields_label_icons_and_hint_are_the_palettes():
+    """Quasar paints a dark field's label, icons and hint `rgba(255, 255, 255,
+    .7)`, the one colour off the palette, and the hex audit cannot see it
+    (2026-10-02). The label keeps Quasar's `:not(.q-field--highlighted)`, so
+    a focused field's label still takes the field's colour."""
+    for sel in (".q-field--dark:not(.q-field--highlighted) .q-field__label",
+                ".q-field--dark .q-field__marginal", ".q-field--dark .q-field__bottom"):
+        assert any(re.search(r"color:\s*var\(--q-[a-z-]+\)", b) for b in _bodies(sel)), sel
+
+
+def test_no_surface_casts_quasars_white_shadow():
+    """Borders, not shadows: a dialog's card and a menu kept Quasar's
+    white-alpha shadow, the only shadows on the page (2026-10-02)."""
+    for sel in (".q-card--dark", ".q-menu--dark"):
+        assert any(re.search(r"box-shadow:\s*none", b) for b in _bodies(sel)), sel
+
+
+def test_a_fields_outline_is_a_control_a_reader_can_see():
+    """A control's boundary needs 3:1 (WCAG 2, 1.4.11): an outlined field and
+    the composer's frame, the boundary of its borderless name field on /arcs,
+    were `border`, 1.4:1 on the card (2026-10-02). A field sits on the card
+    and in the top bar on the page, so both."""
+    from symbion.gui.theme import PALETTE, quasar_colors
+    for sel, prop in ((".q-field--dark.q-field--outlined .q-field__control:before", "border-color"),
+                      (".sb-composer", "border")):
+        (slot,) = [m[1] for b in _bodies(sel)
+                   if (m := re.search(rf"{prop}:[^;]*var\(--q-([a-z-]+)\)", b))]
+        colour = quasar_colors()[slot.replace("-", "_")]
+        for ground in (PALETTE.bg_page, PALETTE.bg_panel):
+            assert _ratio(colour, ground) >= 3, (sel, slot, ground)
+
+
+def test_a_link_inside_prose_is_underlined():
+    """In a note's text a link is accent beside text_emph, 1.4:1 apart, so its
+    colour alone does not mark it (WCAG 2, 1.4.1; 2026-10-02). `a` takes no
+    underline elsewhere, since a row of chips read as a ransom note."""
+    from symbion.gui.theme import PALETTE
+    assert _ratio(PALETTE.accent, PALETTE.text_emph) < 3
+    for sel in (".sb-note .nicegui-markdown a", ".sb-md-card .nicegui-markdown a"):
+        assert any(re.search(r"text-decoration:\s*underline", b) for b in _bodies(sel)), sel

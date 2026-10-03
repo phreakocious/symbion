@@ -33,9 +33,10 @@ class Palette:
     bg_panel: str = "#181825"
     bg_raise: str = "#1e1e2e"
     border: str = "#313244"       # surface0
-    border_hi: str = "#45475a"    # surface1: a hovered card, an empty box
+    border_hi: str = "#45475a"    # surface1: a hovered card, a ref's dashes
     # text: the four steps a terminal row prints in. Small text on a card
-    # takes `muted` (4.7:1 on mantle); `dim` (3.6:1) is for marks, not words.
+    # takes `muted` (4.7:1 on mantle); `dim` (3.6:1) is for marks, not words:
+    # the empty resolve ring is one (border_hi read 1.9:1, 2026-10-02).
     text_emph: str = T.TEXT
     text_body: str = T.BODY
     text_muted: str = T.META
@@ -224,7 +225,10 @@ a { text-decoration: none; }
 /* the card's width, not its widest code line's: a long line scrolls in its block */
 .sb-md-card .nicegui-markdown { color: var(--q-emph); font-size: 14.5px; line-height: 1.6;
                                 width: 100%; min-width: 0; overflow-wrap: anywhere; }
-.sb-md-card .nicegui-markdown a { color: var(--q-primary); }
+/* links in prose: accent is 1.4:1 from the text around it, so an underline
+   marks them (WCAG 2, 1.4.1; 2026-10-02). Links elsewhere take none. */
+.sb-md-card .nicegui-markdown a { color: var(--q-primary); text-decoration: underline;
+                                  text-underline-offset: 2px; }
 .sb-md-card .nicegui-markdown h1 { font-size: 22px; line-height: 1.3; margin: 18px 0 8px; }
 .sb-md-card .nicegui-markdown h2 { font-size: 18px; line-height: 1.3; margin: 16px 0 6px; }
 .sb-md-card .nicegui-markdown :is(h3, h4, h5, h6) { font-size: 15px; line-height: 1.3;
@@ -256,10 +260,12 @@ a.sb-board-aside:hover { color: var(--q-primary); }
 a.sb-arc-name { font-size: 16px; font-weight: 600; color: var(--q-emph); }
 a.sb-arc-name:hover { color: var(--q-primary); }
 
-/* the composer: a card holding a borderless body and one toolbar */
-.sb-composer { background: var(--q-panel); border: 1px solid var(--q-border);
+/* the composer: a card holding a borderless body and one toolbar. Its frame
+   is the body's boundary, so it reads 3:1 like a field's outline, and
+   focused it takes a focused field's accent (2026-10-02). */
+.sb-composer { background: var(--q-panel); border: 1px solid var(--q-dim);
                border-radius: 12px; padding: 4px 12px 10px; width: 100%; }
-.sb-composer:focus-within { border-color: var(--q-border-hi); }
+.sb-composer:focus-within { border-color: var(--q-primary); }
 .sb-composer .sb-compose-body .q-field__native { font-size: 15px; line-height: 1.5;
                                                  min-height: 48px; }
 .sb-composer .sb-compose-tags input { font-family: var(--mono); font-size: 12px; }
@@ -334,7 +340,7 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
    below. A card's is at its right and the toolbar sits beside it; an arc's
    checklist keeps its boxes on the left, since every row there has one. */
 .q-btn.sb-resolve { width: 22px; height: 22px; min-width: 22px; min-height: 22px; padding: 0;
-                    margin-top: 1px; border: 1.5px solid var(--q-border-hi); flex: none; }
+                    margin-top: 1px; border: 1.5px solid var(--q-dim); flex: none; }
 .q-btn.sb-resolve .q-icon { font-size: 14px; }
 .q-btn.sb-resolve:hover, .q-btn.sb-resolve:focus-visible { border-color: var(--q-good); }
 /* a done box on an arc's checklist: ticked, and its row steps back */
@@ -383,6 +389,11 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 .q-menu .q-item { color: var(--q-body); }
 .q-menu .q-item--active, .q-menu .q-item.q-manual-focusable--focused,
 .q-menu .q-item:hover { color: var(--q-primary); }
+/* Borders, not shadows: Quasar gives a dark menu and a dialog's card a white
+   glow, the only shadows on the page (2026-10-02). A dialog's card takes a
+   card's border and corners. */
+.q-menu--dark { box-shadow: none; }
+.q-card--dark { box-shadow: none; border: 1px solid var(--q-border); border-radius: 12px; }
 /* Quasar's own #fff (measured 2026-10-01). On a filled button and a notice,
    Mocha's pastels take the page colour as text; a notice with no type is
    Quasar's grey, so it takes the panel; a field's own text is the page's.
@@ -397,14 +408,26 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   /* an unlayered muted rule read text-primary's blue (2026-10-01) */
   .q-btn.sb-keys { color: var(--q-muted) !important; }
   .q-btn.sb-keys:hover { color: var(--q-emph) !important; }
+  /* Quasar's `no-outline` is `outline: 0 !important` on every button, so
+     keyboard focus showed only Quasar's faint tint (2026-10-02). accent is
+     5.9:1 or more on every ground, a selected sidebar row's included. */
+  :is(a, .q-btn):focus-visible { outline: 2px solid var(--q-primary) !important;
+                                 outline-offset: 2px; }
   .q-btn.text-white, .q-notification[class*=bg-] { color: var(--q-dark-page) !important; }
   .q-notification:not([class*=bg-]) { background: var(--q-panel) !important;
                                       color: var(--q-emph) !important;
                                       border: 1px solid var(--q-border); }
 }
 .q-field--dark .q-field__native, .q-field--dark .q-field__input { color: var(--q-emph) !important; }
+/* Quasar's rgba(255, 255, 255, .7), the one colour off the palette and out of
+   the hex audit's sight (2026-10-02). A highlighted label keeps the field's
+   colour, as in Quasar. */
+.q-field--dark:not(.q-field--highlighted) .q-field__label,
+.q-field--dark .q-field__marginal, .q-field--dark .q-field__bottom { color: var(--q-body); }
 .q-field--outlined .q-field__control { border-radius: 8px; }
-.q-field--dark.q-field--outlined .q-field__control:before { border-color: var(--q-border); }
+/* an outline is a control's boundary: 3:1 on the card and the page (border
+   read 1.4:1, 2026-10-02) */
+.q-field--dark.q-field--outlined .q-field__control:before { border-color: var(--q-dim); }
 /* a filled button is sentence case and medium, not Quasar's shouted caps */
 .q-btn { text-transform: none; font-weight: 500; letter-spacing: 0; border-radius: 7px; }
 /* not !important: Quasar's is a plain layered rule, and `.q-menu .q-item` must still win */
@@ -437,7 +460,8 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
                 border-radius: 4px; background: var(--q-raise); }
 .sb-note pre code { padding: 0; background: none; }
 /* body links (a cited note id is one) took the browser's default blue */
-.sb-note .nicegui-markdown a { color: var(--q-primary); }
+.sb-note .nicegui-markdown a { color: var(--q-primary); text-decoration: underline;
+                               text-underline-offset: 2px; }
 /* A note is a paragraph, not a document. A real <h1> in a list of eighty rows
    dominates the board, and markdown eats a line-leading `#tag` into one -- the
    harvest strips those now, but a deliberate heading still has to sit down. */

@@ -5,7 +5,6 @@ misattribution visible BEFORE it is permanent in an append-only file."""
 from __future__ import annotations
 
 from importlib import metadata
-from pathlib import Path
 
 from nicegui import run, ui
 
@@ -88,8 +87,9 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     with ui.header(elevated=False).classes("sb-header"):
         with ui.row(wrap=False).classes("items-center gap-3 w-full sb-topbar") \
                 .style("min-height:56px"):
-            ui.button(icon="menu", on_click=drawer.toggle) \
-                .props('flat dense round aria-label="menu"').classes("sb-narrow text-body")
+            ui.button(icon="menu", on_click=drawer.toggle, color=None) \
+                .props('flat dense round aria-label="menu"').classes("sb-narrow text-body") \
+                .mark("menu")
             with ui.row(wrap=False).classes("items-center gap-2 sb-crumbs"):
                 for i, (label, to) in enumerate(crumbs):
                     if i:
@@ -241,7 +241,7 @@ def _other_stores(ctx) -> None:
             with ui.link(target=r["url"]).classes("sb-nav-item").mark("store-item") \
                     .tooltip(f"{path}\n{r['url']}"):
                 ui.icon("swap_horiz")
-                ui.label(Path(path).name.removesuffix("-notes"))
+                ui.label(servers.name(path))
 
 
 def _search_box(q: str, keep: dict) -> None:

@@ -185,6 +185,28 @@ def why_unverifiable(prov) -> str
 
 Every chip is a link: kind, status, author and each tag → `/notes?…`; target and each ref → `/object?…`; activity → `/activity?id=`.
 
+### A fixed port per store (2026-10-02)
+
+**Where it starts.** One `serve` runs per store (2026-10-01). `build_page` binds one `ctx`, and one process for many stores would put a `ctx` on every request and let a write cross stores. While it runs, each serve writes `{pid, url, store, started}` to `$XDG_CACHE_HOME/symbion/serve/<pid>.json`. `gui/servers.py` reads the live records, the earliest per store, and the sidebar links the other stores from them.
+
+**The problem.** A serve's port is not stable. Every serve tries 43210 first, so only one store can hold it, and every other serve takes a free port, a new one at each restart. Even the serve on 43210 loses it at a restart: `pick_free_port` tests the port with a bind to any address and no `SO_REUSEADDR`, and the connections the last serve closed, still in TIME_WAIT, refuse that bind (measured 2026-10-02, macOS and Linux). A row link an agent gave the user, an id link in a terminal, or a URL in a row then points at nothing, although a serve on that store runs. Each agent session also keeps the URL its summary read at start.
+
+**Decision: each store has its own port, derived from its name.**
+
+- **The port.** `20000 + crc32(name) % 10000`, where `name` is the store's directory name less a `-notes` suffix: the name the sidebar shows. The range is below the ports either OS assigns to outgoing connections (macOS from 49152, Linux from 32768). The same store gets the same port at every restart, from every session, and on every machine where its directory has the same name. `--port` still overrides it.
+- **The test bind.** `pick_free_port` binds `127.0.0.1`, the address uvicorn binds, with `SO_REUSEADDR`, as uvicorn does. Measured 2026-10-02, on macOS and Linux: that bind passes through TIME_WAIT and is refused while a live listener holds the port. The other forms are wrong. Without `SO_REUSEADDR`, TIME_WAIT refuses it. With `SO_REUSEADDR` on any address, macOS accepts it while a serve holds `127.0.0.1` on that port. *Amended 2026-10-02, after review:* the store's port gets two test binds, both with `SO_REUSEADDR`: `127.0.0.1`, and any address. On macOS a listener on every address (`0.0.0.0`) passes the `127.0.0.1` bind, uvicorn's bind beside it succeeds too, and the serve then takes that service's loopback traffic with no warning; the any-address bind refuses it, and still passes TIME_WAIT. Each form alone is wrong on macOS; both together are right on macOS and Linux.
+- **Collisions are detected.** If the store's port is taken, the serve takes a free port, and the warning names the holder from the records. Another serve on this store already gets its warning. Another store whose name hashes to the same port is named, with its path. Anything else is "a process that is not a symbion serve". At 20 stores the chance that any two names share a port is 1.9%; at 50, 12%. A `port =` key in `symbion.toml` waits for the first real collision; until then, `--port` fixes one.
+- **Nothing else changes.** `summary`'s serve line, the id links at a terminal, SKILL.md and the sidebar keep the URL from the record. That URL now stays the same across restarts, so the links they made stay good.
+- **Open tabs survive a restart.** A restarted serve comes back on the same port. NiceGUI's socket.io client keeps trying to reconnect, and when the new process does not know its client id, the handshake fails and the page reloads (read in `nicegui.js`, NiceGUI 3.16.0; run 2026-10-02 in Chrome: an open tab reloaded itself from the restarted serve).
+- Limit: with two serves on one store, the earlier holds the store's port and the links. If it stops, the links go to the later one, on a free port, and stay there while the later one runs, even after the first restarts.
+
+**Rejected.**
+
+- *A router on 43210*, run in every serve with `SO_REUSEPORT`, with links of the form `127.0.0.1:43210/<name>/<rest>` redirected to the store's serve. The owner proposed it, and a first draft of this section specified it. A review found it unready. Its worst finding, measured again here: the shared port spreads one serve's failure to every store's links. On macOS the newest listener takes every connection, so with the newest listener stopped by SIGSTOP (what ctrl-Z sends), 3 of 3 requests timed out, for every store. It also needed a threaded server, a timeout, a port override so tests do not answer real links, and a refusal of `--port 43210`, and an open tab still died at a restart. It gave one port for every store and readable links, but the goal was links that stay good, and a port per store gives that with less.
+- *Store-free router links, the router searching the live stores for the id.* It loads every store on each request, needs rules for id tails and collisions, and serves only routes that carry an id.
+- *A sticky port per store* (remember the store's last port and try it first). It needs a file of state, gives a different port on each machine, and a restart that finds the remembered port taken moves the links for good.
+- *A uuid in `symbion.toml` as the hash input.* Nothing mints one, and every existing store would need one added. The name works until two names collide, and the collision is detected.
+
 ### The boards page and `summary()` must not disagree
 
 The `/` page and `summary.summary()` select the same three sets, and if they diverge the page and the SessionStart hook report different open work — worse than either being wrong alone, because each corroborates the other by existing.

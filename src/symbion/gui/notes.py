@@ -16,16 +16,54 @@ from urllib.parse import quote
 
 from nicegui import ui
 from nicegui.elements.mixins.value_element import ValueElement
+from pygments import highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import get_lexer_by_name
+from pygments.util import ClassNotFound
 
 from .. import api, catalog, gitref, term
 from .. import summary as summ
 from .. import store as S
 from .filters import href
 
-# Bodies carry code-style identifiers (snake_case_module). markdown2's default
-# emphasis matches intra-word underscores and mangles them to <em>;
-# `code-friendly` keeps *asterisk* emphasis and disables underscore emphasis.
-NOTE_MD_EXTRAS = ["fenced-code-blocks", "tables", "code-friendly"]
+# A checkout's markdown file, in the viewer, is read by ui.markdown (markdown2).
+# It carries code-style identifiers (snake_case_module), and markdown2's
+# default emphasis mangles intra-word underscores to <em>; `code-friendly`
+# keeps *asterisk* emphasis and disables underscore emphasis. A row body is
+# read in term.body_parser instead, as at a terminal.
+FILE_MD_EXTRAS = ["fenced-code-blocks", "tables", "code-friendly"]
+
+
+def _highlight(code: str, lang: str, _attrs: str) -> str:
+    """A fenced block in a language pygments knows, coloured as markdown2
+    coloured it, in the .codehilite classes ui.markdown serves the CSS for.
+    Any other block gets "", and markdown-it escapes it plain."""
+    try:
+        lexer = get_lexer_by_name(lang)
+    except ClassNotFound:
+        return ""
+    return (f'<pre class="codehilite"><code>'
+            f'{highlight(code, lexer, HtmlFormatter(nowrap=True))}</code></pre>')
+
+
+_BODY_MD = term.body_parser(_highlight)
+
+
+@functools.lru_cache(maxsize=1000)
+def _body_html(body: str) -> str:
+    return _BODY_MD.render(body)
+
+
+class NoteMarkdown(ui.markdown):
+    """A row's body, read as `list` and `show` read it at a terminal: the
+    same parser, so a list, a `~~strike~~` and a raw tag come out alike.
+    ui.markdown's markdown2 read them otherwise, so this replaces its
+    renderer, keeping its DOMPurify pass and its .codehilite CSS."""
+    # ponytail: overrides a private nicegui hook; if it moves,
+    # test_a_tag_in_a_body_prints_as_text fails, and ui.html takes the HTML.
+    def _handle_content_change(self, content: str) -> None:
+        self._props["innerHTML"] = _body_html(content)
+
 
 # store.new_id's shape, or the 10-character tail SKILL.md says to cite.
 # Bodies cite rows by id ("settled by <id>"), and the GUI had no way to
@@ -222,7 +260,7 @@ def id_link(n) -> None:
         ui.clipboard.write(n.id)
         ui.notify(f"copied {n.id}")
 
-    ui.button(icon="content_copy", on_click=_copy) \
+    ui.button(icon="content_copy", on_click=_copy, color=None) \
         .props('flat dense round size=xs aria-label="copy id"').classes("sb-copy") \
         .tooltip("copy the full id").mark("note-copy-id")
 
@@ -261,7 +299,7 @@ def md_button(ctx, name, label: str = ""):
                 ui.space()
                 ui.button(icon="close", on_click=dialog.close) \
                     .props('flat dense round size=sm aria-label="close"')
-            ui.markdown(text, extras=NOTE_MD_EXTRAS).mark("md-view")
+            ui.markdown(text, extras=FILE_MD_EXTRAS).mark("md-view")
         dialog.open()
 
     return ui.button(label, icon="article", on_click=_open) \
@@ -321,12 +359,13 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                               rm=("priority",) if has_pri else (), author=author)
                     refresh()
 
-                ui.button(icon="star" if has_pri else "star_outline", on_click=_star) \
+                ui.button(icon="star" if has_pri else "star_outline", color=None,
+                          on_click=_star) \
                     .props("flat dense round size=sm" + (" color=warning" if has_pri else "")
                            + ' aria-label="toggle priority"') \
                     .tooltip("toggle #priority").mark("note-star")
-                ui.button(icon="edit", on_click=lambda n=n: edit_dialog(ctx, n, refresh,
-                                                                        author=author)) \
+                ui.button(icon="edit", color=None,
+                          on_click=lambda n=n: edit_dialog(ctx, n, refresh, author=author)) \
                     .props('flat dense round size=sm aria-label="edit"') \
                     .tooltip("supersede / edit").mark("note-edit")
 
@@ -354,7 +393,7 @@ def _note_content(ctx, n, compact: bool, hit) -> None:
             else:
                 ui.label(text).classes("sb-note-text")
     elif n.body:
-        ui.markdown(link_ids(n.body, ctx.store_dir), extras=NOTE_MD_EXTRAS)   # sanitize=True default
+        NoteMarkdown(link_ids(n.body, ctx.store_dir))   # sanitize=True default: DOMPurify
     if n.measurements:
         with ui.row().classes("gap-3 flex-wrap").mark("measurements"):
             for k, v in n.measurements.items():

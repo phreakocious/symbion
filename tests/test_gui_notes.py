@@ -204,6 +204,58 @@ async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
     assert f'href="/notes?id={later.id}"' in md.props["innerHTML"]
 
 
+async def test_a_tag_in_a_body_prints_as_text(user: User, repo, tmp_path):
+    """A body is read at a terminal too, where `<pre>` is five characters.
+    markdown2 passes raw tags through and DOMPurify keeps the legal ones: a
+    `<pre>` in prose set the rest of a row in one unwrapped monospace line,
+    and `<td>` and a `<repo>` placeholder vanished."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "a <td> cell; ../<repo>-notes; wrap it in <pre> tags; "
+                              "the code `<pre>`; <https://example.org>"},
+                author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    html = md.props["innerHTML"]
+    assert "&lt;td&gt; cell" in html and "../&lt;repo&gt;-notes" in html, html
+    assert "&lt;pre&gt; tags" in html, html
+    assert "<pre" not in html and "<td" not in html, html
+    assert "<code>&lt;pre&gt;</code>" in html, html          # escaped once, not twice
+    assert '<a href="https://example.org">' in html, html
+
+
+async def test_a_body_reads_as_it_does_at_a_terminal(user: User, repo, tmp_path):
+    """The GUI read bodies with markdown2 and the terminal with CommonMark:
+    a list right under a line of prose was a list on a tty and one run-on
+    paragraph here, and `~~x~~` kept its tildes. One parser now. `_` still
+    makes no emphasis, as markdown2's code-friendly kept it, and a fenced
+    block in a language pygments knows is still coloured."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "Steps:\n1. a sample\n2. a test\n\n"
+                              "~~gone~~ and __init__.py\n\n```python\nx = 1\n```\n\n"
+                              "```nosuchlang\n<y>\n```"},
+                author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    html = md.props["innerHTML"]
+    assert "<ol>" in html and "<li>a sample</li>" in html, html
+    assert "<s>gone</s>" in html, html
+    assert "__init__.py" in html and "<strong>" not in html, html
+    assert '<pre class="codehilite"><code><span class="n">x</span>' in html, html
+    assert '<code class="language-nosuchlang">&lt;y&gt;\n</code>' in html, html
+
+
 async def test_a_compact_row_clips_a_long_verdict_and_a_full_one_does_not(
         user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
@@ -240,6 +292,31 @@ async def test_icon_buttons_have_names_a_screen_reader_can_read(user: User, repo
                          ("note-edit", "edit")):
         (b,) = user.find(marker=marker).elements
         assert b.props.get("aria-label") == name, (marker, b.props)
+
+
+async def test_a_cards_icon_buttons_take_the_theme_colour(user: User, repo, tmp_path):
+    """A NiceGUI button is Quasar's primary unless told otherwise, and that
+    `text-primary` is `!important` in NiceGUI's last layer: the star, edit
+    and copy-id buttons rendered accent over theme.py's body and muted
+    (measured in serve, 2026-10-02). They carry no colour of their own; a
+    starred row's star is `warning`."""
+    ctx = api.resolve(str(tmp_path))
+    for tags in ([], ["priority"]):
+        api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "b", "tags": tags}, author="ada")
+    rows = store.heads(store.load(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        for n in rows:
+            render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    for marker in ("note-edit", "note-copy-id"):
+        colours = [b.props.get("color") for b in user.find(marker=marker).elements]
+        assert colours == [None, None], (marker, colours)
+    stars = sorted(str(b.props.get("color")) for b in user.find(marker="note-star").elements)
+    assert stars == ["None", "warning"]
 
 
 async def test_the_id_links_to_the_note_alone(user: User, repo, tmp_path):

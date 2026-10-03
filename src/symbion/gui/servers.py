@@ -13,11 +13,26 @@ from __future__ import annotations
 import json
 import os
 import time
+import zlib
 from pathlib import Path
 
 
 def _dir() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "symbion" / "serve"
+
+
+def name(store) -> str:
+    """A store's name: its directory, less a `-notes` suffix. The sidebar
+    shows it, and the store's port derives from it."""
+    return Path(store).resolve().name.removesuffix("-notes")
+
+
+def port(store) -> int:
+    """The store's own port: the same at every restart, from every session,
+    and on every machine where its directory has the same name (the owner,
+    2026-10-02: a row link must not go stale). Below the ports either OS
+    gives outgoing connections (macOS from 49152, Linux from 32768)."""
+    return 20000 + zlib.crc32(name(store).encode()) % 10000
 
 
 def record(url: str, store) -> Path:

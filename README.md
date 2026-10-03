@@ -1,5 +1,7 @@
 # symbion
 
+![symbion: a project's notebook in the browser, and `symbion list` in a terminal over it](https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/banner.png)
+
 A per-project notebook and ticket registry for small projects, driven by a
 person and a coding agent through one CLI. The CLI stands alone; the agent side
 (a shared skill and a SessionStart hook) supports Claude Code and Codex.
@@ -184,8 +186,10 @@ symbion push         # when the store has a remote
 symbion serve        # the one command that needs the gui extra
 ```
 
-A local page at `http://127.0.0.1:43210` (or another free port: `serve` prints
-it, and `--port` picks one). It has:
+![The notebook page of symbion serve: a sidebar of places and open counts by kind, and boards of note cards](https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/gui.png)
+
+A local page on a port of the store's own, the same at every restart, so a link
+to a row stays good (`serve` prints it, and `--port` picks another). It has:
 
 - boards: by kind on the notebook, by target on the targets page;
 - a note list where every tag, kind, author and target is a filter link;

@@ -31,6 +31,15 @@ def _count(user: User) -> str:
     return label.text
 
 
+async def test_the_menu_button_takes_the_theme_colour(user: User, ctx_with_notes):
+    """Its `text-body` is `!important` but unlayered, so the `text-primary` a
+    NiceGUI button gets by default, `!important` in NiceGUI's last layer,
+    won: the menu button was accent (2026-10-02). It carries no colour."""
+    await user.open("/")
+    (b,) = user.find(marker="menu").elements
+    assert b.props.get("color") is None, b.props
+
+
 async def test_notes_filters_by_tag(user: User, ctx_with_notes):
     await user.open("/notes?tag=red")
     await user.should_see("alpha body")
