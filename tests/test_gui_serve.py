@@ -2,6 +2,7 @@
 builds the pages in-process and skips serve.main() and uvicorn entirely."""
 import json
 import os
+import random
 import re
 import signal
 import socket
@@ -23,9 +24,19 @@ SYMBION = str(Path(sys.executable).parent / "symbion")
 
 
 def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A port nothing holds on any address, below both OSes' ephemeral
+    ranges, as a store's own port is. One from bind(127.0.0.1, 0) can be held
+    by another user's connection on another address: the 127.0.0.1 bind
+    passes it, and serve's any-address test bind refuses it (a CI macOS
+    runner, 2026-10-03)."""
+    for port in random.sample(range(20000, 30000), 500):
+        with socket.socket() as s:
+            try:
+                s.bind(("", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("no free port in 20000-29999")
 
 
 def _get_page(p, port):
@@ -186,7 +197,7 @@ def test_a_restarted_serve_gets_its_port_back_through_time_wait():
     answered a request moved to a random port (measured 2026-10-02, on
     macOS and Linux)."""
     from symbion.gui.serve import pick_free_port
-    lst = _listener()
+    lst = _listener(_free_port())
     port = lst.getsockname()[1]
     cli = socket.create_connection(("127.0.0.1", port))
     conn, _ = lst.accept()
