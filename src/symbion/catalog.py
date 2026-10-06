@@ -108,7 +108,9 @@ def names(cfg, target_type: str, *, allow_empty: bool = False) -> list[str]:
 
 
 def resolve(query: str, candidates) -> str:
-    """Exact, else unique substring, else the input. Ambiguity refuses."""
+    """Exact, else unique substring, else the one name equal but for case,
+    else the input. Substring ambiguity refuses; case-only twins (README.md,
+    readme.md) are a miss, which `match` names in its `did you mean`."""
     q = nfc(query)
     if q in candidates:
         return q
@@ -117,7 +119,10 @@ def resolve(query: str, candidates) -> str:
         return hits[0]
     if len(hits) > 1:
         raise AmbiguousName(q, hits)
-    return q
+    # `Balancer` reached `Load Balancer` as a substring while the closer
+    # `load balancer` missed (2026-10-03).
+    same = [c for c in candidates if c.casefold() == q.casefold()]
+    return same[0] if len(same) == 1 else q
 
 
 def pool(cfg, target_type: str) -> list[str]:
@@ -191,15 +196,21 @@ def match(cfg, target_type: str, query: str, candidates) -> str:
         b = gitref.only_on_default_branch(cfg, got)
         where = f"; it is on {b}, not in this worktree" if b else ""
         # 0.9: a typo scored 0.97 to 0.98 against its file in this repo, and a
-        # new file 0.84 against its siblings, which share its directory.
-        near = difflib.get_close_matches(got, candidates, n=3, cutoff=0.9)
+        # new file 0.84 against its siblings, which share its directory. Case
+        # is folded: 'load balancer' scored 0.85 against 'Load Balancer'.
+        folded = {}
+        for c in candidates:
+            folded.setdefault(c.casefold(), []).append(c)
+        near = [c for f in difflib.get_close_matches(got.casefold(), list(folded), n=3,
+                                                     cutoff=0.9) for c in folded[f]]
         guess = f"; did you mean {', '.join(map(repr, near))}?" if near else ""
         print(f"note: {got!r} matches nothing in the {target_type} catalog; "
               f"taken as typed{where}{guess}", file=sys.stderr)
     elif got != nfc(query):
         # A non-exact pick is never silent:
         # `--name foo` landing on src/foo_test.py must be visible to undo.
-        print(f"note: {query!r} resolved to {got!r} (unique substring in the {target_type} catalog)",
+        how = "same name but for case" if got.casefold() == nfc(query).casefold() else "unique substring"
+        print(f"note: {query!r} resolved to {got!r} ({how} in the {target_type} catalog)",
               file=sys.stderr)
     return got
 

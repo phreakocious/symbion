@@ -6,8 +6,8 @@ Read this before `arc seed`, `arc reconcile`, or editing `[catalogs]` or
 A catalog type (e.g. `file`) is a shell command under `[catalogs]` that prints
 the type's legal names, one per line; `symbion schema` lists this store's. It
 runs in the root of the current worktree. A name you type resolves against
-it: exact, else unique substring, else your typed string, stored with a note
-on stderr.
+it: exact, else unique substring, else the one name equal but for case, else
+your typed string, stored with a note on stderr.
 
 ## Seed: add, unless there is a catalog
 

@@ -1,6 +1,8 @@
 import json
 import subprocess
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from symbion import store, summary
@@ -575,6 +577,25 @@ def test_render_labels_the_priority_block_not_a_bare_star(tmp_path):
     assert "task 0" in text.splitlines()[0]
     assert any(ln.startswith("  priority [task] item:in-arc") for ln in text.splitlines()), text
     assert not any(ln.startswith("  * ") for ln in text.splitlines())
+
+
+def test_a_star_says_how_long_it_has_been_on(tmp_path, monkeypatch):
+    """A star on a row with no status never expires, and the priority block
+    filled with finished results starred while they were news (2026-09-24).
+    Each star prints its age, counted from the oldest row of its chain that
+    carries it, so a later edit does not make it read fresh. Under a day it
+    says nothing."""
+    cfg = Config(project_root=tmp_path)
+    t0 = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    n = store.add(tmp_path, kind="decision", target={"type": "project", "name": None},
+                  body="chose x", tags=["priority"], created_at=t0.isoformat())
+    monkeypatch.setattr(store, "_now_iso", lambda: (t0 + timedelta(days=3)).isoformat())
+    store.supersede(tmp_path, n.id, author="other", body="picked x")
+    data = summary.summary(tmp_path, cfg, _now=t0 + timedelta(days=12, hours=1))
+    assert data["priority"][0]["starred_days"] == 12
+    assert "[decision, starred 12d ago]" in summary.render_summary(data)
+    data = summary.summary(tmp_path, cfg, _now=t0 + timedelta(hours=1))
+    assert "starred" not in summary.render_summary(data)
 
 
 def test_arc_rows_carry_an_age(tmp_path):

@@ -127,7 +127,7 @@ def test_seed_names_raises_valueerror_not_systemexit(repo, tmp_path):
 
 
 def test_why_unverifiable_separates_the_three_causes():
-    assert api.why_unverifiable(None) == "no provenance"
+    assert api.why_unverifiable({"runs": 3}) == "stamp names no commit"
     assert api.why_unverifiable({"sha": "abc", "dirty": True}) == "dirty tree"
     assert api.why_unverifiable({"sha": "abc"}) == "commit unavailable"
 

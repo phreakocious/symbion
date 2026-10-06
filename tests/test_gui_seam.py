@@ -32,7 +32,7 @@ GUI_DIR = Path(__file__).resolve().parent.parent / "src" / "symbion" / "gui"
 ALLOWED_STORE_READS = {
     "load", "load_malformed", "load_arcs", "heads", "heads_for", "query",
     "tag_counts", "arc_items", "arc_progress", "read_status", "due_state", "since_cutoff",
-    "exists", "newest_first", "written_at", "shown", "appended", "stamp_sha",
+    "exists", "newest_first", "written_at", "shown", "appended", "stamp_sha", "unholdable",
     "notes_path", "arcs_path", "Note", "Arc", "Target",
     "STATUSES", "BUILTIN_TARGET_TYPES",
 }

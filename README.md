@@ -82,7 +82,8 @@ That sets up Claude Code; `--agent codex` sets up Codex instead, and
 `--agent both` sets up both.
 
 This creates `../<repo>-notes`, a git repo with no remote, holding a commented
-`symbion.toml` whose every value has a default. For Claude Code, the first
+`symbion.toml` whose every value has a default and a README.md that says what
+the store is. For Claude Code, the first
 `init` on a machine also links `~/.claude/skills/symbion` to the skill directory in the installed
 package (SKILL.md, adoption.md, catalogs.md and the hook script), so an upgrade
 reaches every project. It registers the hook in `~/.claude/settings.json` when
@@ -126,6 +127,7 @@ bash ~/.agents/skills/symbion/session_start.sh     # the same, with only Codex s
 | either, then `  N per-project symbion copies from an older init: …` | an old `init` left the skill, hook or registration in this project; remove them (the link replaces them) |
 | `symbion: cannot read store at … because 'symbion' is not on PATH` | see Install |
 | `symbion: no store at …; run \`symbion init\`` | no store yet, or `.symbion`/`SYMBION_DIR` names a missing path |
+| `error: …/.symbion is a link to …` or `error: cannot read …/.symbion` | `.symbion` is there but is not a file symbion can read; the message gives the fix |
 | nothing | no store, no `.symbion` and no `SYMBION_DIR`, or the hook is not registered (or not trusted in Codex) |
 
 **3. Tell the agent.** One line in `CLAUDE.md` (Claude Code) or `AGENTS.md`
@@ -180,6 +182,9 @@ symbion commit -m "adoption: README ticket closed"
 symbion push         # when the store has a remote
 ```
 
+`commit` says `no remote` while the store has none. A store kept on one disk on
+purpose takes `local_only = true` in its `symbion.toml`, and `commit` stops saying so.
+
 ## Browse it (optional)
 
 ```bash
@@ -195,7 +200,7 @@ to a row stays good (`serve` prints it, and `--port` picks another). It has:
 - a note list where every tag, kind, author and target is a filter link;
 - a search box (`/`): its text filters the page as you type, and Enter
   searches the whole store (every word, literally, in any case, or a pasted
-  note id);
+  note id), as a pause in the typing does once nothing on the page matches;
 - a new note from any page (`n`), on that page's object or any other: `#tag`
   and `!kind` in its body set its tags and kind, and Shift Enter adds it and
   starts the next;
@@ -246,7 +251,8 @@ on the tool's version and the project's config:
 symbion arc seed --scope file --dry-run     # no arc needed; writes nothing
 ```
 
-Names resolve exact, then unique substring, else as typed. `cli.py` matches
+Names resolve exact, then unique substring, then the one name equal but for
+case, else as typed. `cli.py` matches
 both `src/symbion/cli.py` and `tests/test_cli.py`, so it is refused: use the
 full path.
 
@@ -289,7 +295,8 @@ where two separate adds would store both.
   and `verdict` is a pre-registration, closed by `resolve --result`.
 - **`priority` stars a row** for the next session's summary:
   `supersede <id> --add-tag priority`, until the row is resolved or
-  `--rm-tag priority` takes the star off.
+  `--rm-tag priority` takes the star off. From a day on, the summary prints
+  its age.
 - **Due dates.** `--due 2026-10-01` (or an ISO datetime) on any status row. An
   open row past due or due within 7 days leads the session-start summary
   (`overdue 2d`, `due in 3d`). `list --overdue` lists those past due, and
@@ -312,10 +319,13 @@ where two separate adds would store both.
 - **Store:** `../<repo>-notes`, beside the *main* worktree; linked worktrees
   share it. `SYMBION_DIR` or `--dir PATH` (anywhere in the argv) override. A
   store named from another repo, or a command run inside a store (to edit
-  `symbion.toml`, say), resolves in the store's own repo and says so on stderr.
+  `symbion.toml`, say), resolves in the store's own repo. A write or a catalog
+  run says so on stderr.
   `init` inside a store refuses.
 - **A store not named after its repo:** put its path in a `.symbion` file in
-  the repo root (first non-blank line; relative to the repo, or absolute).
+  the repo root (first non-blank line; relative to the main checkout, or
+  absolute; a file, not a link to the store). A linked worktree's pointer
+  counts while the main checkout has none, as on a branch that adopts symbion.
   `symbion --dir ../other-notes init --yes` writes it. If the repo already
   reads a store that exists, init creates the new store and leaves the
   pointer alone; `--repoint` changes it. Commit it; a relative path
@@ -323,9 +333,24 @@ where two separate adds would store both.
   it has to find. Set it whenever the names differ: after a repo directory is
   renamed, every command, writes included, reports
   `no store at ../<new-name>-notes` until a `.symbion` names the old store.
+  A note under that error names any store beside the repo that no project
+  claims, by its name or by a pointer.
 - **Files:** `notes.jsonl` (append-only once committed: a correction is a
   new row that supersedes the old one; before `symbion commit`, an edit to
   your own row rewrites it), `arcs.jsonl`, `symbion.toml`.
+- **Secrets:** a store is a git repo, so any pre-commit hook guards it;
+  symbion ships none. [gitleaks](https://github.com/gitleaks/gitleaks), for
+  one, scans only what a commit adds, from the store's `.git/hooks/pre-commit`:
+
+  ```sh
+  exec gitleaks git --pre-commit --staged --redact --no-banner --no-color -v -l warn .
+  ```
+
+  A refusal names a line of `notes.jsonl`, and `symbion commit` commits
+  nothing. `symbion supersede <id> --body …` rewrites your own uncommitted row
+  in place, so the secret never reaches history. A row someone else wrote, or
+  one another row cites, gets a new row instead: edit that line out of
+  `notes.jsonl` by hand.
 - **Reading:** `symbion summary` (what the hook prints),
   `symbion context --target TYPE:NAME`, `symbion context --branch REF`,
   `symbion list --json`.

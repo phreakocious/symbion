@@ -234,6 +234,21 @@ async def test_a_notes_own_view_lists_its_earlier_versions(user: User, ctx_with_
     assert len(user.find(marker="note-edit").elements) == 1     # the current row's only
 
 
+async def test_earlier_versions_show_their_target(user: User, ctx_with_notes):
+    """A rename is a new version whose only change is the target, and the
+    earlier versions were drawn without one: the change was invisible."""
+    ctx = ctx_with_notes
+    nid = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "old-name"}},
+                  author="ada").id
+    api.commit(ctx, "c")
+    api.rename_target(ctx, "item", "old-name", "new-name", author="ada")
+    head = next(n for n in store.heads(store.load(ctx.store_dir)) if n.supersedes == nid)
+    await user.open(f"/notes?id={head.id}")
+    await user.should_see("new-name")
+    user.find(marker="history").click()
+    await user.should_see("old-name")
+
+
 async def test_a_note_never_superseded_has_no_history(user: User, ctx_with_notes):
     nid = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
     await user.open(f"/notes?id={nid}")
@@ -306,15 +321,22 @@ async def test_tags_page_lists_the_vocabulary_with_counts(user: User, ctx_with_n
 
 async def test_object_view_surfaces_notes_that_REF_the_target(user: User, repo, tmp_path):
     """heads_for carries a reverse edge query() cannot express -- that is why
-    /object exists rather than being another canned filter."""
+    /object exists rather than being another canned filter.
+
+    The page names the object, so a row ON it leaves its target out; a row
+    that only refers to it names its own. Without it, that row's "N commits
+    since" read as the page's file (2026-10-05)."""
     ctx = api.resolve(str(tmp_path))
     api.add(ctx, {"kind": "note", "target": {"type": "item", "name": "other"},
                   "body": "points at widget", "refs": [{"type": "item", "name": "widget"}]},
             author="ada")
+    api.add(ctx, {"kind": "note", "target": {"type": "item", "name": "widget"},
+                  "body": "on widget"}, author="ada")
     build_page(ctx, author="ada")
 
     await user.open("/object?type=item&name=widget")
     await user.should_see("points at widget")
+    assert [e.text for e in user.find(marker="note-target").elements] == ["item: other"]
 
 
 async def test_object_view_handles_a_name_with_a_slash(user: User, repo, tmp_path):
@@ -781,6 +803,25 @@ async def test_the_sidebar_counts_open_parked_rows_under_their_own_head(
     assert side.parent_slot.children[0].text == "parked"
 
 
+async def test_the_sidebar_lists_the_kinds_with_no_status_under_records(
+        user: User, repo, tmp_path):
+    """The sidebar showed no kind without a status bit (2026-10-02). Such
+    a kind has no open count: it shows its rows, and
+    links to them."""
+    ctx = api.resolve(str(tmp_path))
+    for body in ("chose x", "chose y"):
+        api.add(ctx, {"kind": "decision", "target": {"type": "project", "name": None},
+                      "body": body}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    (side,) = user.find(marker="kind-decision").elements
+    assert side.props["href"] == "/notes?kind=decision"
+    assert side.default_slot.children[-1].text == "2"
+    assert side.parent_slot.children[0].text == "records"
+    (note,) = user.find(marker="kind-note").elements
+    assert note.default_slot.children[-1].text == "0"
+
+
 def test_the_viewer_reads_only_markdown_inside_the_checkout(repo, tmp_path):
     """A target name is typed text: the viewer must not read through it."""
     from symbion.gui.notes import md_path
@@ -842,6 +883,24 @@ async def test_typing_in_the_search_box_does_not_leave_the_page(user: User, ctx_
     user.find(marker="search").trigger("keydown.enter")
     await user.should_see(marker="result-count")
     assert _count(user).startswith("1 of 2 notes match")
+
+
+async def test_a_filter_that_hides_every_card_searches_the_store(user: User, ctx_with_notes,
+                                                                 monkeypatch):
+    """The page's script sends the text after a pause once its filter hides
+    every card: a superseded id matched no card and read as a row that was
+    gone (the owner, 2026-10-05). The page that shows that search stays."""
+    from nicegui import ui
+    await user.open("/tags")
+    user.find(marker="search").trigger("update:value", "beta")
+    await user.should_see(marker="result-count")
+    assert _count(user).startswith("1 of 2 notes match")
+    went = []
+    monkeypatch.setattr(ui.navigate, "to", went.append)
+    user.find(marker="search").trigger("update:value", " beta ")
+    assert went == []
+    user.find(marker="search").trigger("update:value", "beta gamma")
+    assert len(went) == 1 and "gamma" in went[0], went
 
 
 async def test_the_sidebar_links_the_other_stores_a_serve_runs_on(user: User, repo, tmp_path,
@@ -937,3 +996,45 @@ async def test_targets_page_boards_each_target_open_work_first(user: User, repo,
     await user.should_see("open body")
     await user.should_see("ref body")
     assert user.find(marker="place-targets").elements
+
+
+async def test_a_card_on_a_file_says_how_many_commits_changed_it_since(user: User, repo,
+                                                                         tmp_path):
+    """Each page of cards counts once for its rows, as it reads HEAD once."""
+    (tmp_path / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n')
+    ctx = api.resolve(str(tmp_path))
+    arc = api.create_arc(ctx, "a", "", "mixed", author="ada")
+    api.add(ctx, {"kind": "bug", "target": {"type": "file", "name": "f"}, "body": "on f",
+                  "refs": [{"type": "arc", "name": arc.id}]}, author="ada")
+    for i in range(2):
+        (repo / "f").write_text(f"v{i}")
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam",
+                        f"edit {i}"], check=True, cwd=repo)
+    build_page(ctx, author="ada")
+    for url in ("/", "/notes", "/object?type=file&name=f", "/targets", f"/arc?id={arc.id}"):
+        await user.open(url)
+        await user.should_see("2 commits since")
+
+
+async def test_a_page_of_boards_counts_commits_since_once(user: User, repo, tmp_path,
+                                                          monkeypatch):
+    """A count per board took /targets from 0.37 s to 0.62 s (2026-10-05)."""
+    (tmp_path / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n')
+    for name in ("g", "h"):
+        (repo / name).write_text(name)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+                   check=True, cwd=repo)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm",
+                    "g h"], check=True, cwd=repo)
+    ctx = api.resolve(str(tmp_path))
+    for name, kind in (("f", "bug"), ("g", "task"), ("h", "question")):    # three boards
+        api.add(ctx, {"kind": kind, "target": {"type": "file", "name": name},
+                      "body": f"on {name}"}, author="ada")
+    build_page(ctx, author="ada")
+    calls = []
+    real = gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda cfg, *a, **k: calls.append(a[0]) or real(cfg, *a, **k))
+    for url in ("/", "/targets"):
+        calls.clear()
+        await user.open(url)
+        assert calls.count("hash-object") == 1, (url, calls)

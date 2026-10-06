@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -454,6 +455,42 @@ def test_rename_resolves_the_new_name_the_way_add_does(repo, tmp_path, capsys):
     assert [r.name for n in hs for r in n.refs] == [new]
 
 
+def test_rename_names_the_rows_whose_body_still_names_the_old_name(repo, tmp_path, capsys):
+    """An --amend moved a check and a resolve's ref to the new sha, and the
+    resolve still read "Fixed in <old>." until a hand supersede (2026-10-02).
+    A commit is matched by the 7-character prefix a body cites."""
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+         "--allow-empty", "-m", "c1")
+    old, new = (subprocess.run(["git", "rev-parse", r], cwd=repo, check=True,
+                               capture_output=True, text=True).stdout.strip()
+                for r in ("HEAD~1", "HEAD"))
+    s = tmp_path / "s"
+    run("add", "--kind", "note", "--type", "commit", "--name", old, "--body", "ran", store_dir=s)
+    run("add", "--kind", "note", "--type", "project", "--ref", f"commit:{old}",
+        "--body", f"Fixed in {old[:7]}.", store_dir=s)
+    run("add", "--kind", "note", "--type", "item", "--name", "x", "--body", f"see {old[:7]}",
+        store_dir=s)
+    run("add", "--kind", "note", "--type", "item", "--name", "y", "--body", "unrelated", store_dir=s)
+    capsys.readouterr()
+    assert run("rename", old, new, "--type", "commit", store_dir=s) == 0
+    named = [n.id for n in store.newest_first(store.heads(store.load(s))) if old[:7] in n.body]
+    assert len(named) == 2
+    assert capsys.readouterr().err == (
+        f"note: {old[:7]} is still in the body of 2 rows: {', '.join(named)}; "
+        f"supersede each to update it (list --grep '\\b{old[:7]}')\n")
+    assert run("rename", "y", "z", "--type", "item", store_dir=s) == 0
+    assert capsys.readouterr().err == "", "no body names y"
+    # A name is matched as a word: a one-letter item named three unrelated
+    # rows (the 0.3.0 review, 2026-10-05).
+    for body in ("banana", "plan on a", "nothing"):
+        run("add", "note", "--target", "item:q", "--body", body, store_dir=s)
+    run("add", "note", "--target", "item:a", "--body", "on itself", store_dir=s)
+    capsys.readouterr()
+    assert run("rename", "a", "b", "--type", "item", store_dir=s) == 0
+    err = capsys.readouterr().err
+    assert "a is still in the body of 1 row:" in err and r"(list --grep '\ba\b')" in err, err
+
+
 def test_seed_dry_run_creates_nothing(tmp_path, capsys):
     run("arc", "create", "--name", "x", "--scope", "item", store_dir=tmp_path)
     aid = store.load_arcs(tmp_path)[0].id
@@ -552,11 +589,17 @@ def test_reconcile_apply_leaves_stale_open(tmp_path):
     assert items["stale1"] == "open"
 
 
-def test_reconcile_resolve_stale_closes_it(tmp_path):
+def test_reconcile_resolve_stale_closes_it(tmp_path, capsys):
+    """The reason goes below the task's body, as `resolve --body` puts it:
+    replacing lost the claim the row was about (2026-09-26 audit)."""
     aid = _seeded_reconcile_arc(tmp_path)
+    stale, = [n for n in store.load(tmp_path) if n.target.name == "stale1"]
+    run("supersede", stale.id, "--body", "the claim", store_dir=tmp_path)
     assert run("arc", "reconcile", aid, "--resolve-stale", store_dir=tmp_path) == 0
-    items = {n.target.name: n.status for n in store.arc_items(store.load(tmp_path), aid)}
-    assert items["stale1"] == "resolved"
+    items = {n.target.name: n for n in store.arc_items(store.load(tmp_path), aid)}
+    assert items["stale1"].status == "resolved"
+    assert items["stale1"].body == ("the claim\n\nreconcile: target 'stale1' disappeared "
+                                    "from the thing catalog; no rename evidence.")
 
 
 def test_reconcile_leads_with_how_much_it_could_check(tmp_path, capsys):
@@ -710,6 +753,15 @@ def test_arc_archive_hides_from_list_but_keeps_checkboxes(tmp_path, capsys):
     rows = json.loads(capsys.readouterr().out)
     assert aid not in [r["id"] for r in rows]
     assert len(store.arc_items(store.load(tmp_path), aid)) == 1
+    # An archived campaign's done/total was unreachable from the CLI
+    # (2026-10-03): --all shows it, and the plain view says it hides one.
+    run("arc", "list", store_dir=tmp_path)
+    assert "+1 archived (arc list --all)" in capsys.readouterr().out
+    run("arc", "list", "--all", "--json", store_dir=tmp_path)
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["id"], r["archived"], r["done"], r["total"]) for r in rows] == [(aid, True, 0, 1)]
+    run("arc", "list", "--all", store_dir=tmp_path)
+    assert "0/1  x  (archived)" in capsys.readouterr().out
 
 
 def test_an_arc_id_that_names_no_arc_is_refused_on_write(tmp_path, capsys):
@@ -1382,6 +1434,20 @@ def test_list_name_reads_the_type_prefix_its_own_miss_hint_prints(tmp_path, caps
     assert "read 'item:dns audit' as --type item --name 'dns audit'" in err
 
 
+def test_list_takes_target_as_add_and_context_do(tmp_path, capsys):
+    """An agent typed `list --target file:src/x.py` by analogy with `add`
+    and `context`, and got argparse's usage error (2026-10-02)."""
+    run("add", "note", "--target", "item:dns audit", "--body", "x", store_dir=tmp_path)
+    run("add", "note", "--target", "item:other", "--body", "y", store_dir=tmp_path)
+    run("add", "note", "--target", "project", "--body", "z", store_dir=tmp_path)
+    capsys.readouterr()
+    for target, bodies in (("item:dns audit", ["x"]), ("project", ["z"])):
+        assert run("list", "--target", target, "--json", store_dir=tmp_path) == 0
+        assert [r["body"] for r in json.loads(capsys.readouterr().out)] == bodies
+    assert run("list", "--target", "item:x", "--name", "x", store_dir=tmp_path) == 2
+    assert "--target or --type/--name, not both" in capsys.readouterr().err
+
+
 def test_list_name_prefers_a_target_literally_named_with_a_colon(tmp_path, capsys):
     """The split is a fallback, not a rewrite: a row whose target name really
     is `item:x` must still win, and --type given means --name was literal."""
@@ -1546,6 +1612,26 @@ def test_arc_todo_json_carries_the_body(tmp_path, capsys):
     capsys.readouterr()
     run("arc", "todo", aid, "--json", store_dir=tmp_path)
     assert json.loads(capsys.readouterr().out)[0]["body"] == "do the thing"
+
+
+def test_a_check_with_no_stamp_reads_unstamped_with_its_age(repo, tmp_path, capsys, tty):
+    """Rows migrated from a store that predates stamping read `unverifiable
+    (no provenance)`, as a dirty or squashed stamp does: an alarm on every
+    such row, none of them news. JSON names the state; text gives the age."""
+    from datetime import datetime, timedelta
+    store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
+    five = (datetime.now().astimezone() - timedelta(days=5, hours=1)).isoformat(timespec="seconds")
+    store.add(store_dir, kind="check", target={"type": "item", "name": "x"},
+              checked="c", result="r", created_at=five)
+    run("list", "--kind", "check", "--json", store_dir=store_dir)
+    assert [r["state"] for r in json.loads(capsys.readouterr().out)] == ["unstamped"]
+    run("list", "--kind", "check", store_dir=store_dir)
+    assert "state=unstamped (5d ago)" in capsys.readouterr().out
+    tty()
+    run("list", "--kind", "check", store_dir=store_dir)
+    out = capsys.readouterr().out
+    assert "unstamped (5d ago)" in out and "unverifiable" not in out
 
 
 def test_list_text_names_why_a_check_is_unverifiable(repo, tmp_path, capsys):
@@ -2241,6 +2327,71 @@ def test_supersede_takes_a_body_file_too(tmp_path, capsys):
     assert head.body == "second, with an apostrophe's worth of prose"
 
 
+@pytest.mark.parametrize("verb", ["supersede", "resolve", "add"])
+@pytest.mark.parametrize("piped", ["", " \n\n"])
+def test_a_body_file_that_reads_nothing_writes_nothing(tmp_path, capsys, monkeypatch,
+                                                       verb, piped):
+    """`producer | symbion supersede <id> --body-file -` with a producer that
+    failed (no pipefail) read "" and replaced a long body at exit 0. Empty
+    stdin is a broken producer far more often than intent; `--body ''` says intent."""
+    run("add", "task", "--target", "project", "--body", "keep me", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    before = store.load(tmp_path)
+    monkeypatch.setattr("sys.stdin", io.StringIO(piped))
+    args = {"supersede": ["supersede", nid], "resolve": ["resolve", nid],
+            "add": ["add", "task", "--target", "project"]}[verb]
+    assert run(*args, "--body-file", "-", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert "--body-file" in err and "nothing was written" in err
+    assert ("--body ''" in err) == (verb == "supersede")
+    assert store.load(tmp_path) == before
+
+
+@pytest.mark.parametrize("verb", ["resolve", "supersede"])
+def test_a_field_the_kind_cannot_hold_is_named_when_a_write_drops_it(tmp_path, capsys,
+                                                                    verb):
+    """A legacy bug carrying checked/result (a migrated store's) loses them
+    from the head on its next write: the store drops what the kind cannot
+    hold. Silent, that is text loss; said, the writer can move it into the body."""
+    run("add", "bug", "--target", "project", "--body", "b", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    path = store.notes_path(tmp_path)
+    path.write_text(path.read_text(encoding="utf-8")
+                    .replace('"checked": null', '"checked": "ran it"')
+                    .replace('"result": null', '"result": "it failed"'), encoding="utf-8")
+    args = ["--body", "fixed"] if verb == "resolve" else ["--add-tag", "x"]
+    assert run(verb, nid, *args, store_dir=tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert out.strip() != nid
+    assert "checked, result" in err and "verdict bit" in err
+    assert f"{nid} keeps them" in err
+
+    capsys.readouterr()
+    assert run("supersede", out.strip(), "--add-tag", "y", store_dir=tmp_path) == 0
+    assert "keeps them" not in capsys.readouterr().err, "a clean row says nothing"
+
+
+def test_a_rename_names_the_rows_that_dropped_a_field(tmp_path, capsys):
+    """A sweep supersedes each row it moves, so a legacy row's field its kind
+    cannot hold left the head with only the sweep's counts printed
+    (reproduced 2026-10-03)."""
+    run("add", "decision", "--target", "item:a", "--body", "d", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    run("add", "decision", "--target", "item:a", "--body", "clean", store_dir=tmp_path)
+    path = store.notes_path(tmp_path)
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines[0] = lines[0].replace('"checked": null', '"checked": "ran it"')
+    path.write_text("".join(lines), encoding="utf-8")
+    capsys.readouterr()
+    assert run("rename", "a", "b", "--type", "item", store_dir=tmp_path) == 0
+    err = capsys.readouterr().err
+    assert (f"note: 1 row dropped checked, a field its kind cannot hold; the old row "
+            f"keeps it: show {nid} --json") in err, err
+    capsys.readouterr()
+    assert run("rename", "b", "c", "--type", "item", store_dir=tmp_path) == 0
+    assert "dropped" not in capsys.readouterr().err, "the moved rows are clean now"
+
+
 def test_resolve_body_and_add_tag_land_on_the_resolving_row(repo, tmp_path, capsys):
     """A question's answer and an idea's fate are the value of closing them;
     one command, one row. The answer goes below the question: replacing it
@@ -2356,6 +2507,28 @@ def _declare(store_dir, text):
     (store_dir / "symbion.toml").write_text(text)
 
 
+def test_prepend_puts_a_new_lead_above_the_body_but_never_a_pre_registrations(
+        repo, tmp_path, capsys):
+    """Correcting a long row's lead took a rebuild by hand: list --json, the
+    body to one file, the new lead to another, cat, --body-file - (2026-10-02).
+    A pre-registration keeps its registered text on top, so it refuses."""
+    _declare(tmp_path, PREREG)
+    run("add", "task", "--target", "item:t", "--body", "STILL BROKEN\n\ntables",
+        store_dir=tmp_path)
+    tid = capsys.readouterr().out.strip()
+    assert run("supersede", tid, "--prepend", "--body", "FIXED", store_dir=tmp_path) == 0
+    assert store.heads(store.load(tmp_path))[0].body == "FIXED\n\nSTILL BROKEN\n\ntables"
+    assert run("supersede", tid, "--prepend", "--append", "--body", "x",
+               store_dir=tmp_path) != 0
+    capsys.readouterr()
+    run("add", "prediction", "--target", "item:p", "--checked", "run x", "--body", "x rises",
+        store_dir=tmp_path)
+    pid = capsys.readouterr().out.strip()
+    assert run("supersede", pid, "--prepend", "--body", "lead", store_dir=tmp_path) == 1
+    assert "pre-registration" in capsys.readouterr().err
+    assert len(store.load(tmp_path)) == 2
+
+
 def test_add_kind_choices_come_from_the_table_and_the_error_names_it(tmp_path, capsys):
     _declare(tmp_path, '[kinds]\nanomaly = { status = true }\n')
     assert run("add", "--kind", "anomaly", "--type", "project", store_dir=tmp_path) == 0
@@ -2432,6 +2605,21 @@ def test_a_kind_typed_as_a_type_is_told_rows_join_through_objects(tmp_path, caps
     assert (f"'check' is a kind: a {what} names an object, never a row. Give this row "
             f"that row's target, and cite its id in the body") in capsys.readouterr().err
     assert store.load(tmp_path) == []
+
+
+@pytest.mark.parametrize("argv", [
+    ["add", "idea", "--target", "item:x", "--ref", "item:20261002-120000-123456-abc"],
+    ["add", "idea", "--target", "item:123456-abc"],
+    ["add", "idea", "--target", "item:x", "--ref", "item:…120000-123456-abc"],
+])
+def test_an_item_named_like_a_row_id_is_refused(tmp_path, capsys, argv):
+    """`--ref item:<row id>` meant "see this row" and stored a new item by
+    that name at exit 0, three times in one session (2026-10-02)."""
+    assert run(*argv, store_dir=tmp_path) == 1
+    assert ("has the shape of a row id: an item names an object, never a row. Give this "
+            "row that row's target, and cite its id in the body") in capsys.readouterr().err
+    assert store.load(tmp_path) == []
+    assert run("add", "idea", "--target", "item:build 123456", store_dir=tmp_path) == 0
 
 
 def test_show_is_list_id(tmp_path, capsys):
@@ -2911,6 +3099,10 @@ def test_a_json_read_of_an_absent_store_says_so_on_stderr(tmp_path, capsys, argv
     out = capsys.readouterr()
     assert json.loads(out.out) is not None
     assert f"symbion: no store at {gone}" in out.err, out.err
+    if argv[0] == "context":
+        # summary's gate: a client that reads only stdout and the exit code
+        # showed "no notes" for a missing store (2026-10-03)
+        assert json.loads(out.out)["store"] is None
     assert run("summary", "--json", store_dir=gone) == 0
     out = capsys.readouterr()
     assert json.loads(out.out)["store"] is None and out.err == ""
@@ -3042,7 +3234,8 @@ def test_a_row_keeps_its_labels_in_every_summary_block(tmp_path, capsys, monkeyp
     assert line("starred").startswith("  priority from ada "), line("starred")
     assert line("due").startswith("  due in 2d from ada "), line("due")
     for name in ("starred", "due", "plain"):
-        assert "from ada [prediction, registered 2026-09-20] " in line(name), line(name)
+        assert "from ada [prediction, registered 2026-09-20" in line(name), line(name)
+    assert "registered 2026-09-20, starred " in line("starred"), "a star's age rides along"
     assert line("mine").startswith("  priority [task] item:mine "), line("mine")
 
 
@@ -3423,6 +3616,9 @@ def test_add_says_when_a_catalog_name_is_stored_as_typed(tmp_path, capsys):
     assert err.rstrip().endswith("; did you mean 'src/parser.py'?"), err
     run("list", "--type", "file", "--name", "src/lexer.py", store_dir=tmp_path)    # 0.72
     assert "did you mean" not in capsys.readouterr().err, "a new file is no typo"
+    # case is no evidence of a new name: 'Src/Parsre.py' scored 0.77 as typed
+    run("list", "--type", "file", "--name", "Src/Parsre.py", store_dir=tmp_path)
+    assert capsys.readouterr().err.splitlines()[0].endswith("; did you mean 'src/parser.py'?")
     assert out.strip() == store.load(tmp_path)[-1].id, "stdout is still just the id"
     assert run("add", "--kind", "bug", "--type", "file", "--name", "src/parser.py",
                store_dir=tmp_path) == 0
@@ -3519,6 +3715,26 @@ def test_commit_counts_its_rows_by_author(tmp_path, capsys):
                          capture_output=True, text=True).stdout
     assert msg.strip() == "ada's work\n\nRows: ada 2, codex 1", msg
 
+
+def test_commit_names_the_files_it_takes_beside_the_rows(tmp_path, capsys):
+    """`add -A` takes every path in the store. A plan went in with 7 rows
+    under a line that named only the rows (2026-10-02), and a script did the
+    same (2026-10-05)."""
+    run("add", "--kind", "note", "--type", "project", "--body", "w", store_dir=tmp_path)
+    run("commit", store_dir=tmp_path)            # the store's own first files
+    run("add", "--kind", "note", "--type", "project", "--body", "x", "--author", "ada",
+        store_dir=tmp_path)
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "measure.py").write_text("print(1)\n")
+    capsys.readouterr()
+    assert run("commit", store_dir=tmp_path) == 0
+    assert "committed: rows ada 1; 1 file: tools/measure.py\n" in capsys.readouterr().out
+    for name in ("a ä.md", "b.md", "c.md", "d.md"):
+        (tmp_path / "tools" / name).write_text("plan\n")
+    assert run("commit", store_dir=tmp_path) == 0
+    assert ("committed: 4 files: tools/a ä.md, tools/b.md, tools/c.md, +1 more\n"
+            in capsys.readouterr().out)
+
 def test_commit_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capsys):
     """The other direction, which printed only `committed` -- the same as a
     backed-up store (2026-09-23). No push
@@ -3531,6 +3747,18 @@ def test_commit_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capsy
     assert "no remote: this store exists on one disk" in out and "push" not in out, out
     assert run("commit", store_dir=tmp_path) == 1
     assert "no remote" in capsys.readouterr().out
+
+
+def test_commit_on_a_local_only_store_says_nothing_of_a_remote(tmp_path, capsys):
+    """A store kept on one disk on purpose read the nag at every commit
+    (2026-10-03). `local_only = true` quiets it; push still
+    refuses, since there is nowhere to push."""
+    run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=tmp_path)
+    (tmp_path / "symbion.toml").write_text("local_only = true\n")
+    capsys.readouterr()
+    assert run("commit", store_dir=tmp_path) == 0
+    assert "no remote" not in capsys.readouterr().out
+    assert run("push", store_dir=tmp_path) == 1
 
 
 def test_commit_a_hook_refuses_says_so_with_the_hooks_words(tmp_path, capsys,
@@ -3938,7 +4166,9 @@ def test_context_names_its_count_and_what_it_is_for(tmp_path, capsys):
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == "1 note; +1 other head (list)", lines[0]
     run("context", "--json", store_dir=tmp_path)
-    assert set(json.loads(capsys.readouterr().out)) == {"notes"}, "json shape unchanged"
+    data = json.loads(capsys.readouterr().out)
+    assert set(data) == {"store", "gui", "notes"}, "no header in json"
+    assert data["store"] == str(tmp_path)
 
 
 def test_list_and_arc_list_on_an_empty_store_name_the_next_verb(tmp_path, capsys):
@@ -4058,6 +4288,48 @@ def test_a_read_on_an_absent_store_names_it_rather_than_the_verb_that_forks_it(t
     out, err = capsys.readouterr()
     assert (out, err) == ("", f"symbion: no store at {nowhere}; run `symbion init`\n")
     assert not nowhere.exists()
+
+
+def test_a_renamed_repo_is_shown_the_store_no_project_names(repo, tmp_path, capsys):
+    """A repo renamed without a `.symbion` reads `no store at <new>-notes;
+    run symbion init`, and init starts a second store. Its old store sits
+    beside it with no project of its name. A store some sibling's pointer
+    names is claimed, though its name matches nothing (`claimed-notes`)."""
+    store.ensure_store(tmp_path / "old-notes")
+    store.ensure_store(tmp_path / "claimed-notes")
+    (tmp_path / "plain-notes").mkdir()                   # not a store
+    q = tmp_path / "q"
+    q.mkdir()
+    _git(q, "init", "-q", "-b", "main")
+    (q / ".symbion").write_text("../claimed-notes\n")
+    assert cli.main(["list"]) == 1
+    err = capsys.readouterr().err
+    assert err == (f"symbion: no store at {tmp_path.resolve() / 'p-notes'}; run `symbion init`\n"
+                   "note: if this repo was renamed, its store may be ../old-notes, which no "
+                   "project names: `echo ../old-notes > .symbion` points this repo at it, "
+                   "instead of init\n"), err
+    shutil.rmtree(tmp_path / "old-notes")
+    assert cli.main(["list"]) == 1
+    assert "note:" not in capsys.readouterr().err, "no orphan, no note"
+
+
+@pytest.mark.parametrize("argv, code", [
+    (["context", "--target", "widget:x", "--json"], 0),
+    (["list", "--type", "widget"], 1),
+    (["list", "--kind", "prediction", "--json"], 0),
+    (["add", "prediction", "--target", "widget:x"], 1),
+    (["arc", "create", "--name", "x", "--scope", "widget"], 1),
+])
+def test_an_absent_store_is_named_before_a_type_or_kind_its_config_would_declare(
+        tmp_path, capsys, argv, code):
+    """The types, kinds and scopes past the built-in ones are declared in the
+    store's symbion.toml, so with the store absent, argparse refused a catalog
+    type as `invalid type 'widget'`, and a client that shows stderr told its
+    user the type was wrong (2026-10-03). The missing store is the error."""
+    nowhere = tmp_path / "nowhere"
+    assert cli.main(["--dir", str(nowhere), *argv]) == code
+    err = capsys.readouterr().err
+    assert err == f"symbion: no store at {nowhere}; run `symbion init`\n", err
 
 
 def test_the_summary_header_counts_what_the_arcs_hold(tmp_path, capsys):
@@ -4195,11 +4467,15 @@ def test_a_cwd_inside_a_store_reads_that_store_in_its_own_project(two_projects, 
         assert _bare("list") == 0
         out, err = capsys.readouterr()
         assert out.splitlines()[0] == "1 row", out
-        assert f"{s} belongs to {own}" in err, "say which repo computes catalogs"
+        # On every read it was noise, so a real mismatch was skipped with it
+        # (2026-10-01): a read is right for the store it reads.
+        assert "belongs to" not in err, err
         assert _bare("arc", "seed", "--scope", "file", "--dry-run") == 0
-        assert "own_only.py" in capsys.readouterr().out
+        c = capsys.readouterr()
+        assert "own_only.py" in c.out and f"{s} belongs to {own}" in c.err, "a catalog run says whose"
     assert _bare("add", "--kind", "check", "--type", "project",
                  "--checked", "c", "--result", "r") == 0
+    assert f"{s} belongs to {own}" in capsys.readouterr().err, "a write says whose repo stamps it"
     assert store.load(s)[-1].provenance["sha"] == _head(own)
     assert not (s.parent / "own-notes-notes").exists()
 
@@ -4449,6 +4725,8 @@ def test_a_serve_on_the_store_links_ids_at_a_terminal_and_summary_names_it(tmp_p
     assert "symbion serve" not in capsys.readouterr().out
     assert run("summary", "--json", store_dir=store_dir) == 0
     assert json.loads(capsys.readouterr().out)["gui"] is None
+    assert run("context", "--json", store_dir=store_dir) == 0
+    assert json.loads(capsys.readouterr().out)["gui"] is None
 
     servers.record(url, store_dir)
     other = servers._dir() / "other.json"                         # started earlier, elsewhere
@@ -4457,6 +4735,9 @@ def test_a_serve_on_the_store_links_ids_at_a_terminal_and_summary_names_it(tmp_p
     assert run("summary", store_dir=store_dir) == 0
     assert line in capsys.readouterr().out.splitlines()
     assert run("summary", "--json", store_dir=store_dir) == 0
+    assert json.loads(capsys.readouterr().out)["gui"] == url
+    # a client that shows an object's rows links them without a second process
+    assert run("context", "--target", "project", "--json", store_dir=store_dir) == 0
     assert json.loads(capsys.readouterr().out)["gui"] == url
     assert run("list", store_dir=store_dir) == 0                  # a pipe: no link
     assert url not in capsys.readouterr().out
@@ -4468,3 +4749,83 @@ def test_a_serve_on_the_store_links_ids_at_a_terminal_and_summary_names_it(tmp_p
         assert f";{page}\x1b\\{nid[-10:]}\x1b]8;;\x1b\\" in raw, (verb, raw)
         assert raw.count(page) == 1, ("the id alone, not its whole line", verb, raw)
         assert "2222" not in raw, (verb, raw)
+
+
+def test_a_row_on_a_file_counts_the_commits_that_changed_it_since(tmp_path, repo, capsys):
+    """`add` stamps the file's content, a supersede keeps that stamp (a tag
+    added later is no re-reading of the file), and the reads count from it."""
+    _declare(tmp_path, '[catalogs]\nfile = "git ls-files"\n')
+    (repo / "f").write_text("seen")             # the row is written over this edit
+    run("add", "note", "--target", "file:f", "--body", "on f", store_dir=tmp_path)
+    run("add", "note", "--target", "item:x", "--body", "on x", store_dir=tmp_path)
+    capsys.readouterr()
+
+    def since():
+        run("list", "--json", store_dir=tmp_path)
+        return {r["target"]["name"]: r["commits_since"] for r in json.loads(capsys.readouterr().out)}
+
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "carries it")
+    assert since() == {"f": 0, "x": None}
+    (repo / "f").write_text("later")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "later")
+    assert since() == {"f": 1, "x": None}
+
+    _commit(tmp_path, capsys)
+    run("list", "--type", "file", "--json", store_dir=tmp_path)
+    nid = json.loads(capsys.readouterr().out)[0]["id"]
+    run("supersede", nid, "--add-tag", "priority", store_dir=tmp_path)
+    capsys.readouterr()
+    assert since() == {"f": 1, "x": None}, "the revision keeps the stamp"
+
+    run("list", store_dir=tmp_path)
+    lines = capsys.readouterr().out.splitlines()
+    assert any("file:f" in ln and "commits_since=1" in ln for ln in lines), lines
+    assert not any("item:x" in ln and "commits_since" in ln for ln in lines), lines
+    run("context", "--target", "file:f", "--json", store_dir=tmp_path)
+    assert json.loads(capsys.readouterr().out)["notes"][0]["commits_since"] == 1
+
+
+def test_a_seeded_row_stamps_its_file_as_add_does(tmp_path, repo, capsys):
+    """`arc seed` built its rows with no stamp, so a box counted every commit
+    dated after it, the one carrying its own seed-time edit included (the
+    0.3.0 review, 2026-10-05). A sweep and named seeds both stamp."""
+    _declare(tmp_path, '[catalogs]\nfile = "git ls-files"\n')
+    (repo / "g").write_text("g")
+    _git(repo, "add", "g")
+    (repo / "f").write_text("seen")             # the seed is written over this edit
+    for how in (["--scope", "file"], ["--scope", "file", "--name", "g"]):
+        run("arc", "create", "--name", "a" + str(len(how)), "--scope", "file", store_dir=tmp_path)
+        aid = capsys.readouterr().out.strip()
+        assert run("arc", "seed", aid, *how, store_dir=tmp_path) == 0
+        capsys.readouterr()
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "carries it")
+    capsys.readouterr()
+    run("list", "--json", store_dir=tmp_path)
+    rows = json.loads(capsys.readouterr().out)
+    assert sorted((r["target"]["name"], r["commits_since"]) for r in rows) == \
+        [("f", 0), ("g", 0), ("g", 0)], rows
+
+
+def test_a_revision_of_an_unstamped_row_counts_from_the_row_it_revises(tmp_path, repo, capsys):
+    """A row written before stamping counts the commits dated after it. Its
+    revision is written later, but an amendment or a tag is no re-reading of
+    the file: counted from the revision's own date, the count fell to 0."""
+    _declare(tmp_path, '[catalogs]\nfile = "git ls-files"\n')
+    rid = "20200101-000000-000000-abc"
+    with store.notes_path(tmp_path).open("a") as fh:
+        fh.write(json.dumps({"id": rid, "kind": "task", "target": {"type": "file", "name": "f"},
+                             "created_at": "2020-01-01T00:00:00+00:00", "author": "t",
+                             "body": "on f", "status": "open"}) + "\n")
+    (repo / "f").write_text("later")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "changes f")
+    _commit(tmp_path, capsys)
+
+    def since():
+        run("list", "--json", store_dir=tmp_path)
+        return [r["commits_since"] for r in json.loads(capsys.readouterr().out)]
+
+    assert since() == [2], "c0 and `changes f`, both after 2020"
+    run("supersede", rid, "--append", "--body", "more", store_dir=tmp_path)
+    run("supersede", rid, "--add-tag", "priority", store_dir=tmp_path)
+    capsys.readouterr()
+    assert since() == [2]

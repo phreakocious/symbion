@@ -1,7 +1,6 @@
 import json
 import pytest
 from symbion import store
-from symbion.config import Config
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
 
@@ -42,11 +41,10 @@ def test_reconcile_attributes_its_writes_to_the_runner(tmp_path):
     person who ran reconcile, not the person who wrote the task."""
     act = store.create_arc(tmp_path, "x", "", "file", author="claude")
     store.seed_arc(tmp_path, act.id, "file", ["gone.py"], author="claude")
-    cfg = Config(project_root=tmp_path)
     rows = store.reconcile_arc(store.load(tmp_path), act.id,
                                     live_for=lambda t: set(), rename_map={},
                                     catalog_types={"file"})
-    store.apply_reconciliation(tmp_path, rows, cfg, resolve_stale=True,
+    store.apply_reconciliation(tmp_path, rows, resolve_stale=True,
                                author="ada")
     head = store.arc_items(store.load(tmp_path), act.id)[0]
     assert head.author == "ada"

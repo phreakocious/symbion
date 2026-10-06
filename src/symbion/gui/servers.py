@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import zlib
 from pathlib import Path
@@ -35,9 +36,25 @@ def port(store) -> int:
     return 20000 + zlib.crc32(name(store).encode()) % 10000
 
 
-def record(url: str, store) -> Path:
-    """This process's record; the caller removes the path when it stops."""
+def _temp_roots() -> list[Path]:
+    # Both: on macOS TMPDIR is under /private/var/folders, while a Claude
+    # Code scratchpad, where a session's scratch store sits, is under /tmp.
+    return [Path(tempfile.gettempdir()), Path("/tmp")]
+
+
+def _scratch(path) -> bool:
+    p = Path(path).resolve()
+    return any(p.is_relative_to(r.resolve()) for r in _temp_roots())
+
+
+def record(url: str, store) -> Path | None:
+    """This process's record; the caller removes the path when it stops.
+    None for a scratch store when the cache is not scratch too: a scratch
+    serve started without XDG_CACHE_HOME was listed in the owner's sidebar
+    (2026-10-05). A test's cache is under a temp root, so it still records."""
     d = _dir()
+    if _scratch(store) and not _scratch(d):
+        return None
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{os.getpid()}.json"
     path.write_text(json.dumps({"pid": os.getpid(), "url": url,

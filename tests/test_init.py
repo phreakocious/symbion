@@ -77,6 +77,22 @@ def test_init_rerun_keeps_the_link_the_registration_and_the_toml(repo, tmp_path,
     assert "# customized" in toml.read_text()
 
 
+def test_init_writes_a_store_readme_once(repo, tmp_path, capsys):
+    """The owner, 2026-10-05: a store should say what it is. A person who
+    opens the store's repo, on a forge or a disk, met bare JSONL. A re-run
+    keeps the file, edited or not."""
+    s = tmp_path / "store"
+    assert run("init", "--yes", store_dir=s) == 0
+    text = (s / "README.md").read_text()
+    assert f"`{repo.name}`" in text and "https://github.com/phreakocious/symbion" in text
+    assert "banner.png" in text and "notes.jsonl" in text and "symbion summary" in text
+    (s / "README.md").write_text("ours\n")
+    capsys.readouterr()
+    assert run("init", "--yes", store_dir=s) == 0
+    assert (s / "README.md").read_text() == "ours\n"
+    assert f"wrote {s / 'README.md'}" not in capsys.readouterr().out
+
+
 def test_init_leaves_a_foreign_skill_dir_alone(repo, tmp_path, capsys):
     mine = _home() / ".claude/skills/symbion"
     mine.mkdir(parents=True)
@@ -304,6 +320,7 @@ def test_init_without_yes_lists_each_change_and_makes_none(repo, tmp_path, capsy
     out = capsys.readouterr().out
     link, settings = _home() / ".claude/skills/symbion", _home() / ".claude/settings.json"
     for line in (f"will create {s}", f"will write {s / 'symbion.toml'}",
+                 f"will write {s / 'README.md'}",
                  f"will link {link} -> ", f"will write {settings}",
                  f"will write {repo / '.symbion'} -> ../other-notes"):
         assert line in out, out

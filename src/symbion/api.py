@@ -86,15 +86,15 @@ def resolve(dir_value=None, follow_owner=True) -> Ctx:
         root = wroot = None
     in_store = (dir_value is None and not from_env and store.is_store(root))
     store_dir = (Path(dir_value).resolve() if dir_value is not None
-                 else root if in_store else config.store_dir(root))
+                 else root if in_store else config.store_dir(root, wroot))
     # What the CWD's own tree names, before follow_owner moves `root` -- so a
     # caller can say "this is not the store you get by standing here". The
     # tree, not config.store_dir: SYMBION_DIR names a store too, and a reader
     # who cannot see the environment is exactly who the label is for.
-    tree_default = None if root is None else config.tree_store(root)
+    tree_default = None if root is None else config.tree_store(root, wroot)
     followed = False
     if (follow_owner and (dir_value is not None or from_env or in_store)
-            and (root is None or config.tree_store(root) != store_dir)):
+            and (root is None or tree_default != store_dir)):
         owner = config.store_owner(store_dir)
         if owner is not None:
             root = wroot = owner
@@ -183,6 +183,16 @@ def check_name(typ: str, name) -> None:
                              f"a named subject is item:{name}")
     elif not isinstance(name, str) or not name.strip():
         raise ValueError(f"target type {typ!r} needs a name: {typ}:NAME")
+    elif typ == "item" and _ROW_ID.fullmatch(name):
+        # `--ref item:<row id>` meant "see this row" and minted an item by
+        # that name at exit 0, three times in one session (2026-10-02).
+        raise ValueError(f"item:{name} has the shape of a row id: an item names an "
+                         f"object, never a row. Give this row that row's target, and "
+                         f"cite its id in the body")
+
+
+# A whole id or a cited tail (`…120000-123456-abc`, `123456-abc`): store.new_id.
+_ROW_ID = re.compile(r"(?:…|\.\.\.)?(?:\d{8}-)?(?:\d{6}-)?\d{6}-[0-9a-f]{3}")
 
 
 def kind_as_type(typ, kinds, what: str) -> str:
@@ -493,8 +503,8 @@ def why_unverifiable(prov) -> str:
     this the GUI badge cannot say WHY, and a dirty stamp -- the check's own
     claim made against a tree nobody can reconstruct -- reads identically to
     a squashed sha."""
-    if not store.stamp_sha(prov):
-        return "no provenance"
+    if not store.stamp_sha(prov):                # no stamp at all is `unstamped`
+        return "stamp names no commit"
     if prov.get("dirty"):
         return "dirty tree"
     return "commit unavailable"
@@ -574,7 +584,14 @@ def add_fields(ctx: Ctx, fields) -> list:
         if not f.get("author"):
             raise ValueError(f"row {i}: author is required")
     return store.add_many(ctx.store_dir, fields, target_types=ctx.target_types,
-                          canonicalize=lambda rows: canonicalize_rows(ctx, rows))
+                          canonicalize=lambda rows: _stamped(ctx, canonicalize_rows(ctx, rows)))
+
+
+def _stamped(ctx: Ctx, rows) -> list[dict]:
+    """Each row with its target file's content as it is now (gitref.target_blob),
+    read after the name resolves: the file is the one the stored name names."""
+    return [r | {"target_blob": gitref.target_blob(ctx.cfg, r["target"]["type"],
+                                                   r["target"]["name"])} for r in rows]
 
 
 def add_many(ctx: Ctx, rows, *, author: str) -> list:
@@ -584,12 +601,13 @@ def add_many(ctx: Ctx, rows, *, author: str) -> list:
 
 
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
-              add_refs=None, **fields) -> store.Note:
-    """Target and provenance are INHERITED from the superseded row and never
-    re-resolved, so this needs no canonicalization -- a departed target stays
-    editable. `refs`, if given, is new input: checked here, resolved under
-    the lock by `canonicalize_rows`, which sees only `fields` -- never the
-    inherited target or refs.
+              add_refs=None, prepend_body: str | None = None, **fields) -> store.Note:
+    """Target, provenance and target_blob are INHERITED from the superseded row
+    and never re-resolved (a tag added later is no re-reading of the file), so
+    this needs no canonicalization -- a departed target stays editable.
+    `refs`, if given, is new input: checked here, resolved under the lock by
+    `canonicalize_rows`, which sees only `fields` -- never the inherited
+    target or refs.
 
     Inheritance is ENFORCED, not merely documented. store.supersede's own
     `note_from_dict(base)` gets no `target_types=`, so a `target` forwarded
@@ -609,7 +627,7 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
     same open pre-registration can both read it open and both re-stamp, the
     second landing as a stamped correction to an already-resolved row -- the
     same race shape as `retag`, and equally no data loss."""
-    for key in ("target", "provenance"):
+    for key in ("target", "provenance", "target_blob"):
         if key in fields:
             raise ValueError(
                 f"supersede cannot set {key!r}: it is inherited from the "
@@ -626,7 +644,7 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
             fields["provenance"] = _stamp(ctx, tip.kind, tip.spec,
                                          bool((tip.provenance or {}).get("external")))
     return store.supersede(ctx.store_dir, note_id, author=author, append_body=append_body,
-                           add_refs=add_refs,
+                           add_refs=add_refs, prepend_body=prepend_body,
                            canonicalize=lambda f: canonicalize_rows(ctx, [f])[0], **fields)
 
 
@@ -643,11 +661,13 @@ def seed(ctx: Ctx, arc_id: str, target_type: str, names=None, *, author: str,
             raise ValueError(_ITEM_NEEDS_NAMES)
         return store.seed_arc(ctx.store_dir, arc_id, "item", [catalog.nfc(n) for n in names],
                               author=author, kind=kind)
+    stamp = lambda ns: gitref.target_blobs(ctx.cfg, target_type, ns)     # noqa: E731
     if not names:
         return store.seed_arc(ctx.store_dir, arc_id, target_type,
-                              catalog.names(ctx.cfg, target_type), author=author, kind=kind)
+                              catalog.names(ctx.cfg, target_type), author=author, kind=kind,
+                              stamp=stamp)
     return store.seed_arc(ctx.store_dir, arc_id, target_type, [catalog.nfc(n) for n in names],
-                          author=author, kind=kind,
+                          author=author, kind=kind, stamp=stamp,
                           canonicalize=lambda ns: canonicalize_names(ctx, target_type, ns))
 
 

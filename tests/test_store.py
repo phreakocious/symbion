@@ -466,6 +466,20 @@ def test_supersede_heals_a_legacy_row_carrying_a_field_its_kind_cannot_hold(tmp_
     assert store.heads(store.load(tmp_path)) == [new]
 
 
+def test_a_supersede_that_drops_a_field_never_edits_in_place(tmp_path):
+    """An uncommitted row's own author edits it in place (`rewritable`), so no
+    earlier version is kept. A dropped field would then be gone from disk, not
+    only from the head: the old row must stay as the copy that keeps it."""
+    n = store.add(tmp_path, kind="decision", target={"type": "project", "name": None},
+                  body="b", author="claude")
+    path = store.notes_path(tmp_path)
+    path.write_text(path.read_text(encoding="utf-8")
+                    .replace('"checked": null', '"checked": "ran it"'), encoding="utf-8")
+    new = store.supersede(tmp_path, n.id, author="claude", tags=["x"])
+    assert new.id != n.id and new.checked is None
+    assert [r.checked for r in store.load(tmp_path)] == ["ran it", None]
+
+
 def test_a_status_the_kind_no_longer_holds_is_not_read(tmp_path):
     """The table is the semantics; the disk is the history. A kind given a
     status bit it should not carry mints every finished result open.

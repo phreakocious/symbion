@@ -309,6 +309,17 @@ a.sb-tag:hover { color: var(--q-primary); }
 .sb-has-actions .sb-note-main > :first-child::before { content: ""; float: right;
                                                        width: 64px; height: 22px; }
 .sb-resolvable .sb-note-main > :first-child::before { width: 100px; }
+/* a footer as the first line (a bare row) is flex, where that float is an
+   item at its start: it pushed the chips in by its width (2026-10-03) */
+.sb-has-actions .sb-note-main > .sb-note-foot:first-child::before { content: none; }
+.sb-has-actions .sb-note-main > .sb-note-foot:first-child { padding-right: 64px; }
+.sb-resolvable .sb-note-main > .sb-note-foot:first-child { padding-right: 100px; }
+/* a bare row's text is its target: the name as a body, its type dim before it */
+.sb-headline-type { color: var(--q-muted); font-family: var(--mono); font-size: 12px;
+                    margin-right: 8px; }
+.sb-headline-type:empty { display: none; }
+/* a checklist box with no text is one line */
+.sb-note.sb-box { padding-top: 8px; padding-bottom: 8px; align-items: center; }
 .sb-note-text { color: var(--q-emph); font-size: 14.5px; line-height: 1.55;
                 text-wrap: pretty; }
 /* a path or a URL with no space in it breaks rather than widening the page */

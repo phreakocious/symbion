@@ -96,6 +96,28 @@ def test_item_scope_is_not_offered_as_a_seed_all_scope(seeded):
         api.seed_names(ctx, "item", None)
 
 
+async def test_a_bodiless_box_is_its_target_and_kinds_show_only_when_mixed(user: User, seeded):
+    """A seeded box drew an empty text line, then `task` and its target in
+    chips, on every row of a catalog-sized checklist. Both directions: a
+    box with a body keeps its text, and a second kind brings the chips back."""
+    ctx, act = seeded
+
+    @ui.page("/t")
+    def page():
+        checklist(ctx, act.id, lambda: None, author="ada")
+
+    await user.open("/t")
+    assert len(user.find(marker="note-headline").elements) == 2
+    await user.should_not_see(marker="checklist-body")
+    await user.should_not_see(marker="checklist-kind")
+    api.add(ctx, {"kind": "bug", "target": {"type": "item", "name": "one"},
+                  "body": "broken thing", "arc_id": act.id}, author="ada")
+    await user.open("/t")
+    await user.should_see("broken thing")
+    assert len(user.find(marker="checklist-kind").elements) == 3
+    assert len(user.find(marker="note-headline").elements) == 2
+
+
 async def test_a_project_row_on_the_checklist_is_clickable(user: User, seeded):
     """The bug: a project-target
     task filed under an arc rendered on the arc page with nothing

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -37,6 +38,8 @@ class Config:
     resolvers: dict = field(default_factory=dict)
     provenance_command: str | None = None
     command_timeout: int = 30
+    # A store with no remote on purpose: `commit` stops saying so.
+    local_only: bool = False
     # The store this Config was loaded from, so configured commands can hand
     # a nested symbion the SAME store: `--dir` is argv and cannot be inherited,
     # SYMBION_DIR is. None for a hand-built Config (test fixtures), which then
@@ -80,7 +83,11 @@ def work_root(cwd=None) -> Path:
 POINTER_FILE = ".symbion"
 
 
-def _pointer(root: Path) -> Path | None:
+class PointerError(ValueError):
+    """A `.symbion` that is there but names no store symbion can read."""
+
+
+def _pointer(root: Path, work: Path | None = None) -> Path | None:
     """`<root>/.symbion`: the store this project uses, when it is not the
     sibling the name implies.
 
@@ -96,31 +103,51 @@ def _pointer(root: Path) -> Path | None:
     First non-blank line, the same rule as a resolver's stdout, so a `# why:`
     line can follow it. Blank or whitespace-only falls through to the
     default: an empty file must not resolve to `root` itself, which would
-    make the project its own store."""
+    make the project its own store.
+
+    A pointer that is there but cannot be read is refused, never read as
+    absent: absent names the sibling, and `no store at <sibling>; run
+    symbion init` sent a `ln -s ../store .symbion` toward a second store
+    (2026-10-03).
+
+    `work`, the current worktree: its pointer counts while the main checkout
+    has none, as on a branch that adopts symbion. Its path still resolves
+    against `root`: it is the project's, and `../x` from a worktree nested
+    in the repo would name a directory inside it (2026-10-03)."""
     p = root / POINTER_FILE
+    if work is not None and not (p.exists() or p.is_symlink()):
+        p = work / POINTER_FILE
     try:
         text = p.read_text(encoding="utf-8")
-    except OSError:
-        return None
+    except OSError as e:
+        if isinstance(e, FileNotFoundError) and not p.is_symlink():
+            return None
+        how = f"{POINTER_FILE} is a file whose first line names the store"
+        if p.is_symlink() and not p.is_file():       # a link to the store, there or not
+            t = os.readlink(p)
+            q = shlex.quote(str(p))
+            raise PointerError(f"{p} is a link to {t}; {how}. Replace it: "
+                               f"rm {q} && echo {shlex.quote(t)} > {q}") from None
+        raise PointerError(f"cannot read {p} ({e.strerror}); {how}") from None
     for line in text.splitlines():
         if line.strip():
             return (root / Path(line.strip()).expanduser()).resolve()
     return None
 
 
-def store_dir(root: Path) -> Path:
+def store_dir(root: Path, work: Path | None = None) -> Path:
     """SYMBION_DIR, else `.symbion`, else the sibling `<name>-notes`. The env
     var stays outermost: a one-off invocation against another store must not
     be overridden by a file in the tree."""
     env = os.environ.get("SYMBION_DIR")
     if env:
         return Path(env).resolve()
-    return tree_store(root)
+    return tree_store(root, work)
 
 
-def tree_store(root: Path) -> Path:
+def tree_store(root: Path, work: Path | None = None) -> Path:
     """The store a project names for itself: `.symbion`, else the sibling."""
-    pointed = _pointer(root)
+    pointed = _pointer(root, work)
     if pointed is not None:
         return pointed
     return (root.parent / f"{root.name}-notes").resolve()
@@ -153,6 +180,16 @@ def store_owner(store) -> Path | None:
     return owners[0] if len(owners) == 1 else None
 
 
+def orphan_stores(root: Path) -> list[Path]:
+    """The stores beside `root` that no project claims (`store_owner`): where
+    a repo renamed with no `.symbion` left its store. A store that a sibling's
+    pointer names is claimed though its name matches no project, so another
+    project's store is never offered to the renamed one."""
+    from . import store                  # late: config is imported before store
+    return sorted(s for s in root.parent.glob("*-notes")
+                  if store.exists(s) and store_owner(s) is None)
+
+
 def _claims(cand: Path, store: Path) -> Path | None:
     """`cand` when it is the top of a MAIN worktree whose own rules name
     `store`. A subdirectory of a repo resolves to the repo, a linked worktree
@@ -161,9 +198,9 @@ def _claims(cand: Path, store: Path) -> Path | None:
         return None
     try:
         root = project_root(cand)
-    except (subprocess.CalledProcessError, RuntimeError):
-        return None
-    if root != cand.resolve() or tree_store(root) != store:
+        if root != cand.resolve() or tree_store(root) != store:
+            return None
+    except (subprocess.CalledProcessError, RuntimeError, PointerError):
         return None
     return root
 
@@ -207,6 +244,9 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
         raise ValueError(
             f"[resolvers] in {p} names {orphans} with no [catalogs] entry: a resolver "
             f"replaces the match rule for a catalog type, and the catalog declares the type")
+    local_only = d.get("local_only", False)
+    if not isinstance(local_only, bool):
+        raise ValueError(f"local_only in {p} is {local_only!r}: write true or false, unquoted")
     return Config(
         project_root=resolved_root,
         work_root=resolved_work,
@@ -219,5 +259,6 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
         resolvers=resolvers,
         provenance_command=prov.get("command"),
         command_timeout=d.get("command_timeout", 30),
+        local_only=local_only,
         store=Path(store).resolve(),
     )

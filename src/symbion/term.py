@@ -164,6 +164,8 @@ def _state(n, state) -> tuple[str, str]:
         return f"unverifiable ({api.why_unverifiable(n.provenance)})", BAD
     if st == "external":           # the run's age: a supersede inherits it
         return f"external ({summ.age_phrase(n.provenance['at'])})", META
+    if st == "unstamped":          # the row's age: no stamp says when the run was
+        return f"unstamped ({summ.age_phrase(n.created_at)})", META
     if st == "current":
         return st, GOOD
     if st == "pending":            # registered, not yet run: nothing to judge
@@ -171,7 +173,7 @@ def _state(n, state) -> tuple[str, str]:
     return (st if dist is None else f"{st} {dist}"), WARN
 
 
-def _head(n, *, status, state, due, subject, head, width, gui) -> tuple[Text, int]:
+def _head(n, *, status, state, due, subject, head, width, gui, since=None) -> tuple[Text, int]:
     """The row's first line, and the column its target starts at. With a
     `width`, a line too long for it gives up the refs count first, then the
     end of its tags, then the end of its target. With `gui`, a running
@@ -202,6 +204,8 @@ def _head(n, *, status, state, due, subject, head, width, gui) -> tuple[Text, in
     if state is not None:
         word, color = _state(n, state)
         post.append("  " + word, ink(color))
+    if since:
+        post.append(f"  {summ._count(since, 'commit')} since", ink(META))
     if due is not None:
         past, days = due
         post.append("  " + summ.due_phrase(due), ink(ROLE[summ.due_role(past, days)]))
@@ -269,7 +273,7 @@ def _details(n, head, state) -> list[Text]:
     return out
 
 
-def print_note(n, *, status, state, due, subject, head, full, gui=None) -> None:
+def print_note(n, *, status, state, due, subject, head, full, gui=None, since=None) -> None:
     """`status` is the chain head's, `state` api.verdict_state's pair and
     `due` store.due_state's pair for an open row, all computed by the caller
     the same way for the pipe line. `gui` is the URL of a serve on the row's
@@ -277,7 +281,7 @@ def print_note(n, *, status, state, due, subject, head, full, gui=None) -> None:
     con = Console(highlight=False, markup=False, emoji=False, theme=MARKDOWN)
     width = None if full else con.width
     line, indent = _head(n, status=status, state=state, due=due, subject=subject,
-                         head=head, width=width, gui=gui)
+                         head=head, width=width, gui=gui, since=since)
     if not full:
         con.print(line, no_wrap=True, overflow="ellipsis", crop=True)
         teaser = _teaser(n, status == "resolved" or head is not None, indent, width)

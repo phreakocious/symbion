@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 import pytest
@@ -171,6 +172,18 @@ def test_load_refuses_a_resolver_whose_type_has_no_catalog(repo, tmp_path):
     assert config.load(store, project_root=repo).resolvers == {"num": "head -1"}
 
 
+def test_load_refuses_a_local_only_that_is_not_a_boolean(repo, tmp_path):
+    """`local_only = "false"` is a non-empty string, which reads as true."""
+    store = tmp_path / "myproj-notes"
+    store.mkdir()
+    (store / "symbion.toml").write_text('local_only = "false"\n')
+    with pytest.raises(ValueError) as e:
+        config.load(store, project_root=repo)
+    assert "local_only" in str(e.value) and str(store / "symbion.toml") in str(e.value)
+    (store / "symbion.toml").write_text("local_only = true\n")
+    assert config.load(store, project_root=repo).local_only is True
+
+
 def test_load_refuses_a_resolver_on_a_builtin_type(repo, tmp_path):
     """A `[resolvers]` key on a built-in type (`commit`, `item`, `project`,
     `arc`) loads silently today and never runs: `canonical` returns before
@@ -240,6 +253,19 @@ def test_pointer_takes_the_first_non_blank_line(repo, monkeypatch):
     assert config.store_dir(repo) == (repo.parent / "elsewhere").resolve()
 
 
+@pytest.mark.parametrize("target", ["a store", "nothing"])
+def test_a_pointer_that_is_a_link_is_refused_with_the_fix(repo, monkeypatch, target):
+    """`ln -s ../store .symbion` read as no pointer: the read raised, the
+    except swallowed it, and the error named the sibling and said `run symbion
+    init`, which would fork a second store (2026-10-03)."""
+    monkeypatch.delenv("SYMBION_DIR", raising=False)
+    if target == "a store":
+        (repo.parent / "elsewhere").mkdir()
+    (repo / ".symbion").symlink_to("../elsewhere")
+    with pytest.raises(config.PointerError, match=r"link to \.\./elsewhere.*echo \.\./elsewhere >"):
+        config.store_dir(repo)
+
+
 def test_no_pointer_is_still_the_sibling_default(repo, monkeypatch):
     """The other direction of the blank-pointer test: absent means absent, so
     stores adopted before this existed need no migration."""
@@ -282,6 +308,38 @@ def test_a_store_two_repos_point_at_has_no_owner(repo, tmp_path):
     for r in (repo, twin):
         (r / ".symbion").write_text("../shared\n")
     assert config.store_owner(tmp_path / "shared") is None
+
+
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root reads a mode-0 file")
+def test_a_sibling_with_an_unreadable_pointer_claims_nothing(repo, tmp_path):
+    """One project's broken pointer must not break `--dir` for a store it
+    does not name."""
+    twin = tmp_path / "twin"
+    twin.mkdir()
+    subprocess.run(["git", "init", "-q", str(twin)], check=True)
+    (twin / ".symbion").write_text("../archive\n")
+    (twin / ".symbion").chmod(0)
+    (repo / ".symbion").write_text("../archive\n")
+    try:
+        assert config.store_owner(tmp_path / "archive") == repo
+    finally:
+        (twin / ".symbion").chmod(0o644)
+
+
+def test_a_pointer_only_in_a_linked_worktree_names_the_store(repo, tmp_path):
+    """A project adopting symbion on a branch has `.symbion` in that branch's
+    worktree before the main checkout has it, and symbion read only main's:
+    `no store at <main>-notes; run symbion init`, the advice that forks a
+    second store (2026-10-03). The path is the project's, so it resolves
+    against the main checkout even from a worktree nested inside it. Main's
+    own pointer still wins: worktrees share one store."""
+    wt = repo / ".worktrees" / "wt"
+    _git(repo, "worktree", "add", "-q", "-d", str(wt), "HEAD")
+    (wt / ".symbion").write_text("../elsewhere-store\n")
+    root, work = config.project_root(wt), config.work_root(wt)
+    assert config.store_dir(root, work) == (tmp_path / "elsewhere-store").resolve()
+    (repo / ".symbion").write_text("../main-store\n")
+    assert config.store_dir(root, work) == (tmp_path / "main-store").resolve()
 
 
 def test_a_linked_worktree_pointer_claims_nothing(repo, tmp_path):

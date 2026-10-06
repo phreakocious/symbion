@@ -24,9 +24,19 @@ main=$(git -C "$root" worktree list --porcelain 2>/dev/null) && main="${main%%$'
 # pointer beside the project, then the sibling the name implies. `read -r`
 # with the default IFS already trims, and `|| [ -n "$line" ]` catches a file
 # with no trailing newline. A blank pointer must fall through, never resolve
-# to $main itself.
+# to $main itself. A pointer that is there but not a readable file (a link to
+# a directory) goes on to `summary`, which names it: `read` printed bash's
+# "Is a directory" and the hook went silent (2026-10-03).
 store="$SYMBION_DIR"
-if [ -z "$store" ] && [ -r "$main/.symbion" ]; then
+p="$main/.symbion"
+# A linked worktree's pointer counts while main has none (a branch adopting
+# symbion), and its path still resolves against $main, as in config._pointer.
+if ! [ -e "$p" ] && ! [ -L "$p" ]; then
+  top=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null) && p="$top/.symbion"
+fi
+if [ -z "$store" ] && { [ -e "$p" ] || [ -L "$p" ]; } && ! { [ -f "$p" ] && [ -r "$p" ]; }; then
+  store="$p"
+elif [ -z "$store" ] && [ -r "$p" ]; then
   while read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
     case "$line" in
@@ -35,7 +45,7 @@ if [ -z "$store" ] && [ -r "$main/.symbion" ]; then
       *)     store="$main/$line" ;;
     esac
     break
-  done < "$main/.symbion"
+  done < "$p"
 fi
 # User-level since 2026-09-24 (registered in ~/.claude/settings.json), so
 # this runs in EVERY project. A store, a nonblank `.symbion` pointer or SYMBION_DIR

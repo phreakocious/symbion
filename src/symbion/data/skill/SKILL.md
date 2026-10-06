@@ -40,7 +40,8 @@ A kind is a label on three bits, and the bits are all symbion knows:
   `--checked` says who ran it; one from another tree or day is a `note` on its
   commit. A check on something outside the repo (DNS, a host's logs, a live
   database) takes `--external`: it is stamped with when it ran, since
-  otherwise any later commit makes it read `behind N`.
+  otherwise any later commit makes it read `behind N`. A row migrated from
+  a store that predates stamping reads `unstamped`, with its age.
 - **`status` + `verdict`** is a pre-registration. No default kind has both:
   declare one under `[kinds]` in `symbion.toml`, e.g. `prediction = { status
   = true, verdict = true }`. That table replaces the defaults:
@@ -87,7 +88,8 @@ target, on stderr. If the new row settles or revises one, `resolve` or
 row's first 100 characters. Evidence and provenance follow the point.
 Text added with `--append` never reaches that line, which then reads `+1
 amendment`. To correct the lead of a row that is not a pre-registration,
-rewrite it with `supersede <id> --body`. Until `symbion commit`, a supersede
+put a new one above it with `supersede <id> --prepend --body …`, or rewrite
+the whole body with `--body`. Until `symbion commit`, a supersede
 of your own row that no other row cites changes that row and keeps its id; a
 resolve, and any edit after the commit, adds a row.
 
@@ -122,25 +124,29 @@ EOF
 `add`, `resolve`, `supersede`, `arc create` and `arc seed` print the ids
 they wrote on stdout: capture them (`nid=$(symbion add …)`). `show`, `list --id`,
 `resolve` and `supersede` take a unique tail of an id. Cite the 10-character
-tail (`920030-8ca`); 3 characters are often shared.
+tail (`412907-3be`); 3 characters are often shared.
 
 ## Reading
 
 **A row is what was true when it was written.** A `check` says how far HEAD
-has moved since (`behind N`); a plain row says nothing. Before you give the
-user a row's count or state as current, re-run the check it names.
+has moved since (`behind N`). A row on a file in this checkout says how many
+commits have changed that file since the row saw it (`commits_since`, printed
+above 0); any other row says nothing. Before you give the user a row's count or
+state as current, re-run the check it names.
 
 Use `--json` on `list`, `summary`, `context`, `arc list` and `arc todo`. A row
 has `id`, `kind`, `target: {type, name}` (`name` is `null` on a `project`
 target), `created_at`, `author`, `body`, `status`, `checked`, `result`,
 `arc_id`, `due`, `supersedes`, `tags`, `refs`, `provenance`, `measurements`,
-`evidence`; `list` adds `state` and `distance` on verdict kinds, and `head` on
-a superseded row. There is no `ts` or `title`: a guessed key reads as a silent
-`null`. `list`, `arc list` and `arc todo` return a bare array; `summary` and
+`evidence`, `target_blob`. `list`, `context` and `arc todo` add
+`commits_since` (null unless the target is a file in this checkout); `list`
+also adds `state` and `distance` on verdict kinds, and `head` on a superseded
+row. There is no `ts` or `title`: a guessed key reads as a silent `null`.
+`list`, `arc list` and `arc todo` return a bare array; `summary` and
 `context` return an object, and `context` puts its rows under `notes`.
 `summary --json` rows are digests (`target` is a `type:name` string, `body` is
-clipped), and it has `store`, which is `null` when no store exists: gate on
-it, not on counts or the exit code.
+clipped). `summary` and `context` have `store`, which is `null` when no store
+exists: gate on it, not on counts or the exit code.
 
 ```bash
 symbion list --status open --json
@@ -158,7 +164,8 @@ that shows each hidden set; `--limit 0` shows all. `--json` is paged only by
 A person may browse the same store at `symbion serve`. Rows retain their
 authors whether written through the GUI, a terminal, or another agent. While
 one runs, `summary` names its URL and a row's page, `<url>/notes?id=<id>`: give the user that
-link when you point them at a row.
+link when you point them at a row. `summary --json` and `context --json` carry the URL as
+`gui`, `null` while none runs.
 
 ## Checklists: arcs
 
@@ -188,7 +195,9 @@ rows someone else wrote. From there:
 - `--tag priority` at `add`, or `supersede <id> --add-tag priority` later,
   stars a row for the next session. Star what it must act on, not news. The
   star stays until the row is resolved or `supersede <id> --rm-tag priority`
-  takes it off; a row with no status has only the second way.
+  takes it off; a row with no status has only the second way. From a day
+  on, the summary prints each star's age (`starred 12d ago`): unstar a
+  stale one.
 
 ## Session end, and a handoff file
 
@@ -214,9 +223,11 @@ place for symbion reports, use that.
 
 - **A write is not in git history until `symbion commit`, and not off this
   disk until `symbion push`.** `commit` never pushes; it says how many
-  commits are not on the remote, or that the store has none. It takes every
-  pending row, another writer's too, and names whose: `committed: rows
-  claude 2, codex 4`.
+  commits are not on the remote, or that the store has none (unless its
+  `symbion.toml` sets `local_only = true`). It takes every
+  pending row, another writer's too, and every other changed file in the
+  store, and names them: `committed: rows claude 2, codex 4; 1 file:
+  tools/x.py`.
 - **A catalog miss stores your typed string.** A name that matches nothing
   becomes its own target, with only a note on stderr and exit 0.
 
@@ -237,10 +248,10 @@ made is refused, naming the path.
 | command | does |
 |---|---|
 | `add KIND --target T:N [--body …] [--tag …]… [--ref T:N]… [--due DATE] [--arc-id ID]` | append a row; prints its id |
-| `list [--kind K] [--status S] [--tag T] [--arc ID] [--grep PAT [-F]] [--overdue] [--since 2h] [--all] [--limit N] [--full] [--json]` | heads, newest first; `--all` adds superseded rows |
+| `list [--kind K] [--target T:N] [--status S] [--tag T] [--arc ID] [--grep PAT [-F]] [--overdue] [--since 2h] [--all] [--limit N] [--full] [--json]` | heads, newest first; `--all` adds superseded rows |
 | `show <id>... [--json]` | rows by id, as `list --id <id>...` (an array in `--json`) |
 | `resolve <id> [--body …] [--result …] [--ref T:N] [--add-tag …]` | close a row; `--body` goes below the current body, after a blank line it inserts |
-| `supersede <id> [--body …] [--append] [--add-tag …] [--rm-tag …] [--tag …] [--add-ref T:N] [--ref T:N] [--checked …] [--result …] [--due DATE]` | correct a row; `--tag` and `--ref` replace the inherited ones, `--add-tag` and `--add-ref` add to them; `--append` adds the body after a blank line it inserts |
+| `supersede <id> [--body …] [--append] [--prepend] [--add-tag …] [--rm-tag …] [--tag …] [--add-ref T:N] [--ref T:N] [--checked …] [--result …] [--due DATE]` | correct a row; `--tag` and `--ref` replace the inherited ones, `--add-tag` and `--add-ref` add to them; `--append` adds the body after a blank line it inserts, `--prepend` above one |
 | `commit [-m MSG]` | commit the store |
 | `push` | push the store's commits to its remote |
 | `rename <old> <new> --type T [--to-type T2]` | move every row and ref on a renamed object; `--to-type` changes its type too |

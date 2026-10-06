@@ -29,12 +29,15 @@ RECENT_DAYS = 14
 
 
 def _board(ctx, title, rows, author, *, aside: str = "", more: str = "", tip: str = "",
-           git_head=None, to: str = "", show_target: bool = True) -> None:
+           git_head=None, to: str = "", show_target: bool = True, since=None) -> None:
     """A heading and its cards. An empty board is its heading alone, quieter:
     a box saying "none" took a card's room to say nothing. `aside` names the
     rows of this kind the board leaves out, and `more` links the view with
     them all: beside the sidebar's count of every open row, a heading of the
-    others alone read as a miscount. `to` makes the title a link."""
+    others alone read as a miscount. `to` makes the title a link. `since` is
+    gitref.commits_since for a page of boards, counted once (a count per
+    board took /targets from 0.37 s to 0.62 s, 2026-10-05); a card it lacks
+    is counted here."""
     with ui.element("section").classes("sb-board" + ("" if rows else " sb-board-empty")) \
             .mark("board"):
         with ui.element("div").classes("sb-board-head"):
@@ -45,9 +48,12 @@ def _board(ctx, title, rows, author, *, aside: str = "", more: str = "", tip: st
                 link = ui.link(aside, more).classes("sb-board-aside").mark("board-aside")
                 if tip:
                     link.tooltip(tip)
+        since = since or {}
+        since = since | gitref.commits_since(ctx.cfg, [n for n in rows if n.id not in since])
         for n in rows:
             render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
-                        show_target=show_target, compact=True, git_head=git_head)
+                        show_target=show_target, compact=True, git_head=git_head,
+                        since=since.get(n.id))
 
 
 def _recent(ctx, n, since, git_head) -> bool:
@@ -98,8 +104,9 @@ def _history(ctx, every, head, author: str, git_head=None) -> None:
     with ui.expansion(f"earlier versions ({len(chain)})").classes("w-full sb-card") \
             .mark("history"):
         for old in chain:
+            # with its target: a rename is a version that changed nothing else
             render_note(ctx, old, lambda: None, author=author, actions=False,
-                        git_head=git_head)
+                        git_head=git_head, show_target=True)
 
 
 def build_page(ctx, *, author: str) -> None:
@@ -113,6 +120,10 @@ def build_page(ctx, *, author: str) -> None:
         git_head = gitref.head_sha(ctx.cfg)
         heads = S.heads(S.load(ctx.store_dir))
         newest = S.newest_first(heads)
+        # The boards' pool, counted once: all heads cost twice as much.
+        since = gitref.commits_since(ctx.cfg, [n for n in newest if n.spec.verdict
+                                               or S.read_status(n) == "open"
+                                               or "priority" in n.tags])
         with ui.column().classes("sb-main gap-5"):
             ui.label(f"{summ._count(len(heads), 'note')} · {ctx.store_dir}") \
                 .classes("sb-subtitle sb-mono")
@@ -127,19 +138,22 @@ def build_page(ctx, *, author: str) -> None:
                     in_arcs = len(summ.open_notes(newest, label)) - len(rows)
                     _board(ctx, f"open {label}", rows, author,
                            aside=f"· {in_arcs} in arcs" if in_arcs else "",
-                           more=filters.href(kind=label, status="open"), git_head=git_head)
-            _board(ctx, "priority", summ.starred(newest), author, git_head=git_head)
-            since = datetime.now().astimezone() - timedelta(days=RECENT_DAYS)
+                           more=filters.href(kind=label, status="open"), git_head=git_head,
+                           since=since)
+            _board(ctx, "priority", summ.starred(newest), author, git_head=git_head,
+                   since=since)
+            young = datetime.now().astimezone() - timedelta(days=RECENT_DAYS)
             for label, k in ctx.kinds.items():
                 if k.verdict:
                     every = [n for n in newest if n.kind == label]
-                    rows = [n for n in every if _recent(ctx, n, since, git_head)][:25]
+                    rows = [n for n in every if _recent(ctx, n, young, git_head)][:25]
                     left = len(every) - len(rows)
                     _board(ctx, f"recent {label}", rows, author,
                            aside=f"· {left} more" if left else "",
                            more=filters.href(kind=label),
                            tip=f"every {label}: this board holds the last {RECENT_DAYS} days "
-                               f"and any still current at HEAD", git_head=git_head)
+                               f"and any still current at HEAD", git_head=git_head,
+                           since=since)
 
     @ui.page("/notes")
     def notes_page(request: Request):
@@ -199,10 +213,11 @@ def build_page(ctx, *, author: str) -> None:
                     .mark("result-count")
             if kwargs:
                 ui.link("clear filters", "/notes").classes("text-body")
+            since = gitref.commits_since(ctx.cfg, shown)
             for n in shown:
                 render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
                             show_target=True, base=base, compact="id" not in kwargs,
-                            hit=q.split(), git_head=git_head)
+                            hit=q.split(), git_head=git_head, since=since[n.id])
             if len(shown) < len(rows):
                 ui.link(f"+{len(rows) - len(shown)} older not shown — show all",
                         filters.href(**base, all="1")).classes("text-body").mark("show-all")
@@ -237,6 +252,7 @@ def build_page(ctx, *, author: str) -> None:
                 return f"commit: {name[:7]} {summ.clip(subj[name], 60)}"
             return f"{typ}: {name}" if name else typ
 
+        since = gitref.commits_since(ctx.cfg, [n for t in own for n in live[t]])
         with ui.column().classes("sb-main gap-5"):
             ui.label(f"{summ._count(len(own), 'target')} with notes on them, open work first") \
                 .classes("sb-subtitle")
@@ -244,7 +260,7 @@ def build_page(ctx, *, author: str) -> None:
                 to = target_href(*t)
                 _board(ctx, title(*t), live[t], author,
                        to=to, aside=f"· {summ._count(len(on[t]), 'note')}", more=to,
-                       git_head=git_head, show_target=False)
+                       git_head=git_head, show_target=False, since=since)
 
     @ui.page("/tags")
     def tags_page():
@@ -280,12 +296,16 @@ def build_page(ctx, *, author: str) -> None:
         git_head = gitref.head_sha(ctx.cfg)
         with ui.column().classes("sb-main gap-4"):
             with ui.row().classes("items-center gap-3"):
-                ui.label(f"{len(rows)} notes on or referencing this object") \
+                ui.label(f"{summ._count(len(rows), 'note')} on or referencing this object") \
                     .classes("sb-subtitle")
                 md_button(ctx, name, "read the file")
+            since = gitref.commits_since(ctx.cfg, rows)
             for n in rows:
+                # The page names the object: a row only referring to it names its own.
                 render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
-                            compact=not live(n) and bool(n.spec.status), git_head=git_head)
+                            compact=not live(n) and bool(n.spec.status), git_head=git_head,
+                            since=since[n.id],
+                            show_target=(n.target.type, n.target.name) != (type, name))
 
     @ui.page("/arcs")
     def arcs_page():
@@ -363,7 +383,9 @@ def build_page(ctx, *, author: str) -> None:
                 if about:
                     ui.label("notes about this arc").classes("sb-board-title")
                     git_head = gitref.head_sha(ctx.cfg)
+                    since = gitref.commits_since(ctx.cfg, about)
                     for n in about:
-                        render_note(ctx, n, body.refresh, author=author, git_head=git_head)
+                        render_note(ctx, n, body.refresh, author=author, git_head=git_head,
+                                    since=since[n.id])
 
             body()

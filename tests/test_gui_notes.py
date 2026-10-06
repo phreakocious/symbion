@@ -49,6 +49,69 @@ async def test_check_badge_says_why_it_is_unverifiable(user: User, repo, tmp_pat
     await user.should_see("dirty tree")
 
 
+async def test_a_row_with_no_body_leads_with_its_target(user: User, repo, tmp_path):
+    """A seeded box has no text: its target is what it says, and the card
+    led with an empty line and put the target in a chip below. Both
+    directions: a row with a body keeps its target chip and no headline."""
+    ctx = api.resolve(str(tmp_path))
+    bare = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "alpha"}},
+                   author="ada")
+    said = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "beta"},
+                         "body": "words"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, bare, lambda: None, author="ada", show_target=True)
+
+    @ui.page("/u")
+    def page_u():
+        render_note(ctx, said, lambda: None, author="ada", show_target=True)
+
+    await user.open("/t")
+    await user.should_see("alpha")
+    [lead] = user.find(marker="note-headline").elements
+    assert lead.props["href"] == "/object?type=item&name=alpha"
+    assert len(user.find(marker="note-target").elements) == 1, "the headline, not a chip too"
+    await user.open("/u")
+    await user.should_see("words")
+    await user.should_not_see(marker="note-headline")
+    assert len(user.find(marker="note-target").elements) == 1
+
+
+async def test_a_row_with_no_body_on_its_own_page_leads_with_its_arc(user: User, repo, tmp_path):
+    """On the object's own page the target is the page: the arc is what is
+    left to say, by its name, and the arc chip would say it twice."""
+    ctx = api.resolve(str(tmp_path))
+    act = api.create_arc(ctx, "Audit for accuracy", "d", "item", author="ada")
+    [n] = api.seed(ctx, act.id, "item", ["alpha"], author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada", show_target=False)
+
+    await user.open("/t")
+    await user.should_see("Audit for accuracy")
+    [lead] = user.find(marker="note-headline").elements
+    assert lead.props["href"] == f"/arc?id={act.id}"
+    await user.should_not_see(marker="note-arc")
+
+
+async def test_a_check_with_no_stamp_reads_unstamped(user: User, repo, tmp_path):
+    from datetime import datetime, timedelta
+    ctx = api.resolve(str(tmp_path))
+    five = (datetime.now().astimezone() - timedelta(days=5, hours=1)).isoformat(timespec="seconds")
+    n = store.add(tmp_path, kind="check", target={"type": "project", "name": None},
+                  checked="x", result="y", author="t", created_at=five)
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("unstamped — 5d ago")
+    await user.should_not_see("unverifiable")
+
+
 async def test_an_external_check_badge_reads_external(user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "check", "target": {"type": "item", "name": "dns"},
@@ -1032,3 +1095,35 @@ async def test_the_edit_dialog_says_whether_the_row_itself_changes(user: User, r
         await user.open(f"/t/{who}")
         user.find(marker="note-edit").click()
         await user.should_see(words)
+
+
+async def test_a_since_chip_lists_the_commits_it_counts(user: User, repo, tmp_path):
+    """"2 commits since" asks the reader to look at them, as `behind N` does,
+    so the tip lists them, newest first, filled on hover."""
+    import subprocess
+    from symbion import gitref
+    from symbion.gui.notes import since_tip
+    (tmp_path / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n')
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "file", "name": "f"}, "body": "b"},
+                author="ada")
+    shas = []
+    for i in range(2):
+        (repo / "f").write_text(f"v{i}")
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam",
+                        f"edit {i}"], check=True, cwd=repo)
+        shas.append(gitref.head_sha(ctx.cfg))
+    assert since_tip(ctx.cfg, n).splitlines() == [
+        "f changed in 2 commits since this row:",
+        f"{shas[1][:7]} edit 1", f"{shas[0][:7]} edit 0"]
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada",
+                    since=gitref.commits_since(ctx.cfg, [n])[n.id])
+
+    await user.open("/t")
+    await user.should_see("2 commits since")
+    await user.should_not_see("edit 1")                     # not yet: lazy
+    user.find(marker="note-since").trigger("mouseenter")
+    await user.should_see("edit 1")

@@ -10,7 +10,7 @@ from nicegui import ui
 from .. import api
 from .. import store as S
 from .. import summary as summ
-from .notes import ago, edit_dialog, id_link, kind_class, target_link
+from .notes import ago, bare, edit_dialog, id_link, kind_class, target_headline, target_link
 
 
 def seed_all_scopes(ctx) -> set:
@@ -35,15 +35,18 @@ def seedable(ctx, kind: str = "task") -> bool:
 
 def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
     """Head tasks for an arc, not-done first, then by target name, then in
-    the order written. Each row carries its kind and clipped body: six boxes
-    on one file drew six identical target lines (2026-09-27). A row is the
-    notebook's card, its box the card's resolve box, ticked when done."""
+    the order written. Each row carries its clipped body: six boxes on one
+    file drew six identical target lines (2026-09-27). A row is the
+    notebook's card, its box the card's resolve box, ticked when done. A
+    bare row (a seeded box) is one line led by its target, and the kind
+    shows only when the arc holds more than one (every row said `task`)."""
     items = S.arc_items(S.load(ctx.store_dir), arc_id)
     items.sort(key=lambda n: (S.read_status(n) == "resolved",
                               (n.target.name or "").lower(), S.written_at(n), n.id))
     if not items:
         ui.label("no targets yet — seed a scope above").classes("text-muted")
         return
+    mixed = len({fu.kind for fu in items}) > 1
     for fu in items:
         done = S.read_status(fu) == "resolved"
 
@@ -58,7 +61,8 @@ def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
             refresh()
 
         with ui.element("div").classes(f"sb-note w-full {kind_class(fu.kind)}"
-                                       + (" sb-done" if done else "")) \
+                                       + (" sb-done" if done else "")
+                                       + (" sb-box" if bare(fu) else "")) \
                 .props(f"data-id={fu.id}").mark("checklist-row"):
             ui.button(icon="check", on_click=_toggle) \
                 .props(f'flat round dense aria-label="{"reopen" if done else "resolve"}"') \
@@ -66,11 +70,17 @@ def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
                 .tooltip("reopen" if done else "resolve") \
                 .mark("checklist-toggle", f"toggle-{fu.id}")   # per-row: find() returns a SET
             with ui.element("div").classes("sb-note-main"):
-                ui.label(summ.clip(fu.body, summ.HEAD_CHARS)).classes("sb-note-text") \
-                    .mark("checklist-body")
+                if not bare(fu):
+                    ui.label(summ.clip(fu.body, summ.HEAD_CHARS)).classes("sb-note-text") \
+                        .mark("checklist-body")
                 with ui.element("div").classes("sb-note-foot"):
-                    ui.label(fu.kind).classes(f"sb-chip sb-kindchip {kind_class(fu.kind)}")
-                    target_link(fu)
+                    if bare(fu):
+                        target_headline(fu)
+                    if mixed:
+                        ui.label(fu.kind).classes(f"sb-chip sb-kindchip {kind_class(fu.kind)}") \
+                            .mark("checklist-kind")
+                    if not bare(fu):
+                        target_link(fu)
                     with ui.element("span").classes("sb-note-by"):
                         if done:      # the tick's row: its author ticked it, then
                             ui.label(fu.author).classes("sb-note-meta")

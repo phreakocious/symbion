@@ -29,12 +29,11 @@ def test_apply_retargets_renamed_and_leaves_stale_open(tmp_path):
     closing stale items passes silently."""
     act = store.create_arc(tmp_path, "x", "", "file")
     store.seed_arc(tmp_path, act.id, "file", ["moved.py", "gone.py"])
-    cfg = Config(project_root=tmp_path)
     rows = store.reconcile_arc(
         store.load(tmp_path), act.id,
         live_for=lambda t: {"renamed.py"},
         rename_map={"moved.py": "renamed.py"}, catalog_types={"file"})
-    retargeted, _, resolved = store.apply_reconciliation(tmp_path, rows, cfg)
+    retargeted, _, resolved = store.apply_reconciliation(tmp_path, rows)
     assert (retargeted, resolved) == (1, 0)
     items = {n.target.name: store.read_status(n)
              for n in store.arc_items(store.load(tmp_path), act.id)}
@@ -45,11 +44,10 @@ def test_apply_retargets_renamed_and_leaves_stale_open(tmp_path):
 def test_resolve_stale_closes_them_explicitly(tmp_path):
     act = store.create_arc(tmp_path, "x", "", "file")
     store.seed_arc(tmp_path, act.id, "file", ["gone.py"])
-    cfg = Config(project_root=tmp_path)
     rows = store.reconcile_arc(store.load(tmp_path), act.id,
                                     live_for=lambda t: set(), rename_map={},
                                     catalog_types={"file"})
-    *_, resolved = store.apply_reconciliation(tmp_path, rows, cfg, resolve_stale=True)
+    *_, resolved = store.apply_reconciliation(tmp_path, rows, resolve_stale=True)
     assert resolved == 1
     items = store.arc_items(store.load(tmp_path), act.id)
     assert store.read_status(items[0]) == "resolved"
@@ -121,14 +119,13 @@ def test_resolve_stale_skips_a_prediction_and_closes_a_task_in_the_same_run(tmp_
     store.seed_arc(tmp_path, act.id, "file", ["gone.py"])
     p = store.add(tmp_path, kind="prediction", target={"type": "file", "name": "also_gone.py"},
                   arc_id=act.id, checked="the sweep")
-    cfg = Config(project_root=tmp_path)
     rows = store.reconcile_arc(store.load(tmp_path), act.id,
                                live_for=lambda t: set(), rename_map={},
                                catalog_types={"file"})
     by_name = {r["target_name"]: r for r in rows}
     assert by_name["gone.py"]["needs_result"] is False
     assert by_name["also_gone.py"]["needs_result"] is True
-    retargeted, _, resolved = store.apply_reconciliation(tmp_path, rows, cfg, resolve_stale=True)
+    retargeted, _, resolved = store.apply_reconciliation(tmp_path, rows, resolve_stale=True)
     assert (retargeted, resolved) == (0, 1)
     items = {n.target.name: store.read_status(n)
              for n in store.arc_items(store.load(tmp_path), act.id)}
@@ -144,11 +141,10 @@ def test_apply_retargets_a_renamed_prediction(tmp_path):
     act = store.create_arc(tmp_path, "x", "", "file")
     store.add(tmp_path, kind="prediction", target={"type": "file", "name": "moved.py"},
               arc_id=act.id)
-    cfg = Config(project_root=tmp_path)
     rows = store.reconcile_arc(store.load(tmp_path), act.id,
                                live_for=lambda t: {"renamed.py"},
                                rename_map={"moved.py": "renamed.py"}, catalog_types={"file"})
-    assert store.apply_reconciliation(tmp_path, rows, cfg) == (1, 0, 0)
+    assert store.apply_reconciliation(tmp_path, rows) == (1, 0, 0)
     (item,) = store.arc_items(store.load(tmp_path), act.id)
     assert (item.target.name, store.read_status(item)) == ("renamed.py", "open")
 
@@ -166,8 +162,7 @@ def test_apply_moves_every_row_on_a_renamed_name_not_only_the_arc_item(tmp_path)
     rows = store.reconcile_arc(store.load(tmp_path), act.id,
                                live_for=lambda t: {"renamed.py"},
                                rename_map={"moved.py": "renamed.py"}, catalog_types={"file"})
-    assert store.apply_reconciliation(tmp_path, rows, Config(project_root=tmp_path)) \
-        == (2, 1, 0)
+    assert store.apply_reconciliation(tmp_path, rows) == (2, 1, 0)
     hs = {n.supersedes: n for n in store.heads(store.load(tmp_path))}
     assert hs[outside.id].target.name == "renamed.py"
     assert hs[referrer.id].refs == (store.Target("file", "renamed.py"),)

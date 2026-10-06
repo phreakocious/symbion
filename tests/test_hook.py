@@ -101,6 +101,17 @@ def test_hook_names_a_pointer_to_a_store_that_is_not_there(git_repo):
     assert r.returncode == 0 and "no store at" in r.stdout and "gone-notes" in r.stdout
 
 
+def test_hook_names_a_pointer_that_links_to_a_directory(git_repo):
+    """`read` on a directory printed bash's `read error: Is a directory` and
+    the hook went silent, as in a project that never adopted symbion."""
+    (git_repo.parent / "elsewhere").mkdir()
+    (git_repo / ".symbion").symlink_to("../elsewhere")
+    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin"})
+    assert r.returncode == 0 and "read error" not in r.stdout + r.stderr
+    assert "is a link to ../elsewhere" in r.stdout
+
+
 def test_hook_exits_0_and_prints_nothing_when_symbion_is_not_installed_and_no_store(tmp_path):
     """The quiet direction of the not-installed case: no sibling store, so
     this is a project that never adopted symbion, and the hook must say
@@ -276,22 +287,26 @@ def test_hook_names_a_malformed_kinds_table_instead_of_reading_as_no_store(git_r
     assert "[kinds]" in r.stdout and "'note'" in r.stdout, f"silent: {r.stdout!r}"
 
 
-@pytest.mark.parametrize("layout", ["sibling", "pointer", "none"])
+@pytest.mark.parametrize("layout", ["sibling", "pointer", "worktree pointer", "none"])
 def test_hook_in_a_linked_worktree_reads_the_main_checkouts_store(git_repo, tmp_path, layout):
     """config.project_root() is the MAIN worktree, so every linked worktree
     shares its store. The hook derived `<linked-name>-notes` and exited 0
     before the CLI ran: a session started in a linked worktree heard nothing.
     The worktree sits under another parent and the pointer is untracked, so
     neither the worktree's name nor its own `.symbion` can reach the store.
+    `worktree pointer`: a project adopting symbion on a branch has the
+    pointer in the linked worktree first, and its path is the project's,
+    so it resolves against the main checkout, not the worktree.
     `none` is the other direction: a project that never adopted stays silent."""
     wt = tmp_path / "wt" / "feature"
     _git(git_repo, "worktree", "add", "-q", "--detach", str(wt))
-    s = {"sibling": tmp_path / "proj-notes", "pointer": tmp_path / "elsewhere-store"}.get(layout)
+    s = {"sibling": tmp_path / "proj-notes", "pointer": tmp_path / "elsewhere-store",
+         "worktree pointer": tmp_path / "elsewhere-store"}.get(layout)
     if s:
         store.ensure_store(s)
         store.add(s, kind="bug", target={"type": "project", "name": None}, status="open")
-    if layout == "pointer":
-        (git_repo / ".symbion").write_text("../elsewhere-store\n")
+    if layout in ("pointer", "worktree pointer"):
+        ((git_repo if layout == "pointer" else wt) / ".symbion").write_text("../elsewhere-store\n")
     r = subprocess.run([BASH, str(HOOK)], cwd=wt, capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin",
                             "CLAUDE_PROJECT_DIR": str(wt)})

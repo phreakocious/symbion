@@ -57,6 +57,15 @@ def test_resolve_miss_falls_back_to_the_input():
     assert catalog.resolve("gone.py", ["src/parser.py"]) == "gone.py"
 
 
+def test_resolve_a_unique_case_only_match_after_substring_misses():
+    """`Balancer` reached `Load Balancer` as a substring while the closer
+    `load balancer` missed (2026-10-03). Case-only twins stay a miss."""
+    names = ["Load Balancer", "Load Shedding"]
+    assert catalog.resolve("Balancer", names) == "Load Balancer"
+    assert catalog.resolve("load balancer", names) == "Load Balancer"
+    assert catalog.resolve("Readme.md", ["README.md", "readme.md"]) == "Readme.md"
+
+
 def test_item_type_is_never_canonicalized(tmp_path):
     c = cfg(tmp_path, thing="echo a")
     assert catalog.canonical(c, "item", "  anything typed ") == "  anything typed "
@@ -303,5 +312,8 @@ def test_match_announces_a_substring_pick_but_not_an_exact_one(tmp_path, capsys)
     assert catalog.match(c, "t", "pars", ["src/parser.py", "src/cli.py"]) == "src/parser.py"
     out, err = capsys.readouterr()
     assert out == "" and err == "note: 'pars' resolved to 'src/parser.py' (unique substring in the t catalog)\n", err
+    assert catalog.match(c, "t", "SRC/CLI.PY", ["src/parser.py", "src/cli.py"]) == "src/cli.py"
+    assert capsys.readouterr().err == \
+        "note: 'SRC/CLI.PY' resolved to 'src/cli.py' (same name but for case in the t catalog)\n"
     catalog.match(c, "t", "nothing", ["src/parser.py"])
     assert "matches nothing in the t catalog; taken as typed" in capsys.readouterr().err

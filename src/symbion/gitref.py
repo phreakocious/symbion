@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 from pathlib import Path
@@ -154,9 +155,16 @@ def check_state(cfg, prov, head: str | None = None):
     `current`, contradicting the very thing the flag exists to record.
 
     An external stamp (`add --external`) outranks both: the check read
-    something outside the tree, so no commit or edit bears on it."""
+    something outside the tree, so no commit or edit bears on it.
+
+    No stamp at all is `unstamped`: a row migrated from a store that predates
+    stamping (symbion stamps every verdict it writes). Nothing about it is
+    suspect, so it is not `unverifiable`, which a migrated store's many such
+    rows turned into noise over the stamps that are (2026-10-03)."""
     if prov and prov.get("external"):
         return ("external", None)
+    if not prov:
+        return ("unstamped", None)
     if not store.stamp_sha(prov):
         return ("unverifiable", None)
     if prov.get("dirty"):
@@ -240,6 +248,119 @@ def oneline(cfg, rng: str, n: int) -> list[str]:
     return r.stdout.splitlines() if r.returncode == 0 else []
 
 
+def _file(cfg, ttype, name) -> str | None:
+    """`name` when `ttype` is a catalog type and `name` a file in this
+    checkout. A catalog lists other things too (URLs, part numbers), so
+    the file must be here, and inside the checkout."""
+    root = _root(cfg)
+    if root is None or not name or ttype not in cfg.catalogs:
+        return None
+    root = Path(root).resolve()
+    p = (root / name).resolve()
+    return name if p.is_file() and p.is_relative_to(root) else None
+
+
+def target_blob(cfg, ttype, name) -> str | None:
+    """The blob id of a row's target file as the row saw it, uncommitted
+    edits included. `hash-object` applies the file's filters, so this is the
+    blob git stores once that content is committed: commits_since anchors
+    on it."""
+    return target_blobs(cfg, ttype, [name]).get(name)
+
+
+def target_blobs(cfg, ttype, names) -> dict:
+    """`target_blob` for many names in one `hash-object`: a seed sweep stamps
+    a whole catalog. A name that is no file here has no entry."""
+    # ponytail: one argv; a catalog past ~10k paths may need chunks (ARG_MAX).
+    paths = {n: p for n in names if (p := _file(cfg, ttype, n))}
+    r = _git(cfg, "hash-object", "--", *paths.values()) if paths else None
+    out = r.stdout.split() if r and r.returncode == 0 else []
+    return dict(zip(paths, out)) if len(out) == len(paths) else {}
+
+
+def _file_history(cfg, paths) -> tuple[dict, float]:
+    """(path -> [(sha, committer time, blob after, position)], the position
+    of the first merge), in one walk in topological order: a commit before
+    its parents. A merge has no `--raw` record, so no path lists one; the
+    walk lists those that matter to `paths`. NUL-delimited: a header
+    `SHA TIME PARENTS`, then per changed path a `:modes blobs status` record
+    and the path. No paths, no walk: an empty pathspec reads every commit."""
+    if not paths:
+        return {}, math.inf
+    r = _git(cfg, "log", "-z", "--topo-order", "--no-renames", "--raw", "--no-abbrev",
+             "--format=%H %ct %P", "HEAD", "--", *(f":(literal){p}" for p in paths))
+    toks = r.stdout.split("\0") if r.returncode == 0 else []
+    hist, head, merge, i = {}, None, None, 0
+    while i < len(toks):
+        t = toks[i].lstrip("\n")
+        if t.startswith(":") and head and i + 1 < len(toks):
+            hist.setdefault(toks[i + 1], []).append((*head, t.split()[3], pos))
+            i += 2
+            continue
+        if t:
+            sha, ct, *parents = t.split()
+            pos = 0 if head is None else pos + 1
+            head = (sha, int(ct))
+            if len(parents) > 1 and merge is None:
+                merge = pos
+        i += 1
+    return hist, math.inf if merge is None else merge
+
+
+def changed_since(cfg, notes) -> dict:
+    """id -> the commits, newest first, that changed the row's target file
+    after the content the row saw; None when the target is no file in this
+    checkout.
+
+    The list is empty while the file is what the row saw (`target_blob`).
+    Otherwise it starts after the newest commit that holds that content and
+    goes by ancestry: the commit carrying an edit the row was written over is
+    not in it, and a merged branch's commits are, whatever their dates.
+    Merge commits are left out; the commits they bring are in. A row with no
+    stamp (written before stamping), or whose content no commit holds (edited
+    again before the commit, or rewritten by a rebase), gets the commits
+    dated after its chain's first row: a revision inherits the stamp, and
+    a row with none keeps the time the target was read.
+    # ponytail: the walk reads each file's whole history on every read and
+    # serve page of cards, plus a rev-list per (file, anchor) below a merge;
+    # cache across calls if a page turns slow."""
+    files = {n.id: _file(cfg, n.target.type, n.target.name) for n in notes}
+    paths = sorted({p for p in files.values() if p})
+    r = _git(cfg, "hash-object", "--", *paths) if paths else None
+    now = dict(zip(paths, r.stdout.split())) if r and r.returncode == 0 else {}
+    hist, merge = _file_history(cfg, sorted({files[n.id] for n in notes if files[n.id]
+                                             and now.get(files[n.id]) != n.target_blob}))
+    anchored, out = {}, {}
+    for n in notes:
+        path = files[n.id]
+        if path is None or (n.target_blob and now.get(path) == n.target_blob):
+            out[n.id] = None if path is None else []
+            continue
+        commits = hist.get(path, [])
+        t = store.written_at(n, n.first_written).timestamp()
+        out[n.id] = [sha for sha, ct, *_ in commits if ct > t]
+        anchor, at = next(((sha, pos) for sha, _, blob, pos in commits
+                           if blob == n.target_blob), (None, None))
+        if anchor and at < merge:
+            # No merge above the anchor: every commit listed before it is a
+            # descendant of it, and every descendant is listed before it.
+            out[n.id] = [sha for sha, _, _, pos in commits if pos < at]
+            continue
+        if anchor and (path, anchor) not in anchored:
+            c = _git(cfg, "rev-list", "--no-merges", f"{anchor}..HEAD",
+                     "--", f":(literal){path}")
+            anchored[path, anchor] = c.stdout.split() if c.returncode == 0 else None
+        if anchored.get((path, anchor)) is not None:
+            out[n.id] = anchored[path, anchor]
+    return out
+
+
+def commits_since(cfg, notes) -> dict:
+    """id -> how many commits changed_since lists, None where it has none:
+    the count every read prints."""
+    return {k: None if v is None else len(v) for k, v in changed_since(cfg, notes).items()}
+
+
 def uncommitted(store) -> tuple[int, bool]:
     """(new note rows, registry modified).
 
@@ -268,6 +389,23 @@ def uncommitted(store) -> tuple[int, bool]:
         elif rel.endswith("arcs.jsonl"):
             registry = registry or bool((store / rel).read_text().strip())
     return notes, registry
+
+
+def committed(store_dir) -> str:
+    """What HEAD took, as `commit` and the GUI's button say it: the `Rows:`
+    trailer, then by name every path but symbion's own two. `add -A` takes
+    every path in the store, and a plan, then a script, went in under a line
+    that named only the rows (2026-10-02, 2026-10-05). `-z`: a name git
+    would quote prints as written."""
+    rows = _git(store_dir, "log", "-1", "--format=%(trailers:key=Rows,valueonly)").stdout.strip()
+    files = [p for p in _git(store_dir, "show", "-z", "--name-only", "--format=", "HEAD")
+             .stdout.split("\0") if p.strip() and p not in (store.NOTES_FILE, store.ARCS_FILE)]
+    said = [f"rows {rows}"] if rows else []
+    if files:
+        more = f", +{len(files) - 3} more" if len(files) > 3 else ""
+        said.append(f"{len(files)} file{'' if len(files) == 1 else 's'}: "
+                    f"{', '.join(files[:3])}{more}")
+    return "committed" + (": " + "; ".join(said) if said else "")
 
 
 def unpushed(store) -> int | None:

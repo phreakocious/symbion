@@ -314,7 +314,9 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         "open_in_arcs": sum(r["open"] for r in rows),
         "arcs": rows[:a_cap],
         "arcs_elided": max(0, len(rows) - a_cap),
-        "priority": [digest(n, BODY_CHARS) for n in priority[:p_cap]],
+        "priority": [{**digest(n, BODY_CHARS),
+                      "starred_days": age_days(_starred_at(by_id, n), _now)}
+                     for n in priority[:p_cap]],
         "priority_elided": max(0, len(priority) - p_cap),
         "people": [{**digest(n, HEAD_CHARS), "author": n.author} for n in people[:o_cap]],
         "people_elided": max(0, len(people) - o_cap),
@@ -359,6 +361,20 @@ def _root(by_id, n):
     registration; 14 of 14 open prediction heads in three adopter stores
     restated it in the body (measured 2026-09-26)."""
     return list(_chain(by_id, n))[-1]
+
+
+def _starred_at(by_id, n) -> str:
+    """When n's star went on: the oldest row of its chain that carries it
+    unbroken up to the head. A star on a row with no status never expires,
+    so its age is what shows a stale one (2026-09-24: most of one store's
+    stars were results starred while they were news). An uncommitted edit rewrites
+    its row in place, keeping that row's time."""
+    at = n.created_at
+    for row in _chain(by_id, n):
+        if "priority" not in row.tags:
+            break
+        at = row.created_at
+    return at
 
 
 def _amendments(by_id, n) -> int:
@@ -410,8 +426,9 @@ def _labelled(paint, r) -> str:
                    if r.get(k))
     reg = f", registered {r['registered']}" if r.get("registered") else ""
     amd = f", +{_count(r['amendments'], 'amendment')}" if r.get("amendments") else ""
+    star = f", starred {r['starred_days']}d ago" if r.get("starred_days") else ""
     return (by and by + " ") + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
-                          label=r["kind"] + reg + amd)
+                          label=r["kind"] + reg + amd + star)
 
 
 def render_summary(d: dict, paint=plain) -> str:
@@ -529,7 +546,14 @@ def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -
                     if (S.read_status(n) == "open" and not n.spec.parked)
                     or (not n.spec.status and not n.spec.verdict
                         and "retired" not in n.tags)]
-    return {"notes": [S.read_dict(n) for n in rows]}
+    # `store` and `gui` as summary's: `store` is null when no store exists,
+    # since an absent store's read keeps exit 0 and `notes: []`, which a
+    # client read as an object with no rows; `gui` spared a client a second
+    # process only to learn the URL (2026-10-03).
+    since = gitref.commits_since(cfg, rows)
+    return {"store": str(store_dir) if S.exists(store_dir) else None,
+            "gui": (r := servers.serving(store_dir)) and r["url"],
+            "notes": [S.read_dict(n) | {"commits_since": since[n.id]} for n in rows]}
 
 
 # ---- schema: the vocabulary, for the hook, the skill and a human ----

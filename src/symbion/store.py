@@ -17,7 +17,7 @@ import secrets
 import shutil
 import subprocess
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 
@@ -60,7 +60,11 @@ class Note:
     provenance: dict | None = None  # domain stamp: what this note was measured against
     measurements: dict | None = None  # flat: finite float/int/str values only
     evidence: tuple = ()              # store-relative paths, never absolute
+    target_blob: str | None = None    # the target file's blob id when written (gitref.target_blob)
     spec: K.Kind = K.Kind()           # the kind's bits, set at read time; NEVER serialized
+    # Its chain's first created_at, set at read time on a revision; NEVER
+    # serialized. A revision is no re-reading of the target (see target_blob).
+    first_written: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -158,15 +162,15 @@ def since_cutoff(value: str, now: datetime | None = None) -> datetime:
     return typed(dt)
 
 
-def written_at(n) -> datetime:
-    """A row's created_at as an instant: what every order sorts on. A string
+def written_at(n, stamp: str | None = None) -> datetime:
+    """A row's created_at, or `stamp`, as an instant: what every order sorts on. A string
     sort put `10-01T05:00+09:00` after `09-30T22:00+00:00`, though it is two
     hours earlier, so a store written from two zones listed out of order. Rows from before
     offsets were stamped are naive: local wall clock, which is what they
     were written in. A hand-edited stamp that is not ISO sorts oldest
     rather than stopping every read."""
     try:
-        dt = datetime.fromisoformat(n.created_at)
+        dt = datetime.fromisoformat(stamp or n.created_at)
     except (TypeError, ValueError):
         return datetime.min.replace(tzinfo=timezone.utc)
     return dt if dt.tzinfo else dt.astimezone()
@@ -321,6 +325,7 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
         provenance=d.get("provenance"),
         measurements=d.get("measurements"),
         evidence=tuple(d.get("evidence") or ()),
+        target_blob=d.get("target_blob"),
         spec=kinds[d["kind"]],
     )
 
@@ -345,6 +350,7 @@ def note_to_dict(note: Note) -> dict:
         "provenance": note.provenance,
         "measurements": note.measurements,
         "evidence": list(note.evidence),
+        "target_blob": note.target_blob,
     }
 
 
@@ -543,6 +549,14 @@ def _read_notes(file: Path, kinds):
             good.append(note_from_dict(json.loads(raw), kinds=kinds))
         except Exception as e:                  # malformed hand-edit can't take down a read
             bad.append((i, raw, str(e)))
+    # A revision is appended after the row it revises, so one pass in file
+    # order finds each chain's start; a predecessor not yet read leaves the
+    # revision's own time.
+    first = {}
+    for i, n in enumerate(good):
+        if n.supersedes in first:
+            good[i] = n = replace(n, first_written=first[n.supersedes])
+        first[n.id] = n.first_written or n.created_at
     return good, bad
 
 
@@ -640,9 +654,18 @@ def appended(body: str | None, more: str) -> str:
     return body + "\n" * max(0, 2 - have) + more
 
 
+def unholdable(note: Note) -> list[str]:
+    """The fields `note` carries that its kind's bits cannot hold: a legacy
+    row's (a migration, or a kind whose bits changed). The next supersede drops
+    them from the new row."""
+    return [k for k, bit in (("checked", note.spec.verdict), ("result", note.spec.verdict),
+                             ("status", note.spec.status), ("due", note.spec.status))
+            if not bit and getattr(note, k) is not None]
+
+
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
-                        in_place=None, **fields) -> Note:
+                        in_place=None, prepend_body: str | None = None, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
     multi-row aggregate (`rename_target`, `apply_reconciliation`) can hold
@@ -670,15 +693,19 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
 
     `append_body` adds to the TIP's body, read here under the caller's lock,
     so a revision that landed after the caller read the row is kept.
+    `prepend_body` goes above it, the same way, as a new lead; a
+    pre-registration refuses it, since its registered text stays on top.
 
     `in_place(tip) -> bool`, when given, may turn the append into a rewrite
     of the tip's own line; `supersede` passes `rewritable`. A sweep passes
     none and always appends."""
-    if append_body is not None:
-        if "body" in fields:
-            raise ValueError("append_body and body are two sources for one field")
-        if not append_body.strip():
-            raise ValueError("nothing to append: the text is empty")
+    for added in (append_body, prepend_body):
+        if added is None:
+            continue
+        if "body" in fields or (append_body is not None and prepend_body is not None):
+            raise ValueError("body, append_body and prepend_body are sources for one field")
+        if not added.strip():
+            raise ValueError("nothing to add: the text is empty")
     old = next((n for n in notes if n.id == old_id), None)
     if old is None:
         raise KeyError(old_id)
@@ -704,6 +731,8 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     base.update(fields)
     if append_body is not None:
         base["body"] = appended(old.body, append_body)
+    if prepend_body is not None:
+        base["body"] = appended(prepend_body, old.body) if old.body else prepend_body
     if add_refs:
         # Onto the TIP's refs, as append_body is onto its body; the
         # inherited ones are never re-resolved.
@@ -717,6 +746,9 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     if spec is None:
         raise ValueError(f"unknown kind {base['kind']!r}; this store's kinds are "
                          f"{', '.join(kinds)} (declared under [kinds] in symbion.toml)")
+    if prepend_body is not None and spec.status and spec.verdict:
+        raise ValueError(f"{old.id} is a pre-registration: its registered text stays on "
+                         f"top, so nothing goes above it (--append adds after it)")
     # A legacy row (a hand-written migration, or a kind whose bits changed)
     # can carry a field its kind cannot hold. The reader loads it as written;
     # the WRITER owns the invariants, so an INHERITED illegal field is dropped
@@ -725,18 +757,18 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     # every later supersede). The same field passed in `fields` still refuses,
     # and so does a KIND CHANGE that would shed a field: that is not a legacy
     # row, it is the caller moving a row somewhere its fields do not fit.
-    if base["kind"] == old.kind:
-        for key, legal in (("checked", spec.verdict), ("result", spec.verdict),
-                           ("status", spec.status), ("due", spec.status)):
-            if not legal and key not in fields:
-                base[key] = None
+    dropped = [k for k in unholdable(old) if k not in fields] if base["kind"] == old.kind else []
+    for key in dropped:
+        base[key] = None
     for key in ("checked", "result"):          # rule 5, on a legacy row
         if key not in fields and base.get(key) in NULL_WORDS:
             base[key] = None
     check_fields(base["kind"], spec, base)
-    if in_place is not None and base.get("status") == old.status and in_place(old):
+    if in_place is not None and not dropped and base.get("status") == old.status \
+            and in_place(old):
         # Keeps the id, the time and the row it revised: see `rewritable`.
         # A status change never comes here: a resolve's time is when it closed.
+        # Nor a drop: the old row is then the only copy of what was dropped.
         note = note_from_dict(base, kinds=kinds)
         _rewrite_note_unlocked(store, note)
         return note
@@ -753,7 +785,8 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
 
 
 def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
-              append_body: str | None = None, add_refs=None, **fields) -> Note:
+              append_body: str | None = None, add_refs=None,
+              prepend_body: str | None = None, **fields) -> Note:
     """Append a correction superseding old_id -- the single-row public entry
     point. One outer `_lock` spans load -> fast-forward -> mint -> write; see
     `_supersede_unlocked` for what happens inside it.
@@ -781,7 +814,7 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
                 add_refs = canonicalize({"refs": add_refs})["refs"]
         return _supersede_unlocked(store, notes, old_id, author=author,
                                    append_body=append_body, add_refs=add_refs,
-                                   in_place=lambda tip: rewritable(store, notes, tip, author),
+                                   prepend_body=prepend_body, in_place=lambda tip: rewritable(store, notes, tip, author),
                                    **fields)
 
 
@@ -1221,7 +1254,8 @@ def _mint_unique(used: set, _gen=None) -> str:
     return nid
 
 
-def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _gen=None, canonicalize=None):
+def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _gen=None,
+             canonicalize=None, stamp=None):
     """One open row of `kind` per name that has no head item yet. Idempotent.
 
     `item` scope never runs a catalog — names are always explicit (the caller
@@ -1232,7 +1266,9 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
     here stamps provenance, so a seeded verdict row would be a prediction
     with no commitment sha and no falsifier.
 
-    `canonicalize(names) -> names` runs inside the lock, so idempotence is judged on the canonical name."""
+    `canonicalize(names) -> names` runs inside the lock, so idempotence is judged on the canonical name.
+    `stamp(names) -> {name: blob}` stamps each new row's file as `add` does,
+    so its commits_since counts from the content it was seeded over."""
     kinds = K.read_kinds(store)
     spec = kinds.get(kind)
     if spec is None:
@@ -1255,6 +1291,7 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
         members = {(n.target.type, n.target.name)
                    for n in arc_items(notes, arc_id)}
         used = {n.id for n in notes}
+        blobs = stamp([n for n in names if (target_type, n) not in members]) if stamp else {}
         created = []
         for name in names:
             if (target_type, name) in members:
@@ -1263,7 +1300,7 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
                 "id": _mint_unique(used, _gen), "kind": kind,
                 "target": {"type": target_type, "name": name},
                 "created_at": _now_iso(), "author": author, "body": "",
-                "status": "open", "arc_id": arc_id,
+                "status": "open", "arc_id": arc_id, "target_blob": blobs.get(name),
             }, kinds=kinds)
             _append_note_unlocked(store, note)
             created.append(note)
@@ -1313,7 +1350,7 @@ def reconcile_arc(notes, arc_id, live_for, rename_map, catalog_types):
     return rows
 
 
-def apply_reconciliation(store, rows, cfg, resolve_stale=False, author=None):
+def apply_reconciliation(store, rows, resolve_stale=False, author=None):
     """Act on reconcile rows. A 'renamed' task's old name is renamed onto the
     live one for EVERY head, in the arc or not, target or ref (the
     `rename_target` sweep): the rename is a fact about the object, and moving
@@ -1358,9 +1395,8 @@ def apply_reconciliation(store, rows, cfg, resolve_stale=False, author=None):
             elif r["status"] == "stale" and resolve_stale and not r.get("needs_result"):
                 new_note = _supersede_unlocked(
                     store, notes, r["id"], author=author, kinds=kinds, status="resolved",
-                    body=f"reconcile: target {r['target_name']!r} disappeared "
-                         f"from the {cfg.stale_target_noun} catalog; "
-                         f"no rename evidence.")
+                    append_body=f"reconcile: target {r['target_name']!r} disappeared "
+                                f"from the {r['target_type']} catalog; no rename evidence.")
                 notes.append(new_note)
                 resolved += 1
     return retargeted, repointed, resolved

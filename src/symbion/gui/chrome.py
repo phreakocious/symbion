@@ -19,8 +19,11 @@ from .theme import DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, quasar_colors, root_v
 # From anywhere but a field being typed in or an open dialog: `/` focuses the
 # search box, `n` and `?` press the buttons they name. What is typed in the
 # box hides the cards on the page that lack a word of it (`sbFilter`): every
-# word, in any case, in the card's text or its id.
+# word, in any case, in the card's text or its id. When it hides them all, a
+# pause in the typing searches the store, as Enter does: a superseded id, or a
+# row on no card of this page, read as gone (the owner, 2026-10-05).
 _KEYS_JS = """<script>
+let sbExpandTimer;
 const sbKeys = {'/': '.sb-search input', 'n': '.sb-new', '?': '.sb-keys'};
 document.addEventListener('keydown', e => {
   if (e.ctrlKey || e.metaKey || e.altKey || !Object.hasOwn(sbKeys, e.key)) return;
@@ -31,7 +34,7 @@ document.addEventListener('keydown', e => {
   e.preventDefault();
   if (e.key === '/') { el.focus(); el.select(); } else el.click();
 });
-function sbFilter(text) {
+function sbFilter(text, expand) {
   const words = (text || '').toLowerCase().split(/\\s+/).filter(Boolean);
   for (const card of document.querySelectorAll('.sb-main .sb-note')) {
     const hay = (card.textContent + ' ' + (card.dataset.id || '')).toLowerCase();
@@ -40,6 +43,9 @@ function sbFilter(text) {
   for (const board of document.querySelectorAll('.sb-board'))
     board.classList.toggle('sb-filtered',
       words.length > 0 && !board.querySelector('.sb-note:not(.sb-filtered)'));
+  clearTimeout(sbExpandTimer);
+  if (words.length && !document.querySelector('.sb-main .sb-note:not(.sb-filtered)'))
+    sbExpandTimer = setTimeout(() => expand(text), 700);
 }
 </script>"""
 
@@ -164,7 +170,7 @@ _PLACES = (("Notebook", "/", "menu_book"), ("All notes", "/notes", "notes"),
 def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
     """Brand, places, an open count per kind that has a status, the parked
     ones under their own head (an open idea showed nowhere: the owner,
-    2026-10-02), and who is writing. The badge is not decoration: see the
+    2026-10-02), a row count per kind with none, and who is writing. The badge is not decoration: see the
     module docstring."""
     with ui.element("div").classes("sb-side-inner"):
         with ui.link(target="/").classes("sb-brand").mark("brand-link"):
@@ -186,13 +192,16 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
             with ui.element("div").classes("sb-nav"):
                 ui.label(head).classes("sb-nav-head")
                 for k in kinds:
-                    n = len(summ.open_notes(heads, k))
-                    with ui.link(target=href(kind=k, status="open")).classes(
-                            f"sb-nav-item {kind_class(k)}" + ("" if n else " sb-zero")) \
-                            .mark(f"open-{k}"):
-                        ui.element("span").classes("sb-dot")
-                        ui.label(k)
-                        ui.label(str(n)).classes("sb-nav-n")
+                    _kind_item(k, len(summ.open_notes(heads, k)),
+                               href(kind=k, status="open"), f"open-{k}")
+        # The kinds with no status, which showed nowhere here (the owner,
+        # 2026-10-02): no open count, so each shows its rows.
+        plain = [k for k, spec in ctx.kinds.items() if not spec.status]
+        if plain:
+            with ui.element("div").classes("sb-nav"):
+                ui.label("records").classes("sb-nav-head")
+                for k in plain:
+                    _kind_item(k, sum(h.kind == k for h in heads), href(kind=k), f"kind-{k}")
         _closed(heads)
         _other_stores(ctx)
         with ui.element("div").classes("sb-who"):
@@ -204,6 +213,14 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
                 .classes("sb-keys").mark("keys").tooltip("keyboard shortcuts (?)")
         ui.link(f"symbion {metadata.version('symbion')}", SOURCE, new_tab=True) \
             .classes("sb-source").mark("source").tooltip("source on GitHub")
+
+
+def _kind_item(k: str, n: int, target: str, mark: str) -> None:
+    with ui.link(target=target).classes(
+            f"sb-nav-item {kind_class(k)}" + ("" if n else " sb-zero")).mark(mark):
+        ui.element("span").classes("sb-dot")
+        ui.label(k)
+        ui.label(str(n)).classes("sb-nav-n")
 
 
 def _closed(heads, n: int = 5) -> None:
@@ -246,7 +263,8 @@ def _other_stores(ctx) -> None:
 
 def _search_box(q: str, keep: dict) -> None:
     """Typing filters the cards on this page, in the browser; Enter searches
-    the whole store (the owner, 2026-10-01)."""
+    the whole store (the owner, 2026-10-01), and so does a pause once the
+    filter hides every card (2026-10-05)."""
     box = ui.input(placeholder="Filter · Enter searches all", value=q) \
         .props('dense outlined clearable aria-label="search"').classes("sb-search") \
         .mark("search")
@@ -260,10 +278,17 @@ def _search_box(q: str, keep: dict) -> None:
         text = e.args if isinstance(e.args, str) else box.value
         ui.navigate.to(href(**{**keep, "q": (text or "").strip() or None}))
 
-    box.on("update:value", js_handler="(v) => sbFilter(v)")
+    def _expand(e):
+        # The page that shows this search can hide all its cards: an id hit's
+        # card lacks the id's text. Reloading it would change nothing.
+        if (e.args if isinstance(e.args, str) else "").split() != q.split():
+            _go(e)
+
+    box.on("update:value", _expand, js_handler="(v) => sbFilter(v, emit)")
     box.on("keydown.enter", _go, js_handler="(e) => emit(e.target.value)")
-    box.tooltip("typing filters this page; Enter searches the store: every word, "
-                "in any case, in body, target, checked, result, refs or tags; or a note id")
+    box.tooltip("typing filters this page, and searches the store when nothing here "
+                "matches; Enter searches the store: every word, in any case, in body, "
+                "target, checked, result, refs or tags; or a note id")
 
 
 # Seconds between reads of the store's git state for the two buttons.
@@ -307,7 +332,7 @@ def _commit_button(ctx, n: int, registry: bool) -> None:
             ui.notify(str(e), type="negative", multi_line=True,
                       close_button="dismiss", timeout=0)
             return
-        ui.notify("committed" if ok else "nothing to commit")
+        ui.notify(gitref.committed(ctx.store_dir) if ok else "nothing to commit")
         ui.navigate.reload()
 
     # On a phone the word goes and the count stays: the icon says commit.

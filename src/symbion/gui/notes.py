@@ -132,6 +132,44 @@ def target_link(n) -> None:
         .classes("sb-chip sb-target").mark("note-target")
 
 
+def bare(n) -> bool:
+    """A row with nothing to say, no body and no verdict: a seeded box. What
+    it targets is its whole content, so that leads instead of a blank line."""
+    return not n.body.strip() and not n.spec.verdict
+
+
+@functools.lru_cache(maxsize=8)
+def _arc_names(store_dir: str, _stamp) -> dict:
+    """Arc id -> name. `_stamp` is arcs.jsonl's mtime and size, as `_tails`'s."""
+    return {a.id: a.name for a in S.load_arcs(store_dir)}
+
+
+def _headline(url: str, kind: str, text: str, *marks) -> None:
+    with ui.link(target=url).classes("sb-note-open").mark("note-headline", *marks):
+        ui.html(f'<span class="sb-headline-type">{html.escape(kind)}</span>'
+                f'{html.escape(text)}', sanitize=False).classes("sb-note-text")
+
+
+def target_headline(n) -> None:
+    """A bare row's target as its text: the name bright, the type dim before
+    it. It stands in for `target_link`'s chip, so it carries that marker."""
+    if n.target.type == "project" or not n.target.name:
+        _headline(href(id=n.id), "", "project", "note-target")
+    else:
+        _headline(target_href(n.target.type, n.target.name), n.target.type,
+                  n.target.name, "note-target")
+
+
+def arc_headline(ctx, n) -> None:
+    """A bare row on its own object's page: the target is the page, so the
+    arc is what is left to say, by its name."""
+    p = S.arcs_path(ctx.store_dir)
+    st = p.stat() if p.exists() else None
+    name = _arc_names(str(ctx.store_dir), st and (st.st_mtime_ns, st.st_size)) \
+        .get(n.arc_id, n.arc_id)
+    _headline(f"/arc?id={quote(n.arc_id)}", "arc", name)
+
+
 TIP_COMMITS = 8
 
 
@@ -164,8 +202,10 @@ def _check_badge(ctx, n, git_head=None) -> None:
         text = f"unverifiable — {api.why_unverifiable(n.provenance)}"
     elif state == "external":
         text = f"external — {summ.age_phrase(n.provenance['at'])}"
+    elif state == "unstamped":
+        text = f"unstamped — {summ.age_phrase(n.created_at)}"
     cls = {"current": "sb-chip-good", "behind": "sb-chip-notable", "external": "",
-           "pending": "",
+           "pending": "", "unstamped": "",
            "ahead": "sb-chip-notable",
            "diverged": "sb-chip-bad", "unverifiable": "sb-chip-bad"}[state]
     chip = ui.label(text).classes(f"sb-chip {cls}").mark("check-state")
@@ -179,6 +219,32 @@ def _check_badge(ctx, n, git_head=None) -> None:
     def _fill():
         if not tip.text:
             tip.text = check_tip(ctx.cfg, n.provenance, state, distance)
+
+    chip.on("mouseenter", _fill)
+
+
+def since_tip(cfg, n) -> str:
+    """The commits a card's "N commits since" counts, newest first: like
+    `behind N`, the count asks the reader to go and look at them."""
+    shas = gitref.changed_since(cfg, [n])[n.id] or []
+    if not shas:
+        return ""
+    subj = gitref.subjects(cfg, shas[:TIP_COMMITS])
+    more = f"\n+{len(shas) - TIP_COMMITS} more" if len(shas) > TIP_COMMITS else ""
+    return (f"{n.target.name} changed in {summ._count(len(shas), 'commit')} since this row:\n"
+            + "\n".join(f"{s[:7]} {subj.get(s, '')}" for s in shas[:TIP_COMMITS]) + more)
+
+
+def _since_chip(ctx, n, since: int) -> None:
+    """Neutral, not a warning: on a busy file nearly every row has one."""
+    chip = ui.label(f"{summ._count(since, 'commit')} since").classes("sb-chip") \
+        .mark("note-since")
+    with chip:
+        tip = ui.tooltip("")
+
+    def _fill():                    # on hover, as the check badge's: a walk per card
+        if not tip.text:
+            tip.text = since_tip(ctx.cfg, n)
 
     chip.on("mouseenter", _fill)
 
@@ -310,7 +376,8 @@ def md_button(ctx, name, label: str = ""):
 
 def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                 base: dict | None = None, compact: bool = False, hit=(),
-                actions: bool = True, git_head: str | None = None) -> None:
+                actions: bool = True, git_head: str | None = None,
+                since: int | None = None) -> None:
     """One note row: a card. What it says first, then one line of where it
     points and what it is, the resolve ring on its left and star and edit
     over its corner. Every chip is a link into the filtered view -- that is
@@ -320,7 +387,8 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     `hit` is the search's words: a compact body then shows and marks them.
     `actions=False` drops the buttons: an earlier version is history, and an
     edit made from it would land on the current row. `git_head` is
-    gitref.head_sha's, read once by a page of many check badges."""
+    gitref.head_sha's, read once by a page of many check badges, and `since`
+    the row's gitref.commits_since, counted once by a page of many cards."""
     def narrow(**kv):
         return href(**{**(base or {}), **kv})
 
@@ -334,8 +402,8 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     with ui.element("div").classes(cls + (" sb-resolvable" if resolvable else "")) \
             .props(f"data-id={n.id}").mark("note-row"):
         with ui.element("div").classes("sb-note-main"):
-            _note_content(ctx, n, compact, hit)
-            _note_foot(ctx, n, status, narrow, show_target, git_head)
+            _note_content(ctx, n, compact, hit, show_target)
+            _note_foot(ctx, n, status, narrow, show_target, git_head, since)
         # On the right, after the text: on the left it pushed an open row's
         # text in past a closed row's (the owner, 2026-10-01).
         if resolvable:
@@ -370,8 +438,14 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                     .tooltip("supersede / edit").mark("note-edit")
 
 
-def _note_content(ctx, n, compact: bool, hit) -> None:
-    """The body, the verdict, measurements and evidence: what the row says."""
+def _note_content(ctx, n, compact: bool, hit, show_target: bool = False) -> None:
+    """The body, the verdict, measurements and evidence: what the row says.
+    A bare row says its target, or on that target's own page, its arc."""
+    if bare(n):
+        if show_target:
+            target_headline(n)
+        elif n.arc_id:
+            arc_headline(ctx, n)
     if n.spec.verdict:
         # Clipped on a board like the body: a check's `checked` ran to
         # three lines and pushed the next row off the screen.
@@ -404,7 +478,7 @@ def _note_content(ctx, n, compact: bool, hit) -> None:
         ui.label("evidence: " + ", ".join(n.evidence)).classes("sb-note-meta")
 
 
-def _note_foot(ctx, n, status, narrow, show_target: bool, git_head) -> None:
+def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) -> None:
     """One wrapping line: what kind and state the row is and where it points
     on the left; who wrote it, when, and its id on the right."""
     with ui.element("div").classes("sb-note-foot"):
@@ -417,9 +491,12 @@ def _note_foot(ctx, n, status, narrow, show_target: bool, git_head) -> None:
         if n.spec.verdict:
             _check_badge(ctx, n, git_head)
         if show_target:
-            target_link(n)
+            if not bare(n):                 # else the headline says it
+                target_link(n)
             md_button(ctx, n.target.name)
-        if n.arc_id:
+        if since:
+            _since_chip(ctx, n, since)
+        if n.arc_id and (show_target or not bare(n)):
             ui.link(f"arc: {n.arc_id}", f"/arc?id={quote(n.arc_id)}") \
                 .classes("sb-chip sb-target").mark("note-arc")
         for r in n.refs:

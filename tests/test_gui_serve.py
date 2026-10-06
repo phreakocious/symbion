@@ -168,6 +168,20 @@ def test_a_second_serve_on_a_store_takes_its_links_when_the_first_stops(tmp_path
     assert not list(first.parent.glob("*.json")), "the second leaves its record"
 
 
+def test_a_scratch_store_records_only_into_a_scratch_cache(tmp_path, monkeypatch):
+    """A scratch serve started without XDG_CACHE_HOME was listed in the
+    owner's sidebar (2026-10-05). A store under a temp root records only
+    when the cache is under one too, as a test's is; the owner's cache is
+    not, even when XDG_CACHE_HOME names it."""
+    from symbion.gui import servers
+    scratch = tmp_path / "tmp"
+    monkeypatch.setattr(servers, "_temp_roots", lambda: [scratch])
+    for cache, records in ((tmp_path / "home-cache", False), (scratch / "cache", True)):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+        assert bool(servers.record("http://127.0.0.1:1", scratch / "s")) is records, cache
+        assert bool(servers.record("http://127.0.0.1:1", tmp_path / "s")), cache
+
+
 def test_a_stores_port_is_its_names_and_the_same_on_every_machine(tmp_path):
     """The owner, 2026-10-02: a row link must not go stale when its serve
     restarts. Each store takes a port derived from its name, so a restart,

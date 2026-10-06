@@ -1,3 +1,4 @@
+import os
 import subprocess
 import pytest
 from symbion import catalog, config, gitref
@@ -56,6 +57,17 @@ def test_dirty_check_at_head_is_never_current(repo):
     assert prov["dirty"] is True
     state, _ = gitref.check_state(cfg, prov)
     assert state == "unverifiable"
+
+
+def test_no_stamp_reads_unstamped_and_a_stamp_without_a_commit_unverifiable(repo):
+    """A row from a store that predates stamping has no provenance: nothing
+    about it is suspect, it is only unplaced against the tree. A stamp that
+    names no commit (a provenance command's own object) still claims a run
+    symbion cannot place."""
+    cfg = Config(project_root=repo)
+    assert gitref.check_state(cfg, None) == ("unstamped", None)
+    assert gitref.check_state(cfg, {}) == ("unstamped", None)
+    assert gitref.check_state(cfg, {"runs": 3}) == ("unverifiable", None)
 
 
 def test_a_stamp_is_a_commit_id_never_a_ref(repo):
@@ -407,3 +419,146 @@ def test_store_path_still_derives_from_the_main_worktree(repo, linked, monkeypat
     root = config.project_root(cwd=linked)
     assert root == repo
     assert config.store_dir(root) == repo.parent / f"{repo.name}-notes"
+
+
+# ---- commits_since: has a row's file changed since the row saw it ----
+def _commit_at(repo, msg, when, *extra):
+    env = {"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-am", msg, *extra],
+                   env={**os.environ, **env}, check=True, capture_output=True)
+
+
+def _file_row(cfg, name, created_at, stamp=True):
+    from symbion import store
+    blob = gitref.target_blob(cfg, "file", name) if stamp else None
+    return store.Note(id=f"r-{created_at}", kind="note", created_at=created_at, author="t",
+                      body="", target=store.Target(type="file", name=name), target_blob=blob)
+
+
+def _since(cfg, row):
+    return gitref.commits_since(cfg, [row])[row.id]
+
+
+def test_target_blob_is_the_blob_git_would_commit_and_only_for_a_file_here(repo):
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files", "host": "true"})
+    (repo / "f0").write_text("edited")
+    assert gitref.target_blob(cfg, "file", "f0") == _run(repo, "hash-object", "f0")
+    assert gitref.target_blob(cfg, "item", "f0") is None, "an item is no path"
+    assert gitref.target_blob(cfg, "file", "gone.py") is None
+    assert gitref.target_blob(cfg, "host", "/etc/hosts") is None, "outside the checkout"
+
+
+def test_the_commit_that_carries_what_the_row_saw_is_not_counted(repo):
+    """The row is written over an uncommitted edit. By date, the commit that
+    carries that edit counts against the row; anchored on the stamped
+    content, it is the row's own starting point."""
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    (repo / "f0").write_text("edited")
+    row = _file_row(cfg, "f0", "2030-01-04T00:00:00+00:00")
+    _commit_at(repo, "carries the edit", "2030-01-05T00:00:00+00:00")
+    assert _since(cfg, row) == 0
+    (repo / "f0").write_text("later")
+    _commit_at(repo, "later", "2030-01-06T00:00:00+00:00")
+    assert _since(cfg, row) == 1
+
+
+def test_a_merged_commit_dated_before_the_row_counts_and_the_merge_does_not(repo):
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    (repo / "f0").write_text("a\nb\nc\nd\ne\n")
+    _commit_at(repo, "base", "2030-01-01T00:00:00+00:00")
+    _run(repo, "checkout", "-q", "-b", "side")
+    (repo / "f0").write_text("a\nb\nc\nd\nE\n")
+    _commit_at(repo, "side", "2030-01-02T00:00:00+00:00")
+    _run(repo, "checkout", "-q", "main")
+    row = _file_row(cfg, "f0", "2030-01-03T00:00:00+00:00")
+    (repo / "f0").write_text("A\nb\nc\nd\ne\n")   # both sides change f0, so the merge's
+    _commit_at(repo, "main", "2030-01-03T12:00:00+00:00")   # file matches neither parent
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "merge", "-q", "--no-ff", "--no-edit", "side"], check=True,
+                   capture_output=True, env={**os.environ,
+                                             "GIT_COMMITTER_DATE": "2030-01-04T00:00:00+00:00"})
+    assert _since(cfg, row) == 2, "main's commit and side's; by date, side's is before the row"
+
+
+def test_without_a_commit_holding_the_stamp_the_count_falls_back_to_dates(repo):
+    """An unstamped row (written before stamping), and a stamped one whose
+    content was edited again before any commit took it."""
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    (repo / "f0").write_text("seen")
+    stamped = _file_row(cfg, "f0", "2030-01-03T00:00:00+00:00")
+    unstamped = _file_row(cfg, "f0", "2030-01-03T00:00:00+00:00", stamp=False)
+    (repo / "f0").write_text("edited again")
+    _commit_at(repo, "after", "2030-01-04T00:00:00+00:00")
+    assert _since(cfg, stamped) == 1
+    assert _since(cfg, unstamped) == 1
+    assert _since(cfg, _file_row(cfg, "f1", "2030-01-03T00:00:00+00:00", stamp=False)) == 0
+
+
+def test_commits_since_is_none_where_the_target_is_no_file_here(repo):
+    from symbion import store
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    item = store.Note(id="i", kind="note", created_at="2030-01-01T00:00:00+00:00",
+                      author="t", body="", target=store.Target(type="item", name="f0"))
+    gone = _file_row(cfg, "gone.py", "2030-01-01T00:00:00+00:00")
+    assert gitref.commits_since(cfg, [item, gone]) == {"i": None, gone.id: None}
+
+
+def test_a_row_written_on_a_branch_counts_mains_commits_once_merged(repo):
+    """The row is written on a side branch, and read on main after the merge.
+    Its anchor and main's commit are on two lines: which one a log lists
+    first says nothing about ancestry, so the count must not come from order."""
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    (repo / "f0").write_text("a\nb\nc\nd\ne\n")
+    _commit_at(repo, "base", "2030-01-01T00:00:00+00:00")
+    _run(repo, "checkout", "-q", "-b", "side")
+    (repo / "f0").write_text("a\nb\nc\nd\nE\n")
+    _commit_at(repo, "side", "2030-01-03T00:00:00+00:00")
+    row = _file_row(cfg, "f0", "2030-01-03T01:00:00+00:00")
+    _run(repo, "checkout", "-q", "main")
+    (repo / "f0").write_text("A\nb\nc\nd\ne\n")
+    _commit_at(repo, "main", "2030-01-02T00:00:00+00:00")
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "merge", "-q", "--no-ff", "--no-edit", "side"], check=True,
+                   capture_output=True, env={**os.environ,
+                                             "GIT_COMMITTER_DATE": "2030-01-04T00:00:00+00:00"})
+    assert _since(cfg, row) == 1, "main's commit; side's is the anchor"
+
+
+def test_a_linear_history_counts_without_a_rev_list(repo, monkeypatch):
+    """Each stamped row's anchor took a `rev-list`: a page of rows on busy
+    files paid one git call per row. With no merge above the anchor, the
+    walk's own order is the answer."""
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    row = _file_row(cfg, "f0", "2030-01-01T00:00:00+00:00")
+    for i in range(3):
+        (repo / "f0").write_text(f"v{i}")
+        _commit_at(repo, f"v{i}", f"2030-01-0{i + 2}T00:00:00+00:00")
+    seen = []
+    real = gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda cfg, *a, **k: seen.append(a[0]) or real(cfg, *a, **k))
+    assert _since(cfg, row) == 3
+    assert "rev-list" not in seen, seen
+
+
+def test_an_ancestor_dated_after_the_anchor_is_not_counted(repo):
+    """Committer dates need not follow ancestry (a skewed clock, a rebase):
+    here a merged branch's commit is dated after the row, yet is an ancestor
+    of the commit the row saw. By date it counts; by ancestry it does not."""
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    (repo / "f0").write_text("a\nb\nc\nd\ne\n")
+    _commit_at(repo, "base", "2030-01-01T00:00:00+00:00")
+    _run(repo, "checkout", "-q", "-b", "side")
+    (repo / "f0").write_text("a\nb\nc\nd\nE\n")
+    _commit_at(repo, "skewed", "2030-01-10T00:00:00+00:00")
+    _run(repo, "checkout", "-q", "main")
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "merge", "-q", "--no-ff", "--no-edit", "side"], check=True,
+                   capture_output=True, env={**os.environ,
+                                             "GIT_COMMITTER_DATE": "2030-01-02T00:00:00+00:00"})
+    (repo / "f0").write_text("A\nb\nc\nd\nE\n")
+    _commit_at(repo, "seen", "2030-01-03T00:00:00+00:00")
+    row = _file_row(cfg, "f0", "2030-01-03T12:00:00+00:00")
+    (repo / "f0").write_text("A\nB\nc\nd\nE\n")
+    _commit_at(repo, "after", "2030-01-04T00:00:00+00:00")
+    assert _since(cfg, row) == 1, "only `after`"
