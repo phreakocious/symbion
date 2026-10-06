@@ -23,7 +23,7 @@ def _git(cfg_or_path, *args):
         # so a check reads `unverifiable`, a subject falls back to its sha.
         return subprocess.CompletedProcess(["git", *args], 128, "", "not a git repository")
     return subprocess.run(["git", "-C", str(root), *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, encoding="utf-8")
 
 
 def _root(cfg_or_path):
@@ -387,7 +387,7 @@ def uncommitted(store) -> tuple[int, bool]:
             with open(store / rel, encoding="utf-8") as f:
                 notes += sum(1 for _ in f)
         elif rel.endswith("arcs.jsonl"):
-            registry = registry or bool((store / rel).read_text().strip())
+            registry = registry or bool((store / rel).read_text(encoding="utf-8").strip())
     return notes, registry
 
 

@@ -677,12 +677,13 @@ def _declare(store_dir, text):
 
 
 def test_kind_class_is_by_label_as_in_the_terminal():
-    """A kind the store declares has no colour of its own: it takes the one
-    every declared kind shares, as a `list` row prints it."""
+    """A kind the store declares takes the colour every declared kind shares,
+    as a `list` row prints it, unless its `color` picks one: its own class
+    then carries that, from the store's rule after the theme's."""
     from symbion.gui.notes import kind_class
     assert kind_class("bug") == "sb-kind-bug"
     assert kind_class("decision") == "sb-kind-decision"
-    assert kind_class("measurement") == "sb-kind-own"
+    assert kind_class("measurement") == "sb-kind-own sb-kind-measurement"
 
 
 async def test_add_form_lists_exactly_the_declared_kinds(user: User, repo, tmp_path):

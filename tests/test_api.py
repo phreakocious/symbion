@@ -56,6 +56,19 @@ def test_a_codex_shell_writes_as_codex_and_its_gui_as_the_person(monkeypatch):
     assert api.gui_author() == "ada"
 
 
+def test_a_hermes_shell_writes_as_hermes_and_its_gui_as_the_person(monkeypatch):
+    """HERMES_AGENT is Hermes's CLAUDECODE: it exports it on each terminal
+    command (measured in a Hermes CLI shell, 2026-10-06, with
+    HERMES_SESSION_ID too, which gateway contexts strip). A Hermes launched
+    from a Claude Code session carries CLAUDECODE too."""
+    monkeypatch.setenv("HERMES_AGENT", "true")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+
+    assert api.author_default() == "hermes"
+    assert api.gui_author() == "ada"
+
+
 def test_symbion_author_wins_for_both(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("SYMBION_AUTHOR", "sam")
@@ -777,7 +790,7 @@ def test_the_catalog_runs_once_per_write_not_once_per_row(repo, tmp_path):
     store_dir = tmp_path / "s"
     store.ensure_store(store_dir)
     (store_dir / "symbion.toml").write_text(
-        f'[catalogs]\nfile = "echo run >> {tmp_path}/cat.calls; echo src/parser.py"\n')
+        f'[catalogs]\nfile = "echo run >> {tmp_path.as_posix()}/cat.calls; echo src/parser.py"\n')
     ctx = api.resolve(str(store_dir))
     api.add_many(ctx, [_row("parser", "file")] * 3, author="t")
     assert (tmp_path / "cat.calls").read_text().count("run") == 1
@@ -887,7 +900,7 @@ def test_the_catalog_runs_once_per_supersede_not_once_per_ref(repo, tmp_path):
     store_dir = tmp_path / "s"
     store.ensure_store(store_dir)
     (store_dir / "symbion.toml").write_text(
-        f'[catalogs]\nfile = "echo run >> {tmp_path}/cat.calls; echo src/parser.py; echo src/lexer.py"\n')
+        f'[catalogs]\nfile = "echo run >> {tmp_path.as_posix()}/cat.calls; echo src/parser.py; echo src/lexer.py"\n')
     ctx = api.resolve(str(store_dir))
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}}, author="t")
     assert not (tmp_path / "cat.calls").exists(), "a project target runs no catalog"

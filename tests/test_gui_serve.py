@@ -21,6 +21,20 @@ from symbion import store     # noqa: E402
 # The console script beside this venv's python (test_hook.py says why not
 # shutil.which): its `__main__` guard is half of what broke --reload.
 SYMBION = str(Path(sys.executable).parent / "symbion")
+# Windows signals no process group: the child leads its own console group,
+# and Ctrl+Break, which serve takes as Ctrl-C, is what reaches it there.
+GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+         else {"start_new_session": True})
+STOP = signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM
+CTRL_C = signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT
+
+
+def _kill(p):
+    """The serve and whatever it started."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+    else:
+        os.killpg(p.pid, signal.SIGKILL)
 
 
 def _free_port() -> int:
@@ -66,24 +80,28 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     p = subprocess.Popen(
         [SYMBION, "--dir", str(tmp_path), "serve", "--reload", "--no-browser",
          "--port", str(port), "--author", "t"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
-        start_new_session=True)
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, **GROUP)
     status = page = None
     try:
         status, page = _get_page(p, port)
         # one record, the parent's: the reload worker serves, but never records
         running = [json.loads(f.read_text()) for f in records.glob("*.json")]
     finally:
-        os.killpg(p.pid, signal.SIGTERM)     # the reloader and its worker
+        if os.name == "nt":
+            p.send_signal(STOP)
+        else:
+            os.killpg(p.pid, STOP)           # the reloader and its worker
         try:
             out = p.communicate(timeout=10)[0].decode()
         except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL)
+            _kill(p)
             out = p.communicate()[0].decode()
     assert status == 200, out
     assert out.count("symbion →") == 1, out   # one server announced, not two
-    assert [(r["pid"], r["url"], r["store"]) for r in running] == \
-        [(p.pid, f"http://127.0.0.1:{port}", str(tmp_path.resolve()))], running
+    assert [(r["url"], r["store"]) for r in running] == \
+        [(f"http://127.0.0.1:{port}", str(tmp_path.resolve()))], running
+    # On Windows the console script is a launcher, and the serve runs under it.
+    assert os.name == "nt" or running[0]["pid"] == p.pid, running
     assert not list(records.glob("*.json")), "a serve that stopped leaves its record"
     # ui.run's favicon, which only a served page carries: NiceGUI's own icon
     # is a static .ico, ours an inline SVG.
@@ -108,15 +126,14 @@ def test_ctrl_c_stops_a_serve_quietly(tmp_path):
     p = subprocess.Popen(
         [SYMBION, "--dir", str(tmp_path), "serve", "--no-browser",
          "--port", str(port), "--author", "t"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
-        start_new_session=True)
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, **GROUP)
     try:
         status, _ = _get_page(p, port)
-        p.send_signal(signal.SIGINT)
+        p.send_signal(CTRL_C)
         out = p.communicate(timeout=15)[0].decode()
     finally:
         if p.poll() is None:
-            os.killpg(p.pid, signal.SIGKILL)
+            _kill(p)
             p.communicate()
     assert status == 200, out
     assert "Traceback" not in out and p.returncode == 0, (p.returncode, out)
@@ -144,7 +161,7 @@ def test_a_second_serve_on_a_store_takes_its_links_when_the_first_stops(tmp_path
     assert seen.pop() == ["http://127.0.0.1:1111"]
 
     first = tmp_path / "cache" / "symbion" / "serve" / "first.json"
-    dead = subprocess.Popen(["true"])
+    dead = subprocess.Popen([sys.executable, "-c", ""])
     dead.wait()
 
     def _first(pid, started=1.0):

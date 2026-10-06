@@ -55,12 +55,12 @@ def test_init_links_the_user_skill_and_writes_nothing_into_the_project(repo, tmp
     link into the install is current by construction."""
     assert run("init", "--yes", store_dir=tmp_path / "store") == 0
     link = _home() / ".claude/skills/symbion"
-    assert link.is_symlink() and link.resolve() == Path(str(SKILL_DIR)).resolve()
+    assert link.resolve() == Path(str(SKILL_DIR)).resolve()  # Windows may use a junction
     assert (link / "SKILL.md").read_text() == (SKILL_DIR / "SKILL.md").read_text()
     assert not (repo / ".claude").exists() and not (repo / "hooks").exists()
     settings = json.loads((_home() / ".claude/settings.json").read_text())
     cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-    assert cmd == 'bash "$HOME/.claude/skills/symbion/session_start.sh"'
+    assert cmd == 'sh "$HOME/.claude/skills/symbion/session_start.sh"'
     out = capsys.readouterr().out
     assert f"linked {link}" in out and f"wrote {_home() / '.claude/settings.json'}" in out
 
@@ -75,6 +75,26 @@ def test_init_rerun_keeps_the_link_the_registration_and_the_toml(repo, tmp_path,
     out = capsys.readouterr().out
     assert "kept" in out and "linked" not in out and "SessionStart" not in out, out
     assert "# customized" in toml.read_text()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a junction is Windows'")
+def test_init_links_by_junction_where_windows_refuses_a_symlink(repo, tmp_path, capsys,
+                                                               monkeypatch):
+    """A symlink on Windows needs Developer Mode or an elevated shell; a
+    person's own terminal has neither. An elevated ssh session never sees the
+    refusal, so it is forced here, as WinError 1314."""
+    def refuse(*a, **kw):
+        raise OSError(22, "A required privilege is not held by the client", None, 1314)
+    monkeypatch.setattr(Path, "symlink_to", refuse)
+    store = tmp_path / "store"
+    assert run("init", "--yes", store_dir=store) == 0
+    link = _home() / ".claude/skills/symbion"
+    assert not link.is_symlink() and link.resolve() == Path(str(SKILL_DIR)).resolve()
+    assert (link / "SKILL.md").read_text() == (SKILL_DIR / "SKILL.md").read_text()
+    capsys.readouterr()
+    assert run("init", "--yes", store_dir=store) == 0
+    out = capsys.readouterr().out
+    assert "kept" in out and "linked" not in out and "left alone" not in out, out
 
 
 def test_init_writes_a_store_readme_once(repo, tmp_path, capsys):
@@ -224,7 +244,7 @@ def test_init_records_a_store_outside_the_parent_as_an_absolute_pointer(repo, tm
     far = tmp_path / "far" / "away-notes"
     far.parent.mkdir()
     assert run("init", "--yes", store_dir=far) == 0
-    assert (repo / ".symbion").read_text().strip() == str(far.resolve())
+    assert (repo / ".symbion").read_text().strip() == far.resolve().as_posix()
 
 
 def test_init_rerun_keeps_an_unchanged_pointer_quiet(repo, tmp_path, capsys):

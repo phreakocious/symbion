@@ -678,7 +678,8 @@ def test_a_batch_on_a_resolver_type_names_no_misses(repo, tmp_path, capsys, monk
     # nothing would ever be a miss and the check could not fail.
     (tmp_path / "mint.py").write_text("import sys; print(sys.stdin.readline().strip())\n")
     _declare(tmp_path, f'[catalogs]\nnum = "printf 1.00"\n'
-                       f'[resolvers]\nnum = "{sys.executable} {tmp_path / "mint.py"}"\n')
+                       f'[resolvers]\nnum = "{Path(sys.executable).as_posix()} '
+                       f'{(tmp_path / "mint.py").as_posix()}"\n')
     rows = "".join(json.dumps({"kind": "note", "target": {"type": "num", "name": v},
                                "body": "b"}) + "\n" for v in ("5.00", "7.00"))
     monkeypatch.setattr("sys.stdin", io.StringIO(rows))
@@ -1219,6 +1220,21 @@ def test_text_views_on_a_tty_are_the_pipe_text_in_colour(tmp_path, capsys, tty):
         assert _sgr(colour) in shown, (argv, shown)
 
 
+def test_a_kinds_picked_colour_paints_its_rows_and_its_schema_line(tmp_path, capsys, tty):
+    """A store's own kinds all printed in one lavender, so several of them read
+    alike (2026-10-06). `color` names a palette colour per kind."""
+    from symbion import kinds as K
+    store.ensure_store(tmp_path)
+    (tmp_path / "symbion.toml").write_text(
+        '[kinds]\nanomaly = { status = true, color = "flamingo" }\nnote = {}\n')
+    run("add", "anomaly", "--target", "item:x", "--body", "b", store_dir=tmp_path)
+    capsys.readouterr()
+    tty()
+    for argv in (("list",), ("schema",), ("summary",)):
+        assert run(*argv, store_dir=tmp_path) == 0, argv
+        assert _sgr(K.COLORS["flamingo"]) in capsys.readouterr().out, argv
+
+
 def _parsers(p):
     """A parser and every verb's under it, `arc seed` included."""
     yield p
@@ -1330,6 +1346,22 @@ def test_a_reader_that_closes_the_pipe_early_gets_no_python_error(argv, tmp_path
                         *argv], stdout=w, stderr=subprocess.PIPE, text=True)
     os.close(w)
     assert (p.returncode, p.stderr) == (141, "")
+
+
+def test_a_pipe_in_the_windows_code_page_carries_utf8_both_ways(tmp_path):
+    """On Windows a pipe's encoding is cp1252: `list` exited 1 on a row holding
+    `→`, and a body piped to --body-file - was stored garbled. PYTHONIOENCODING
+    gives any platform that pipe."""
+    sym = str(Path(sys.executable).parent / "symbion")
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+    store.ensure_store(tmp_path)
+    add = subprocess.run([sym, "--dir", str(tmp_path), "add", "note", "--target", "project",
+                          "--body-file", "-"], input="arrow →\n".encode(), env=env,
+                         capture_output=True)
+    assert add.returncode == 0, add.stderr
+    assert store.load(tmp_path)[0].body.strip() == "arrow →"
+    ls = subprocess.run([sym, "--dir", str(tmp_path), "list"], env=env, capture_output=True)
+    assert ls.returncode == 0 and "arrow →" in ls.stdout.decode(), ls.stderr
 
 
 @pytest.mark.parametrize("argv", [["--help"], ["init", "--help"], ["add", "-h"]])
@@ -1807,6 +1839,41 @@ def test_add_from_json_reads_stdin_and_a_bad_row_writes_nothing(tmp_path, capsys
     err = capsys.readouterr().err
     assert "line 2" in err and "id" in err
     assert store.load(tmp_path) == []
+
+
+@pytest.mark.parametrize("key,bad,said", [
+    ("kind", [1], "kind must be a string"), ("body", 5, "body must be a string"),
+    ("status", 5, "status must be a string"), ("status", "done", "status is open or resolved"),
+    ("checked", 5, "checked must be a string"), ("result", 5, "result must be a string"),
+    ("arc_id", 5, "arc_id must be a string"), ("due", 5, "due must be a string"),
+    ("author", 5, "author must be a string"), ("tags", "pri", "tags must be a list"),
+    ("tags", [1], "tags must be strings"), ("refs", "item:y", "refs must be a list"),
+    ("refs", [5], "each ref is {type, name} or TYPE:NAME"),
+    ("target", ["item", "x"], "target is {type, name} or TYPE:NAME")])
+def test_from_json_refuses_a_key_of_the_wrong_type_before_it_writes(
+        tmp_path, capsys, monkeypatch, key, bad, said):
+    """A key of the wrong type crashed into api.py (a ref spelled TYPE:NAME),
+    stored garbage at exit 0 (`"tags": "pri"` as three one-letter tags, a
+    number as a status), or wrote the row and then crashed (2026-10-06)."""
+    row = {"kind": "check" if key in ("checked", "result") else "task",
+           "target": {"type": "item", "name": "x"}, key: bad}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(row) + "\n"))
+    assert run("add", "--from-json", "-", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert f"line 1: {said}" in err and "Traceback" not in err, err
+    assert store.load(tmp_path) == []
+
+
+def test_from_json_takes_type_name_as_every_flag_spells_it(tmp_path, capsys, monkeypatch):
+    """`--target`, `--ref` and `summary --json` spell an object TYPE:NAME, so
+    a row writer guesses it; `refs: ["commit:abc1234"]` was a traceback."""
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        '{"kind": "note", "target": "item:x", "refs": ["item:y", "project", '
+        '{"type": "item", "name": "z"}]}\n'))
+    assert run("add", "--from-json", "-", store_dir=tmp_path) == 0
+    n = store.load(tmp_path)[0]
+    assert summ.ref_label(n.target) == "item:x"
+    assert [summ.ref_label(r) for r in n.refs] == ["item:y", "project:", "item:z"]
 
 
 def test_add_from_json_fed_list_json_says_what_it_reads(tmp_path, capsys, monkeypatch):
@@ -3495,7 +3562,7 @@ def test_supersede_ref_hands_the_original_query_to_the_resolver(repo, tmp_path, 
     s = reading_store(tmp_path)
     (tmp_path / "resolve_reading.py").write_text(
         "import sys\nq = sys.stdin.readline().rstrip('\\n')\n"
-        f"open('{tmp_path}/seen', 'a').write(q + '\\n')\nprint(q)\n")
+        f"open('{tmp_path.as_posix()}/seen', 'a').write(q + '\\n')\nprint(q)\n")
     _reading_add(s, "40.40")
     nid = capsys.readouterr().out.strip()
     assert run("supersede", nid, "--ref", "reading:41.25", store_dir=s) == 0
@@ -3672,7 +3739,7 @@ def test_commit_reports_the_unpushed_count_when_the_store_has_a_remote(tmp_path,
     capsys.readouterr()
     assert run("commit", store_dir=store_dir) == 0
     out = capsys.readouterr().out
-    assert "1 commit" in out and f"symbion --dir {store_dir} push" in out, out
+    assert "1 commit" in out and f"symbion --dir {store_dir.as_posix()} push" in out, out
     assert "no remote" not in out
 
 
@@ -3910,6 +3977,25 @@ def test_an_external_check_lists_its_age_not_a_tree_state(repo, tmp_path, capsys
     run("list", "--name", "old", store_dir=tmp_path)
     days = summ.age_days("2026-01-01T00:00:00+00:00")
     assert f"state=external ({days}d ago)" in capsys.readouterr().out
+
+
+def test_supersede_takes_external_only_where_the_row_already_has_it(repo, tmp_path, capsys):
+    """A supersede keeps the row's stamp, so `--external` copied from the
+    `add` that wrote the row failed as an unrecognized argument (2026-10-06).
+    On an external row it changes nothing; on a commit-stamped one it refuses,
+    naming the verb that makes an external reading."""
+    ext = _add(tmp_path, capsys, "check", "--target", "item:dns", "--external",
+               "--checked", "dig", "--result", "ok")
+    assert run("supersede", ext, "--external", "--result", "ok, re-read",
+               store_dir=tmp_path) == 0
+    capsys.readouterr()
+    sha = _add(tmp_path, capsys, "check", "--target", "item:t", "--checked", "pytest",
+               "--result", "ok")
+    assert run("supersede", sha, "--external", "--result", "x", store_dir=tmp_path) == 1
+    assert "add --external" in capsys.readouterr().err
+    rows = {n.id: n for n in store.load(tmp_path)}
+    assert (rows[ext].result, rows[ext].provenance["external"]) == ("ok, re-read", True)
+    assert rows[sha].result == "ok" and len(rows) == 2
 
 
 def test_from_json_takes_external(tmp_path, capsys, monkeypatch):
@@ -4414,6 +4500,15 @@ def test_a_write_refuses_a_store_init_never_made(tmp_path, capsys, monkeypatch, 
     assert not fresh.exists()
 
 
+def test_no_git_on_path_is_named_not_a_traceback(tmp_path, monkeypatch, capsys):
+    """A hook's PATH that held no git (the packages' dir left out, OpenBSD,
+    2026-10-05) printed a FileNotFoundError traceback into the session."""
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    assert cli.main(["--dir", str(tmp_path / "s"), "summary"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: symbion runs git, and no `git` is on PATH") and "Traceback" not in err
+
+
 def test_the_store_refuses_a_write_the_cli_did_not_screen(tmp_path):
     """The GUI and api write through store, not the CLI's guard: the store's
     own check is what keeps them from starting one."""
@@ -4699,6 +4794,7 @@ def test_an_edit_before_a_commit_says_it_changed_the_row_itself(tmp_path, capsys
     out, err = capsys.readouterr()
     assert out.strip() == nid
     assert f"note: {nid} was not yet committed, so it was edited in place" in err
+    assert "`symbion commit` before an edit keeps one, and commits every other " in err
     assert "--tag replaced the tags, dropping 'a'" in err
     _commit(tmp_path, capsys)
     assert run("supersede", nid, "--body", "v3", store_dir=tmp_path) == 0

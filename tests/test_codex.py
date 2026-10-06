@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -30,12 +31,13 @@ def test_install_preview_apply_and_rerun(tmp_path, capsys, agent):
     assert "\nnote: Codex runs this hook only after you trust it: in Codex, run /hooks" \
         in capsys.readouterr().out
     link = home / ".agents/skills/symbion"
-    assert link.is_symlink() and link.resolve() == SKILL
+    assert link.resolve() == SKILL  # a junction when Windows disallows symlinks
     assert (home / ".claude/skills/symbion").exists() == (agent == "both")
     hook_file = home / ".codex/hooks.json"
     entry = json.loads(hook_file.read_text())["hooks"]["SessionStart"][0]
     assert entry["matcher"] == "startup|resume|clear|compact"
     assert entry["hooks"][0]["command"] == cli._CODEX_HOOK_COMMAND
+    assert entry == cli._codex_hook_entry(link)
     before = hook_file.read_bytes()
     capsys.readouterr()
     assert cli.main([*args, "--yes"]) == 0
@@ -63,10 +65,14 @@ def test_codex_preserves_existing_config_and_foreign_skill(tmp_path, monkeypatch
     assert "left alone" in out and "run /hooks to review it" in out
 
 
-def test_the_installed_codex_hook_reads_its_session_cwd_as_codex(tmp_path):
+def test_the_installed_codex_hook_reads_its_session_cwd_as_codex(tmp_path, monkeypatch):
     """Codex runs a hook in the session's cwd. A CLAUDE_PROJECT_DIR inherited
     from a Claude Code parent must not pick another project, and the summary's
     reader is codex, so a row codex wrote is not listed as someone else's."""
+    home = tmp_path / "home with spaces"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     project = tmp_path / "project with spaces"
     project.mkdir()
     subprocess.run(["git", "init", "-q", str(project)], check=True)
@@ -77,10 +83,17 @@ def test_the_installed_codex_hook_reads_its_session_cwd_as_codex(tmp_path):
     for author, body in (("codex", "my parked idea"), ("human", "owner parked idea")):
         store.add(notes, kind="idea", target={"type": "project", "name": None},
                   author=author, body=body, status="open")
-    command = json.loads((Path.home() / ".codex/hooks.json").read_text()
-                         )["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-    env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+    handler = json.loads((Path.home() / ".codex/hooks.json").read_text()
+                         )["hooks"]["SessionStart"][0]["hooks"][0]
+    command = handler["commandWindows" if os.name == "nt" else "command"]
+    git = Path(shutil.which("git")).parent       # /usr/local/bin on OpenBSD
+    # A bare base PATH proves the hook needs nothing from the developer's;
+    # Windows keeps its own, where powershell.exe lives.
+    base = os.environ["PATH"] if os.name == "nt" else "/usr/bin:/bin"
+    env = {**os.environ, "PATH": os.pathsep.join([str(Path(sys.executable).parent), str(git), base]),
            "CLAUDE_PROJECT_DIR": str(tmp_path)}
+    if os.name == "nt":
+        env["SYMBION_PROJECT_DIR"] = str(tmp_path)  # Windows always uses the session cwd
     result = subprocess.run(command, shell=True, cwd=project, env=env, text=True,
                             input=json.dumps({"cwd": str(project), "source": "startup"}),
                             capture_output=True)

@@ -118,7 +118,7 @@ def test_explicit_project_root_in_toml_also_pins_work_root(repo, tmp_path):
     store.mkdir()
     wt = tmp_path / "myproj-wt1"
     _git(repo, "worktree", "add", "-q", "-d", str(wt), "HEAD")
-    (store / "symbion.toml").write_text(f'project_root = "{repo}"\n')
+    (store / "symbion.toml").write_text(f'project_root = "{repo.as_posix()}"\n')
     cfg = config.load(store, project_root=repo, work_root=wt)
     assert cfg.project_root == repo
     assert cfg.work_root == repo, "explicit project_root must pin work_root"
@@ -133,7 +133,7 @@ def test_explicit_work_root_in_toml_overrides_the_pin(repo, tmp_path):
     wt = tmp_path / "myproj-wt1"
     _git(repo, "worktree", "add", "-q", "-d", str(wt), "HEAD")
     (store / "symbion.toml").write_text(
-        f'project_root = "{repo}"\nwork_root = "{wt}"\n')
+        f'project_root = "{repo.as_posix()}"\nwork_root = "{wt.as_posix()}"\n')
     cfg = config.load(store, project_root=repo)
     assert cfg.project_root == repo
     assert cfg.work_root == wt
@@ -254,14 +254,14 @@ def test_pointer_takes_the_first_non_blank_line(repo, monkeypatch):
 
 
 @pytest.mark.parametrize("target", ["a store", "nothing"])
-def test_a_pointer_that_is_a_link_is_refused_with_the_fix(repo, monkeypatch, target):
+def test_a_pointer_that_is_a_link_is_refused_with_the_fix(repo, monkeypatch, target, symlink):
     """`ln -s ../store .symbion` read as no pointer: the read raised, the
     except swallowed it, and the error named the sibling and said `run symbion
     init`, which would fork a second store (2026-10-03)."""
     monkeypatch.delenv("SYMBION_DIR", raising=False)
     if target == "a store":
         (repo.parent / "elsewhere").mkdir()
-    (repo / ".symbion").symlink_to("../elsewhere")
+    symlink(repo / ".symbion", "../elsewhere", directory=True)
     with pytest.raises(config.PointerError, match=r"link to \.\./elsewhere.*echo \.\./elsewhere >"):
         config.store_dir(repo)
 
@@ -311,6 +311,7 @@ def test_a_store_two_repos_point_at_has_no_owner(repo, tmp_path):
 
 
 @pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root reads a mode-0 file")
+@pytest.mark.skipif(os.name == "nt", reason="chmod cannot make a file unreadable on Windows")
 def test_a_sibling_with_an_unreadable_pointer_claims_nothing(repo, tmp_path):
     """One project's broken pointer must not break `--dir` for a store it
     does not name."""

@@ -17,6 +17,7 @@ from rich.text import Text
 from rich.theme import Theme
 
 from . import api, store
+from . import kinds as K
 from . import summary as summ
 
 # Catppuccin Mocha: pastels made for a dark background. rich maps each hex to
@@ -29,6 +30,12 @@ GOOD, WARN, BAD = "#a6e3a1", "#f9e2af", "#f38ba8"
 KIND = {"bug": "#eba0ac", "task": "#89b4fa", "question": "#cba6f7", "idea": "#f5c2e7",
         "decision": "#fab387", "check": "#94e2d5", "note": "#a6adc8"}
 OWN_KIND = "#b4befe"        # a kind this store's [kinds] table declares
+
+
+def kind_hex(kind: str, spec=None) -> str:
+    """A kind's colour: the palette name its [kinds] `color` picks, else its
+    default's, else the one every kind a store declares shares."""
+    return K.COLORS[spec.color] if spec is not None and spec.color else KIND.get(kind, OWN_KIND)
 # The names summary.plain's `role` takes, so the summary, schema and arc
 # lines colour a row's parts as a `list` row does.
 ROLE = {"text": TEXT, "body": BODY, "meta": META, "faded": FADED,
@@ -142,7 +149,7 @@ def help_formatter(plain):
     return Help
 
 
-def painter():
+def painter(kinds=None):
     """A `paint(text, role)` for summary.render_summary and the other plain
     renderers: the text in its role's colour, as the escape codes this
     terminal takes; plain text where _color_system finds none. The width
@@ -153,7 +160,7 @@ def painter():
 
     def paint(text: str, role: str) -> str:
         kind = role.removeprefix("kind:")
-        c = ROLE[role] if kind == role else KIND.get(kind, OWN_KIND)
+        c = ROLE[role] if kind == role else kind_hex(kind, (kinds or {}).get(kind))
         return Style(color=c).render(text, color_system=system)
     return paint
 
@@ -187,7 +194,7 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None) -> tu
     line.append(f"  {age(n.created_at):>4}  ", ink(META))
     mark, color = {"open": ("○", ink(TEXT)), "resolved": ("✓", GOOD)}.get(status, (" ", ""))
     line.append(mark + " ", color)
-    line.append(f"{n.kind:<{KIND_W}}  ", ink(KIND.get(n.kind, OWN_KIND)))
+    line.append(f"{n.kind:<{KIND_W}}  ", ink(kind_hex(n.kind, n.spec)))
     indent = line.cell_len
 
     type_, _, name = summ.ref_label(n.target).partition(":")

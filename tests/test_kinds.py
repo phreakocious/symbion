@@ -87,6 +87,22 @@ def test_render_toml_round_trips_the_defaults():
     assert K.parse_kinds(tomllib.loads(text)["kinds"]) == K.DEFAULT_KINDS
 
 
+def test_a_kind_takes_a_palette_colour_by_name():
+    assert K.parse_kinds({"measurement": {"verdict": True, "color": "green"}}) == \
+        {"measurement": K.Kind(verdict=True, color="green")}
+
+
+@pytest.mark.parametrize("bad", ["gren", "#a6e3a1", 5, ["red"]])
+def test_a_colour_off_the_palette_is_refused_naming_the_palette(bad):
+    with pytest.raises(ValueError, match="'audit'.*rosewater.*lavender"):
+        K.parse_kinds({"audit": {"color": bad}})
+
+
+def test_render_toml_round_trips_a_colour():
+    kinds = {"anomaly": K.Kind(status=True, color="red"), "note": K.Kind()}
+    assert K.parse_kinds(tomllib.loads(K.render_toml(kinds))["kinds"]) == kinds
+
+
 def test_render_toml_round_trips_a_declared_when_with_quotes():
     """`schema --toml` renders a store's own table, whose `when` may hold
     anything a toml string can: an f-string of it broke on the first `"`."""

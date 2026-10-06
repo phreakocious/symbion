@@ -9,7 +9,12 @@ This module holds the schema, the locked file I/O and the arc registry.
 """
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:                     # Windows
+    fcntl = None
+    import errno
+    import msvcrt
 import json
 import os
 import re
@@ -18,7 +23,7 @@ import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 from . import catalog  # for nfc() only -- catalog does not import store, so
@@ -429,12 +434,27 @@ def _now_iso() -> str:
     return _utcnow().isoformat(timespec="seconds")
 
 
+_last_minted = None
+
+
 def new_id(_clock=None, _rand=None) -> str:
     """Microsecond-resolution, lexically-sortable id: YYYYMMDD-HHMMSS-ffffff-xxx,
-    in UTC. _clock/_rand are injectable for deterministic tests."""
+    in UTC. _clock/_rand are injectable for deterministic tests.
+
+    The id breaks a same-second tie in every order (`newest_first`), so a
+    later mint must sort later. Windows before Python 3.13 reads the clock in
+    ~15.6 ms ticks, which gave a whole batch one microsecond: a reading at or
+    up to a second behind the last mint steps one microsecond past it. A
+    clock set back further is read as it is."""
+    # ponytail: per process; two processes minting in one tick are concurrent
+    # writers, and the random tail orders them
+    global _last_minted
     clock = _clock or _utcnow
     rand = _rand or (lambda: secrets.randbelow(4096))
     now = clock()
+    if _last_minted is not None and timedelta(0) <= _last_minted - now < timedelta(seconds=1):
+        now = _last_minted + timedelta(microseconds=1)
+    _last_minted = now
     return f"{now.strftime('%Y%m%d-%H%M%S-%f')}-{rand():03x}"
 
 
@@ -474,10 +494,26 @@ def _lock(store):
     p.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            # Byte 0, locked past EOF is allowed. LK_LOCK gives up after 10
+            # tries a second apart; flock waits, so this waits too.
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as e:
+                    if e.errno != errno.EDEADLOCK:
+                        raise
+        try:
+            yield
+        finally:
+            if fcntl:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            else:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -485,7 +521,9 @@ def _replace_atomically(path: Path, body: str) -> None:
     """Write via temp + fsync + rename, so a crash leaves the old file whole."""
     tmp = path.with_name(f".tmp.{os.getpid()}.{path.name}")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        # LF on every platform: Windows text mode writes CRLF, and a store
+        # is shared by clones on all of them.
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(body)
             f.flush()
             os.fsync(f.fileno())
@@ -517,7 +555,8 @@ def ensure_store(store) -> bool:
             f.touch()
             created = True
     if not (store / ".git").exists():
-        r = subprocess.run(["git", "init", "-q", str(store)], capture_output=True, text=True)
+        r = subprocess.run(["git", "init", "-q", str(store)], capture_output=True, text=True,
+                           encoding="utf-8")
         if r.returncode:
             # git can fail after making `.git`, and a left `.git` makes every
             # later call skip this init: remove the one this call made.
@@ -527,7 +566,7 @@ def ensure_store(store) -> bool:
         created = True
     ignore = store / ".gitignore"
     if not ignore.exists():
-        ignore.write_text(f"{LOCK_FILE}\n.tmp.*\n", encoding="utf-8")
+        ignore.write_text(f"{LOCK_FILE}\n.tmp.*\n", encoding="utf-8", newline="\n")
         created = True
     return created
 
@@ -580,7 +619,7 @@ def load_malformed(store):
 
 
 def _append_line_unlocked(file, line: str) -> None:
-    with open(file, "a", encoding="utf-8") as f:
+    with open(file, "a", encoding="utf-8", newline="\n") as f:     # LF, as above
         f.write(line + "\n")
 
 
@@ -843,7 +882,8 @@ def _committed_ids(store) -> set | None:
     if subprocess.run([*git, "rev-parse", "-q", "--verify", "HEAD"],
                       capture_output=True).returncode:
         return set()
-    r = subprocess.run([*git, "show", f"HEAD:{NOTES_FILE}"], capture_output=True, text=True)
+    r = subprocess.run([*git, "show", f"HEAD:{NOTES_FILE}"], capture_output=True, text=True,
+                       encoding="utf-8")
     return {_line_id(raw) for raw in r.stdout.splitlines()} if r.returncode == 0 else None
 
 
@@ -1037,10 +1077,10 @@ def commit(store, message: str, cfg) -> bool:
     require_store(store)
     git = ["git", "-C", str(store)]
     with _lock(store):
-        r = subprocess.run([*git, "add", "-A"], capture_output=True, text=True)
+        r = subprocess.run([*git, "add", "-A"], capture_output=True, text=True, encoding="utf-8")
         if r.returncode == 0:
             r = subprocess.run([*git, "diff", "--cached", "--quiet"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, encoding="utf-8")
             if r.returncode == 0:                 # nothing staged
                 return False
             if r.returncode == 1:                 # something staged
@@ -1048,7 +1088,7 @@ def commit(store, message: str, cfg) -> bool:
                 # once named another agent's rows as its own work (2026-10-02).
                 # The trailer says whose they are.
                 diff = subprocess.run([*git, "diff", "--cached", "-U0", "--", NOTES_FILE],
-                                      capture_output=True, text=True).stdout
+                                      capture_output=True, text=True, encoding="utf-8").stdout
                 by: dict[str, int] = {}
                 for line in diff.splitlines():
                     if line.startswith("+{"):
@@ -1062,7 +1102,7 @@ def commit(store, message: str, cfg) -> bool:
                     [*git, "-c", f"user.name={cfg.git_name}",
                      "-c", f"user.email={cfg.git_email}", "commit", "-q", "-m", message,
                      *(["-m", f"Rows: {rows}"] if rows else [])],
-                    capture_output=True, text=True)
+                    capture_output=True, text=True, encoding="utf-8")
     if r.returncode:
         said = (r.stderr + r.stdout).strip() or f"exit {r.returncode}, no output"
         raise RuntimeError(f"git refused the commit; the notes are on disk, "

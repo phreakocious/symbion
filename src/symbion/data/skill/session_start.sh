@@ -1,9 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # SessionStart: surface the symbion summary, and never fail a session doing it.
 # An absent store or a broken config is NAMED on stdout, never fatal. An uninstalled symbion
 # prints nothing too -- unless this project has adopted symbion, where
 # silence would hide exactly the failure this hook is meant to surface.
-# PATH may be empty here, so the store check uses bash builtins only.
+# PATH may be empty here, so the store check uses shell builtins only. POSIX sh,
+# not bash: OpenBSD, FreeBSD and Alpine have no bash in base (exit 127, 2026-10-05).
 #
 # `root` is resolved OUTSIDE the branch on purpose. It used to be assigned
 # inside the not-installed branch, so the installed path never saw it and ran
@@ -18,7 +19,10 @@ root="${SYMBION_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
 # worktree check `<linked-name>-notes` and exit silent (found 2026-10-02).
 # With no git on PATH, or no repo at $root, it stays $root. `summary` still
 # runs in $root, where HEAD and check state are this worktree's.
-main=$(git -C "$root" worktree list --porcelain 2>/dev/null) && main="${main%%$'\n'*}" && main="${main#worktree }"
+nl='
+'
+cr=$(printf '\r' 2>/dev/null)   # a pointer saved on Windows ends its line in CRLF
+main=$(git -C "$root" worktree list --porcelain 2>/dev/null) && main="${main%%"$nl"*}" && main="${main#worktree }"
 [ -n "$main" ] || main="$root"
 # Same precedence as config.store_dir: SYMBION_DIR, then the `.symbion`
 # pointer beside the project, then the sibling the name implies. `read -r`
@@ -38,10 +42,11 @@ if [ -z "$store" ] && { [ -e "$p" ] || [ -L "$p" ]; } && ! { [ -f "$p" ] && [ -r
   store="$p"
 elif [ -z "$store" ] && [ -r "$p" ]; then
   while read -r line || [ -n "$line" ]; do
+    line="${line%"$cr"}"
     [ -n "$line" ] || continue
     case "$line" in
       "~/"*) store="$HOME/${line#"~/"}" ;;
-      /*)    store="$line" ;;
+      /*|[A-Za-z]:[/\\]*) store="$line" ;;   # a Windows drive is absolute too
       *)     store="$main/$line" ;;
     esac
     break

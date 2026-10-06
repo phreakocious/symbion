@@ -34,7 +34,9 @@ def _isolated_home(tmp_path_factory, monkeypatch):
     "outside any git repo" test otherwise found that repo, and `init` wrote a
     `.symbion` into its root. The cache goes with HOME: `summary` and a
     terminal's ids read the running serves' records from it."""
-    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    home = str(tmp_path_factory.mktemp("home"))
+    monkeypatch.setenv("HOME", home)
+    monkeypatch.setenv("USERPROFILE", home)     # Path.home() on Windows
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path_factory.getbasetemp()))
     for k in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
@@ -42,7 +44,7 @@ def _isolated_home(tmp_path_factory, monkeypatch):
     for k in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
         monkeypatch.setenv(k, "t@t")
     # The agent running pytest must not be the author a test reads.
-    for k in ("SYMBION_AUTHOR", "CLAUDECODE", "CODEX_THREAD_ID"):
+    for k in ("SYMBION_AUTHOR", "CLAUDECODE", "CODEX_THREAD_ID", "HERMES_AGENT"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -55,6 +57,9 @@ def _pinned_terminal(monkeypatch):
     codes back. It passed only where the launching shell set COLORTERM."""
     for k, v in (("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("COLUMNS", "80")):
         monkeypatch.setenv(k, v)
+    # On Windows rich asks the console API for colour depth and ignores
+    # COLORTERM, and a faked tty has no console: it rendered 8-bit.
+    monkeypatch.setattr("rich.console.WINDOWS", False)
     # symbion prints UTC unless TZ is set: a developer's TZ must not change
     # what a test reads.
     monkeypatch.delenv("TZ", raising=False)
@@ -93,6 +98,20 @@ def tmp_store(tmp_path):
     from symbion import store
     store.ensure_store(tmp_path)
     return tmp_path
+
+
+@pytest.fixture
+def symlink():
+    """Exercise actual symlinks when the Windows account can create them.
+    Junction-based skill installation is tested independently of this privilege."""
+    def create(link, target, *, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except OSError as error:
+            if os.name == "nt" and error.winerror == 1314:
+                pytest.skip("Windows account lacks symlink privilege (Developer Mode or elevation)")
+            raise
+    return create
 
 
 @pytest.fixture

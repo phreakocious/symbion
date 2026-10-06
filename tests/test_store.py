@@ -1,4 +1,8 @@
-import fcntl
+try:
+    import fcntl
+except ImportError:                     # Windows
+    fcntl = None
+    import msvcrt
 import json
 import os
 from datetime import datetime
@@ -372,11 +376,17 @@ def _lock_held(store_dir) -> bool:
     non-blocking LOCK_EX from a fresh fd fails while the writer holds it."""
     fd = os.open(store_dir / store.LOCK_FILE, os.O_RDWR)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except (BlockingIOError, PermissionError):     # PermissionError: msvcrt's EACCES
         return True
     else:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        else:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         return False
     finally:
         os.close(fd)
@@ -689,6 +699,21 @@ def test_time_is_utc_unless_tz_is_set(monkeypatch):
     assert store.canon_due("2026-10-01T09:00") == datetime(2026, 10, 1, 9).astimezone().isoformat()
 
 
+def test_a_coarse_clock_still_mints_ids_in_write_order():
+    """Windows before Python 3.13 reads the clock in ~15.6 ms ticks, so a batch
+    shared one microsecond and the random tail ordered it: the summary listed
+    a batch out of order (measured 2026-10-06, Python 3.11 on Windows). A
+    repeat of the last reading steps one microsecond on; a clock set back more
+    than a second is read as it is."""
+    from datetime import timezone
+    tick = datetime(2026, 10, 6, 13, 49, 26, 953263, tzinfo=timezone.utc)
+    tails = iter([0xfff, 0x800, 0x000])
+    ids = [store.new_id(_clock=lambda: tick, _rand=lambda: next(tails)) for _ in range(3)]
+    assert ids == sorted(ids) and len({i[:22] for i in ids}) == 3, ids
+    back = datetime(2026, 10, 6, 13, 49, 20, tzinfo=timezone.utc)
+    assert store.new_id(_clock=lambda: back, _rand=lambda: 0) == "20261006-134920-000000-000"
+
+
 def test_rows_from_two_zones_list_in_the_order_they_were_written(tmp_path):
     """A string sort put `10-01T05:00+09:00` after `09-30T22:00+00:00`, though
     it is two hours earlier: a store written from two zones listed out of order."""
@@ -744,3 +769,13 @@ def test_an_edit_keeps_the_old_row_where_its_history_matters(tmp_path, case):
                         **edit)
     assert b.id != a.id and b.supersedes == a.id
     assert next(n for n in store.load(tmp_path) if n.id == a.id).body == "v1"
+
+
+def test_a_store_is_written_lf_on_every_platform(tmp_path):
+    """Text mode on Windows writes CRLF, and a store is shared by clones on
+    every platform."""
+    store.ensure_store(tmp_path)
+    store.add(tmp_path, kind="note", target={"type": "project", "name": None}, body="a")
+    store._replace_atomically(tmp_path / "x", "a\nb\n")
+    for f in (store.notes_path(tmp_path), tmp_path / ".gitignore", tmp_path / "x"):
+        assert b"\r" not in f.read_bytes(), f

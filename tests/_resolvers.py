@@ -38,12 +38,13 @@ def reading_store(tmp_path: Path, *, counter: bool = False) -> Path:
     ensure_store(store)
     (tmp_path / "resolve_reading.py").write_text(READING_RESOLVER)
     (tmp_path / "catalog_reading.py").write_text(STORE_CATALOG)
-    py = sys.executable
-    resolver = f"{py} {tmp_path / 'resolve_reading.py'}"
+    # Forward slashes: a C:\ path is an escape in TOML and in sh.
+    py = Path(sys.executable).as_posix()
+    resolver = f"{py} {(tmp_path / 'resolve_reading.py').as_posix()}"
     if counter:
-        resolver = f"echo hit >> {store / 'resolver.calls'}; " + resolver
+        resolver = f"echo hit >> {(store / 'resolver.calls').as_posix()}; " + resolver
     (store / "symbion.toml").write_text(
-        f'[catalogs]\nreading = "{py} {tmp_path / "catalog_reading.py"} {store / "notes.jsonl"}"\n'
+        f'[catalogs]\nreading = "{py} {(tmp_path / "catalog_reading.py").as_posix()} {(store / "notes.jsonl").as_posix()}"\n'
         f'[resolvers]\nreading = "{resolver}"\n')
     return store
 

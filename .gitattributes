@@ -1,0 +1,2 @@
+# A sh script checked out with CRLF (Git for Windows autocrlf) fails in sh.
+*.sh text eol=lf

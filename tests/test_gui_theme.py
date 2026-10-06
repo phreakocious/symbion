@@ -39,6 +39,28 @@ def test_the_gui_prints_in_the_terminal_palette():
     assert chips == {**term.KIND, "own": term.OWN_KIND}
 
 
+def test_a_picked_kind_colour_is_a_rule_on_that_kinds_class():
+    """A store's own kinds all shared one lavender, so several of them read
+    alike (2026-10-06). The page adds this after the theme, so a default
+    kind's own colour is replaced too."""
+    from symbion import kinds as K
+    from symbion.gui.theme import kind_css
+    assert kind_css({"anomaly": K.Kind(status=True, color="flamingo"), "note": K.Kind(),
+                     "bug": K.Kind(status=True, color="red")}) == \
+        ".sb-kind-anomaly { --kind: #f2cdcd; }\n.sb-kind-bug { --kind: #f38ba8; }\n"
+
+
+def test_every_palette_colour_reads_on_every_ground():
+    """A kind's `color` is a palette name, never a hex, so no store can pick
+    an unreadable one: each passes WCAG AA text contrast (4.5:1)."""
+    from symbion import kinds as K
+    from symbion.gui.theme import Palette
+    p = Palette()
+    low = [(n, g) for n, h in K.COLORS.items() for g in (p.bg_panel, p.bg_raise)
+           if _ratio(h, g) < 4.5]
+    assert not low, low
+
+
 def test_text_that_sets_no_colour_takes_the_text_colour():
     """Quasar's dark body is #fff, and a note's markdown body set no colour of
     its own: a short body rendered white beside the clipped long ones
@@ -93,7 +115,7 @@ def test_every_kind_class_is_defined_in_theme():
     from symbion import kinds as K
     from symbion.gui.notes import kind_class
     from symbion.gui.theme import DARK_CSS
-    classes = {kind_class(k) for k in [*K.DEFAULT_KINDS, "sausage"]}
+    classes = {kind_class(k).split()[0] for k in [*K.DEFAULT_KINDS, "sausage"]}
     missing = [c for c in classes if not re.search(rf"\.{c}\s*\{{", DARK_CSS)]
     assert not missing, f"no CSS rule for: {missing}"
 
@@ -113,6 +135,15 @@ def test_portaled_quasar_menus_and_tooltips_are_themed():
     css = (GUI_DIR / "theme.py").read_text(encoding="utf-8")
     for sel in (".q-menu", ".q-tooltip"):
         assert re.search(rf"{re.escape(sel)}\s*\{{", css), f"no rule for {sel}"
+
+
+def test_a_tooltip_is_capped_over_quasars_inline_width():
+    """Quasar's position engine writes max-width inline, as wide as the space
+    left, so a closed row's tooltip ran 1216px across a 1280px page
+    (2026-10-06). Only an !important cap beats an inline style."""
+    from symbion.gui.theme import DARK_CSS
+    rule = re.search(r"\.q-tooltip\s*\{([^}]*)\}", DARK_CSS).group(1)
+    assert re.search(r"max-width:[^;]*\d+ch[^;]*!important", rule), rule
 
 
 def test_only_link_chips_light_up_on_hover():

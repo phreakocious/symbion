@@ -61,7 +61,7 @@ def test_kinds_are_the_store_s_own_with_their_when(tmp_path):
     d = _store(tmp_path)
     (d / "symbion.toml").write_text(
         '[kinds]\nanomaly = { status = true, when = "off the curve" }\nnote = {}\n')
-    assert tab(f"symbion --dir {d} add ", tmp_path) == {"anomaly": "off the curve", "note": ""}
+    assert tab(f"symbion --dir {d.as_posix()} add ", tmp_path) == {"anomaly": "off the curve", "note": ""}
 
 
 def test_resolve_offers_open_rows_and_show_every_head(tmp_path):
@@ -72,17 +72,17 @@ def test_resolve_offers_open_rows_and_show_every_head(tmp_path):
     _main(d, "resolve", fixed, "--body", "done")
     ids = _ids(d)
 
-    got = tab(f"symbion --dir {d} resolve ", tmp_path)
+    got = tab(f"symbion --dir {d.as_posix()} resolve ", tmp_path)
     assert got == {ids["open bug"]: "[bug] item:x  open bug"}
-    assert set(tab(f"symbion --dir {d} show ", tmp_path)) == set(ids.values())
+    assert set(tab(f"symbion --dir {d.as_posix()} show ", tmp_path)) == set(ids.values())
     assert fixed not in ids.values()                 # superseded by its resolution
 
 
 def test_a_target_completes_its_type_then_names_from_targets_and_refs(tmp_path):
     d = _store(tmp_path)
     _main(d, "add", "note", "--target", "item:a b", "--ref", "item:c", "--body", "n")
-    assert {"item:", "project"} <= set(tab(f"symbion --dir {d} context --target ", tmp_path))
-    assert set(tab(f"symbion --dir {d} context --target item:", tmp_path)) == {"item:a b", "item:c"}
+    assert {"item:", "project"} <= set(tab(f"symbion --dir {d.as_posix()} context --target ", tmp_path))
+    assert set(tab(f"symbion --dir {d.as_posix()} context --target item:", tmp_path)) == {"item:a b", "item:c"}
 
 
 def test_tags_complete_with_their_counts(tmp_path):
@@ -90,10 +90,10 @@ def test_tags_complete_with_their_counts(tmp_path):
     for tags in (["ux"], ["ux", "cli"]):
         _main(d, "add", "note", "--target", "item:x", "--body", "n",
               *(a for t in tags for a in ("--tag", t)))
-    assert tab(f"symbion --dir {d} list --tag ", tmp_path) == {"ux": "2 rows", "cli": "1 row"}
+    assert tab(f"symbion --dir {d.as_posix()} list --tag ", tmp_path) == {"ux": "2 rows", "cli": "1 row"}
 
 
 def test_dir_on_the_line_names_the_store_for_arcs(tmp_path):
     d = _store(tmp_path)
     _main(d, "arc", "create", "--name", "Tidy docs")
-    assert tab(f"symbion --dir {d} arc todo ", tmp_path) == {"tidy-docs": "Tidy docs"}
+    assert tab(f"symbion --dir {d.as_posix()} arc todo ", tmp_path) == {"tidy-docs": "Tidy docs"}

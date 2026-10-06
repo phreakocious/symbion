@@ -14,7 +14,8 @@ from .. import summary as summ
 from . import servers
 from .filters import href
 from .notes import add_form, ago, kind_class
-from .theme import DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, quasar_colors, root_vars_css
+from .theme import (DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, kind_css, quasar_colors,
+                    root_vars_css)
 
 # From anywhere but a field being typed in or an open dialog: `/` focuses the
 # search box, `n` and `?` press the buttons they name. What is typed in the
@@ -82,7 +83,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     ui.add_head_html('<meta name="darkreader-lock"><script>'
                      'document.querySelectorAll(".darkreader--fallback").forEach(e => e.remove())'
                      '</script>')
-    ui.add_head_html(f"<style>{DARK_CSS}</style>")
+    ui.add_head_html(f"<style>{DARK_CSS}{kind_css(ctx.kinds)}</style>")
     ui.add_head_html(_KEYS_JS)
     heads = S.heads(S.load(ctx.store_dir))
     # value=None: open beside the page on a wide window, a slide-over behind

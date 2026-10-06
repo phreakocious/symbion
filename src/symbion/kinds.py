@@ -24,6 +24,7 @@ class Kind:
     parked: bool = False
     verdict: bool = False
     when: str = ""
+    color: str = ""      # a COLORS name; "" takes the kind's default colour
 
 
 DEFAULT_KINDS: dict[str, Kind] = {
@@ -37,7 +38,13 @@ DEFAULT_KINDS: dict[str, Kind] = {
 }
 
 BITS = ("status", "parked", "verdict")
-_KEYS = set(BITS) | {"when"}
+_KEYS = set(BITS) | {"when", "color"}
+# Catppuccin Mocha's accents, the palette symbion prints in: a kind's `color`
+# is one of these names, so each reads on every ground (4.5:1 or better).
+COLORS = {"rosewater": "#f5e0dc", "flamingo": "#f2cdcd", "pink": "#f5c2e7",
+          "mauve": "#cba6f7", "red": "#f38ba8", "maroon": "#eba0ac", "peach": "#fab387",
+          "yellow": "#f9e2af", "green": "#a6e3a1", "teal": "#94e2d5", "sky": "#89dceb",
+          "sapphire": "#74c7ec", "blue": "#89b4fa", "lavender": "#b4befe"}
 _LABEL = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
@@ -58,14 +65,18 @@ def parse_kinds(section) -> dict[str, Kind]:
         bad = sorted(set(v) - _KEYS)
         if bad:
             raise ValueError(f"[kinds] {label!r}: unknown key(s) {bad}; "
-                             f"keys are status, parked, verdict, when")
+                             f"keys are status, parked, verdict, when, color")
         for b in BITS:
             if b in v and not isinstance(v[b], bool):
                 raise ValueError(f"[kinds] {label!r}: {b} must be true or false")
         if "when" in v and not isinstance(v["when"], str):
             raise ValueError(f"[kinds] {label!r}: when must be a string")
+        if "color" in v and (not isinstance(v["color"], str) or v["color"] not in COLORS):
+            raise ValueError(f"[kinds] {label!r}: color {v['color']!r} is not a palette "
+                             f"colour; one of {', '.join(COLORS)}")
         k = Kind(status=v.get("status", False), parked=v.get("parked", False),
-                 verdict=v.get("verdict", False), when=v.get("when", ""))
+                 verdict=v.get("verdict", False), when=v.get("when", ""),
+                 color=v.get("color", ""))
         if k.parked and not k.status:
             raise ValueError(f"[kinds] {label!r}: parked requires status")
         out[label] = k
@@ -97,5 +108,7 @@ def render_toml(kinds: dict[str, Kind]) -> str:
         parts = [f"{b} = true" for b in BITS if getattr(k, b)]
         if k.when:
             parts.append(f"when = {json.dumps(k.when, ensure_ascii=False)}")
+        if k.color:
+            parts.append(f'color = "{k.color}"')
         lines.append(f"{label:<{w}} = {{ {', '.join(parts)} }}")
     return "\n".join(lines) + "\n"

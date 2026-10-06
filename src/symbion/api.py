@@ -130,20 +130,23 @@ def _git_user_name() -> str:
     # patches `cli.subprocess.run`, which is the same module object
     # only while this file says `import subprocess`. A `from subprocess import
     # run` edit here silently unhooks that patch point.
-    r = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True)
+    r = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True, encoding="utf-8")
     return r.stdout.strip()
 
 
 def author_default() -> str:
-    """The CLI rule: SYMBION_AUTHOR > "codex" if CODEX_THREAD_ID > "claude" if
-    CLAUDECODE > git user.name > "user". Each agent sets its marker in the
-    shell it runs commands in, which makes CLI attribution self-configuring.
-    Codex comes first: a Codex launched from a Claude Code session inherits
-    CLAUDECODE, and the innermost agent is the one writing."""
+    """The CLI rule: SYMBION_AUTHOR > "codex" if CODEX_THREAD_ID > "hermes" if
+    HERMES_AGENT > "claude" if CLAUDECODE > git user.name > "user". Each
+    agent sets its marker in the shell it runs commands in, which makes CLI
+    attribution self-configuring. Claude comes last: a Codex or a Hermes
+    launched from a Claude Code session inherits CLAUDECODE, and the innermost
+    agent is the one writing."""
     if os.environ.get("SYMBION_AUTHOR"):
         return os.environ["SYMBION_AUTHOR"]
     if os.environ.get("CODEX_THREAD_ID"):
         return "codex"
+    if os.environ.get("HERMES_AGENT"):
+        return "hermes"
     if os.environ.get("CLAUDECODE"):
         return "claude"
     return _git_user_name() or "user"
@@ -151,7 +154,8 @@ def author_default() -> str:
 
 def gui_author() -> str:
     """The GUI rule: SYMBION_AUTHOR > git user.name > "user", the agent
-    markers (CLAUDECODE, CODEX_THREAD_ID) deliberately NOT consulted.
+    markers (CLAUDECODE, CODEX_THREAD_ID, HERMES_AGENT) deliberately NOT
+    consulted.
 
     The explorer is the human's interface, so the identity is a property of
     the surface, not of the environment. `symbion serve` is launched from the
@@ -205,14 +209,23 @@ def kind_as_type(typ, kinds, what: str) -> str:
             f"row that row's target, and cite its id in the body")
 
 
+def as_object(v):
+    """`TYPE:NAME`, as every flag and `summary --json` spell an object, in the
+    row shape {type, name}; anything else as given, for the caller's check."""
+    if not isinstance(v, str):
+        return v
+    typ, _, name = v.partition(":")
+    return {"type": typ, "name": name or None}
+
+
 def check_refs(target_types, refs, kinds=()) -> list[dict]:
-    """Shape and type of row-shaped refs, name NFC'd; NO catalog runs, so a
-    caller outside the lock can report a bad ref before locking. Resolution
-    is `canonicalize_rows`', under the lock."""
+    """Shape and type of refs, {type, name} or TYPE:NAME, name NFC'd; NO
+    catalog runs, so a caller outside the lock can report a bad ref before
+    locking. Resolution is `canonicalize_rows`', under the lock."""
     out = []
-    for r in refs or ():
+    for r in map(as_object, refs or ()):
         if not isinstance(r, dict) or not isinstance(r.get("type"), str):
-            raise ValueError("refs must be [{type, name}]")
+            raise ValueError(f"each ref is {{type, name}} or TYPE:NAME, not {r!r}")
         if r["type"] not in target_types:
             raise ValueError(f"unknown ref type {r['type']!r} (choose from "
                              f"{', '.join(sorted(target_types))})"
@@ -426,13 +439,27 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
     missing = sorted({"kind", "target"} - set(row))
     if missing:
         raise ValueError(f"missing {missing}")
+    # Every key's type before anything reads one: a number crashed a reader
+    # or was stored as given, and a string where a list goes was stored as
+    # its letters (2026-10-06).
+    for key in ("kind", "body", "status", "checked", "result", "arc_id", "due", "author"):
+        if row.get(key) is not None and not isinstance(row[key], str):
+            raise ValueError(f"{key} must be a string, not {row[key]!r}")
+    if row.get("status") not in (None, *store.STATUSES):
+        raise ValueError(f"status is open or resolved, not {row['status']!r}")
+    for key in ("tags", "refs"):
+        if not isinstance(row.get(key) or [], list):
+            raise ValueError(f"{key} must be a list, not {row[key]!r}")
+    if not all(isinstance(t, str) for t in row.get("tags") or ()):
+        raise ValueError(f"tags must be strings, not {row['tags']!r}")
+    refs = check_refs(ctx.target_types, row.get("refs"), ctx.kinds)
     spec = ctx.kinds.get(row["kind"])
     if spec is None:
         raise ValueError(f"unknown kind {row['kind']!r} (choose from {', '.join(ctx.kinds)}); "
                          f"kinds are declared in {ctx.store_dir / config.CONFIG_FILE} under [kinds]")
-    t = row["target"]
+    t = as_object(row["target"])
     if not isinstance(t, dict) or not isinstance(t.get("type"), str):
-        raise ValueError("target must be {type, name}")
+        raise ValueError(f"target is {{type, name}} or TYPE:NAME, not {t!r}")
     if t["type"] not in ctx.target_types:
         raise ValueError(f"unknown target type {t['type']!r} (choose from "
                          f"{', '.join(sorted(ctx.target_types))})"
@@ -446,7 +473,7 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
         raise ValueError(f"--external is not valid for kind {row['kind']!r}: it has no "
                          f"verdict bit, so it carries no provenance to stamp "
                          f"(`symbion schema` lists the verdict kinds)")
-    check_arc_targets(ctx, [t, *(row.get("refs") or ())])
+    check_arc_targets(ctx, [t, *refs])
     return dict(
         kind=row["kind"],
         target={"type": t["type"], "name": catalog.nfc(t.get("name"))},
@@ -455,7 +482,7 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
         arc_id=check_arc(ctx, row.get("arc_id")), due=row.get("due"),
         tags=list(row.get("tags") or ()),
         author=row.get("author") or author,
-        refs=check_refs(ctx.target_types, row.get("refs"), ctx.kinds),
+        refs=refs,
         provenance=_stamp(ctx, row["kind"], spec, external),
     )
 
@@ -705,6 +732,6 @@ def push(ctx: Ctx, *, capture: bool = False) -> subprocess.CompletedProcess:
     words. `capture` is for a caller with no terminal (the GUI): they come
     back as text, and git may not prompt, which would wait forever."""
     gitref.set_upstream(ctx.store_dir)
-    kw = dict(capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    kw = dict(capture_output=True, text=True, encoding="utf-8", stdin=subprocess.DEVNULL,
               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}) if capture else {}
     return subprocess.run(["git", "-C", str(ctx.store_dir), "push"], **kw)

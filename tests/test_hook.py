@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -6,18 +7,24 @@ from pathlib import Path
 import pytest
 
 from symbion import store
+from symbion.catalog import posix_sh
 
 HOOK = Path(__file__).resolve().parents[1] / "src/symbion/data/skill/session_start.sh"
 
 # Resolved once, via the test runner's own PATH, and invoked by absolute path.
-# subprocess.run(["bash", ...], env={**SRC_ENV, "PATH": ...}) resolves argv[0] itself
+# subprocess.run(["sh", ...], env={**SRC_ENV, "PATH": ...}) resolves argv[0] itself
 # through the CHILD's PATH (os.get_exec_path(env)) -- so a PATH that is empty
 # or wrong (as test_hook_exits_0_when_symbion_is_not_installed needs, to prove
-# symbion is genuinely unreachable) makes bash itself unresolvable and raises
+# symbion is genuinely unreachable) makes the shell itself unresolvable and raises
 # FileNotFoundError in the parent before the hook ever runs. An absolute path
 # has a dirname, so Python skips PATH search for the interpreter while the
 # hook's own `command -v symbion` still runs inside the broken env below.
-BASH = shutil.which("bash") or "/bin/bash"
+# A strict POSIX shell where there is one: macOS's /bin/sh is bash and
+# accepts bashisms, and a system without bash ran no hook at all (2026-10-05).
+# On Windows, the sh Git for Windows installs, which Claude Code runs hooks under.
+SH = shutil.which("dash") or ("/bin/sh" if os.name != "nt" else posix_sh())
+if SH is None:
+    pytest.skip("no sh: Git for Windows installs one", allow_module_level=True)
 
 # The dir holding the `symbion` console script this suite itself runs under
 # (installed editable into this venv) -- NOT from shutil.which("symbion"),
@@ -29,6 +36,13 @@ SYMBION_BIN = str(Path(sys.executable).parent)
 # That script imports symbion through the venv's editable install; this
 # tree's src/ goes first (conftest.py says why).
 SRC_ENV = {"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+# Windows will not start a process with no SYSTEMROOT in its environment.
+# Nor will Path.home() answer there without USERPROFILE.
+SRC_ENV.update({k: os.environ[k] for k in ("SYSTEMROOT", "USERPROFILE") if k in os.environ})
+# The hook's PATH: this venv's `symbion` first, then the git the suite runs
+# under. A bare `/usr/bin:/bin` held no git where packages install to
+# /usr/local/bin (OpenBSD, 2026-10-05), and `symbion` died on it.
+TOOLS = os.pathsep.join([SYMBION_BIN, str(Path(shutil.which("git")).parent), "/usr/bin", "/bin"])
 
 
 def _git(cwd, *args):
@@ -57,9 +71,9 @@ def test_hook_prints_the_zero_line_for_an_empty_but_existing_store(git_repo, tmp
     on an early exit too, since both print nothing to stderr and return 0."""
     store_dir = tmp_path / "store"
     store.ensure_store(store_dir)
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo,
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
                        capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin",
+                       env={**SRC_ENV, "PATH": TOOLS,
                             "SYMBION_DIR": str(store_dir)})
     assert r.returncode == 0
     assert r.stderr == ""
@@ -74,9 +88,9 @@ def test_hook_names_the_absent_store(git_repo, tmp_path):
     field while the next `add` forked a second store. Exit 0 and empty
     stderr still hold: the hook never fails a session. The sibling test
     below keeps the genuinely quiet direction (not installed, no store)."""
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo,
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
                        capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin",
+                       env={**SRC_ENV, "PATH": TOOLS,
                             "SYMBION_DIR": str(tmp_path / "nope")})
     assert r.returncode == 0
     assert r.stderr == ""
@@ -89,25 +103,25 @@ def test_hook_is_silent_in_a_project_that_never_adopted_symbion(git_repo):
     no `.symbion` pointer and no SYMBION_DIR is a project that never adopted
     symbion, and it must hear nothing -- the tests around this one keep the
     loud directions (a named store that is absent, a store with rows)."""
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin"})
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": TOOLS})
     assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
 
 
 def test_hook_names_a_pointer_to_a_store_that_is_not_there(git_repo):
     (git_repo / ".symbion").write_text("../gone-notes\n")
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin"})
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": TOOLS})
     assert r.returncode == 0 and "no store at" in r.stdout and "gone-notes" in r.stdout
 
 
-def test_hook_names_a_pointer_that_links_to_a_directory(git_repo):
+def test_hook_names_a_pointer_that_links_to_a_directory(git_repo, symlink):
     """`read` on a directory printed bash's `read error: Is a directory` and
     the hook went silent, as in a project that never adopted symbion."""
     (git_repo.parent / "elsewhere").mkdir()
-    (git_repo / ".symbion").symlink_to("../elsewhere")
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin"})
+    symlink(git_repo / ".symbion", "../elsewhere", directory=True)
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": TOOLS})
     assert r.returncode == 0 and "read error" not in r.stdout + r.stderr
     assert "is a link to ../elsewhere" in r.stdout
 
@@ -116,7 +130,7 @@ def test_hook_exits_0_and_prints_nothing_when_symbion_is_not_installed_and_no_st
     """The quiet direction of the not-installed case: no sibling store, so
     this is a project that never adopted symbion, and the hook must say
     nothing -- the loud test below covers the other direction."""
-    r = subprocess.run([BASH, str(HOOK)], cwd=tmp_path,
+    r = subprocess.run([SH, str(HOOK)], cwd=tmp_path,
                        capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": "/nonexistent"})
     assert r.returncode == 0
@@ -134,7 +148,7 @@ def test_hook_names_the_missing_binary_when_a_sibling_store_exists(git_repo, tmp
     store_dir = tmp_path / "proj-notes"
     store_dir.mkdir()
     (store_dir / "notes.jsonl").write_text("")
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo,
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
                        capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": "/nonexistent"})
     assert r.returncode == 0
@@ -159,8 +173,8 @@ def test_hook_summarizes_the_project_dir_not_the_cwd(tmp_path):
     store.add(tmp_path / "proj-notes", kind="bug",
               target={"type": "project", "name": None}, status="open")
 
-    r = subprocess.run([BASH, str(HOOK)], cwd=other, capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin",
+    r = subprocess.run([SH, str(HOOK)], cwd=other, capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": TOOLS,
                             "CLAUDE_PROJECT_DIR": str(proj)})
     assert r.returncode == 0 and r.stderr == ""
     assert "bug 1" in r.stdout, f"summarized the cwd, not the project: {r.stdout!r}"
@@ -179,8 +193,8 @@ def test_hook_still_uses_the_cwd_when_no_project_dir_is_set(tmp_path):
     store.add(tmp_path / "proj-notes", kind="bug",
               target={"type": "project", "name": None}, status="open")
 
-    r = subprocess.run([BASH, str(HOOK)], cwd=proj, capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin"})
+    r = subprocess.run([SH, str(HOOK)], cwd=proj, capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": TOOLS})
     assert r.returncode == 0 and r.stderr == ""
     assert "bug 1" in r.stdout
 
@@ -196,9 +210,9 @@ def test_hook_prints_open_heads_and_not_the_schema(git_repo, tmp_path):
     (store_dir / "symbion.toml").write_text('[kinds]\nanomaly = { status = true }\n')
     store.add(store_dir, kind="anomaly", target={"type": "project", "name": None},
               body="latency drifts 2 ms", status="open")
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo,
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
                        capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin",
+                       env={**SRC_ENV, "PATH": TOOLS,
                             "SYMBION_DIR": str(store_dir)})
     assert r.returncode == 0 and r.stderr == ""
     lines = r.stdout.splitlines()
@@ -218,7 +232,7 @@ def test_hook_finds_a_pointed_store_with_no_symbion_on_path(git_repo, tmp_path):
     store_dir.mkdir()
     (store_dir / "notes.jsonl").write_text("")
     (git_repo / ".symbion").write_text("../elsewhere-store\n")
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo,
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
                        capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": "/nonexistent", "HOME": str(tmp_path)})
     assert r.returncode == 0 and r.stderr == ""
@@ -236,7 +250,7 @@ def test_hook_names_a_selected_store_that_is_missing_with_no_symbion_on_path(git
         (git_repo / ".symbion").write_text("../gone-store\n")
     else:
         env["SYMBION_DIR"] = str(tmp_path / "gone-store")
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env)
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env)
     assert r.returncode == 0 and r.stderr == ""
     assert "not on PATH" in r.stdout and "gone-store" in r.stdout
 
@@ -249,11 +263,26 @@ def test_hook_is_silent_on_the_same_tree_without_the_pointer(git_repo, tmp_path)
     store_dir.mkdir()
     (store_dir / "notes.jsonl").write_text("")
     assert not (git_repo / ".symbion").exists()
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo,
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
                        capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": "/nonexistent", "HOME": str(tmp_path)})
     assert r.returncode == 0 and r.stderr == ""
     assert r.stdout == ""
+
+
+def test_hook_reads_a_pointer_saved_with_crlf(git_repo, tmp_path):
+    """Notepad, or text mode on Windows, ends the pointer's line in CRLF, and
+    `read -r` keeps the CR: the hook named a store whose name ended in it,
+    which is not there."""
+    store_dir = tmp_path / "elsewhere-store"
+    store_dir.mkdir()
+    (store_dir / "notes.jsonl").write_text("")
+    (git_repo / ".symbion").write_bytes(b"../elsewhere-store\r\n")
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
+                       capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": "/nonexistent", "HOME": str(tmp_path)})
+    assert r.returncode == 0 and r.stderr == ""
+    assert "elsewhere-store because 'symbion' is not on PATH" in r.stdout, r.stdout
 
 
 def test_hook_ignores_a_blank_pointer(git_repo, tmp_path):
@@ -262,7 +291,7 @@ def test_hook_ignores_a_blank_pointer(git_repo, tmp_path):
     claim a store that is really the project tree."""
     (git_repo / ".symbion").write_text("\n  \n")
     (git_repo / "notes.jsonl").write_text("")
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo,
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
                        capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": "/nonexistent", "HOME": str(tmp_path)})
     assert r.returncode == 0 and r.stderr == ""
@@ -278,9 +307,9 @@ def test_hook_names_a_malformed_kinds_table_instead_of_reading_as_no_store(git_r
     store_dir = tmp_path / "store"
     store.ensure_store(store_dir)
     (store_dir / "symbion.toml").write_text('[kinds]\nnote = { status = "yes" }\n')
-    r = subprocess.run([BASH, str(HOOK)], cwd=git_repo,
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo,
                        capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin",
+                       env={**SRC_ENV, "PATH": TOOLS,
                             "SYMBION_DIR": str(store_dir)})
     assert r.returncode == 0
     assert r.stderr == ""
@@ -307,8 +336,8 @@ def test_hook_in_a_linked_worktree_reads_the_main_checkouts_store(git_repo, tmp_
         store.add(s, kind="bug", target={"type": "project", "name": None}, status="open")
     if layout in ("pointer", "worktree pointer"):
         ((git_repo if layout == "pointer" else wt) / ".symbion").write_text("../elsewhere-store\n")
-    r = subprocess.run([BASH, str(HOOK)], cwd=wt, capture_output=True, text=True,
-                       env={**SRC_ENV, "PATH": f"{SYMBION_BIN}:/usr/bin:/bin",
+    r = subprocess.run([SH, str(HOOK)], cwd=wt, capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": TOOLS,
                             "CLAUDE_PROJECT_DIR": str(wt)})
     assert r.returncode == 0 and r.stderr == ""
     if s:

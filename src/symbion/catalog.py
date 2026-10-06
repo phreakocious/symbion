@@ -5,10 +5,12 @@ from __future__ import annotations
 import contextlib
 import difflib
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import unicodedata
+from pathlib import Path
 
 NON_CANONICAL_TYPES = {"item", "project", "arc", "commit"}
 DEFAULT_COMMAND_TIMEOUT = 30
@@ -26,6 +28,18 @@ class AmbiguousName(ValueError):
 
 def nfc(s):
     return unicodedata.normalize("NFC", s) if isinstance(s, str) else s
+
+
+def posix_sh() -> str | None:
+    """The sh a configured command runs in on Windows: one on PATH, else the
+    one Git for Windows installs beside its git (Git/cmd/git.exe beside
+    Git/bin/sh.exe). Its installer puts only Git/cmd on PATH."""
+    found = shutil.which("sh")
+    if found:
+        return found
+    git = shutil.which("git")
+    sh = Path(git).resolve().parents[1] / "bin" / "sh.exe" if git else None
+    return str(sh) if sh and sh.exists() else None
 
 
 def run_configured(cfg, cmd: str, input: str | None = None):
@@ -61,16 +75,34 @@ def run_configured(cfg, cmd: str, input: str | None = None):
     # after the error said killed (found 2026-10-02). Out of the terminal's
     # process group, the command no longer sees a Ctrl-C, so any exit kills it.
     # ponytail: a child that calls setsid() itself escapes; a cgroup would not.
+    # shell=True on Windows is cmd.exe, which ran `git ls-files '*.py'` with
+    # the quotes kept and matched nothing. A store's symbion.toml is shared
+    # across machines, so its commands mean the same sh on each.
+    args, shell = cmd, True
+    if os.name == "nt":
+        sh = posix_sh()
+        if sh is None:
+            raise CatalogError(f"a configured command runs in sh, and no `sh` is on PATH "
+                               f"or beside git; install Git for Windows: {cmd}")
+        args, shell = [sh, "-c", cmd], False
     with subprocess.Popen(
-            cmd, shell=True, cwd=str(cfg.work_root), env=env, text=True,
+            args, shell=shell, cwd=str(cfg.work_root), env=env, text=True, encoding="utf-8",
             stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as p:
+        if p.stdin:
+            # Text mode on Windows wrote the resolver's lines as CRLF, and a
+            # query read with `read q` kept the CR and matched nothing.
+            p.stdin.reconfigure(newline="\n")
         try:
             out, err = p.communicate(
                 input, timeout=getattr(cfg, "command_timeout", None) or DEFAULT_COMMAND_TIMEOUT)
         except BaseException as e:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(p.pid, signal.SIGKILL)
+            if os.name == "nt":                # no process groups: kill the tree
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                               capture_output=True)
+            else:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(p.pid, signal.SIGKILL)
             p.wait()
             if isinstance(e, subprocess.TimeoutExpired):
                 raise CatalogError(

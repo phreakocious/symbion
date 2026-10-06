@@ -14,9 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.11", "3.x"]
     runs-on: ${{ matrix.os }}
+    # Git Bash on Windows, so one script serves every runner.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -27,10 +31,11 @@ jobs:
       # The core must run without the [gui] extra.
       - name: wheel smoke, no extras
         run: |
-          python -m venv /tmp/bare
-          /tmp/bare/bin/pip install dist/*.whl
-          /tmp/bare/bin/symbion -V
-          /tmp/bare/bin/symbion --help
+          python -m venv "$RUNNER_TEMP/bare"
+          b="$RUNNER_TEMP/bare/bin"; [ -d "$b" ] || b="$RUNNER_TEMP/bare/Scripts"   # Windows
+          "$b/pip" install dist/*.whl
+          "$b/symbion" -V
+          "$b/symbion" --help
       - name: suite from the unpacked sdist
         run: |
           mkdir sdist && tar xzf dist/*.tar.gz -C sdist --strip-components 1

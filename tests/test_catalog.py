@@ -141,6 +141,9 @@ def rcfg(tmp_path, cat, res, **kw):
 def test_run_configured_input_reaches_stdin(tmp_path):
     c = Config(project_root=tmp_path)
     assert catalog.run_configured(c, "cat", input="x\ny\n").stdout == "x\ny\n"
+    # Bytes, not text read back: text mode turns a CR the command got into
+    # nothing on the way out. Windows sent CRLF.
+    assert catalog.run_configured(c, "wc -c", input="x\ny\n").stdout.strip() == "4"
 
 
 def test_resolver_exit_0_stores_the_printed_name_even_outside_the_catalog(tmp_path):

@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import errno
 import functools
 from importlib import metadata, resources
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -44,13 +46,13 @@ def _resolved_author(args) -> str:
 # edit; a link into the install cannot drift.
 _SKILL_LINK = Path(".claude/skills/symbion")          # under $HOME
 _CODEX_SKILL_LINK = Path(".agents/skills/symbion")
-_HOOK_COMMAND = 'bash "$HOME/.claude/skills/symbion/session_start.sh"'
+_HOOK_COMMAND = 'sh "$HOME/.claude/skills/symbion/session_start.sh"'
 # Codex runs a hook in the session's cwd (its hooks docs, 2026-10-02). The
 # project is named so a CLAUDE_PROJECT_DIR inherited from a Claude Code parent
 # cannot pick another one, and the author so `summary` knows its reader:
 # whether a hook's process carries CODEX_THREAD_ID is not measured.
 _CODEX_HOOK_COMMAND = ('SYMBION_PROJECT_DIR="$PWD" SYMBION_AUTHOR="${SYMBION_AUTHOR:-codex}" '
-                       'bash "$HOME/.agents/skills/symbion/session_start.sh"')
+                       'sh "$HOME/.agents/skills/symbion/session_start.sh"')
 
 
 def _hook_entry(command: str) -> dict:
@@ -59,11 +61,23 @@ def _hook_entry(command: str) -> dict:
                        "timeout": 10, "statusMessage": "Reading symbion notes..."}]}
 
 
+def _codex_hook_entry(link: Path) -> dict:
+    entry = _hook_entry(_CODEX_HOOK_COMMAND)
+    # Codex's Windows override runs without Git Bash on PATH. An absolute
+    # path avoids shell-specific HOME expansion; -File handles spaces.
+    if os.name == "nt":
+        entry["hooks"][0]["commandWindows"] = (
+            'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass '
+            f'-File "{link / "session_start.ps1"}"')
+    return entry
+
+
 _HOOK_ENTRY = _hook_entry(_HOOK_COMMAND)
 _HOOK_SETTINGS = {"hooks": {"SessionStart": [_HOOK_ENTRY]}}
 # The script's path, not the command: JSON escapes the command's quotes, and a
 # hand-written entry may spell it `~/...`; either way it runs this file.
 _HOOK_SCRIPT = "skills/symbion/session_start.sh"
+_WINDOWS_HOOK_SCRIPT = "skills/symbion/session_start.ps1"
 # What an older init wrote into each project, and the registration that ran it.
 _OLD_HOOK = "$CLAUDE_PROJECT_DIR/hooks/session_start.sh"
 
@@ -90,20 +104,44 @@ def _link_user_skill(write: bool = True, agent: str = "claude") -> bool:
     skill dir that is not this link is someone's; it is named, never replaced.
     Returns whether it changes anything."""
     codex = agent == "codex"
-    link = Path.home() / (_CODEX_SKILL_LINK if codex else _SKILL_LINK)
+    link = Path.home() / (_SKILL_LINK if agent == "claude" else _CODEX_SKILL_LINK)
     target = _skill_dir()
     command = _CODEX_HOOK_COMMAND if codex else _HOOK_COMMAND
-    entry = _hook_entry(command)
+    entry = _codex_hook_entry(link) if codex else _hook_entry(command)
+    command = entry["hooks"][0].get("commandWindows", command)
     changed = False
-    if link.is_symlink() and link.resolve() == target.resolve():
+    # resolve() follows a symlink or a junction, and a real directory resolves
+    # to itself, never to the package.
+    if link.exists() and link.resolve() == target.resolve():
         changed |= _act(write, "keep", f"{link} -> {target}")
-    elif link.exists() or link.is_symlink():
+    elif os.path.lexists(link):             # a dangling junction too, which is no symlink
         print(f"note: {link} exists and is not a link to {target}; left alone")
     else:
         if write:
             link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target, target_is_directory=True)
+            try:
+                link.symlink_to(target, target_is_directory=True)
+            except OSError:
+                if os.name != "nt":
+                    raise
+                # A symlink needs Developer Mode or an elevated shell; a
+                # junction needs neither.
+                import _winapi
+                _winapi.CreateJunction(str(target), str(link))
         changed |= _act(write, "link", f"{link} -> {target}")
+    if agent == "hermes":
+        # Hermes has no hook whose output reaches the model as a summary: its
+        # on_session_start return is ignored, and pre_llm_call fires every turn
+        # and wants JSON (hermes-agent docs, 2026-10-06). Its config is YAML,
+        # which the stdlib cannot read, so init names both steps every run.
+        config = (Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+                  / "config.yaml")
+        print(f"note: Hermes reads this skill once ~/.agents/skills is listed under "
+              f"skills.external_dirs in {config}; init does not read or edit that file")
+        print("note: Hermes runs no symbion hook; for the session-start summary, add this "
+              "line to the project's AGENTS.md:\n- At the start of a session, run "
+              "`symbion summary` unless a hook already printed it.")
+        return changed
     settings = ((Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
                  / "hooks.json") if codex else Path.home() / ".claude" / "settings.json")
     # Codex skips a new or changed hook until the person trusts it, and says
@@ -171,9 +209,11 @@ def _hook_registered(settings: Path, *, toml: bool = False) -> bool | None:
     entries = hooks.get("SessionStart", [])
     if not isinstance(entries, list):
         return None
-    return any(_HOOK_SCRIPT in str(h.get("command", ""))
+    return any(script in str(h.get(key, "")).replace("\\", "/")
                for e in entries if isinstance(e, dict)
-               for h in (e.get("hooks") or []) if isinstance(h, dict))
+               for h in (e.get("hooks") or []) if isinstance(h, dict)
+               for key in ("command", "commandWindows", "command_windows")
+               for script in (_HOOK_SCRIPT, _WINDOWS_HOOK_SCRIPT))
 
 
 def _old_copies(root: Path) -> list[str]:
@@ -182,7 +222,7 @@ def _old_copies(root: Path) -> list[str]:
     project's own hooks/session_start.sh is not ours unless it runs symbion."""
     out = []
     if (root / _SKILL_LINK).exists():
-        out.append(str(_SKILL_LINK))
+        out.append(_SKILL_LINK.as_posix())
     hook = root / "hooks" / "session_start.sh"
     if hook.exists() and "symbion summary" in hook.read_text(encoding="utf-8", errors="replace"):
         out.append("hooks/session_start.sh")
@@ -212,7 +252,7 @@ def _ignored_paths(store_dir, prefix: str) -> list[str]:
     """Paths under `prefix` that `git add -A` skips. `--ignored=matching`
     names each ignored FILE; the default collapses them to the directory."""
     r = subprocess.run(["git", "-C", str(store_dir), "status", "--porcelain",
-                        "--ignored=matching"], capture_output=True, text=True)
+                        "--ignored=matching"], capture_output=True, text=True, encoding="utf-8")
     return sorted(ln[3:] for ln in r.stdout.splitlines()
                   if ln.startswith("!! ") and ln[3:].startswith(prefix + "/"))
 
@@ -255,7 +295,7 @@ def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
     for selected in (("claude", "codex") if agent == "both" else (agent,)):
         changed |= _link_user_skill(write, selected)
     if changed and agent in ("codex", "both"):
-        s = shlex.quote(str(Path(store_dir).resolve()))
+        s = shlex.quote(Path(store_dir).resolve().as_posix())
         print(f"note: Codex's sandbox writes only inside the project, and the store is "
               f"outside it: launch `codex --add-dir {s}`, or add {s} to "
               "sandbox_workspace_write.writable_roots in Codex's config.toml. "
@@ -312,7 +352,7 @@ def _record_pointer(store_dir: Path, project_root: Path, store_from_env: bool = 
     named = config._pointer(project_root)
     if store_dir == default:
         if named is not None and named != store_dir:
-            print(f"note: {pointer} names {pointer.read_text().strip()!r}, not this store; "
+            print(f"note: {pointer} names {pointer.read_text(encoding='utf-8').strip()!r}, not this store; "
                   f"delete it if that is stale")
         return False
     if store_from_env:
@@ -330,9 +370,9 @@ def _record_pointer(store_dir: Path, project_root: Path, store_from_env: bool = 
     if store_dir.parent == project_root.parent:
         value = f"../{store_dir.name}"
     else:
-        value = str(store_dir)
+        value = store_dir.as_posix()
     if write:
-        pointer.write_text(value + "\n", encoding="utf-8")
+        pointer.write_text(value + "\n", encoding="utf-8", newline="\n")
     was = ""
     if store.exists(current):
         was = f" (was {current}: that store is no longer read from here)"
@@ -359,7 +399,7 @@ item, an arc or the whole project.
 
 Read it from a checkout of `{project}` with `symbion summary`, `symbion list` or
 `symbion serve`. Write with `symbion add`, not by hand.
-''', encoding="utf-8")
+''', encoding="utf-8", newline="\n")
 
 
 def _write_starter_toml(p: Path, cfg) -> None:
@@ -421,17 +461,18 @@ default_branch = "{cfg.default_branch}"
 #   macOS: sed -i '' -e 's/"kind": "old"/"kind": "new"/g' notes.jsonl
 #   GNU:   sed -i    -e 's/"kind": "old"/"kind": "new"/g' notes.jsonl
 # `symbion schema` prints this table with a row count per label.
-{K.render_toml(K.DEFAULT_KINDS)}''', encoding="utf-8")
+{K.render_toml(K.DEFAULT_KINDS)}''', encoding="utf-8", newline="\n")
 
 
 # ---- text rendering ----
-def _painter():
+def _painter(kinds=None):
     """term.painter() at a terminal, else summary.plain. The import sits
-    here for the reason _print_note's does: a pipe never loads rich."""
+    here for the reason _print_note's does: a pipe never loads rich.
+    `kinds` is the store's table, whose `color`s paint its kinds."""
     if not sys.stdout.isatty():
         return summ.plain
     from . import term
-    return term.painter()
+    return term.painter(kinds)
 
 
 def _gui(store_dir):
@@ -545,7 +586,8 @@ One flag covers the file and the pipe: '-' is stdin, as it is for
     if getattr(args, "body_file", None) is None:   # list, resolve, tags, ...
         return
     try:
-        args.body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
+        args.body = (sys.stdin.read() if args.body_file == "-"
+                     else Path(args.body_file).read_text(encoding="utf-8"))
     except OSError as e:
         # SystemExit(str) so main() prints it unprefixed and exits 1, the same
         # shape as every other bad-input refusal here. Uncaught, an OSError
@@ -882,12 +924,13 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     init_says = ("create this project's store with a starter symbion.toml, and link the "
                  "selected agent's skill and session-start hook outside it: ~/.claude for "
                  "Claude Code, ~/.agents/skills and $CODEX_HOME (default ~/.codex) for "
-                 "Codex. Existing "
+                 "Codex, ~/.agents/skills and no hook for Hermes. Existing "
                  "settings are preserved; missing hook entries are printed for you to add. "
                  "Without --yes it lists each change and makes none")
     i = sub.add_parser("init", help=init_says, description=init_says)
-    i.add_argument("--agent", choices=("claude", "codex", "both"), default="claude",
-                   help="agent integration to install (default: claude)")
+    i.add_argument("--agent", choices=("claude", "codex", "hermes", "both"), default="claude",
+                   help="agent integration to install; both is claude and codex "
+                        "(default: claude)")
     i.add_argument("--yes", action="store_true", help="make the changes it lists")
     i.add_argument("--repoint", action="store_true",
                    help="make this project read the store --dir names, though it reads "
@@ -911,10 +954,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     a.add_argument("--from-json", dest="from_json", default=None, metavar="PATH",
                    help="read notes from PATH ('-' for stdin): one JSON object per line, "
                         "not the array `list --json` prints, with only these keys: "
-                        + ", ".join("target{type,name}" if k == "target" else k
+                        + ", ".join({"tags": "tags[]", "refs": "refs[]"}.get(k, k)
                                     for k in _ROW_KEY_ORDER)
-                        + ". Every row is validated before any is written; takes no "
-                          "other note flags")
+                        + ". A target or ref is {type, name} or TYPE:NAME. Every row is "
+                          "validated before any is written; takes no other note flags")
     a.add_argument("--name", default=None, help="target name (omit for project)")
     ab = a.add_mutually_exclusive_group()
     ab.add_argument("--body", default="")
@@ -1029,6 +1072,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     help="check: correct what was checked")
     sp.add_argument("--result", default=None,
                     help="check: correct the verdict")
+    sp.add_argument("--external", action="store_true",
+                    help="a supersede keeps the row's stamp: accepted on a row "
+                         "add --external wrote, refused on any other")
     sp.add_argument("--tag", dest="tags", action="append", default=None,
                     help="replace the inherited tags (repeatable); omit to inherit")
     sp.add_argument("--add-tag", dest="add_tags", action="append", default=[],
@@ -1220,7 +1266,7 @@ def _named_store(ctx) -> str | None:
     root = ctx.cfg.project_root
     rel = (f"../{ctx.store_dir.name}"
            if root is not None and ctx.store_dir.parent == Path(root).parent
-           else str(ctx.store_dir))
+           else ctx.store_dir.as_posix())
     return f"--dir {shlex.quote(rel)}"
 
 
@@ -1444,7 +1490,8 @@ def _say_rewritten(tip, note) -> None:
     (the store's `rewritable`), so the id printed is the one given, not a new one."""
     if tip is not None and note.id == tip.id:
         print(f"note: {note.id} was not yet committed, so it was edited in place; "
-              f"no earlier version is kept", file=sys.stderr)
+              f"no earlier version is kept (`symbion commit` before an edit keeps one, "
+              f"and commits every other writer's pending rows too)", file=sys.stderr)
 
 
 def _say_dropped(tip, note) -> None:
@@ -1760,7 +1807,7 @@ def _dispatch(args, ctx) -> int:
             if hidden:
                 print(f"note: not in this array: {'; '.join(hidden)}", file=sys.stderr)
         else:
-            paint = _painter()
+            paint = _painter(ctx.kinds)
             if not args.note_id:
                 print(paint(_list_header(total, len(notes), _hidden(every, base, args, filt),
                                          scanned=len(base), filters=given), "meta"))
@@ -1809,6 +1856,11 @@ def _dispatch(args, ctx) -> int:
         return 0
 
     if args.cmd == "supersede":
+        if args.external and tip is not None and not (tip.provenance or {}).get("external"):
+            print(f"supersede: --external: {tip.id} is stamped with a commit, and a "
+                  f"supersede keeps the stamp; a reading outside this repo is a new row: "
+                  f"add --external", file=sys.stderr)
+            return 1
         fields = _body_fields(args)
         if args.status is not None:
             fields["status"] = args.status
@@ -1976,7 +2028,7 @@ def _dispatch(args, ctx) -> int:
         counts = store.tag_counts(store.load(store_dir))
         if not counts:
             print("no tags yet (add --tag NAME)")
-        paint = _painter()
+        paint = _painter(ctx.kinds)
         for t, cnt in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
             print(f"{paint(f'{cnt:5}', 'meta')}  {paint(t, 'text')}")
         return 0
@@ -1989,14 +2041,14 @@ def _dispatch(args, ctx) -> int:
         data = summ.summary(store_dir, cfg, full=args.full,
                             reader=None if at_terminal else api.author_default())
         # Both links lead to the same skill directory, so either serves.
-        data["skill"] = next((f"~/{link}/SKILL.md" for link in (_SKILL_LINK, _CODEX_SKILL_LINK)
+        data["skill"] = next((f"~/{link.as_posix()}/SKILL.md" for link in (_SKILL_LINK, _CODEX_SKILL_LINK)
                               if (Path.home() / link / "SKILL.md").exists()), None)
         if at_terminal:
             data["skill"] = None      # the line is for an agent; the hook reads a pipe
         data["leftovers"] = (_old_copies(Path(cfg.project_root))
                              if cfg.project_root is not None else [])
         data["named_store"] = _named_store(ctx)
-        print(json.dumps(data) if args.json else summ.render_summary(data, _painter()))
+        print(json.dumps(data) if args.json else summ.render_summary(data, _painter(ctx.kinds)))
         return 0
 
     if args.cmd == "schema":
@@ -2004,7 +2056,7 @@ def _dispatch(args, ctx) -> int:
             print(K.render_toml(ctx.kinds), end="")
             return 0
         data = summ.schema(store_dir, cfg, ctx.kinds)
-        print(json.dumps(data) if args.json else summ.render_schema(data, _painter()))
+        print(json.dumps(data) if args.json else summ.render_schema(data, _painter(ctx.kinds)))
         return 0
 
     if args.cmd == "context":
@@ -2032,7 +2084,7 @@ def _dispatch(args, ctx) -> int:
                 other = len(store.heads(store.load(store_dir))) - len(data["notes"])
                 if other:
                     head += f"; +{summ._count(other, 'other head')} (list)"
-            print(_painter()(head, "meta"))
+            print(_painter(ctx.kinds)(head, "meta"))
             gui = _gui(store_dir)
             for d in data["notes"]:
                 _print_note(store.note_from_dict(d, kinds=ctx.kinds), gui=gui,
@@ -2066,7 +2118,7 @@ def _dispatch_arc(args, ctx) -> int:
         if args.json:
             print(json.dumps(rows))
         else:
-            paint = _painter()
+            paint = _painter(ctx.kinds)
             if not rows:
                 print(paint("0 arcs (arc create --name NAME --scope item|file|mixed|project)",
                             "meta"))
@@ -2172,7 +2224,7 @@ def _dispatch_arc(args, ctx) -> int:
             head = f"{len(rows)} open of {summ._count(len(rows) + resolved, 'item')}"
             if resolved:
                 head += f"; +{resolved} resolved (list --arc {args.id})"
-            paint = _painter()
+            paint = _painter(ctx.kinds)
             print(paint(head, "meta"))
             # The session-start head line: many boxes share one target, so
             # target and id alone could not say which box a line was.
@@ -2214,7 +2266,7 @@ def _dispatch_arc(args, ctx) -> int:
                                         if r["status"] == "uncheckable"}))
                 head += (f"; {c['uncheckable']} uncheckable" if checked else "") + \
                     f" ({why}: no catalog)"
-            paint = _painter()
+            paint = _painter(ctx.kinds)
             print(paint(head, "meta"))
             for r in rows:
                 if r["status"] not in ("renamed", "stale"):
@@ -2331,12 +2383,23 @@ def main(argv=None) -> int:
     """A reader that closes the pipe early (`list | head -1`) asked for less,
     not for a Python error. The write fails inside print, or at the
     interpreter's last flush after main returns, so that flush happens here."""
+    # Windows gives a pipe the ANSI code page (cp1252): `list` exited 1 on a
+    # row holding `→`, which cp1252 lacks, and a body piped to --body-file -
+    # was stored garbled. Whoever reads symbion reads UTF-8.
+    for s in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(s, "reconfigure"):
+            s.reconfigure(encoding="utf-8")
     try:
         code = _main(argv)
         if sys.stdout is not None:               # None when fd 1 was closed
             sys.stdout.flush()
         return code
-    except BrokenPipeError:
+    except OSError as e:
+        # Windows reports the closed pipe as EINVAL with no file named; a bad
+        # path's EINVAL names one.
+        if not (isinstance(e, BrokenPipeError)
+                or (os.name == "nt" and e.errno == errno.EINVAL and e.filename is None)):
+            raise
         # The interpreter flushes stdout once more at exit: devnull takes it.
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 141                               # 128 + SIGPIPE, as a shell reports it
@@ -2405,6 +2468,15 @@ def _main(argv) -> int:
         print(f"error: not a git repository: {os.getcwd()}; the store is derived from "
               f"the project, so name it with --dir <store> to read it from here",
               file=sys.stderr)
+        return 1
+    except FileNotFoundError as e:
+        # Every verb asks git first. A hook's PATH that left out the dir git
+        # installs to (/usr/local/bin on OpenBSD) printed this as a traceback
+        # into the session (2026-10-05). Windows names no file.
+        if e.filename not in ("git", None) or shutil.which("git"):
+            raise
+        print(f"error: symbion runs git, and no `git` is on PATH "
+              f"({os.environ.get('PATH', '')})", file=sys.stderr)
         return 1
     except tomllib.TOMLDecodeError as e:
         # store_dir isn't bound in this frame when api.resolve() raises

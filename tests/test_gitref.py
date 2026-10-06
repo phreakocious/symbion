@@ -161,7 +161,9 @@ def test_a_git_error_reads_unverifiable_not_diverged(repo):
     _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c2")
     prov = {"sha": stamp, "dirty": False}
     assert gitref.check_state(cfg, prov) == ("behind", 2)      # the path is reached
-    (repo / ".git" / "objects" / mid[:2] / mid[2:]).unlink()
+    obj = repo / ".git" / "objects" / mid[:2] / mid[2:]
+    obj.chmod(0o644)                  # git writes it read-only; Windows refuses that unlink
+    obj.unlink()
     # This process keeps what git answered: the two commits still relate so.
     assert gitref.check_state(cfg, prov) == ("behind", 2)
     gitref._RELATIONS.clear()                                  # a fresh process

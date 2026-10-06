@@ -210,7 +210,7 @@ a { text-decoration: none; }
 /* main column, cards */
 .sb-main   { width: 100%; max-width: 920px; margin: 0 auto; padding: 8px 32px 72px;
              box-sizing: border-box; }
-.sb-subtitle { font-size: 13px; color: var(--q-muted); }
+.sb-subtitle { font-size: 13px; color: var(--q-muted); overflow-wrap: anywhere; }
 .sb-card   { background: var(--q-panel) !important; border: 1px solid var(--q-border);
              border-radius: 12px; padding: 14px 16px; }
 .sb-stat-label { color: var(--q-muted); font-size: 11px; font-weight: 600;
@@ -443,9 +443,13 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 .q-btn { text-transform: none; font-weight: 500; letter-spacing: 0; border-radius: 7px; }
 /* not !important: Quasar's is a plain layered rule, and `.q-menu .q-item` must still win */
 .q-item--dark { color: var(--q-emph); }
+/* Quasar sets max-width inline to the space left, so a closed row's 200 chars
+   ran 1216px across a 1280px page (2026-10-06). 80ch holds a sha and a
+   72-char commit subject on one line; a long path or URL breaks inside it. */
 .q-tooltip { background: var(--q-panel) !important; color: var(--q-emph) !important;
              border: 1px solid var(--q-border); font-family: var(--mono); font-size: 11px;
-             white-space: pre-line; }
+             white-space: pre-line; overflow-wrap: anywhere;
+             max-width: min(80ch, calc(100vw - 32px)) !important; }
 
 /* the header's search box, and the words a search found in a result */
 /* the title takes the bar first and the search what is left: shrinking
@@ -518,3 +522,11 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 DARK_CSS += "".join(f".sb-kind-{k} {{ --kind: {c}; }}\n"
                     for k, c in {**T.KIND, "own": T.OWN_KIND}.items())
 DARK_CSS += '.sb-chip[class*="sb-kind-"] { color: var(--kind); }\n'
+
+
+def kind_css(kinds) -> str:
+    """The colours a store's [kinds] picks, one rule per kind on its own
+    class: a page adds this after DARK_CSS, so it wins over the shared
+    `sb-kind-own` and over a default kind's colour alike."""
+    return "".join(f".sb-kind-{k} {{ --kind: {T.kind_hex(k, s)}; }}\n"
+                   for k, s in kinds.items() if s.color)

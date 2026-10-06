@@ -5,6 +5,7 @@
 A per-project notebook and ticket registry for small projects, driven by a
 person and a coding agent through one CLI. The CLI stands alone; the agent side
 (a shared skill and a SessionStart hook) supports Claude Code and Codex.
+Hermes Agent takes the skill, and a line in `AGENTS.md` in place of the hook.
 
 A note is dated, attributed, retractable, and attached to something stable: a
 commit, a file, a free-form item, or the whole project. Seven kinds by default:
@@ -19,11 +20,15 @@ never time-travels your tickets.
 Design and rationale: [`docs/superpowers/specs/2026-09-04-symbion-design.md`](https://github.com/phreakocious/symbion/blob/main/docs/superpowers/specs/2026-09-04-symbion-design.md).
 The best command reference is the agent's: `src/symbion/data/skill/SKILL.md`
 (linked at `~/.claude/skills/symbion` for Claude Code or
-`~/.agents/skills/symbion` for Codex).
+`~/.agents/skills/symbion` for Codex and Hermes Agent).
 
 ## Install
 
-Python 3.11+ and git.
+Python 3.11+ and git. On Windows, use Git for Windows: catalogs and
+resolvers run in its `sh`, which symbion finds beside git even when only
+Git's `cmd` directory is on PATH. Claude Code runs the session-start hook in
+Git's bash; without Git for Windows it fails with `'sh' is not recognized`.
+Codex's hook runs in Windows PowerShell.
 
 ```bash
 pipx install 'symbion[gui]'     # or: uv tool install 'symbion[gui]'
@@ -78,8 +83,8 @@ symbion init          # lists each change and makes none (exit 1 if there are an
 symbion init --yes    # makes them
 ```
 
-That sets up Claude Code; `--agent codex` sets up Codex instead, and
-`--agent both` sets up both.
+That sets up Claude Code; `--agent codex` sets up Codex instead,
+`--agent both` sets up both, and `--agent hermes` sets up Hermes Agent.
 
 This creates `../<repo>-notes`, a git repo with no remote, holding a commented
 `symbion.toml` whose every value has a default and a README.md that says what
@@ -90,15 +95,20 @@ reaches every project. It registers the hook in `~/.claude/settings.json` when
 that file does not exist. When it does, `init` says the hook is already there,
 or prints the entry to append to `hooks.SessionStart` (it merges nothing), or
 says the file is not valid JSON. A `~/.claude/skills/symbion` that is not the
-link is left alone and named.
+link is left alone and named. On Windows the link is a directory junction
+when the account cannot make a symlink, so neither Developer Mode nor an
+elevated terminal is needed.
 
 For Codex, `init --agent codex` links `~/.agents/skills/symbion` to the same
-skill directory and registers the same hook script in `$CODEX_HOME/hooks.json`
+skill directory and registers the hook in `$CODEX_HOME/hooks.json`
 (default `~/.codex/hooks.json`), on the same terms: it writes that file only
 when it is absent, and counts a registration inline in `config.toml`. Codex
 skips a new hook until you trust it in `/hooks`. See the
-[Codex hook documentation](https://learn.chatgpt.com/docs/hooks). The hooks
-need bash, so on Windows use WSL.
+[Codex hook documentation](https://learn.chatgpt.com/docs/hooks). On macOS and
+Linux the command runs `session_start.sh`. On Windows, init adds a
+`commandWindows` override running `session_start.ps1` with Windows PowerShell,
+without loading a profile. WSL is not required. Both commands read the
+session's cwd and use `codex` as the reader unless `SYMBION_AUTHOR` overrides it.
 
 **Give Codex access to the store.** Codex's sandbox writes only inside the
 project, and the store sits beside it. Launch `codex --add-dir
@@ -106,6 +116,22 @@ project, and the store sits beside it. Launch `codex --add-dir
 in Codex's `config.toml`; `init` prints the path. A `.symbion` pointer grants
 no access, and `symbion commit` may still ask for approval. A linked worktree
 uses the main checkout's store, so grant that one.
+
+For Hermes Agent, `init --agent hermes` makes the same
+`~/.agents/skills/symbion` link and registers no hook: no Hermes hook puts
+text in front of the model once, at session start. Hermes reads the link once
+`$HERMES_HOME/config.yaml` (default `~/.hermes/config.yaml`) lists the
+directory. `init` does not edit that file, so add it yourself:
+
+```yaml
+skills:
+  external_dirs:
+    - ~/.agents/skills
+```
+
+The summary then comes from a line in the project's `AGENTS.md` (step 3).
+Hermes's default local terminal writes to the store beside the project with
+no further setup.
 
 The only file `init` writes into the project is a `.symbion` pointer, when the
 store is not the default sibling. It marks the pointer `(git: ignored)` or
@@ -115,9 +141,18 @@ The hook runs in every project and says nothing where there is no store.
 **2. Check the read side.** Start a session, or run the hook by hand:
 
 ```bash
-CLAUDE_PROJECT_DIR=$PWD bash ~/.claude/skills/symbion/session_start.sh
-bash ~/.agents/skills/symbion/session_start.sh     # the same, with only Codex set up
+CLAUDE_PROJECT_DIR=$PWD sh ~/.claude/skills/symbion/session_start.sh
+sh ~/.agents/skills/symbion/session_start.sh     # the same, with only Codex set up
 ```
+
+For Codex on Windows, run this from the project in PowerShell:
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$HOME\.agents\skills\symbion\session_start.ps1"
+```
+
+Hermes Agent has no hook to run: start a session after step 3, and its first
+command should be `symbion summary`.
 
 | output | meaning |
 |---|---|
@@ -131,10 +166,18 @@ bash ~/.agents/skills/symbion/session_start.sh     # the same, with only Codex s
 | nothing | no store, no `.symbion` and no `SYMBION_DIR`, or the hook is not registered (or not trusted in Codex) |
 
 **3. Tell the agent.** One line in `CLAUDE.md` (Claude Code) or `AGENTS.md`
-(Codex):
+(Codex, Hermes Agent):
 
 ```
 - We use symbion for durable notes and tickets. Surface friction with it so it can be addressed.
+```
+
+Hermes Agent runs no hook, so it needs a second line. Hermes reads only the
+first of `.hermes.md`, `AGENTS.override.md`, `AGENTS.md` and `CLAUDE.md` it
+finds in the project, so put the line in that file:
+
+```
+- At the start of a session, run `symbion summary` unless a hook already printed it.
 ```
 
 If that instruction file is gitignored or its owner reviews every change to it,
@@ -292,7 +335,11 @@ where two separate adds would store both.
 - **Kinds are the project's.** Add or rename labels under `[kinds]` in
   `symbion.toml`; renaming one that has rows also takes a one-line `sed` over
   `notes.jsonl`, which `init` writes into the toml. A kind with both `status`
-  and `verdict` is a pre-registration, closed by `resolve --result`.
+  and `verdict` is a pre-registration, closed by `resolve --result`. A kind
+  can pick its colour by a palette name, `color = "teal"`, in the terminal
+  and in `serve`; a declared kind without one shares lavender, and a name
+  outside the palette is refused with the list. symbion 0.3.0 and older
+  refuse the key, so every machine that reads the store needs a newer one.
 - **`priority` stars a row** for the next session's summary:
   `supersede <id> --add-tag priority`, until the row is resolved or
   `--rm-tag priority` takes the star off. From a day on, the summary prints
@@ -304,12 +351,13 @@ where two separate adds would store both.
 - **Time is UTC.** Rows are stamped in UTC, and symbion prints times and reads
   a bare date in UTC. Set `TZ` to print and read them in that zone instead.
 - **Author.** `claude` inside a Claude Code session, `codex` inside a Codex
-  one, else git `user.name`; `--author` or `SYMBION_AUTHOR` overrides. A
-  person typing `! symbion add …` in a session is recorded as the agent
-  unless they pass one. Session start lists the open rows someone other than
-  the reader raised or amended, parked ones included, so the owner's word
-  reaches the agent: `from <author>` names who raised a row, and `last by
-  <author>` who wrote its newest version when that is someone else.
+  one, `hermes` inside a Hermes Agent one, else git `user.name`; `--author`
+  or `SYMBION_AUTHOR` overrides. A person typing `! symbion add …` in a
+  session is recorded as the agent unless they pass one. Session start lists
+  the open rows someone other than the reader raised or amended, parked ones
+  included, so the owner's word reaches the agent: `from <author>` names who
+  raised a row, and `last by <author>` who wrote its newest version when that
+  is someone else.
 - **Record finished work as a resolved task**:
   `add task --target … --status resolved --body "done: …"` for work done
   before it had a ticket.
@@ -363,11 +411,19 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui]'
 .venv/bin/python -m pytest -q
 ```
 
+On Windows, in PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[test,gui]'
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
 The specs in `docs/superpowers/specs/` are dated design records: why each
 decision was made. `SKILL.md` (in `src/symbion/data/skill/`, beside
 `adoption.md` and the hook) is what an agent reads; keep it short and its
 footgun list honest. If this clone is your installed symbion (an editable
 install, then `symbion init --yes`), `~/.claude/skills/symbion` and, with
-`--agent codex`, `~/.agents/skills/symbion` link to that directory, so an edit
-there reaches every session on the machine at once, as an edit to `src/`
-reaches every `symbion` call.
+`--agent codex` or `--agent hermes`, `~/.agents/skills/symbion` link to that
+directory, so an edit there reaches every session on the machine at once, as
+an edit to `src/` reaches every `symbion` call.

@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import signal
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -33,7 +35,10 @@ from .theme import FAVICON_SVG
 def _binds(host: str, port: int) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # On Windows SO_REUSEADDR binds over a live listener, and every
+            # held port read as free; there a bind without it is the probe.
+            if os.name != "nt":
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((host, port))
         return True
     except OSError:
@@ -58,13 +63,30 @@ def pick_free_port(preferred: int) -> int:
 def main(ctx, *, author: str, port=None, show: bool = True,
          reload: bool = False, argv=()) -> None:
     """`argv` is the CLI's own, `--dir` included: --reload re-runs it."""
+    if hasattr(signal, "SIGBREAK"):
+        # Windows' Ctrl+Break: uvicorn stops on it, then re-raises it under
+        # the default handler, which ended the process before the finally
+        # below took the record off. It stops as Ctrl-C does instead.
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
     # With --reload, uvicorn spawns a worker that re-runs main(); its port is
     # unused, and it must neither announce the URL nor re-exec. The worker's
     # __main__ is still spawn's stub while this runs, so only the process
     # name tells the two apart.
     top = multiprocessing.current_process().name == "MainProcess"
     if reload and top and getattr(sys.modules["__main__"].__spec__, "name", None) != __name__:
-        os.execv(sys.executable, [sys.executable, "-m", __name__, *argv])
+        cmd = [sys.executable, "-m", __name__, *argv]
+        if os.name != "nt":
+            os.execv(sys.executable, cmd)
+        # Windows has no exec: os.execv starts a new process and ends this
+        # one, so the console script returned at once and the serve ran on,
+        # detached from its terminal. A Ctrl-C reaches the child too, and the
+        # child stops on it; this waits for that.
+        with subprocess.Popen(cmd) as child:
+            while True:
+                try:
+                    sys.exit(child.wait())
+                except KeyboardInterrupt:
+                    pass
     build_page(ctx, author=author)
     # The store's own port, so a link to it outlives a restart (the owner,
     # 2026-10-02). `--port` overrides it and is never warned about.

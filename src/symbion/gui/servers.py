@@ -59,7 +59,7 @@ def record(url: str, store) -> Path | None:
     path = d / f"{os.getpid()}.json"
     path.write_text(json.dumps({"pid": os.getpid(), "url": url,
                                 "store": str(Path(store).resolve()),
-                                "started": time.time()}))
+                                "started": time.time()}), encoding="utf-8")
     return path
 
 
@@ -70,7 +70,7 @@ def running() -> list[dict]:
     live = []
     for path in _dir().glob("*.json"):
         try:
-            r = json.loads(path.read_text())
+            r = json.loads(path.read_text(encoding="utf-8"))
             pid, _ = int(r["pid"]), (r["url"], r["store"])
             started = float(r.get("started", 0))
         except (OSError, ValueError, KeyError, TypeError):
@@ -94,6 +94,18 @@ def serving(store) -> dict | None:
 def _alive(pid: int) -> bool:
     # ponytail: a pid reused after a crash reads as alive; a port check would
     # catch it, if a stale link ever shows up.
+    if os.name == "nt":
+        # On Windows signal 0 is CTRL_C_EVENT, and os.kill(pid, 0) raised
+        # nothing for a pid that had exited: every record read as alive.
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenProcess(0x1000, False, pid)    # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.get_last_error() == 5    # ERROR_ACCESS_DENIED: someone else's
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return bool(ok) and code.value == 259      # STILL_ACTIVE
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

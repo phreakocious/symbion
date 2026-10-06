@@ -61,7 +61,7 @@ def project_root(cwd=None) -> Path:
     submodules and --separate-git-dir layouts."""
     out = subprocess.run(["git", "worktree", "list", "--porcelain"],
                          cwd=str(cwd) if cwd else None,
-                         capture_output=True, text=True, check=True).stdout
+                         capture_output=True, text=True, encoding="utf-8", check=True).stdout
     for line in out.splitlines():
         if line.startswith("worktree "):
             return Path(line[len("worktree "):]).resolve()
@@ -76,7 +76,7 @@ def work_root(cwd=None) -> Path:
     belongs, because here the current checkout IS what's wanted."""
     out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                          cwd=str(cwd) if cwd else None,
-                         capture_output=True, text=True, check=True).stdout
+                         capture_output=True, text=True, encoding="utf-8", check=True).stdout
     return Path(out.strip()).resolve()
 
 
@@ -125,7 +125,7 @@ def _pointer(root: Path, work: Path | None = None) -> Path | None:
         how = f"{POINTER_FILE} is a file whose first line names the store"
         if p.is_symlink() and not p.is_file():       # a link to the store, there or not
             t = os.readlink(p)
-            q = shlex.quote(str(p))
+            q = shlex.quote(p.as_posix())
             raise PointerError(f"{p} is a link to {t}; {how}. Replace it: "
                                f"rm {q} && echo {shlex.quote(t)} > {q}") from None
         raise PointerError(f"cannot read {p} ({e.strerror}); {how}") from None

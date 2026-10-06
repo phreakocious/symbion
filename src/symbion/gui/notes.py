@@ -103,8 +103,9 @@ def link_ids(body: str, store_dir) -> str:
 def kind_class(kind: str) -> str:
     """A kind's colour, as `list` prints it, for its chip and its row's edge;
     a kind the store declares shares one (2026-10-01; chips by bits before,
-    which left `decision` and `idea` uncoloured)."""
-    return f"sb-kind-{kind}" if kind in term.KIND else "sb-kind-own"
+    which left `decision` and `idea` uncoloured), unless its `color` picks
+    one: theme.kind_css gives its own class that colour."""
+    return f"sb-kind-{kind}" if kind in term.KIND else f"sb-kind-own sb-kind-{kind}"
 
 
 def target_href(type: str, name: str | None) -> str:
@@ -353,7 +354,7 @@ def md_button(ctx, name, label: str = ""):
     def _open():
         path = md_path(ctx, name)
         try:
-            text = path.read_text(errors="replace") if path else None
+            text = path.read_text(encoding="utf-8", errors="replace") if path else None
         except OSError:
             text = None
         if text is None:

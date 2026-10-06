@@ -9,7 +9,8 @@ Dated notes on a commit, a file, an item, an arc or the whole project, kept in
 a git repo of JSONL beside the project, so a conclusion outlives the chat.
 
 Run the installed `symbion`, never `python -m` or a venv path. If `command -v
-symbion` fails, see Install at https://github.com/phreakocious/symbion.
+symbion` (PowerShell: `Get-Command symbion`) fails, see Install at
+https://github.com/phreakocious/symbion.
 `symbion VERB -h` lists a verb's flags.
 
 At the start of a session, run `symbion summary` if no summary was supplied
@@ -40,8 +41,10 @@ A kind is a label on three bits, and the bits are all symbion knows:
   `--checked` says who ran it; one from another tree or day is a `note` on its
   commit. A check on something outside the repo (DNS, a host's logs, a live
   database) takes `--external`: it is stamped with when it ran, since
-  otherwise any later commit makes it read `behind N`. A row migrated from
-  a store that predates stamping reads `unstamped`, with its age.
+  otherwise any later commit makes it read `behind N`. A supersede keeps the
+  stamp, so it corrects the record of that run: a new run is a new row. A
+  row migrated from a store that predates stamping reads `unstamped`, with
+  its age.
 - **`status` + `verdict`** is a pre-registration. No default kind has both:
   declare one under `[kinds]` in `symbion.toml`, e.g. `prediction = { status
   = true, verdict = true }`. That table replaces the defaults:
@@ -91,11 +94,13 @@ amendment`. To correct the lead of a row that is not a pre-registration,
 put a new one above it with `supersede <id> --prepend --body …`, or rewrite
 the whole body with `--body`. Until `symbion commit`, a supersede
 of your own row that no other row cites changes that row and keeps its id; a
-resolve, and any edit after the commit, adds a row.
+resolve, and any edit after the commit, adds a row. To keep the earlier
+version, commit first; that commits every other writer's pending rows too.
 
-`--body` is markdown. A body with backticks goes through `--body-file -` and a
-quoted heredoc (`<<'EOF'`): in `--body "…"` or an unquoted `<<EOF` the shell
-runs each backtick span as a command, silently.
+`--body` is markdown. A body with backticks or `$` goes through `--body-file -`
+and a quoted heredoc (`<<'EOF'`): in `--body "…"` or an unquoted `<<EOF` the
+shell expands each `$name` and `$(…)` and runs each backtick span as a command,
+silently.
 
 ```bash
 symbion add check --target "item:flaky upload test" --checked "pytest -k upload --count 50" --result "50 passed"

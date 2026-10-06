@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 
 import pytest
 
@@ -38,6 +39,19 @@ async def test_the_menu_button_takes_the_theme_colour(user: User, ctx_with_notes
     await user.open("/")
     (b,) = user.find(marker="menu").elements
     assert b.props.get("color") is None, b.props
+
+
+async def test_a_page_carries_the_stores_kind_colours_after_the_theme(user: User, repo,
+                                                                      tmp_path):
+    """A kind's `color` is a rule on its class, and only a rule after the
+    theme's beats `sb-kind-own` and a default kind's colour. `_client` is
+    nicegui's: its test User has no public way to the page's head."""
+    (tmp_path / "symbion.toml").write_text(
+        '[kinds]\nanomaly = { status = true, color = "flamingo" }\nnote = {}\n')
+    build_page(api.resolve(str(tmp_path)), author="ada")
+    await user.open("/")
+    head = user._client.head_html
+    assert head.index(".sb-kind-own {") < head.index(".sb-kind-anomaly { --kind: #f2cdcd; }")
 
 
 async def test_notes_filters_by_tag(user: User, ctx_with_notes):
@@ -830,11 +844,18 @@ def test_the_viewer_reads_only_markdown_inside_the_checkout(repo, tmp_path):
     (repo / "docs" / "a.md").write_text("# A")
     (repo / "notes.txt").write_text("x")
     (tmp_path / "out.md").write_text("outside")
-    (repo / "link.md").symlink_to(tmp_path / "out.md")
     assert md_path(ctx, "docs/a.md") == (repo / "docs" / "a.md").resolve()
-    for name in ("../out.md", str(tmp_path / "out.md"), "link.md", "notes.txt",
+    for name in ("../out.md", str(tmp_path / "out.md"), "notes.txt",
                  "gone.md", "docs", None):
         assert md_path(ctx, name) is None, name
+
+
+def test_the_viewer_refuses_symlinks_outside_the_checkout(repo, tmp_path, symlink):
+    from symbion.gui.notes import md_path
+    ctx = api.resolve(str(tmp_path))
+    (tmp_path / "out.md").write_text("outside")
+    symlink(repo / "link.md", tmp_path / "out.md")
+    assert md_path(ctx, "link.md") is None
 
 
 async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
@@ -914,7 +935,7 @@ async def test_the_sidebar_links_the_other_stores_a_serve_runs_on(user: User, re
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     records = tmp_path / "cache" / "symbion" / "serve"
     records.mkdir(parents=True)
-    dead = subprocess.Popen(["true"])
+    dead = subprocess.Popen([sys.executable, "-c", ""])
     dead.wait()
     for pid, url, store_dir, name in (
             (os.getpid(), "http://127.0.0.1:1111", tmp_path / "elsewhere-notes", "elsewhere"),
