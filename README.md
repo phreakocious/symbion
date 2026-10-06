@@ -40,19 +40,10 @@ The core's three dependencies serve a person at a terminal: `rich` and
 `rich-argparse` colour and align the output (a pipe gets plain text), and
 `argcomplete` does TAB completion.
 
-To work on symbion itself, install a clone editable:
-`pipx install -e /path/to/symbion` (or `uv tool install -e`). Without pipx or uv:
-
-```bash
-cd /path/to/symbion
-python3 -m venv .venv && .venv/bin/pip install -e .
-ln -s "$PWD/.venv/bin/symbion" ~/.local/bin/symbion   # any directory on PATH
-```
-
-Then run `command -v symbion` from another directory. The SessionStart hook
-finds `symbion` through PATH. Without it, the hook prints only
-`symbion: cannot read store at … because 'symbion' is not on PATH` in a
-project that adopted symbion, and nothing elsewhere.
+Run `command -v symbion` from another directory to check that it is on PATH.
+The SessionStart hook finds `symbion` through PATH. Without it, the hook
+prints one line in a project that adopted symbion, and nothing elsewhere:
+`symbion: cannot read store at … because 'symbion' is not on PATH`.
 
 **TAB completion.** Add your shell's line to its rc file:
 
@@ -169,7 +160,7 @@ command should be `symbion summary`.
 (Codex, Hermes Agent):
 
 ```
-- We use symbion for durable notes and tickets. Surface friction with it so it can be addressed.
+- We use symbion for durable notes and tickets.
 ```
 
 Hermes Agent runs no hook, so it needs a second line. Hermes reads only the
@@ -193,9 +184,9 @@ validated together before any is written. Either way:
 **The first note is a check, written now:** the state the store began at,
 which no commit message records. It pays first: dated, re-checkable, and
 visibly stale once HEAD moves. A check stamps HEAD and whether the tree is
-dirty, untracked files included, so on a dirty tree (the instruction line from
-step 3) it reads `unverifiable (dirty tree)`. Commit, write it again, and it
-reads `current`. Files the checked command writes count too, so git-ignore
+dirty, untracked files included. Until step 3's line is committed, the tree is
+dirty and the check reads `unverifiable (dirty tree)`. Commit, write it again,
+and it reads `current`. Files the checked command writes count too, so git-ignore
 `__pycache__/` before checking `pytest`. A check on something outside the repo
 (DNS, a host) takes `--external` and shows its age instead.
 
@@ -302,9 +293,8 @@ symbion arc seed --scope file --dry-run     # no arc needed; writes nothing
 ```
 
 Names resolve exact, then unique substring, then the one name equal but for
-case, else as typed. `cli.py` matches
-both `src/symbion/cli.py` and `tests/test_cli.py`, so it is refused: use the
-full path.
+case, else as typed. `parser.py` matches both `src/parser.py` and
+`tests/test_parser.py`, so it is refused: use the full path.
 
 A catalog of **measured** names (a reading, a serial) needs a resolver, or a
 near-miss mints a second target: substring matching cannot see that `3.1416`
@@ -425,6 +415,10 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e '.[test,gui]'
 .\.venv\Scripts\python.exe -m pytest -q
 ```
+
+To make the clone the `symbion` on PATH, link the venv's script into any
+directory on PATH, `ln -s "$PWD/.venv/bin/symbion" ~/.local/bin/symbion`, or
+install it with `pipx install -e /path/to/symbion` (or `uv tool install -e`).
 
 The specs in `docs/superpowers/specs/` are dated design records: why each
 decision was made. `SKILL.md` (in `src/symbion/data/skill/`, beside
