@@ -83,12 +83,20 @@ def test_a_timeout_kills_the_commands_children_too(tmp_path):
     `; true` makes the shell fork rather than exec the child; `sleep 5`
     above cannot see the difference."""
     marker = tmp_path / "marker"
-    child = f"import time; time.sleep(0.5); open({str(marker)!r}, 'w')"
+    # as_posix: Git's sh hands `\\` to a native program as `\`, so a repr()'d
+    # Windows path read as a \U escape and the child died at once; `; true`
+    # then exited 0 inside the timeout.
+    child = f"import time; time.sleep(0.5); open({marker.as_posix()!r}, 'w')"
+    cmd = f"{shlex.quote(sys.executable)} -c {shlex.quote(child)}; true"
     c = Config(project_root=tmp_path, command_timeout=0.1)
     with pytest.raises(catalog.CatalogError, match="killed"):
-        catalog.run_configured(c, f"{shlex.quote(sys.executable)} -c {shlex.quote(child)}; true")
+        catalog.run_configured(c, cmd)
     time.sleep(0.8)
     assert not marker.exists(), "a child of the timed-out command ran on"
+    # The control: given the time, the same command writes its marker, so the
+    # pass above is the kill's, not a child that never ran.
+    catalog.run_configured(Config(project_root=tmp_path, command_timeout=10), cmd)
+    assert marker.exists(), "the child never ran, so the kill above proved nothing"
 
 def test_command_under_timeout_still_succeeds(tmp_path):
     """A timeout that only ever fires is not a timeout: prove it does not
