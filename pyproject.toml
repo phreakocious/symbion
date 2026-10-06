@@ -1,6 +1,6 @@
 [project]
 name = "symbion"
-version = "0.4.0"
+version = "0.4.1.dev0"
 description = "A notebook and ticket registry for agents: dated rows attached to a commit, a file, an item, an arc or the project, kept in a sibling git repo of JSONL."
 readme = "README.md"
 license = "MIT"

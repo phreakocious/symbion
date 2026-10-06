@@ -242,7 +242,7 @@ The ancestor GUI predates half of symbion's note schema and renders none of it. 
 - **Stale page.** The GUI holds no snapshot; every request re-reads the store. A page rendered before a CLI write is stale in the browser, not in memory, and any navigation corrects it.
 - **Ambiguous name in the add form.** `catalog.resolve` refuses on ambiguity rather than guessing; the form surfaces the candidate list and does not submit.
 - **Departed target.** `supersede` inherits `target` and never re-resolves it (`store.py:352`), so a note on a departed catalog entry stays editable in the GUI exactly as on the CLI.
-- **Bind address.** localhost only, no auth. Single-user local tool; this is stated, not defended.
+- **Bind address.** localhost only, no auth. Single-user local tool; this is stated, not defended. *Amended 2026-10-06:* `--host` binds another address, and `--allow` (repeatable) names the addresses and networks that may connect; this machine always may, and a `--host` past loopback with no `--allow` is refused. The case: `serve` on one machine, the browser on another. Still no auth: an allowlist is not a login, and every allowed client writes as the serve's author. The check is ASGI middleware on both `http` and `websocket` scopes, because the page writes over its websocket. Bound to one address, the serve is reached from this machine at that address, so that address is allowed too, and it is the URL the serve records.
 
 ## Testing
 

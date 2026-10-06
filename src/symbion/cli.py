@@ -11,6 +11,7 @@ import argparse
 import difflib
 import errno
 import functools
+import ipaddress
 from importlib import metadata, resources
 import json
 import os
@@ -830,6 +831,14 @@ def _choice(legal, what, where, store_dir):
     return parse
 
 
+def _network(text: str):
+    """`serve --allow`: an address is its own one-address network."""
+    try:
+        return ipaddress.ip_network(text, strict=False)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def _catalog_choice(legal, what, store_dir, kinds=(), as_kind=None):
     """`kinds` and `as_kind` for a --type: a kind typed there (`--type bug`)
     is named as one, with the flag that takes it."""
@@ -1111,6 +1120,14 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
 
     sv = sub.add_parser("serve", help="local web UI (requires: pip install 'symbion[gui]')")
     sv.add_argument("--port", type=int, default=None)
+    sv.add_argument("--host", default="127.0.0.1", metavar="ADDR",
+                    help="the address to listen on (default: 127.0.0.1, this machine "
+                         "only; 0.0.0.0 is every address); any other needs --allow")
+    sv.add_argument("--allow", action="append", default=[], metavar="CIDR",
+                    type=_network,
+                    help="an address or network that may connect, e.g. 192.168.1.0/24 "
+                         "(repeatable); this machine always may. There is no login: "
+                         "each writes as --author")
     sv.add_argument("--author", default=None,
                     help="identity stamped on GUI writes (default: git user.name)")
     sv.add_argument("--no-browser", action="store_true")
@@ -2019,10 +2036,10 @@ def _dispatch(args, ctx) -> int:
             print("serve needs the gui extra: pip install 'symbion[gui]'",
                   file=sys.stderr)
             return 1
-        gui_serve.main(ctx, author=args.author or api.gui_author(),
-                       port=args.port, show=not args.no_browser,
-                       reload=args.reload, argv=args.argv)
-        return 0
+        return gui_serve.main(ctx, author=args.author or api.gui_author(),
+                              port=args.port, show=not args.no_browser,
+                              reload=args.reload, argv=args.argv,
+                              host=args.host, allow=args.allow)
 
     if args.cmd == "tags":
         counts = store.tag_counts(store.load(store_dir))

@@ -17,6 +17,7 @@ the bare traceback the handler exists to prevent.
 """
 from __future__ import annotations
 
+import ipaddress
 import multiprocessing
 import os
 import signal
@@ -24,17 +25,70 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from nicegui import ui
+from nicegui import app, ui
+from nicegui.helpers import format_url
 
 from . import servers
 from .pages import build_page
 from .theme import FAVICON_SVG
 
 
+class AllowOnly:
+    """ASGI: only this machine and `nets` may connect. Both scopes: the page
+    writes over its websocket, so an http-only check guards nothing."""
+
+    def __init__(self, app, nets) -> None:
+        self.app, self.nets = app, nets
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] in ("http", "websocket") and not self._allowed(scope.get("client")):
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body",
+                            "body": b"symbion serve: not in its --allow\n"})
+            return
+        await self.app(scope, receive, send)
+
+    def _allowed(self, client) -> bool:
+        try:
+            ip = ipaddress.ip_address(client[0])
+        except (TypeError, ValueError):
+            return False
+        # A dual-stack bind (`::`) sees an IPv4 client as ::ffff:a.b.c.d.
+        ip = getattr(ip, "ipv4_mapped", None) or ip
+        return ip.is_loopback or any(ip in n for n in self.nets)
+
+
+def _ip(host: str):
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None                         # a name
+
+
+def loopback(host: str) -> bool:
+    ip = _ip(host)
+    return ip.is_loopback if ip else host == "localhost"
+
+
+def local_url(host: str, port: int) -> str:
+    """Where this machine reaches a serve on `host`: on every address, by
+    loopback; on one address, only there."""
+    ip = _ip(host)
+    if ip and ip.is_unspecified:
+        host = "127.0.0.1" if ip.version == 4 else "::1"
+    return format_url("http", host, port)
+
+
 def _binds(host: str, port: int) -> bool:
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET,
+                           socket.SOCK_STREAM) as s:
             # On Windows SO_REUSEADDR binds over a live listener, and every
             # held port read as free; there a bind without it is the probe.
             if os.name != "nt":
@@ -45,24 +99,33 @@ def _binds(host: str, port: int) -> bool:
         return False
 
 
-def pick_free_port(preferred: int) -> int:
+def pick_free_port(preferred: int, host: str = "127.0.0.1") -> int:
     """`preferred` if it is free, else any free port. Two test binds, both
     with SO_REUSEADDR, as uvicorn binds: without it, the last serve's
     connections in TIME_WAIT refuse the port, and the serve moves at each
     restart. On macOS each bind alone misses a holder: one on 127.0.0.1
     passes the any-address bind, and one on every address passes the
     127.0.0.1 bind, where uvicorn would then take its loopback traffic
-    (measured 2026-10-02)."""
-    if _binds("127.0.0.1", preferred) and _binds("", preferred):
+    (measured 2026-10-02). A third on `host`, the address uvicorn binds:
+    macOS passes both others beside a holder there. Raises OSError when
+    `host` is no address of this machine."""
+    if all(_binds(h, preferred) for h in {"127.0.0.1", "", host}):
         return preferred
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET,
+                       socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
         return s.getsockname()[1]
 
 
-def main(ctx, *, author: str, port=None, show: bool = True,
-         reload: bool = False, argv=()) -> None:
-    """`argv` is the CLI's own, `--dir` included: --reload re-runs it."""
+def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False,
+         argv=(), host: str = "127.0.0.1", allow=()) -> int:
+    """`argv` is the CLI's own, `--dir` included: --reload re-runs it.
+    `allow` is ip_network objects: who besides this machine may connect."""
+    if not loopback(host) and not allow:
+        print(f"error: --host {host} lets other machines connect, and the GUI writes "
+              "with no login: name the ones that may with --allow (an address or a "
+              "network, e.g. 192.168.1.0/24)", file=sys.stderr)
+        return 1
     if hasattr(signal, "SIGBREAK"):
         # Windows' Ctrl+Break: uvicorn stops on it, then re-raises it under
         # the default handler, which ended the process before the finally
@@ -88,14 +151,28 @@ def main(ctx, *, author: str, port=None, show: bool = True,
                 except KeyboardInterrupt:
                     pass
     build_page(ctx, author=author)
+    if not loopback(host):
+        # And the bound address: this machine reaches a serve on one address
+        # from that address, not from loopback.
+        own = _ip(host)
+        app.add_middleware(AllowOnly, nets=[*allow, ipaddress.ip_network(own)] if own
+                           else [*allow])
     # The store's own port, so a link to it outlives a restart (the owner,
     # 2026-10-02). `--port` overrides it and is never warned about.
     want = servers.port(ctx.store_dir) if port is None else None
-    port = port if port is not None else pick_free_port(want)
-    url = f"http://127.0.0.1:{port}"
+    try:
+        port = port if port is not None else pick_free_port(want, host)
+    except OSError as e:
+        print(f"error: cannot listen on {host}: {e.strerror or e}", file=sys.stderr)
+        return 1
+    url = local_url(host, port)
     mine = None
     if top:
         print(f"symbion → {url}  (writing as {author})", flush=True)
+        if not loopback(host):
+            print(f"listening on {host}, port {port}, for this machine and "
+                  f"{', '.join(map(str, allow))}. There is no login: each of them "
+                  f"writes as {author}.", flush=True)
         # For the other serves' sidebars. The first serve on a store stays
         # the one they link while it runs; a second records too, and its
         # links take over when the first stops.
@@ -107,7 +184,7 @@ def main(ctx, *, author: str, port=None, show: bool = True,
         elif want is not None and port != want:
             # Two names can give one port: say whose serve holds it.
             held = next((r for r in servers.running()
-                         if r["url"] == f"http://127.0.0.1:{want}"), None)
+                         if urlsplit(r["url"]).port == want), None)
             who = (f"the serve on {held['store']}, a store whose name gives the same port"
                    if held else "a process that is not a symbion serve")
             print(f"warning: this store's port, {want}, is held by {who}. This serve "
@@ -115,10 +192,10 @@ def main(ctx, *, author: str, port=None, show: bool = True,
                   file=sys.stderr, flush=True)
         mine = servers.record(url, ctx.store_dir)
     try:
-        # Loopback only: the GUI writes rows with no authentication, and
-        # ui.run() defaults to 0.0.0.0 outside native mode.
+        # Never ui.run()'s default, 0.0.0.0 outside native mode: the GUI
+        # writes rows with no authentication.
         ui.run(
-            host="127.0.0.1", port=port, show=show, reload=reload,
+            host=host, port=port, show=show, reload=reload,
             uvicorn_reload_dirs=str(Path(__file__).resolve().parent),
             uvicorn_reload_includes="*.py",
             title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON_SVG,
@@ -131,6 +208,7 @@ def main(ctx, *, author: str, port=None, show: bool = True,
     finally:
         if mine:
             mine.unlink(missing_ok=True)
+    return 0
 
 
 if __name__ in {"__main__", "__mp_main__"}:

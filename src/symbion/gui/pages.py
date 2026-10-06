@@ -163,7 +163,11 @@ def build_page(ctx, *, author: str) -> None:
         params = dict(request.query_params)
         kwargs = filters.from_params(params)
         q = (params.get("q") or "").strip()
-        base = {k: v for k, v in params.items() if k in filters.FILTER_KEYS and v}
+        # What a chip or a search adds to. Not the id: one row has nothing
+        # to narrow, and its kind chip opened that row again under
+        # `id=… · kind=bug` (the owner, 2026-10-06).
+        base = {k: v for k, v in params.items()
+                if k in filters.FILTER_KEYS and k != "id" and v}
         every = S.load(ctx.store_dir)
         heads = S.heads(every)
         old = kwargs.get("id")
@@ -192,7 +196,7 @@ def build_page(ctx, *, author: str) -> None:
         rows = S.newest_first(rows)
         git_head = gitref.head_sha(ctx.cfg)
         shell(ctx, author, [("Notebook", "/"), (filters.describe(kwargs, q), None)], q=q,
-              keep=base, here="" if base else "/notes")
+              keep=base, here="" if base or old else "/notes")
         with ui.column().classes("sb-main gap-4"):
             if len(hits) > 1:
                 ui.label(f"{len(hits)} rows end in -{old}; open the one you mean") \

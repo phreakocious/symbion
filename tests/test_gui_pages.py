@@ -483,6 +483,19 @@ async def test_a_chip_in_a_filtered_view_narrows_it(user: User, ctx_with_notes):
     assert _hrefs(user, "tag-blue") == {"/notes?tag=blue"}
 
 
+async def test_a_chip_or_a_search_on_a_notes_own_page_starts_a_filter(
+        user: User, ctx_with_notes):
+    """One note's page is `?id=`: its chips and the search kept the id, so
+    the kind chip opened the same one row under `id=… · kind=bug`."""
+    bug = store.query(store.load(ctx_with_notes.store_dir), kind="bug")[0]
+    await user.open(f"/notes?id={bug.id}")
+    assert _hrefs(user, "note-kind") == {"/notes?kind=bug"}
+    assert _hrefs(user, "tag-blue") == {"/notes?tag=blue"}
+    user.find(marker="search").type("alpha").trigger("keydown.enter")
+    await user.should_see('search "alpha"')       # the new page; then the whole title
+    assert {e.text for e in user.find(marker="page-title").elements} == {'search "alpha"'}
+
+
 async def test_a_note_under_an_arc_links_to_it_and_the_arc_page_lists_its_notes(
         user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))

@@ -323,3 +323,97 @@ def test_a_port_held_on_every_address_reads_as_taken():
         held.listen()
         port = held.getsockname()[1]
         assert pick_free_port(port) != port
+
+
+# ---- --host and --allow: a serve another machine reaches ----
+
+def test_a_wide_serve_lets_in_this_machine_and_allow_only():
+    """The GUI writes with no login, so past loopback only --allow may
+    connect. Both scopes: the page writes over its websocket, and an
+    http-only check would guard nothing. Lifespan passes, or the app never
+    starts."""
+    import asyncio
+    import ipaddress
+    from symbion.gui.serve import AllowOnly
+    reached, sent = [], []
+
+    async def app(scope, receive, send):
+        reached.append((scope["type"], (scope.get("client") or ("",))[0]))
+
+    async def send(m):
+        sent.append(m)
+
+    mw = AllowOnly(app, nets=[ipaddress.ip_network("10.1.0.0/16")])
+    asyncio.run(mw({"type": "lifespan"}, None, send))
+    ips = ["127.0.0.1", "::1", "10.1.2.3", "::ffff:10.1.2.3", "10.2.0.1", "::ffff:127.0.0.2"]
+    for typ in ("http", "websocket"):
+        for ip in ips:
+            asyncio.run(mw({"type": typ, "client": (ip, 5000)}, None, send))
+        asyncio.run(mw({"type": typ, "client": None}, None, send))
+    assert reached == [("lifespan", "")] + [(t, ip) for t in ("http", "websocket")
+                                            for ip in ips if ip != "10.2.0.1"]
+    assert [m.get("status", m.get("code")) for m in sent if "body" not in m] \
+        == [403, 403, 1008, 1008]
+
+
+def test_a_serve_names_the_address_this_machine_reaches():
+    """The recorded and printed URL: the summary's link and the other
+    stores' sidebars use it. A serve on every address answers on loopback;
+    one on a single address answers only there."""
+    from symbion.gui.serve import local_url
+    assert local_url("127.0.0.1", 5) == "http://127.0.0.1:5"
+    assert local_url("0.0.0.0", 5) == "http://127.0.0.1:5"
+    assert local_url("::", 5) == "http://[::1]:5"
+    assert local_url("192.0.2.7", 5) == "http://192.0.2.7:5"
+    assert local_url("fe80::7", 5) == "http://[fe80::7]:5"
+
+
+def _main_host(tmp_path, monkeypatch, **kw):
+    """serve.main up to ui.run with these flags: its return, what it gave
+    ui.run, and the middleware it added (the app is nicegui's global one,
+    so a real add would reach every later GUI test)."""
+    from symbion import api
+    from symbion.gui import serve
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(serve, "build_page", lambda ctx, author: None)
+    seen, added = {}, []
+    monkeypatch.setattr(serve.ui, "run", lambda **k: seen.update(k))
+    monkeypatch.setattr(serve.app, "add_middleware", lambda cls, **k: added.append(k))
+    store.ensure_store(tmp_path / "s-notes")
+    kw.setdefault("port", _free_port())
+    rc = serve.main(api.resolve(str(tmp_path / "s-notes")), author="t", show=False, **kw)
+    return rc, seen, added
+
+
+def test_a_serve_past_loopback_needs_allow(tmp_path, monkeypatch, capsys):
+    import ipaddress
+    rc, seen, added = _main_host(tmp_path, monkeypatch, host="0.0.0.0")
+    assert rc == 1 and not seen and not added
+    assert "--allow" in capsys.readouterr().err
+
+    net = ipaddress.ip_network("10.1.0.0/16")
+    rc, seen, added = _main_host(tmp_path, monkeypatch, host="0.0.0.0", allow=[net])
+    assert rc == 0 and seen["host"] == "0.0.0.0"
+    assert net in added[0]["nets"]
+    assert "10.1.0.0/16" in capsys.readouterr().out
+
+    rc, seen, added = _main_host(tmp_path, monkeypatch)
+    assert rc == 0 and seen["host"] == "127.0.0.1" and not added
+
+    # On one address, this machine connects from that address, not loopback.
+    rc, seen, added = _main_host(tmp_path, monkeypatch, host="192.0.2.7", allow=[net])
+    assert ipaddress.ip_network("192.0.2.7/32") in added[0]["nets"]
+    capsys.readouterr()
+    # 192.0.2.7 is a documentation address, on no machine: the port probe
+    # binds it, and says so.
+    rc, seen, added = _main_host(tmp_path, monkeypatch, host="192.0.2.7", allow=[net],
+                                 port=None)
+    assert rc == 1 and not seen
+    assert "error: cannot listen on 192.0.2.7" in capsys.readouterr().err
+
+
+def test_a_bad_allow_is_a_usage_error(tmp_path, capsys):
+    from symbion import cli
+    store.ensure_store(tmp_path)
+    assert cli.main(["--dir", str(tmp_path), "serve", "--allow", "lan"]) == 2
+    assert "--allow: 'lan' does not appear to be" in capsys.readouterr().err
