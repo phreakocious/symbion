@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
@@ -27,12 +28,12 @@ if SH is None:
     pytest.skip("no sh: Git for Windows installs one", allow_module_level=True)
 
 # The dir holding the `symbion` console script this suite itself runs under
-# (installed editable into this venv) -- NOT from shutil.which("symbion"),
-# which returns None whenever the calling shell hasn't activated the venv
-# (true of this very test run). sys.executable, UNRESOLVED, is always the
-# venv's own python -- .resolve() would follow the venv symlink straight
-# through to the real system interpreter's bin dir, which has no `symbion`.
-SYMBION_BIN = str(Path(sys.executable).parent)
+# -- NOT from shutil.which("symbion"), which returns None whenever the calling
+# shell hasn't activated the venv (true of this very test run). sysconfig's
+# scripts dir is where pip put it for this interpreter: a venv's bin (Scripts
+# on Windows), or outside a venv the install's own, which on Windows is
+# Scripts beside python.exe, not python.exe's dir (CI's setup-python layout).
+SYMBION_BIN = str(Path(sysconfig.get_path("scripts")))
 # That script imports symbion through the venv's editable install; this
 # tree's src/ goes first (conftest.py says why).
 SRC_ENV = {"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}

@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -1342,7 +1343,7 @@ def test_a_reader_that_closes_the_pipe_early_gets_no_python_error(argv, tmp_path
     run("add", "note", "--target", "project", "--body", "x" * 200_000, store_dir=tmp_path)
     r, w = os.pipe()
     os.close(r)
-    p = subprocess.run([str(Path(sys.executable).parent / "symbion"), "--dir", str(tmp_path),
+    p = subprocess.run([str(Path(sysconfig.get_path("scripts")) / "symbion"), "--dir", str(tmp_path),
                         *argv], stdout=w, stderr=subprocess.PIPE, text=True)
     os.close(w)
     assert (p.returncode, p.stderr) == (141, "")
@@ -1352,7 +1353,7 @@ def test_a_pipe_in_the_windows_code_page_carries_utf8_both_ways(tmp_path):
     """On Windows a pipe's encoding is cp1252: `list` exited 1 on a row holding
     `→`, and a body piped to --body-file - was stored garbled. PYTHONIOENCODING
     gives any platform that pipe."""
-    sym = str(Path(sys.executable).parent / "symbion")
+    sym = str(Path(sysconfig.get_path("scripts")) / "symbion")
     env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
     store.ensure_store(tmp_path)
     add = subprocess.run([sym, "--dir", str(tmp_path), "add", "note", "--target", "project",

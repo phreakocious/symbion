@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import sysconfig
 
 import pytest
 from symbion import cli, store
@@ -21,7 +22,7 @@ def default_codex_home(monkeypatch):
 
 def run_hook(repo, **overrides):
     env = {**os.environ, "PATH": os.pathsep.join([
-        str(Path(sys.executable).parent), str(Path(shutil.which("git")).parent)]),
+        str(Path(sysconfig.get_path("scripts"))), str(Path(shutil.which("git")).parent)]),
         "SYMBION_DIR": "", "SYMBION_AUTHOR": "", **overrides}
     return subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive",
                            "-ExecutionPolicy", "Bypass", "-File", str(HOOK)],

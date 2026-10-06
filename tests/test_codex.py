@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import sysconfig
 
 import pytest
 from symbion import cli, store
@@ -90,7 +91,7 @@ def test_the_installed_codex_hook_reads_its_session_cwd_as_codex(tmp_path, monke
     # A bare base PATH proves the hook needs nothing from the developer's;
     # Windows keeps its own, where powershell.exe lives.
     base = os.environ["PATH"] if os.name == "nt" else "/usr/bin:/bin"
-    env = {**os.environ, "PATH": os.pathsep.join([str(Path(sys.executable).parent), str(git), base]),
+    env = {**os.environ, "PATH": os.pathsep.join([str(Path(sysconfig.get_path("scripts"))), str(git), base]),
            "CLAUDE_PROJECT_DIR": str(tmp_path)}
     if os.name == "nt":
         env["SYMBION_PROJECT_DIR"] = str(tmp_path)  # Windows always uses the session cwd

@@ -2,13 +2,14 @@ import os
 import re
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 
 from symbion import cli, store
 
 # The console script this suite runs under (test_hook.py says why not `which`).
-SYMBION = str(Path(sys.executable).parent / "symbion")
+SYMBION = str(Path(sysconfig.get_path("scripts")) / "symbion")
 
 
 def tab(line, cwd):

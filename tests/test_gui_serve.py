@@ -8,6 +8,7 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.request
 from pathlib import Path
@@ -20,7 +21,7 @@ from symbion import store     # noqa: E402
 
 # The console script beside this venv's python (test_hook.py says why not
 # shutil.which): its `__main__` guard is half of what broke --reload.
-SYMBION = str(Path(sys.executable).parent / "symbion")
+SYMBION = str(Path(sysconfig.get_path("scripts")) / "symbion")
 # Windows signals no process group: the child leads its own console group,
 # and Ctrl+Break, which serve takes as Ctrl-C, is what reaches it there.
 GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
