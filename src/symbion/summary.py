@@ -628,6 +628,20 @@ def render_summary(d: dict, paint=plain) -> str:
     return "\n".join(out)
 
 
+def one_line(d: dict) -> str:
+    """The person's line at session start: the header, the soonest due date
+    and the GUI. The rest of the text is for the agent."""
+    line = render_summary(d).split("\n", 1)[0]
+    n = len(d["due"]) + d["due_elided"]
+    if n == 1:
+        line += f"; 1 row {d['due'][0]['phrase']}"
+    elif n:
+        line += f"; {n} rows due, the first {d['due'][0]['phrase']}"
+    if d.get("gui"):
+        line += f" · {d['gui']}"
+    return line
+
+
 def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -> dict:
     """Composed list/heads_for calls. No new query logic.
 

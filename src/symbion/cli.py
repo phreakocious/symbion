@@ -478,6 +478,16 @@ def _painter(kinds=None):
     return term.painter(kinds)
 
 
+def _hook_json(text: str, line: str) -> str:
+    """A SessionStart hook's plain stdout reaches only the agent. In this JSON
+    `additionalContext` goes to the agent and `systemMessage` to the person's
+    terminal. Codex shows `systemMessage` as a warning, so Codex gets none."""
+    out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+    if api.author_default() != "codex":
+        out["systemMessage"] = line
+    return json.dumps(out)
+
+
 def _gui(store_dir):
     """The URL of a serve on this store, for the ids a terminal prints; None
     in a pipe, whose line never changes."""
@@ -829,7 +839,9 @@ class _Parser(argparse.ArgumentParser):
         if bad and bad[1] in _VERB_HINTS:        # the usage line lists the verbs
             message = f"no verb {bad[1]!r}: {_VERB_HINTS[bad[1]]}"
         stray = re.match(r"argument KIND: invalid kind '([^']*)'", message)
-        if stray and self._argv[:1] != [stray[1]]:
+        if stray and (pair := self._measure_hint([stray[1]])):
+            message = f"{stray[1]!r} was read as KIND: {pair}"
+        elif stray and self._argv[:1] != [stray[1]]:
             # Not the word after `add`: the next word of an unquoted value
             # (`--ref item:a b`) filled the optional KIND, and the list of
             # kinds sent its author to the wrong place (dogfood, 2026-09-29).
@@ -852,6 +864,9 @@ class _Parser(argparse.ArgumentParser):
         if extras and self._subparsers is None:
             hints = [f"{x}: use {_FLAG_HINTS[x]}" for x in extras if x in _FLAG_HINTS]
             bare = [x for x in extras if not x.startswith("-")]
+            if pairs := self._measure_hint(bare):
+                hints.append(pairs)
+                bare = [x for x in bare if not _PAIR.match(x)]
             if bare and "--body" in self._option_string_actions:
                 # A quoted string arrives as one token with its spaces; several
                 # space-free words are an unquoted value that split.
@@ -862,6 +877,17 @@ class _Parser(argparse.ArgumentParser):
                        + "".join(f"; {h}" for h in hints))
         return ns, extras
 
+    def _measure_hint(self, words):
+        """`--measure a=1 b=2` leaves `b=2` over: a second pair, not an
+        unquoted value that split (dogfood, 2026-10-08)."""
+        pairs = [x for x in words if _PAIR.match(x)]
+        if pairs and "--measure" in self._option_string_actions:
+            return "each KEY=VALUE needs its own --measure: " + " ".join(
+                f"--measure {shlex.quote(p)}" for p in pairs)
+        return None
+
+
+_PAIR = re.compile(r"[^\s=-][^\s=]*=")
 
 # A first-day user's guesses (newcomer walk-through, 2026-09-26), each
 # answered with the command that does it.
@@ -1228,7 +1254,11 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     sm = sub.add_parser("summary", help="what is open: counts, due rows, arcs, open rows "
                                         "(the session-start text)")
     sm.add_argument("--full", action="store_true", help="lift the display caps")
-    sm.add_argument("--json", action="store_true")
+    smgrp = sm.add_mutually_exclusive_group()
+    smgrp.add_argument("--json", action="store_true")
+    smgrp.add_argument("--hook", action="store_true",
+                       help="the SessionStart hook's JSON: the text for the agent, "
+                            "and one line for the person's terminal")
 
     sc = sub.add_parser("schema", help="this store's vocabulary: every kind with its bits "
                                        "and row count, then the target types")
@@ -1724,7 +1754,7 @@ def _dispatch(args, ctx) -> int:
             if args.cmd != "summary":
                 print(msg, file=sys.stderr)
         elif args.cmd == "summary":
-            print(msg)
+            print(_hook_json(msg, msg) if args.hook else msg)
             return 0
         else:
             print(msg, file=sys.stderr)
@@ -2183,7 +2213,7 @@ def _dispatch(args, ctx) -> int:
         if not store.exists(store_dir):   # text mode never gets here: see _READS
             print(json.dumps(summ.empty_summary()))
             return 0
-        at_terminal = sys.stdout.isatty() and not args.json
+        at_terminal = sys.stdout.isatty() and not (args.json or args.hook)
         data = summ.summary(store_dir, cfg, full=args.full,
                             reader=None if at_terminal else api.author_default())
         # Both links lead to the same skill directory, so either serves.
@@ -2194,7 +2224,10 @@ def _dispatch(args, ctx) -> int:
         data["leftovers"] = (_old_copies(Path(cfg.project_root))
                              if cfg.project_root is not None else [])
         data["named_store"] = _named_store(ctx)
-        print(json.dumps(data) if args.json else summ.render_summary(data, _painter(ctx.kinds)))
+        if args.hook:
+            print(_hook_json(summ.render_summary(data), summ.one_line(data)))
+        else:
+            print(json.dumps(data) if args.json else summ.render_summary(data, _painter(ctx.kinds)))
         return 0
 
     if args.cmd == "schema":

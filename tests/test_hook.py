@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -46,6 +47,15 @@ SRC_ENV.update({k: os.environ[k] for k in ("SYSTEMROOT", "USERPROFILE") if k in 
 TOOLS = os.pathsep.join([SYMBION_BIN, str(Path(shutil.which("git")).parent), "/usr/bin", "/bin"])
 
 
+
+def _context(stdout):
+    """What the agent reads: a JSON reply's additionalContext, else stdout
+    as it is (an error, or the hook's own not-on-PATH line)."""
+    try:
+        return json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    except ValueError:
+        return stdout
+
 def _git(cwd, *args):
     subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
 
@@ -78,7 +88,28 @@ def test_hook_prints_the_zero_line_for_an_empty_but_existing_store(git_repo, tmp
                             "SYMBION_DIR": str(store_dir)})
     assert r.returncode == 0
     assert r.stderr == ""
-    assert "bug 0" in r.stdout
+    assert "bug 0" in _context(r.stdout)
+
+
+def test_hook_shows_the_person_one_line_and_the_agent_the_summary(git_repo, tmp_path):
+    """A SessionStart hook's plain stdout reaches only the agent; the person
+    saw nothing. systemMessage is the line Claude Code prints to them."""
+    store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
+    store.add(store_dir, kind="bug", target={"type": "project", "name": None},
+              body="the open head", status="open")
+    env = {**SRC_ENV, "PATH": TOOLS, "SYMBION_DIR": str(store_dir)}
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env)
+    assert r.returncode == 0 and r.stderr == ""
+    out = json.loads(r.stdout)
+    assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    text = out["hookSpecificOutput"]["additionalContext"]
+    assert "the open head" in text
+    assert out["systemMessage"] == text.splitlines()[0] and "bug 1" in out["systemMessage"]
+    # Codex shows a systemMessage as a warning: the agent's text only.
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                       env={**env, "SYMBION_AUTHOR": "codex"})
+    assert list(json.loads(r.stdout)) == ["hookSpecificOutput"]
 
 
 def test_hook_names_the_absent_store(git_repo, tmp_path):
@@ -95,8 +126,9 @@ def test_hook_names_the_absent_store(git_repo, tmp_path):
                             "SYMBION_DIR": str(tmp_path / "nope")})
     assert r.returncode == 0
     assert r.stderr == ""
-    assert "no store at" in r.stdout and str(tmp_path / "nope") in r.stdout
-    assert "bug 0" not in r.stdout, "an absent store must not print the zero-counts line"
+    assert "no store at" in _context(r.stdout) and str(tmp_path / "nope") in _context(r.stdout)
+    assert "bug 0" not in _context(r.stdout), "an absent store must not print the zero-counts line"
+    assert "no store at" in json.loads(r.stdout)["systemMessage"], "the person must see it too"
 
 
 def test_hook_is_silent_in_a_project_that_never_adopted_symbion(git_repo):
@@ -113,7 +145,7 @@ def test_hook_names_a_pointer_to_a_store_that_is_not_there(git_repo):
     (git_repo / ".symbion").write_text("../gone-notes\n")
     r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": TOOLS})
-    assert r.returncode == 0 and "no store at" in r.stdout and "gone-notes" in r.stdout
+    assert r.returncode == 0 and "no store at" in _context(r.stdout) and "gone-notes" in _context(r.stdout)
 
 
 def test_hook_names_a_pointer_that_links_to_a_directory(git_repo, symlink):
@@ -123,8 +155,8 @@ def test_hook_names_a_pointer_that_links_to_a_directory(git_repo, symlink):
     symlink(git_repo / ".symbion", "../elsewhere", directory=True)
     r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": TOOLS})
-    assert r.returncode == 0 and "read error" not in r.stdout + r.stderr
-    assert "is a link to ../elsewhere" in r.stdout
+    assert r.returncode == 0 and "read error" not in _context(r.stdout) + r.stderr
+    assert "is a link to ../elsewhere" in _context(r.stdout)
 
 
 def test_hook_exits_0_and_prints_nothing_when_symbion_is_not_installed_and_no_store(tmp_path):
@@ -154,7 +186,7 @@ def test_hook_names_the_missing_binary_when_a_sibling_store_exists(git_repo, tmp
                        env={**SRC_ENV, "PATH": "/nonexistent"})
     assert r.returncode == 0
     assert r.stderr == ""
-    assert "not on PATH" in r.stdout
+    assert "not on PATH" in _context(r.stdout)
 
 
 def test_hook_summarizes_the_project_dir_not_the_cwd(tmp_path):
@@ -178,7 +210,7 @@ def test_hook_summarizes_the_project_dir_not_the_cwd(tmp_path):
                        env={**SRC_ENV, "PATH": TOOLS,
                             "CLAUDE_PROJECT_DIR": str(proj)})
     assert r.returncode == 0 and r.stderr == ""
-    assert "bug 1" in r.stdout, f"summarized the cwd, not the project: {r.stdout!r}"
+    assert "bug 1" in _context(r.stdout), f"summarized the cwd, not the project: {r.stdout!r}"
 
 
 def test_hook_still_uses_the_cwd_when_no_project_dir_is_set(tmp_path):
@@ -197,7 +229,7 @@ def test_hook_still_uses_the_cwd_when_no_project_dir_is_set(tmp_path):
     r = subprocess.run([SH, str(HOOK)], cwd=proj, capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": TOOLS})
     assert r.returncode == 0 and r.stderr == ""
-    assert "bug 1" in r.stdout
+    assert "bug 1" in _context(r.stdout)
 
 
 def test_hook_prints_open_heads_and_not_the_schema(git_repo, tmp_path):
@@ -216,7 +248,7 @@ def test_hook_prints_open_heads_and_not_the_schema(git_repo, tmp_path):
                        env={**SRC_ENV, "PATH": TOOLS,
                             "SYMBION_DIR": str(store_dir)})
     assert r.returncode == 0 and r.stderr == ""
-    lines = r.stdout.splitlines()
+    lines = _context(r.stdout).splitlines()
     # SYMBION_DIR names a store the repo's tree does not, so the header
     # says which one: see test_summary_names_a_store_set_by_the_environment.
     assert lines[0].startswith("symbion --dir ../store: open outside arcs: anomaly 1")
@@ -237,8 +269,8 @@ def test_hook_finds_a_pointed_store_with_no_symbion_on_path(git_repo, tmp_path):
                        capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": "/nonexistent", "HOME": str(tmp_path)})
     assert r.returncode == 0 and r.stderr == ""
-    assert "not on PATH" in r.stdout
-    assert "elsewhere-store" in r.stdout
+    assert "not on PATH" in _context(r.stdout)
+    assert "elsewhere-store" in _context(r.stdout)
 
 
 @pytest.mark.parametrize("via", ["pointer", "SYMBION_DIR"])
@@ -253,7 +285,7 @@ def test_hook_names_a_selected_store_that_is_missing_with_no_symbion_on_path(git
         env["SYMBION_DIR"] = str(tmp_path / "gone-store")
     r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env)
     assert r.returncode == 0 and r.stderr == ""
-    assert "not on PATH" in r.stdout and "gone-store" in r.stdout
+    assert "not on PATH" in _context(r.stdout) and "gone-store" in _context(r.stdout)
 
 
 def test_hook_is_silent_on_the_same_tree_without_the_pointer(git_repo, tmp_path):
@@ -283,7 +315,7 @@ def test_hook_reads_a_pointer_saved_with_crlf(git_repo, tmp_path):
                        capture_output=True, text=True,
                        env={**SRC_ENV, "PATH": "/nonexistent", "HOME": str(tmp_path)})
     assert r.returncode == 0 and r.stderr == ""
-    assert "elsewhere-store because 'symbion' is not on PATH" in r.stdout, r.stdout
+    assert "elsewhere-store because 'symbion' is not on PATH" in _context(r.stdout), r.stdout
 
 
 def test_hook_ignores_a_blank_pointer(git_repo, tmp_path):
@@ -314,7 +346,7 @@ def test_hook_names_a_malformed_kinds_table_instead_of_reading_as_no_store(git_r
                             "SYMBION_DIR": str(store_dir)})
     assert r.returncode == 0
     assert r.stderr == ""
-    assert "[kinds]" in r.stdout and "'note'" in r.stdout, f"silent: {r.stdout!r}"
+    assert "[kinds]" in _context(r.stdout) and "'note'" in _context(r.stdout), f"silent: {r.stdout!r}"
 
 
 @pytest.mark.parametrize("layout", ["sibling", "pointer", "worktree pointer", "none"])
@@ -342,6 +374,6 @@ def test_hook_in_a_linked_worktree_reads_the_main_checkouts_store(git_repo, tmp_
                             "CLAUDE_PROJECT_DIR": str(wt)})
     assert r.returncode == 0 and r.stderr == ""
     if s:
-        assert "bug 1" in r.stdout, f"skipped the main checkout's store: {r.stdout!r}"
+        assert "bug 1" in _context(r.stdout), f"skipped the main checkout's store: {r.stdout!r}"
     else:
         assert r.stdout == ""

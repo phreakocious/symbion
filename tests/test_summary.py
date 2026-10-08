@@ -796,6 +796,24 @@ def test_the_due_block_lists_past_due_and_due_soon_open_rows_once(tmp_path):
         "the due block leads, right under the header"
 
 
+def test_the_persons_line_is_the_header_the_soonest_due_row_and_the_gui(tmp_path):
+    """The hook's systemMessage: one line, whatever the agent's text holds."""
+    cfg = Config(project_root=tmp_path)
+    t = {"type": "item", "name": "x"}
+    store.add(tmp_path, kind="task", target=t, body="late\nsecond line")
+    data = summary.summary(tmp_path, cfg)
+    header = summary.render_summary(data).splitlines()[0]
+    assert summary.one_line(data) == header, "no due row, no serve: the header alone"
+    store.add(tmp_path, kind="task", target=t, due="2000-01-01")
+    data = summary.summary(tmp_path, cfg)
+    assert summary.one_line(data) == (summary.render_summary(data).splitlines()[0]
+                                      + f"; 1 row {data['due'][0]['phrase']}")
+    store.add(tmp_path, kind="task", target=t, due="2001-01-01")
+    data = summary.summary(tmp_path, cfg) | {"gui": "http://127.0.0.1:1"}
+    assert summary.one_line(data).endswith(
+        f"; 2 rows due, the first {data['due'][0]['phrase']} · http://127.0.0.1:1")
+
+
 def test_the_due_block_is_capped_and_says_how_many_it_hid(tmp_path):
     cfg = Config(project_root=tmp_path)
     for i in range(summary.DUE_CAP + 3):

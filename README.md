@@ -7,6 +7,8 @@ person and a coding agent through one CLI. The CLI stands alone; the agent side
 (a shared skill and a SessionStart hook) supports Claude Code and Codex.
 Hermes Agent takes the skill, and a line in `AGENTS.md` in place of the hook.
 
+<img src="https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/session.svg" width="100%" alt="A Claude Code session: symbion's hook hands the agent the open rows; asked to work them, it fixes the bug, resolves its row, and hands the question back.">
+
 A note is dated, attributed, retractable, and attached to something stable: a
 commit, a file, a free-form item, or the whole project. Seven kinds by default:
 `check` (a dated verification), `decision` (an ADR), `bug`, `task`, `question`
@@ -85,7 +87,9 @@ package (SKILL.md, adoption.md, catalogs.md and the hook script), so an upgrade
 reaches every project. It registers the hook in `~/.claude/settings.json` when
 that file does not exist. When it does, `init` says the hook is already there,
 or prints the entry to append to `hooks.SessionStart` (it merges nothing), or
-says the file is not valid JSON. A `~/.claude/skills/symbion` that is not the
+says the file is not valid JSON. At each session start the hook gives the agent
+`symbion summary` and shows you one line of it: the open counts, the soonest due
+row and, while `symbion serve` runs, its address. A `~/.claude/skills/symbion` that is not the
 link is left alone and named. On Windows the link is a directory junction
 when the account cannot make a symlink, so neither Developer Mode nor an
 elevated terminal is needed.

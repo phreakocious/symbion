@@ -3175,6 +3175,22 @@ def test_a_first_guess_that_fails_names_the_command_that_works(tmp_path, capsys,
     assert says in err, err
 
 
+@pytest.mark.parametrize("argv", [
+    ["add", "check", "--target", "project", "--measure", "a=1", "b=2", "c=3"],
+    ["add", "--kind", "check", "--target", "project", "--measure", "a=1", "b=2"],  # b=2 fills KIND
+    ["resolve", "x", "--measure", "a=1", "b=2"],
+    ["supersede", "x", "--measure", "a=1", "b=2"],
+])
+def test_several_pairs_after_one_measure_name_the_flag_per_pair(tmp_path, capsys, argv):
+    """`--measure a=1 b=2` was told "a value with spaces needs quotes", and
+    its author looked for a quoting error that did not exist (dogfood,
+    2026-10-08): `--measure` takes one pair per flag."""
+    assert run(*argv, store_dir=tmp_path) == 2
+    err = capsys.readouterr().err
+    assert "each KEY=VALUE needs its own --measure: --measure b=2" in err, err
+    assert "needs quotes" not in err, err
+
+
 def test_a_body_that_cites_no_row_says_so(tmp_path, capsys):
     """Bodies cited rows that did not exist yet, as placeholders
     (`20990101-123xxx`, a full id of zeros), four times in five days, and

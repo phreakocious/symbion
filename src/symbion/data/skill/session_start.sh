@@ -77,5 +77,7 @@ cd "$root" 2>/dev/null || true   # a failed cd falls back to cwd; the hook never
 # what reaches the agent, and `2>/dev/null` made a store whose symbion.toml
 # carries a broken [kinds] table start the session exactly like a project that
 # never adopted symbion (measured 2026-09-22). Exit 0 still holds either way.
-symbion summary 2>&1 || true
+# --hook prints JSON, whose systemMessage line the person sees too; an error
+# is plain text, which reaches the agent as before.
+symbion summary --hook 2>&1 || true
 exit 0
