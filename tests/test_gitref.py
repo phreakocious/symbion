@@ -131,6 +131,27 @@ def test_commit_that_exists_but_is_not_an_ancestor_of_head_is_diverged(repo):
     assert gitref.check_state(cfg, {"sha": topic_sha, "dirty": False}) == ("diverged", None)
 
 
+def test_a_stamp_no_branch_or_tag_holds_is_dangling(repo):
+    """An amend after a check left its stamp on a commit only the reflog
+    keeps, and it read `diverged`: the word for a run on another live
+    branch, which says look there, where this one says re-run (2026-10-06).
+    A tag keeps the commit, so it holds the stamp as a branch does. Refs
+    change under a serve that keeps one HEAD, so a cached relation must not
+    keep the answer."""
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False}
+    _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--amend", "-m", "c1'")
+    assert gitref.check_state(cfg, prov) == ("dangling", None)
+    _run(repo, "tag", "kept", prov["sha"])
+    assert gitref.check_state(cfg, prov) == ("diverged", None)
+    # The ahead side: a checkout that lags a tip only `main` held.
+    tip = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False}
+    _run(repo, "checkout", "-q", "HEAD~1")
+    assert gitref.check_state(cfg, tip) == ("ahead", 1)
+    _run(repo, "branch", "-q", "-D", "main")
+    assert gitref.check_state(cfg, tip) == ("dangling", None)
+
+
 def test_a_stamp_this_checkout_has_not_reached_is_ahead_not_diverged(repo):
     """The stamp is a DESCENDANT of HEAD: the same line of development, read
     from a checkout that lags it. `merge-base --is-ancestor sha HEAD` fails

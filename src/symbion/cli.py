@@ -14,6 +14,7 @@ import functools
 import ipaddress
 from importlib import metadata, resources
 import json
+import math
 import os
 import re
 import shlex
@@ -438,8 +439,9 @@ default_branch = "{cfg.default_branch}"
 # catalog name per line. Exit 0: the first non-blank stdout line is the name
 # to store, in or out of the list. Exit 2: stdout lists the matches, one per
 # line; symbion refuses as ambiguous. Anything else is an error and stores
-# nothing. It runs while the store lock is held, so it must not write to the
-# store.
+# nothing. Like a catalog, it runs in the root of the current worktree, so a
+# script kept beside this file needs its path from there. It runs while the
+# store lock is held, so it must not write to the store.
 # A NUMERIC catalog without a resolver fragments: 3.1416 is not a
 # substring of 3.14159, so it silently becomes a second target.
 # `set -o pipefail` is load-bearing on a catalog that pipes: /bin/sh reports
@@ -486,8 +488,32 @@ def _gui(store_dir):
     return r and r["url"]
 
 
+def _serve_all(*, restart: bool) -> int:
+    """`serve --restart` and `serve --stop`: one line per serve, exit 1 if
+    any did not."""
+    if os.name == "nt":
+        print("error: serve --restart and --stop need POSIX signals; on Windows, "
+              "Ctrl-C each serve and start it again", file=sys.stderr)
+        return 1
+    from .gui import servers
+    results = servers.signal_all(restart)
+    if not results:
+        print("no symbion serve is running")
+    for what, r in results:
+        if what in ("restarted", "stopped"):
+            print(f"{what} {r['store']}: {r['url']}")
+        elif what == "exited":
+            print(f"{r['store']}: pid {r['pid']} exited instead of restarting; its terminal "
+                  "says why. A serve started before `serve --restart` existed stops on it: "
+                  "start that one again there.")
+        else:
+            print(f"{r['store']}: pid {r['pid']} did not {'restart' if restart else 'stop'} "
+                  "within 30 s")
+    return int(any(what not in ("restarted", "stopped") for what, _ in results))
+
+
 def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
-                since=None) -> None:
+                since=None, added=None) -> None:
     """`state` is api.verdict_state's pair for a verdict row, computed by the
     caller (batched per-listing where it needs a subject lookup); `subject`
     is the commit's subject line for a commit-target note, degrading to the
@@ -495,7 +521,8 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
     line. No created_at prefix: the id IS the timestamp, and the row used to
     print the same fact twice. `head` is the head of a superseded row's
     chain: without it an old row's `[open]` read as live (2026-09-23).
-    `since` is gitref.commits_since's count for the row, printed above 0."""
+    `since` is gitref.commits_since's count for the row, printed above 0.
+    `added` is summary.added's pair, printed below a clipped body."""
     # A superseded row's own status is history: printed first, `[open]`
     # read as live beside a resolved head (2026-09-28). The head's decides.
     status = store.read_status(head if head is not None else n)
@@ -549,17 +576,22 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
             print(f"    checked{at}: {text(n.checked)}")
         if n.result is not None:
             print(f"    result: {text(n.result)}")
+    if n.measurements:
+        m = summ.measured(n.measurements)
+        print(f"    measured: {m if full else summ.clip(m, summ.LIST_BODY_CHARS)}")
     if n.body and full:
         # A body is markdown by contract: printed as written here, so an
         # agent reads exactly what was stored. symbion.term renders it.
         print(f"    {n.body}")
     elif n.body:
         print(f"    {summ.clip(n.body, summ.LIST_BODY_CHARS)}")
+    if added and not full:
+        print(f"    {summ.added_label(added)} {added['added']}")
 
 
 # ---- add: rows in, one write out ----
 _ROW_KEY_ORDER = ("kind", "target", "body", "status", "checked", "result",
-                  "external", "arc_id", "due", "tags", "refs", "author")
+                  "measurements", "external", "arc_id", "due", "tags", "refs", "author")
 _ROW_KEYS = set(_ROW_KEY_ORDER)     # `add -h` prints the order: a copy lost `due`
 
 
@@ -620,6 +652,45 @@ def _body_fields(args, append=False) -> dict:
     return {"append_body" if append else "body": args.body}
 
 
+_MEASURE_MERGE_HELP = ("set a measurement (repeatable), as add --measure takes it: a "
+                       "name given replaces that name, and the others are inherited")
+
+
+def _measures_from_flags(flags) -> dict | None:
+    """`--measure KEY=VALUE`s as measurements: an int, else a float, else the
+    string; a value in double quotes is the string inside them.
+    api.check_measurements judges each value; a repeated name is refused
+    here, where the second would silently replace the first.
+
+    A number is the default even when it does not print back as typed:
+    `python=3.10` stores 3.1 and `zip=02134` 2134, but text would break the
+    comparison a measurement exists for (`"1.50" > 2` is true in jq), and
+    `secs=1.50` is what `printf %.2f` prints. So a note names the quoted
+    form instead, at the write (2026-10-07)."""
+    out = {}
+    for f in flags or ():
+        k, eq, v = f.partition("=")
+        if not eq or not k.strip():
+            raise SystemExit(f"--measure {f!r}: write KEY=VALUE, e.g. --measure passed=412")
+        if k in out:
+            raise SystemExit(f"--measure {k!r} is given twice; give each name once")
+        if len(v) >= 2 and v[0] == v[-1] == '"':
+            out[k] = v[1:-1]
+            continue
+        for parse in (int, float):
+            try:
+                num = parse(v)
+            except ValueError:
+                continue
+            if str(num) != v and math.isfinite(num):
+                print(f"note: --measure {k}={v} is stored as the number {num}; to keep "
+                      f"it as typed, write --measure '{k}=\"{v}\"'", file=sys.stderr)
+            v = num
+            break
+        out[k] = v
+    return out or None
+
+
 def _row_from_flags(args) -> dict:
     """The flag path as a `list --json`-shaped row, so both paths build a
     note the same way. Only the flags actually given are present, which is
@@ -627,7 +698,8 @@ def _row_from_flags(args) -> dict:
     refs = _refs_from_flags(args.refs)
     row = {"kind": args.kind, "target": {"type": args.type, "name": args.name},
            "body": args.body or None, "status": args.status, "checked": args.checked,
-           "result": args.result, "external": args.external,
+           "result": args.result, "measurements": _measures_from_flags(args.measures),
+           "external": args.external,
            "arc_id": args.arc_id, "due": args.due,
            "tags": args.tags or None, "refs": refs or None, "author": args.author}
     row = {k: v for k, v in row.items() if v is not None}
@@ -977,6 +1049,11 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     a.add_argument("--status", default=None, choices=sorted(store.STATUSES))
     a.add_argument("--checked", default=None, help="check: what was checked")
     a.add_argument("--result", default=None, help="check: verdict")
+    a.add_argument("--measure", dest="measures", action="append", default=[],
+                   metavar="KEY=VALUE",
+                   help="a number or a string under `measurements` (repeatable), which "
+                        "list --json gives as an object, so rows compare: --measure passed=412. "
+                        "A value in double quotes stays text: --measure 'python=\"3.10\"'")
     a.add_argument("--external", action="store_true", default=None,
                    help="verdict kinds: what was checked is outside this repo (DNS, a "
                         "host, a live db), so the row is stamped with when it ran, not "
@@ -1016,7 +1093,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                          "(`arc todo` is the open list)")
     li.add_argument("--grep", default=None, metavar="PATTERN",
                     help="regex, case-insensitive, over body, target name, checked, "
-                         "result, refs and #tags; ^ and $ anchor a line")
+                         "result, refs and #tags; ^ and $ anchor a line; an id "
+                         "or its tail also lists that row")
     li.add_argument("-F", "--fixed-strings", action="store_true",
                     help="take --grep as a literal string, not a regex")
     li.add_argument("--overdue", action="store_true",
@@ -1061,6 +1139,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                          "inherited refs stay")
     rs.add_argument("--result", default=None, help="the verdict; required on a "
                     "status+verdict kind (a pre-registration)")
+    rs.add_argument("--measure", dest="measures", action="append", default=[],
+                    metavar="KEY=VALUE", help=_MEASURE_MERGE_HELP)
     rs.add_argument("--author", default=None)
 
     sp = sub.add_parser("supersede", help="record a correction to a note")
@@ -1081,6 +1161,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     help="check: correct what was checked")
     sp.add_argument("--result", default=None,
                     help="check: correct the verdict")
+    sp.add_argument("--measure", dest="measures", action="append", default=[],
+                    metavar="KEY=VALUE", help=_MEASURE_MERGE_HELP)
     sp.add_argument("--external", action="store_true",
                     help="a supersede keeps the row's stamp: accepted on a row "
                          "add --external wrote, refused on any other")
@@ -1132,6 +1214,14 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     help="identity stamped on GUI writes (default: git user.name)")
     sv.add_argument("--no-browser", action="store_true")
     sv.add_argument("--reload", action="store_true", help="dev: reload on .py changes")
+    every = sv.add_mutually_exclusive_group()
+    every.add_argument("--restart", action="store_true",
+                       help="restart every serve you run on this machine, each in its own "
+                            "terminal and on its own port, so an upgrade or a code change "
+                            "reaches it; then exit. Needs no store")
+    every.add_argument("--stop", action="store_true",
+                       help="stop every serve you run on this machine, as Ctrl-C does; "
+                            "then exit. Needs no store")
 
     sub.add_parser("tags", help="list tag vocabulary with counts (catches near-synonyms)")
 
@@ -1502,13 +1592,27 @@ def _say_tip(store_dir, nid: str, *, resolving: bool):
     return tip
 
 
-def _say_rewritten(tip, note) -> None:
+def _say_rewritten(store_dir, tip, note) -> None:
     """An edit by a row's own author before `symbion commit` rewrites it
-    (the store's `rewritable`), so the id printed is the one given, not a new one."""
-    if tip is not None and note.id == tip.id:
+    (the store's `rewritable`), so the id printed is the one given, not a new one.
+    When a citation alone kept the row, the new id came with no reason and read
+    as the rule failing (2026-10-05): the store's other conditions are checked
+    here as `_supersede_unlocked` checks them, so only that case is named."""
+    if tip is None:
+        return
+    if note.id == tip.id:
         print(f"note: {note.id} was not yet committed, so it was edited in place; "
               f"no earlier version is kept (`symbion commit` before an edit keeps one, "
               f"and commits every other writer's pending rows too)", file=sys.stderr)
+        return
+    dropped = store.unholdable(tip) if note.kind == tip.kind else []
+    if note.status != tip.status or dropped or not store.own_draft(store_dir, tip, note.author):
+        return                                   # a new row whatever cites it
+    by = [i for i in store.citing(store.load(store_dir), tip) if i != note.id]
+    if by:
+        more = f", +{len(by) - _NEIGHBOUR_CAP} more" if len(by) > _NEIGHBOUR_CAP else ""
+        print(f"note: {tip.id} is cited by {', '.join(by[:_NEIGHBOUR_CAP])}{more}, "
+              f"so it is kept and this edit is a new row", file=sys.stderr)
 
 
 def _say_dropped(tip, note) -> None:
@@ -1599,6 +1703,8 @@ def _dispatch(args, ctx) -> int:
         import argcomplete
         print(argcomplete.shellcode(["symbion"], shell=args.shell), end="")
         return 0
+    if args.cmd == "serve" and (args.restart or args.stop):
+        return _serve_all(restart=args.restart)
 
     # An absent store is never a first session: `init` creates it. It is a
     # `.symbion` pointer to nowhere, a renamed repo, a wrong --dir or
@@ -1715,11 +1821,22 @@ def _dispatch(args, ctx) -> int:
                 print(f"note: read {args.name!r} as --type {t} "
                       f"--name {shlex.quote(n)}", file=sys.stderr)
                 args.type, args.name = t, n
-        filt = dict(target_type=args.type, target_name=api.canon(cfg, args.type, args.name),
+        filt = dict(target_type=args.type, target_name=api.canon(cfg, args.type, args.name, every),
                     kind=args.kind, tag=args.tag, arc_id=args.arc_id, author=args.author,
                     grep=grep, overdue=args.overdue or None,
                     since=args.since[1] if args.since else None)
         notes = store.query(base, status=args.status, **filt)
+        if grep is not None:
+            # An id is not text the pattern reads, so a cited tail read `0 of
+            # N match` while `show` found its row (2026-10-07). As in the
+            # GUI's search: a pasted id or tail joins the hits, and a
+            # superseded one brings its current row.
+            from .gui import filters
+            want = {i for n in every if filters.id_hit(n.id, args.grep)
+                    for i in (n.id, api._chain_tip(every, n.id).id)}
+            got = {n.id for n in notes}
+            notes += [n for n in store.query(base, status=args.status, **(filt | {"grep": None}))
+                      if n.id in want and n.id not in got]
         if args.note_id and (missing := [i for i in args.note_id
                                          if i not in {n.id for n in notes}]):
             # An empty listing reads the same as "this row exists and matched
@@ -1737,11 +1854,14 @@ def _dispatch(args, ctx) -> int:
             # --name matches a whole name, while add takes a unique substring:
             # `--name` given the start of a longer item name read 0 beside a
             # dozen rows on it (an adopter, 2026-09-26).
+            # A target with exactly that name was emptied by another filter,
+            # which the footer names: `--status open` on a resolved target
+            # read `no target is named 'zed'; these contain it: item:zed`.
             want = args.name.lower()
-            near = Counter(f"{n.target.type}:{n.target.name}" for n in base
-                           if n.target.name and want in n.target.name.lower()
-                           and args.type in (None, n.target.type))
-            if near:
+            typed = [n for n in base if n.target.name and args.type in (None, n.target.type)]
+            near = Counter(f"{n.target.type}:{n.target.name}" for n in typed
+                           if want in n.target.name.lower())
+            if near and not any(n.target.name == filt["target_name"] for n in typed):
                 shown = ", ".join(f"{t} ({summ._count(k, 'row')})" for t, k in near.most_common(3))
                 more = f", +{len(near) - 3} more" if len(near) > 3 else ""
                 print(f"note: no target is named {args.name!r}; these contain it: {shown}{more} "
@@ -1793,10 +1913,11 @@ def _dispatch(args, ctx) -> int:
         # One HEAD for the listing, not a read per check row.
         git_head = gitref.head_sha(cfg) if any(n.spec.verdict for n in notes) else None
         since = gitref.commits_since(cfg, notes)
+        by_id = {n.id: n for n in every}
         if args.json:
             rows = []
             for n in notes:
-                d = store.read_dict(n) | {"commits_since": since[n.id]}
+                d = summ.json_row(n, by_id, since[n.id])
                 if n.spec.verdict:
                     state, distance = api.verdict_state(cfg, n, git_head)
                     d["state"] = state
@@ -1834,12 +1955,16 @@ def _dispatch(args, ctx) -> int:
                    if n.target.type == "commit" and n.target.name}
             subjects = gitref.subjects(cfg, shas) if shas else {}
             gui = _gui(store_dir)
+            # The reader as summary has it: at a terminal the person, who
+            # has no one else's line to be shown.
+            reader = None if sys.stdout.isatty() else api.author_default()
             for n in notes:
                 state = api.verdict_state(cfg, n, git_head) if n.spec.verdict else None
                 subject = subjects.get(n.target.name) if n.target.type == "commit" else None
                 _print_note(n, state=state, subject=subject,
                             full=args.full or bool(args.note_id), head=heads_of.get(n.id),
-                            gui=gui, since=since[n.id])
+                            gui=gui, since=since[n.id],
+                            added=summ.added(by_id, n, reader, summ.LIST_BODY_CHARS))
             if len(notes) < total:
                 # Where the eye stops: a 10-of-33 page read as the whole answer
                 # (an adopter, 2026-09-26), the header notwithstanding.
@@ -1853,6 +1978,7 @@ def _dispatch(args, ctx) -> int:
         fields = {"status": "resolved", **_body_fields(args, append=True)}
         if args.result is not None:
             fields["result"] = args.result
+        measures = _measures_from_flags(args.measures)
         if args.add_tags:
             try:
                 cur = api._chain_tip(store.load(store_dir), args.id)
@@ -1861,12 +1987,13 @@ def _dispatch(args, ctx) -> int:
             fields["tags"] = sorted(set(cur.tags if cur else ()) | set(args.add_tags))
         try:
             note = api.supersede(ctx, args.id, author=_resolved_author(args),
-                                 add_refs=_refs_from_flags(args.refs), **fields)
+                                 add_refs=_refs_from_flags(args.refs),
+                                 add_measurements=measures, **fields)
         except KeyError:
             _no_note(args.id)
             return 1
         print(note.id)
-        _say_rewritten(tip, note)
+        _say_rewritten(store_dir, tip, note)
         _say_dropped(tip, note)
         _name_unknown_ids(store_dir, [args.body])
         _name_near_tags(store_dir, [note])
@@ -1879,6 +2006,7 @@ def _dispatch(args, ctx) -> int:
                   f"add --external", file=sys.stderr)
             return 1
         fields = _body_fields(args)
+        measures = _measures_from_flags(args.measures)
         if args.status is not None:
             fields["status"] = args.status
         if args.checked is not None:
@@ -1896,7 +2024,7 @@ def _dispatch(args, ctx) -> int:
         elif (args.add_tags or args.rm_tags) and args.refs is None and not args.add_refs \
                 and args.body is None and args.status is None \
                 and args.arc_id is None and args.checked is None \
-                and args.result is None and args.due is None:
+                and args.result is None and args.due is None and not measures:
             try:
                 note = api.retag(ctx, args.id, add=args.add_tags, rm=args.rm_tags,
                                  author=_resolved_author(args))
@@ -1904,7 +2032,7 @@ def _dispatch(args, ctx) -> int:
                 _no_note(args.id)
                 return 1
             print(note.id)
-            _say_rewritten(tip, note)
+            _say_rewritten(store_dir, tip, note)
             _say_dropped(tip, note)
             _name_near_tags(store_dir, [note])
             return 0
@@ -1937,14 +2065,15 @@ def _dispatch(args, ctx) -> int:
             # the raw query must reach the lock, or a name that became
             # ambiguous since would resolve by exact match.
             note = api.supersede(ctx, args.id, author=_resolved_author(args),
-                                 add_refs=_refs_from_flags(args.add_refs), **fields)
+                                 add_refs=_refs_from_flags(args.add_refs),
+                                 add_measurements=measures, **fields)
         except KeyError:
             _no_note(args.id)
             return 1
         print(note.id)
         _name_unknown_ids(store_dir, [args.body])
         _name_near_tags(store_dir, [note])
-        _say_rewritten(tip, note)
+        _say_rewritten(store_dir, tip, note)
         _say_dropped(tip, note)
         _name_dropped(tip, note, refs=args.refs is not None, tags=args.tags is not None)
         # --append keeps the lead it adds after, so the note asked about text
@@ -2233,7 +2362,8 @@ def _dispatch_arc(args, ctx) -> int:
             # must not KeyError on the other. `reconcile --json` stays flat
             # because its rows are a report, not notes.
             since = gitref.commits_since(cfg, rows)
-            print(json.dumps([store.read_dict(n) | {"commits_since": since[n.id]} for n in rows]))
+            by_id = {n.id: n for n in notes}
+            print(json.dumps([summ.json_row(n, by_id, since[n.id]) for n in rows]))
         else:
             # A finished arc printed nothing at exit 0, the same as one nobody
             # had started (2026-09-22). Count with denominator; the hidden set
@@ -2434,12 +2564,15 @@ def _main(argv) -> int:
         # `init` installs into the cwd's project, so it never follows a
         # named store to the project that owns it. `completion` runs from a
         # shell's rc file, wherever the shell starts, and reads no store: the
-        # cwd stands in as one, as for `-h` below.
-        if rest[:1] == ["completion"]:
+        # cwd stands in as one, as for `-h` below. So does `serve --restart`
+        # and `--stop`, which act on every store's serve.
+        storeless = (rest[:1] == ["completion"]
+                     or rest[:1] == ["serve"] and bool({"--restart", "--stop"} & set(rest)))
+        if storeless:
             dir_value = os.getcwd()
         no_store = None
         try:
-            ctx = api.resolve(dir_value, follow_owner=rest[:1] not in (["init"], ["completion"]))
+            ctx = api.resolve(dir_value, follow_owner=rest[:1] != ["init"] and not storeless)
         except subprocess.CalledProcessError as e:
             # Help needs no store, but argparse reaches `-h` only after the
             # store resolves, so outside a repo every `--help` exited 1 with

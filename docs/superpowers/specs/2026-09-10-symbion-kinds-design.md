@@ -197,4 +197,4 @@ Both directions: each test is shown to fail on the bug it guards.
 
 - `[resolvers]` for per-type name canonicalization (the second of the two ideas above). Next spec.
 - Renaming built-in target types, statuses (`open`/`resolved`), or the `arc` registry.
-- A fourth bit, a per-kind colour, or per-kind fields beyond `checked`/`result`. `measurements` and `evidence` stay frozen and writer-less (decided 2026-09-04).
+- A fourth bit, a per-kind colour, or per-kind fields beyond `checked`/`result`. `measurements` and `evidence` stay frozen and writer-less (decided 2026-09-04). *Reversed 2026-10-07 for `measurements` only:* a use appeared, an adopter whose agents report counts that `--result` prose cannot compare across rows, so `add --measure KEY=VALUE` and `--from-json`'s `measurements` key write it. The field's name and shape are unchanged. `evidence` stays writer-less. *2026-10-08:* `resolve` and `supersede` write it too, with `--measure` merged onto the inherited measurements: a prediction's counts exist only at its verdict, and a wrong number had no correction.

@@ -2,6 +2,8 @@ import json
 import subprocess
 
 from datetime import datetime, timedelta, timezone
+from itertools import pairwise
+from types import SimpleNamespace
 
 import pytest
 
@@ -537,8 +539,30 @@ def test_clip_drops_emphasis_but_keeps_identifiers_and_globs():
     """`--body` is markdown, so `**bold**` arrives; the terminal showed the
     asterisks literal. Underscores inside a word and a lone glob star are
     NOT emphasis and must survive."""
-    assert summary.clip("**This was measured** and _flagged_ in arc_id '*.py'", 100) \
-        == "This was measured and flagged in arc_id '*.py'"
+    assert summary.clip("**This was measured** and *never* in arc_id '*.py'", 100) \
+        == "This was measured and never in arc_id '*.py'"
+    assert summary.clip("**Plan:** two steps", 100) == "Plan: two steps"
+    # A star before a code span's closing backtick opens nothing.
+    assert summary.clip("`30 * * * *` runs *hourly*", 100) == "`30 * * * *` runs hourly"
+    assert summary.clip("It is **#2 by count** at **-3.5%**", 100) \
+        == "It is #2 by count at -3.5%"
+    # A closing pair is not the tail of a `***` marker inside the span.
+    assert summary.clip("run **rc=0, down from 4 `***` lines to 0**, and", 100) \
+        == "run rc=0, down from 4 `***` lines to 0, and"
+
+
+def test_clip_keeps_two_globs_and_underscore_identifiers_intact():
+    """Two glob stars in one body read as a `*…*` pair, and the preview
+    printed the paths with their stars gone (2026-10-08, on a row deciding
+    which files to delete). In row bodies `_x_` and `__x__` are identifiers
+    (`__init__`, `_cache … type_`), not emphasis."""
+    for s in ("rm logs/run-*.csv and out/*-clean.csv",
+              "touched __init__.py, set _cache and type_ here",
+              "`30 * * * *` and app.*.gz",
+              "read each *.json under cache/*/ today",
+              "zcat logs/*access* here",
+              "f(*args) wrote tmp/*.log"):
+        assert summary.clip(s, 100) == s
 
 
 def test_clip_cuts_at_a_word_boundary_with_an_ellipsis_within_the_cap():
@@ -782,3 +806,46 @@ def test_the_due_block_is_capped_and_says_how_many_it_hid(tmp_path):
     assert data["due_elided"] == 3
     assert "+3 more due (--full)" in summary.render_summary(data)
     assert len(summary.summary(tmp_path, cfg, full=True)["due"]) == summary.DUE_CAP + 3
+
+
+def _versions(*versions):
+    """A supersede chain of (author, body), oldest first: by_id and its head."""
+    rows = [SimpleNamespace(id=f"r{i}", supersedes=f"r{i - 1}" if i else None, author=a,
+                            created_at=f"2026-10-0{i + 1}T00:00:00+00:00", body=b)
+            for i, (a, b) in enumerate(versions)]
+    return {r.id: r for r in rows}, rows[-1]
+
+
+def test_seams_mark_where_each_append_and_prepend_joins_the_heads_body():
+    by_id, head = _versions(("ada", "lead"), ("sam", "lead\n\nmore"),
+                            ("kim", "top\n\nlead\n\nmore"))
+    got = summary.seams(by_id, head)
+    assert got == [(5, "kim", "2026-10-03T00:00:00+00:00", True),
+                   (9, "sam", "2026-10-02T00:00:00+00:00", False)]
+    assert [head.body[a:b] for a, b in pairwise([0, 5, 9, None])] == \
+        ["top\n\n", "lead", "\n\nmore"]
+
+
+def test_a_rewrite_drops_the_seams_before_it_and_an_unchanged_body_keeps_them():
+    kept = _versions(("ada", "a"), ("sam", "a\n\nb"), ("kim", "a\n\nb"))
+    assert summary.seams(*kept) == [(1, "sam", "2026-10-02T00:00:00+00:00", False)]
+    rewritten = _versions(("ada", "a"), ("sam", "a\n\nb"), ("kim", "A\n\nb"))
+    assert summary.seams(*rewritten) == []
+    after = _versions(("ada", "a"), ("sam", "x"), ("kim", "x\n\nc"))
+    assert summary.seams(*after) == [(1, "kim", "2026-10-03T00:00:00+00:00", False)]
+    # A body written into an empty row is its first text, not an amendment.
+    assert summary.seams(*_versions(("ada", ""), ("sam", "b"))) == []
+
+
+def test_one_link_that_adds_above_and_below_gets_a_seam_at_each_end():
+    """A prepend, then an append to the same uncommitted row, rewrites it in
+    place: one link added text at both ends, and read as a rewrite it lost
+    both seams."""
+    by_id, head = _versions(("ada", "lead"), ("sam", "x"), ("kim", "top\n\nx\n\nend"))
+    t = "2026-10-03T00:00:00+00:00"
+    assert summary.seams(by_id, head) == [(5, "kim", t, True), (6, "kim", t, False)]
+    # A newline is not an amendment: a seam marks text on its side.
+    by_id, head = _versions(("ada", "x"), ("sam", "top\n\nx\n"))
+    assert summary.seams(by_id, head) == [(5, "sam", "2026-10-02T00:00:00+00:00", True)]
+    by_id, head = _versions(("ada", "x"), ("sam", "\n\nx\n\nend"))
+    assert summary.seams(by_id, head) == [(3, "sam", "2026-10-02T00:00:00+00:00", False)]

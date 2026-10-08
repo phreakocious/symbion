@@ -14,7 +14,7 @@ from .. import store as S
 from .. import summary as summ
 from . import arcs, filters
 from .chrome import shell
-from .notes import md_button, render_note, target_href
+from .notes import edited, md_button, render_note, target_href
 from .theme import FONTS_DIR, FONTS_URL
 
 # /notes renders this many rows before "show all": every row is a few dozen
@@ -103,10 +103,11 @@ def _history(ctx, every, head, author: str, git_head=None) -> None:
         return
     with ui.expansion(f"earlier versions ({len(chain)})").classes("w-full sb-card") \
             .mark("history"):
-        for old in chain:
+        for old, new in zip(chain, [head, *chain]):
             # with its target: a rename is a version that changed nothing else
             render_note(ctx, old, lambda: None, author=author, actions=False,
-                        git_head=git_head, show_target=True)
+                        git_head=git_head, show_target=True,
+                        diff_to=new if edited(old.body, new.body) else None)
 
 
 def build_page(ctx, *, author: str) -> None:
@@ -218,10 +219,13 @@ def build_page(ctx, *, author: str) -> None:
             if kwargs:
                 ui.link("clear filters", "/notes").classes("text-body")
             since = gitref.commits_since(ctx.cfg, shown)
+            by_id = {n.id: n for n in every}
             for n in shown:
+                # A row's own page marks where each amendment joined its body.
                 render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
                             show_target=True, base=base, compact="id" not in kwargs,
-                            hit=q.split(), git_head=git_head, since=since[n.id])
+                            hit=q.split(), git_head=git_head, since=since[n.id],
+                            seams=summ.seams(by_id, n) if "id" in kwargs else ())
             if len(shown) < len(rows):
                 ui.link(f"+{len(rows) - len(shown)} older not shown — show all",
                         filters.href(**base, all="1")).classes("text-body").mark("show-all")

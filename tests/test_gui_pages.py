@@ -263,6 +263,49 @@ async def test_earlier_versions_show_their_target(user: User, ctx_with_notes):
     await user.should_see("old-name")
 
 
+async def test_a_rows_page_marks_each_amendment_with_who_added_it(user: User, ctx_with_notes):
+    """A seam, not a diff: most supersedes are appends, and a diff of one is
+    the whole old body unchanged (the owner, 2026-10-08). On the row's page
+    only, for now."""
+    ctx = ctx_with_notes
+    first = next(n.id for n in store.load(ctx.store_dir) if n.body == "beta body")
+    api.commit(ctx, "c")
+    mid = api.supersede(ctx, first, author="sam", append_body="gamma line").id
+    api.commit(ctx, "c")
+    last = api.supersede(ctx, mid, author="kim", prepend_body="new lead").id
+    await user.open(f"/notes?id={last}")
+    # .elements is a set: summary.seams' tests hold the order
+    assert {e.text for e in user.find(marker="seam").elements} == {
+        "kim added the above just now", "sam added just now"}
+    for text in ("new lead", "beta body", "gamma line"):
+        await user.should_see(text)
+    user.find(marker="history").click()
+    await user.should_see("earlier versions (2)")
+    await user.should_not_see(marker="diff-del")
+    await user.should_not_see(marker="diff-ins")
+    await user.open("/notes")
+    await user.should_not_see(marker="seam")
+
+
+async def test_earlier_versions_show_an_edit_as_a_diff(user: User, ctx_with_notes):
+    """A replacement (an old-style resolve's "Fixed in …") stays the old
+    card whole: a diff of it is all red and all green."""
+    ctx = ctx_with_notes
+    nid = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                        "body": "a kept paragraph stays\n\nthe old wording"}, author="ada").id
+    api.commit(ctx, "c")
+    mid = api.supersede(ctx, nid, author="sam",
+                        body="a kept paragraph stays\n\nthe new wording").id
+    api.commit(ctx, "c")
+    last = api.supersede(ctx, mid, author="kim", body="Fixed in 1234abc.").id
+    await user.open(f"/notes?id={last}")
+    user.find(marker="history").click()
+    await user.should_see("sam edited this just now")
+    (gone,) = user.find(marker="diff-del").elements
+    (came,) = user.find(marker="diff-ins").elements
+    assert "the old wording" in gone.content and "the new wording" in came.content
+
+
 async def test_a_note_never_superseded_has_no_history(user: User, ctx_with_notes):
     nid = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
     await user.open(f"/notes?id={nid}")

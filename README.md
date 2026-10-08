@@ -238,8 +238,9 @@ to a row stays good (`serve` prints it, and `--port` picks another). It has:
 - a new note from any page (`n`), on that page's object or any other: `#tag`
   and `!kind` in its body set its tags and kind, and Shift Enter adds it and
   starts the next;
-- a page per note with its earlier versions, a tag index, and arc checklists
-  you tick;
+- a page per note: a rule in its body marks where each amendment joined it,
+  with who added it and when, and its earlier versions show an edit as a
+  diff; a tag index, and arc checklists you tick;
 - commit and push buttons, shown while there is something to commit or push.
 
 `?` lists the keys. It writes as **you**: `SYMBION_AUTHOR`, else git
@@ -260,6 +261,11 @@ the other stores a `serve` is running on, on this machine. Each running
 first until it stops, then the second. While a `serve` runs on a store, each id
 that `list`, `show` and `context` print at a terminal links to its row's page
 (cmd-click in iTerm2), and `summary` names the URL.
+
+A running `serve` keeps the symbion it started with. After an upgrade,
+`symbion serve --restart`, run from anywhere, restarts every one in place: in
+its own terminal, on its own port, and its open tabs reload. `--stop` stops
+them all. Neither works on Windows: there, Ctrl-C each one and start it again.
 
 ## Catalogs, when a homogeneous set exists
 
@@ -294,7 +300,9 @@ symbion arc seed --scope file --dry-run     # no arc needed; writes nothing
 
 Names resolve exact, then unique substring, then the one name equal but for
 case, else as typed. `parser.py` matches both `src/parser.py` and
-`tests/test_parser.py`, so it is refused: use the full path.
+`tests/test_parser.py`, so it is refused: use the full path. A read first takes
+a name the store already holds as itself, so a deleted file's rows stay
+readable by its old name.
 
 A catalog of **measured** names (a reading, a serial) needs a resolver, or a
 near-miss mints a second target: substring matching cannot see that `3.1416`
@@ -354,7 +362,12 @@ where two separate adds would store both.
   the open rows someone other than the reader raised or amended, parked ones
   included, so the owner's word reaches the agent: `from <author>` names who
   raised a row, and `last by <author>` who wrote its newest version when that
-  is someone else.
+  is someone else. An answer appended to a row sits below the line the
+  summary prints, so the summary and `list` print the first line the newest
+  amendment by someone else added below the row (`alice added 3h ago: …`).
+  They skip it when the clipped line already shows it. `lead rewritten since`
+  after the age says the row's lead changed after that line, so it answered
+  an earlier question.
 - **Record finished work as a resolved task**:
   `add task --target … --status resolved --body "done: …"` for work done
   before it had a ticket.

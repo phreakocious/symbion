@@ -193,13 +193,13 @@ def resolve_with(cfg, target_type: str, query: str, candidates) -> str:
         raise CatalogError(f"resolver {target_type!r} cannot resolve a name containing a newline: {q!r}")
     r = run_configured(cfg, cmd, input="\n".join([q, *candidates]) + "\n")
     lines = _lines(r.stdout)
-    if r.returncode == 2:
-        if not lines:
-            raise CatalogError(f"resolver {target_type!r} exited 2 (ambiguous) but printed "
-                               f"no candidates: {cmd}")
+    if r.returncode == 2 and lines:
         raise AmbiguousName(q, lines)
     if r.returncode != 0:
-        raise CatalogError(f"resolver {target_type!r} exited {r.returncode}: {cmd}\n"
+        # Python exits 2 on a script path it cannot open: only stderr tells
+        # that from a resolver that found no candidates (2026-10-06).
+        why = " (ambiguous) but printed no candidates" if r.returncode == 2 else ""
+        raise CatalogError(f"resolver {target_type!r} exited {r.returncode}{why}: {cmd}\n"
                            f"{r.stderr.strip()[:400]}")
     if not lines:
         raise CatalogError(f"resolver {target_type!r} printed no name for {q!r}: {cmd}")

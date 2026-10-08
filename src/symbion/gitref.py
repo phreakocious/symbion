@@ -5,6 +5,7 @@ import json
 import math
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from . import catalog, store
@@ -59,10 +60,16 @@ def only_on_default_branch(cfg, name) -> str | None:
     return b if _git(cfg, "cat-file", "-e", f"{b}:{name}").returncode == 0 else None
 
 
-def canon_name(cfg, target_type, name):
+def canon_name(cfg, target_type, name, stored=()):
     """The stored/queried form of a target name -- shared by the write side
     (`add`) and the read side (`list --name`, `context --target`), so an
     abbreviation used on write also matches on read.
+
+    `stored` is a read's: the names the store holds for this type. One of
+    them typed verbatim is that object, before the catalog runs: a deleted
+    file whose name recurs deeper in the tree read as ambiguous, or resolved
+    to a live path holding none of its rows (2026-10-07). A write passes
+    none, so a new row on a deleted path still meets the catalog.
 
     `commit` gets the one built-in exception: peeled to a full object id, so
     a symbolic ref (HEAD, a branch) is frozen at write time instead of
@@ -72,6 +79,21 @@ def canon_name(cfg, target_type, name):
     catalog, so this is the one place both sides can share it from."""
     if name is None:
         return None
+    if (q := catalog.nfc(name)) in stored:
+        if target_type in cfg.catalogs:
+            # A write of `q` lands where the catalog sends it, so a read that
+            # skips the catalog must say where that is, or the row just
+            # written reads as missing.
+            try:
+                pool = catalog.pool(cfg, target_type)
+                got = catalog.resolve_with(cfg, target_type, q, pool) \
+                    if target_type in cfg.resolvers else catalog.resolve(q, pool)
+            except (catalog.CatalogError, catalog.AmbiguousName):
+                got = q
+            if got != q:
+                print(f"note: {q!r} is a stored {target_type} name, read as typed; "
+                      f"the catalog resolves it to {got!r}", file=sys.stderr)
+        return q
     if target_type == "commit":
         return canonical_commit(cfg, name)
     if target_type in catalog.NON_CANONICAL_TYPES:
@@ -148,7 +170,8 @@ def check_state(cfg, prov, head: str | None = None):
     `behind N` and `ahead N` are the two sides of one line of development:
     the stamp is N commits back from this HEAD, or N commits past it.
     `diverged` is kept for what it says -- neither is an ancestor of the
-    other.
+    other. Either of those two whose stamp no branch or tag holds is
+    `dangling`: the run is on a commit only the reflog keeps.
 
     A check stamped dirty:true satisfies sha == HEAD — the common case, since
     the stamp records HEAD at write time — so without precedence it would read
@@ -178,30 +201,40 @@ def check_state(cfg, prov, head: str | None = None):
     if not head:
         return ("unverifiable", None)
     key = (str(_root(cfg)), stamp, head)
-    if key in _RELATIONS:
-        return _RELATIONS[key]
-    # One walk answers every state: the commits only the stamp reaches, and
-    # those only HEAD reaches. It took four git calls a row, three quarters
-    # of a GUI page's render (2026-10-01).
-    r = _git(cfg, "rev-list", "--left-right", "--count", f"{stamp}^{{commit}}...{head}", "--")
-    try:
-        only_stamp, only_head = map(int, r.stdout.split())
-    except ValueError:
-        only_stamp = only_head = None
-    if r.returncode or only_stamp is None:
-        # Rebased away, squashed, shallow; an object missing between the two.
-        return ("unverifiable", None)
-    if only_stamp and only_head:
-        state = ("diverged", None)             # another line of development
-    elif only_stamp:
-        # HEAD is an ancestor of the stamp: the SAME line, read from a
-        # checkout that lags it. A dated baseline stamped on the default
-        # branch read `diverged` -- "another line of development" -- from
-        # every worktree behind it (2026-09-28).
-        state = ("ahead", only_stamp)
-    else:
-        state = ("behind", only_head) if only_head else ("current", 0)
-    _RELATIONS[key] = state
+    state = _RELATIONS.get(key)
+    if state is None:
+        # One walk answers every state: the commits only the stamp reaches,
+        # and those only HEAD reaches. It took four git calls a row, three
+        # quarters of a GUI page's render (2026-10-01).
+        r = _git(cfg, "rev-list", "--left-right", "--count", f"{stamp}^{{commit}}...{head}", "--")
+        try:
+            only_stamp, only_head = map(int, r.stdout.split())
+        except ValueError:
+            only_stamp = only_head = None
+        if r.returncode or only_stamp is None:
+            # Rebased away, squashed, shallow; an object missing between the two.
+            return ("unverifiable", None)
+        if only_stamp and only_head:
+            state = ("diverged", None)             # another line of development
+        elif only_stamp:
+            # HEAD is an ancestor of the stamp: the SAME line, read from a
+            # checkout that lags it. A dated baseline stamped on the default
+            # branch read `diverged` -- "another line of development" -- from
+            # every worktree behind it (2026-09-28).
+            state = ("ahead", only_stamp)
+        else:
+            state = ("behind", only_head) if only_head else ("current", 0)
+        _RELATIONS[key] = state
+    # A stamp HEAD cannot reach may sit on no branch at all: an amend or a
+    # rebase after the check left it to the reflog, and it read `diverged`,
+    # which says "look on that branch" where this says "re-run" (2026-10-06).
+    # Asked on every read: a branch can go while a serve keeps one HEAD. A
+    # git error keeps the relation, as before this test existed.
+    if state[0] in ("ahead", "diverged"):
+        r = _git(cfg, "for-each-ref", "--count=1", "--contains", stamp,
+                 "refs/heads", "refs/remotes", "refs/tags")
+        if r.returncode == 0 and not r.stdout.strip():
+            return ("dangling", None)
     return state
 
 

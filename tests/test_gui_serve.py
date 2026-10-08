@@ -141,6 +141,115 @@ def test_ctrl_c_stops_a_serve_quietly(tmp_path):
     assert not list((tmp_path / "cache" / "symbion" / "serve").glob("*.json"))
 
 
+def _command(pid) -> list[str]:
+    return subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.split()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="no SIGUSR1 on Windows")
+def test_restart_re_execs_every_serve_in_its_own_terminal(tmp_path):
+    """A serve runs the symbion it started with, so a code change or an
+    upgrade reached none of the serves a person had running until each was
+    restarted by hand (the owner, 2026-10-07). `serve --restart` re-execs
+    each in place: the same process, so the same terminal, and with
+    --no-browser, so no tab opens. It needs no store: run from anywhere."""
+    store.ensure_store(tmp_path / "s")
+    (tmp_path / "elsewhere").mkdir()
+    port = _free_port()
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
+    env["XDG_CACHE_HOME"] = str(tmp_path / "cache")
+    env["BROWSER"] = "true"                  # the first start opens "a browser"
+    records = tmp_path / "cache" / "symbion" / "serve"
+    p = subprocess.Popen(
+        [SYMBION, "--dir", str(tmp_path / "s"), "serve", "--port", str(port), "--author", "t"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, **GROUP)
+    try:
+        assert _get_page(p, port)[0] == 200
+        (before,) = [json.loads(f.read_text()) for f in records.glob("*.json")]
+        cli = lambda *a: subprocess.run([SYMBION, "serve", *a], cwd=tmp_path / "elsewhere",  # noqa: E731
+                                        env=env, capture_output=True, text=True, timeout=60)
+        restart = cli("--restart")
+        status, _ = _get_page(p, port)
+        (after,) = [json.loads(f.read_text()) for f in records.glob("*.json")]
+        command = _command(p.pid)
+        zombies = [ln for ln in subprocess.run(["ps", "-A", "-o", "ppid=,stat=,command="],
+                                               capture_output=True, text=True).stdout.splitlines()
+                   if ln.split()[0] == str(p.pid) and "Z" in ln.split()[1]]
+        stop = cli("--stop")
+        out = p.communicate(timeout=15)[0].decode()
+    finally:
+        if p.poll() is None:
+            _kill(p)
+            p.communicate()
+    assert restart.returncode == 0, restart
+    assert f"restarted {(tmp_path / 's').resolve()}: http://127.0.0.1:{port}" in restart.stdout
+    assert status == 200 and after["pid"] == before["pid"] == p.pid, (before, after)
+    assert after["started"] > before["started"]
+    assert command[-1] == "--no-browser", command
+    # multiprocessing's resource tracker exits when the exec closes its pipe,
+    # and the new image never reaps it: a zombie per restart, for days
+    assert not zombies, zombies
+    assert stop.returncode == 0 and f"stopped {(tmp_path / 's').resolve()}" in stop.stdout, stop
+    assert out.count("symbion →") == 2 and "Traceback" not in out, out
+    assert p.returncode == 0, (p.returncode, out)
+    assert not list(records.glob("*.json"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="no ps on Windows; --restart refuses there")
+def test_a_serve_is_known_by_its_whole_command_line(monkeypatch):
+    """procps' and OpenBSD's `ps` cut `command` at $COLUMNS, into a pipe too:
+    with it exported, `serve` fell off the line, every serve read as stale,
+    and --restart deleted their records and said none was running (Linux,
+    2026-10-08). macOS's ps does not cut, so only a Linux or BSD run sees
+    this fail."""
+    from symbion.gui import servers
+    monkeypatch.setenv("COLUMNS", "20")
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "symbion", "serve"])
+    try:
+        assert servers._a_serve(p.pid)
+    finally:
+        p.kill()
+        p.wait()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="no SIGUSR1 on Windows")
+def test_restart_signals_no_process_that_is_not_a_serve(tmp_path, monkeypatch, capsys):
+    """A serve killed outright leaves its record, and after a reboot its pid
+    is soon another process's: SIGUSR1 ends most processes. A record whose
+    pid runs no `symbion serve` is stale, and goes. One that does, and dies
+    on the signal, is a serve started before --restart existed, or one whose
+    restart failed: its terminal says which."""
+    from symbion import cli
+    from symbion.gui import servers
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.chdir(tmp_path)
+    nap = "import time; time.sleep(60)"
+    other = subprocess.Popen([sys.executable, "-c", nap])
+    # A shell parent reaps it when it dies, as a serve's terminal does; a
+    # child of this process would sit as a zombie, which reads as alive.
+    shell = subprocess.Popen(["sh", "-c", f'"{sys.executable}" -c "{nap}" symbion serve & '
+                              'echo $!; wait'], stdout=subprocess.PIPE, text=True)
+    old = int(shell.stdout.readline())
+    try:
+        for name, pid in (("other", other.pid), ("old", old)):
+            servers._dir().mkdir(parents=True, exist_ok=True)
+            (servers._dir() / f"{pid}.json").write_text(json.dumps(
+                {"pid": pid, "url": "http://127.0.0.1:1", "store": f"/x/{name}",
+                 "started": 1.0}))
+        rc = cli.main(["serve", "--restart"])
+        out = capsys.readouterr().out
+    finally:
+        other.kill()
+        other.wait()
+        if shell.poll() is None:
+            os.kill(old, signal.SIGKILL)
+        shell.wait(timeout=10)
+    assert rc == 1, out
+    assert other.returncode == -signal.SIGKILL, "a process that is no serve got the signal"
+    assert "/x/other" not in out and not (servers._dir() / f"{other.pid}.json").exists()
+    assert f"/x/old: pid {old} exited instead of restarting" in out, out
+
+
 def test_a_second_serve_on_a_store_takes_its_links_when_the_first_stops(tmp_path, monkeypatch,
                                                                          capsys):
     """Two serves on one store left two records, and the other stores'

@@ -5,8 +5,6 @@ plain text, which agents, scripts and tests parse; nothing here may change
 it."""
 from __future__ import annotations
 
-from datetime import datetime
-
 from markdown_it import MarkdownIt
 from rich.console import COLOR_SYSTEMS, Console
 from rich.markdown import Markdown
@@ -91,25 +89,6 @@ KIND_W = 8                  # the pipe line pads the kind to 8 too
 MIN_TAGS = 8                # a tag list cut shorter than this says nothing
 MIN_BODY = 30               # narrower, the body leaves the target's column
 
-_UNITS = ((3600, 60, "m"), (86400, 3600, "h"), (14 * 86400, 86400, "d"),
-          (63 * 86400, 7 * 86400, "w"), (365 * 86400, 30.44 * 86400, "mo"))
-
-
-def age(stamp: str, now: datetime | None = None) -> str:
-    """How long ago, in one short unit: `now`, `40m`, `8h`, `3d`, `5w`,
-    `4mo`, `2y`. A stamp without an offset is local time, as in
-    summary.age_days."""
-    then = datetime.fromisoformat(stamp)
-    if then.tzinfo is None:
-        then = then.astimezone()
-    s = max(0.0, ((now or datetime.now().astimezone()) - then).total_seconds())
-    if s < 60:
-        return "now"
-    for below, size, unit in _UNITS:
-        if s < below:
-            return f"{int(s // size)}{unit}"
-    return f"{int(s // (365 * 86400))}y"
-
 
 class _CodeTheme(SyntaxTheme):
     """A fenced block in the inline code's colour, comments faded. rich's
@@ -169,6 +148,8 @@ def _state(n, state) -> tuple[str, str]:
     st, dist = state
     if st == "unverifiable":
         return f"unverifiable ({api.why_unverifiable(n.provenance)})", BAD
+    if st == "dangling":           # on no branch: the run must be redone
+        return st, BAD
     if st == "external":           # the run's age: a supersede inherits it
         return f"external ({summ.age_phrase(n.provenance['at'])})", META
     if st == "unstamped":          # the row's age: no stamp says when the run was
@@ -191,7 +172,7 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None) -> tu
     # appended to it, and the whole line linked (2026-10-01).
     line = Text(style=ink(META))
     line.append(n.id[-ID_TAIL:], Style(color=ink(META), link=gui and f"{gui}/notes?id={n.id}"))
-    line.append(f"  {age(n.created_at):>4}  ", ink(META))
+    line.append(f"  {summ.age(n.created_at):>4}  ", ink(META))
     mark, color = {"open": ("○", ink(TEXT)), "resolved": ("✓", GOOD)}.get(status, (" ", ""))
     line.append(mark + " ", color)
     line.append(f"{n.kind:<{KIND_W}}  ", ink(kind_hex(n.kind, n.spec)))
@@ -277,6 +258,8 @@ def _details(n, head, state) -> list[Text]:
             out.append(labelled(f"checked{at}: ", summ.flatten(n.checked)))
         if n.result is not None:
             out.append(labelled("result: ", summ.flatten(n.result)))
+    if n.measurements:
+        out.append(labelled("measured: ", summ.measured(n.measurements)))
     return out
 
 

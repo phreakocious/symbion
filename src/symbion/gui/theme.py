@@ -335,6 +335,18 @@ a.sb-tag:hover { color: var(--q-primary); }
 /* a check's `checked → result` is its content: as bright as a body, mono at
    the size of a body's inline code (dim metadata before, 2026-10-01) */
 .sb-verdict { color: var(--q-emph); font-family: var(--mono); font-size: 12px; }
+/* where an amendment joined the body: a thin rule in the kind's colour,
+   who added it and when at its end, quieter than the text around it */
+.sb-seam { display: flex; align-items: center; gap: 10px; color: var(--q-dim);
+           font-family: var(--mono); font-size: 11px; }
+.sb-seam::before { content: ""; flex: 1;
+                   border-top: 1px solid color-mix(in srgb, var(--kind) 55%, transparent); }
+/* an earlier version against the next: a block gone, a block that came */
+.sb-diff-del, .sb-diff-ins { padding-left: 10px; border-left: 2px solid; }
+.sb-diff-del { border-color: var(--q-bad); color: var(--q-muted);
+               background: color-mix(in srgb, var(--q-bad) 7%, transparent); }
+.sb-diff-ins { border-color: var(--q-good);
+               background: color-mix(in srgb, var(--q-good) 7%, transparent); }
 a.sb-id { color: var(--q-muted); }
 a.sb-id:hover { color: var(--q-primary); }
 /* copy the id: shown with the card's other buttons */

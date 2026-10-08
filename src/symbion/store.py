@@ -704,7 +704,8 @@ def unholdable(note: Note) -> list[str]:
 
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
-                        in_place=None, prepend_body: str | None = None, **fields) -> Note:
+                        in_place=None, prepend_body: str | None = None,
+                        add_measurements=None, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
     multi-row aggregate (`rename_target`, `apply_reconciliation`) can hold
@@ -779,6 +780,9 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         base["refs"] = have + [r for r in add_refs if r not in have]
     if "refs" in fields or add_refs:
         check_self_ref(base["target"], base["refs"])
+    if add_measurements:
+        # Onto the TIP's too: a name given replaces that name only.
+        base["measurements"] = {**(base.get("measurements") or {}), **add_measurements}
     if fields.get("due") is not None:
         base["due"] = canon_due(fields["due"])
     spec = kinds.get(base["kind"])
@@ -825,7 +829,7 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
 
 def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
               append_body: str | None = None, add_refs=None,
-              prepend_body: str | None = None, **fields) -> Note:
+              prepend_body: str | None = None, add_measurements=None, **fields) -> Note:
     """Append a correction superseding old_id -- the single-row public entry
     point. One outer `_lock` spans load -> fast-forward -> mint -> write; see
     `_supersede_unlocked` for what happens inside it.
@@ -854,7 +858,7 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
         return _supersede_unlocked(store, notes, old_id, author=author,
                                    append_body=append_body, add_refs=add_refs,
                                    prepend_body=prepend_body, in_place=lambda tip: rewritable(store, notes, tip, author),
-                                   **fields)
+                                   add_measurements=add_measurements, **fields)
 
 
 def rewritable(store, notes, tip: Note, author: str | None) -> bool:
@@ -866,13 +870,23 @@ def rewritable(store, notes, tip: Note, author: str | None) -> bool:
     editor, no other row's body cites it, and it is no pre-registration,
     whose registered text is the point. The caller also keeps the status:
     a resolve's time is when the row closed."""
+    return not citing(notes, tip) and own_draft(store, tip, author)
+
+
+def own_draft(store, tip: Note, author: str | None) -> bool:
+    """Every condition of `rewritable` but the citations: `author` wrote
+    `tip`, git has not seen it, and it is no pre-registration."""
     if not author or author != tip.author or (tip.spec.status and tip.spec.verdict):
-        return False
-    if any(n.id != tip.id and n.body and (tip.id in n.body or tip.id[-10:] in n.body)
-           for n in notes):
         return False
     committed = _committed_ids(store)
     return committed is not None and tip.id not in committed
+
+
+def citing(notes, tip: Note) -> list[str]:
+    """The ids of the other rows whose body cites `tip`, whole or by the
+    10-character tail SKILL.md says to cite."""
+    return [n.id for n in notes
+            if n.id != tip.id and n.body and (tip.id in n.body or tip.id[-10:] in n.body)]
 
 
 def _committed_ids(store) -> set | None:
@@ -910,18 +924,25 @@ def heads(notes):
     return [n for n in notes if n.id not in superseded]
 
 
-def heads_for(store, target_type, target_name=None):
+def heads_for(store, target_type, target_name=None, loaded=None):
     """Current heads attached to one object, newest-first — the read-side hook
     for surfacing prior conclusions where the next investigation starts.
     heads() runs on the FULL row set before filtering, so a superseding row
-    never hides from the chain collapse."""
-    allheads = heads(load(store))
+    never hides from the chain collapse. `loaded` is the row set when the
+    caller has already read it."""
+    allheads = heads(load(store) if loaded is None else loaded)
     rows = query(allheads, target_type=target_type, target_name=target_name)
     if target_name is not None:                    # also surface notes that REF this object
         seen = {n.id for n in rows}
         rows = rows + [n for n in allheads if n.id not in seen
                        and any(r.type == target_type and r.name == target_name for r in n.refs)]
     return newest_first(rows)
+
+
+def stored_names(notes, target_type) -> set:
+    """Every name `target_type` carries in these rows, as a target or a ref."""
+    return ({n.target.name for n in notes if n.target.type == target_type}
+            | {r.name for n in notes for r in n.refs if r.type == target_type})
 
 
 def query(notes, *, id=None, target_type=None, target_name=None, kind=None,

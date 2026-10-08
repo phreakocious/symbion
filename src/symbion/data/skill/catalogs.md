@@ -8,7 +8,10 @@ the type's legal names, one per line; `symbion schema` lists this store's. It
 runs in `sh` (on Windows, the one Git for Windows installs), in the root of the
 current worktree. A name you type resolves against
 it: exact, else unique substring, else the one name equal but for case, else
-your typed string, stored with a note on stderr.
+your typed string, stored with a note on stderr. A read (`list --target`,
+`context --target`) first takes a name the store already holds as itself, so
+rows on a deleted file stay readable by its old name; when a write of that name
+would land elsewhere, a note names where.
 
 ## Seed: add, unless there is a catalog
 
@@ -57,8 +60,10 @@ The resolver reads the query on stdin line 1 and one catalog name per line
 after it. Exit 0 and print the name to store, in the list or not: that is how
 a first sighting mints its canonical form. Exit 2 and print the matches to
 refuse as ambiguous. Anything else is an error and stores nothing; a resolver
-never falls back to the substring rule. It runs under the store lock, so it
-must not write to the store. `set -o pipefail` on a piped catalog is
+never falls back to the substring rule. Like a catalog, it runs in the root of
+the current worktree: `tools/resolve_reading.py` above is the project's
+`tools/`, not the store's. It runs under the store lock, so it must not write
+to the store. `set -o pipefail` on a piped catalog is
 load-bearing: without it a failed producer reads as an empty catalog.
 
 Within one write (`add --from-json`, `arc seed --name …`), names resolved by

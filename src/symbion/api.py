@@ -11,6 +11,7 @@ writers at all (tests/test_gui_seam.py).
 from __future__ import annotations
 
 import difflib
+import math
 import os
 import re
 import subprocess
@@ -167,12 +168,13 @@ def gui_author() -> str:
 
 
 # ---- name canonicalization at the I/O boundary ----
-def canon(cfg, target_type, name):
+def canon(cfg, target_type, name, notes=()):
     """The READ-side wrapper (`list --name`, `context --target`): the
     stored/queried form of a target name, so an abbreviation typed on read
-    matches what write stored. The write side is `_canonicalizer`, which
-    also runs the catalog/resolver under the lock; this one never does."""
-    return gitref.canon_name(cfg, target_type, name)
+    matches what write stored, and a name `notes` hold verbatim is itself.
+    The write side is `_canonicalizer`, which also runs the catalog/resolver
+    under the lock; this one never does."""
+    return gitref.canon_name(cfg, target_type, name, store.stored_names(notes, target_type))
 
 
 def check_name(typ: str, name) -> None:
@@ -432,6 +434,25 @@ def check_arc_targets(ctx: Ctx, targets) -> None:
             check_arc(ctx, t.get("name"))
 
 
+def check_measurements(m) -> None:
+    """Flat: a name to a finite number or a non-empty string, as store.Note
+    declares. json.loads reads NaN and Infinity, NaN equals nothing, and
+    True is an int to Python, so each is refused by name rather than stored
+    where a comparison across rows would trip on it."""
+    if not isinstance(m, dict) or not m:
+        raise ValueError(f"measurements is an object of names to numbers or strings, not {m!r}")
+    for k, v in m.items():
+        if not k.strip():
+            raise ValueError(f"measurement name is empty: {m!r}")
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            raise ValueError(f"measurement {k!r} is a number or a string, not {v!r}")
+        if isinstance(v, float) and not math.isfinite(v):
+            raise ValueError(f"measurement {k!r} is {v}: it must be a finite number")
+        if v == "":
+            raise ValueError(f"measurement {k!r} is empty: an unset shell variable? "
+                             f"omit it, or say what it measured")
+
+
 def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
     """A `list --json`-shaped row -> `store.add_many` fields: shape checked,
     kind/type/status validated, names NFC'd (resolution happens under the
@@ -473,12 +494,15 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
         raise ValueError(f"--external is not valid for kind {row['kind']!r}: it has no "
                          f"verdict bit, so it carries no provenance to stamp "
                          f"(`symbion schema` lists the verdict kinds)")
+    if row.get("measurements") is not None:
+        check_measurements(row["measurements"])
     check_arc_targets(ctx, [t, *refs])
     return dict(
         kind=row["kind"],
         target={"type": t["type"], "name": catalog.nfc(t.get("name"))},
         body=row.get("body") or "", status=row.get("status"),
         checked=row.get("checked"), result=row.get("result"),
+        measurements=row.get("measurements"),
         arc_id=check_arc(ctx, row.get("arc_id")), due=row.get("due"),
         tags=list(row.get("tags") or ()),
         author=row.get("author") or author,
@@ -628,7 +652,8 @@ def add_many(ctx: Ctx, rows, *, author: str) -> list:
 
 
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
-              add_refs=None, prepend_body: str | None = None, **fields) -> store.Note:
+              add_refs=None, prepend_body: str | None = None, add_measurements=None,
+              **fields) -> store.Note:
     """Target, provenance and target_blob are INHERITED from the superseded row
     and never re-resolved (a tag added later is no re-reading of the file), so
     this needs no canonicalization -- a departed target stays editable.
@@ -665,6 +690,8 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
         add_refs = check_refs(ctx.target_types, add_refs, ctx.kinds)
     check_arc_targets(ctx, [*(fields.get("refs") or ()), *(add_refs or ())])
     check_arc(ctx, fields.get("arc_id"))
+    if add_measurements:
+        check_measurements(add_measurements)
     if fields.get("status") == "resolved":
         tip = _chain_tip(store.load(ctx.store_dir), note_id)
         if tip.spec.status and tip.spec.verdict and store.read_status(tip) == "open":
@@ -672,6 +699,7 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
                                          bool((tip.provenance or {}).get("external")))
     return store.supersede(ctx.store_dir, note_id, author=author, append_body=append_body,
                            add_refs=add_refs, prepend_body=prepend_body,
+                           add_measurements=add_measurements,
                            canonicalize=lambda f: canonicalize_rows(ctx, [f])[0], **fields)
 
 

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import tempfile
 import time
 import zlib
@@ -63,26 +65,79 @@ def record(url: str, store) -> Path | None:
     return path
 
 
-def running() -> list[dict]:
-    """One live record per store, the earliest started: a store's links
-    stay on its first serve until it stops. A dead one's record is removed:
-    a serve killed outright never removes its own."""
-    live = []
+def _read(path: Path) -> dict | None:
+    try:
+        r = json.loads(path.read_text(encoding="utf-8"))
+        r["pid"], _ = int(r["pid"]), (r["url"], r["store"])
+        r["started"] = float(r.get("started", 0))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None                        # torn mid-write, gone, or not ours
+    return r
+
+
+def live() -> list[dict]:
+    """Every live record, the earliest started first. A dead one's record is
+    removed: a serve killed outright never removes its own."""
+    out = []
     for path in _dir().glob("*.json"):
-        try:
-            r = json.loads(path.read_text(encoding="utf-8"))
-            pid, _ = int(r["pid"]), (r["url"], r["store"])
-            started = float(r.get("started", 0))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue                       # torn mid-write, or not ours
-        if _alive(pid):
-            live.append((started, r))
+        r = _read(path)
+        if r is None:
+            continue
+        if _alive(r["pid"]):
+            out.append(r)
         else:
             path.unlink(missing_ok=True)
+    return sorted(out, key=lambda r: r["started"])
+
+
+def running() -> list[dict]:
+    """One live record per store, the earliest started: a store's links
+    stay on its first serve until it stops."""
     first = {}
-    for _, r in sorted(live, key=lambda sr: sr[0]):
+    for r in live():
         first.setdefault(r["store"], r)
     return list(first.values())
+
+
+def _a_serve(pid: int) -> bool:
+    """Whether `pid` runs `symbion serve`: a record outlives a serve killed
+    outright, and after a reboot its pid is soon another process's. `-ww`:
+    procps' and OpenBSD's ps cut `command` at $COLUMNS, into a pipe too, and
+    with it exported every serve read as stale (Linux, 2026-10-08)."""
+    argv = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.split()
+    return "serve" in argv and any(Path(a).name == "symbion" or a.startswith("symbion.")
+                                   for a in argv)
+
+
+def signal_all(restart: bool, timeout: float = 30.0) -> list[tuple[str, dict]]:
+    """Restart (SIGUSR1) or stop (SIGINT) every serve this user runs, and
+    wait for each: (what happened, its record). A restart is done when the
+    serve has recorded itself again, a stop when its record is gone."""
+    path = lambda r: _dir() / f"{r['pid']}.json"            # noqa: E731
+    sent = []
+    for r in live():
+        try:
+            if not _a_serve(r["pid"]):
+                raise ProcessLookupError
+            os.kill(r["pid"], signal.SIGUSR1 if restart else signal.SIGINT)
+        except ProcessLookupError:                # stale, or it stopped just now
+            path(r).unlink(missing_ok=True)
+            continue
+        sent.append(r)
+    done = {}
+    deadline = time.monotonic() + timeout
+    while len(done) < len(sent) and time.monotonic() < deadline:
+        time.sleep(0.2)
+        for r in (r for r in sent if r["pid"] not in done):
+            now = _read(path(r))
+            if restart and now and now["started"] != r["started"]:
+                done[r["pid"]] = ("restarted", now)
+            elif not restart and (now is None or not _alive(r["pid"])):
+                done[r["pid"]] = ("stopped", r)
+            elif not _alive(r["pid"]):
+                done[r["pid"]] = ("exited", r)
+    return [done.get(r["pid"], ("no answer", r)) for r in sent]
 
 
 def serving(store) -> dict | None:

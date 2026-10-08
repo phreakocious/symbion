@@ -1,6 +1,6 @@
 [project]
 name = "symbion"
-version = "0.4.1.dev0"
+version = "0.5.0"
 description = "A notebook and ticket registry for agents: dated rows attached to a commit, a file, an item, an arc or the project, kept in a sibling git repo of JSONL."
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ Issues = "https://github.com/phreakocious/symbion/issues"
 symbion = "symbion.cli:main"
 
 [project.optional-dependencies]
-gui = ["nicegui>=3.0", "pygments>=2.13"]
+gui = ["nicegui>=3.18", "pygments>=2.13"]
 test = ["pytest", "pytest-asyncio"]
 
 [tool.pytest.ini_options]

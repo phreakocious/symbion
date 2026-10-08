@@ -12,7 +12,8 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
   and the code disagree and the spec's reason still holds, the code has a bug. A change
   that reverses a spec's decision adds a dated note at that decision; renames and
   signatures need none.
-- Before you trust a new test, break the code it guards and watch the test fail.
+- Before you trust a new or changed test, break the code it guards and watch the test
+  fail.
 - A `# ponytail: <limit, upgrade path>` comment marks a deliberate simplification.
 - State the mechanism, not where you saw it: no names, paths or data from your other
   projects in code, tests, docs or commit messages.

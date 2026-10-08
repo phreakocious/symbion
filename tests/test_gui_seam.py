@@ -109,6 +109,7 @@ def test_the_audit_skips_comments_but_not_code_after_a_hash_in_a_string():
 CLI_FILE = GUI_DIR.parent / "cli.py"
 CLI_STORE_CALLS = ALLOWED_STORE_READS | {
     "note_from_dict", "read_dict", "reconcile_arc",      # reads
+    "citing", "own_draft",                                # reads: why an edit was a new row
     "ensure_store", "apply_reconciliation",               # the two writes
 }
 

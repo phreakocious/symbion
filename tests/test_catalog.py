@@ -173,10 +173,13 @@ def test_resolver_exit_2_is_ambiguous_with_the_printed_candidates(tmp_path):
     assert e.value.query == "q" and e.value.candidates == ["x", "y"]
 
 
-def test_resolver_exit_2_with_no_candidates_is_an_error(tmp_path):
-    c = rcfg(tmp_path, "echo a", "exit 2")
-    with pytest.raises(catalog.CatalogError):
+def test_resolver_exit_2_with_no_candidates_is_an_error_that_keeps_stderr(tmp_path):
+    """Python exits 2 on a script path it cannot open, so a wrong path landed
+    in the ambiguous branch, and that branch dropped the stderr that named it."""
+    c = rcfg(tmp_path, "echo a", f"{shlex.quote(sys.executable)} tools/no_such_resolver.py")
+    with pytest.raises(catalog.CatalogError) as e:
         catalog.canonical(c, "t", "q")
+    assert "printed no candidates" in str(e.value) and "No such file" in str(e.value)
 
 
 @pytest.mark.parametrize("res", ["exit 1", "true", "printf '\\n\\n'", "sleep 5"])

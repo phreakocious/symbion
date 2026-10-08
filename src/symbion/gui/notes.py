@@ -12,6 +12,7 @@ import html
 import re
 from contextlib import nullcontext
 from datetime import datetime
+from difflib import SequenceMatcher
 from urllib.parse import quote
 
 from nicegui import ui
@@ -52,6 +53,40 @@ _BODY_MD = term.body_parser(_highlight)
 @functools.lru_cache(maxsize=1000)
 def _body_html(body: str) -> str:
     return _BODY_MD.render(body)
+
+
+def _blocks(body: str) -> list[str]:
+    """The body's top-level markdown blocks, each as the source lines it
+    spans: a fence or a table is one block, blank lines and all."""
+    lines = body.splitlines(keepends=True)
+    return ["".join(lines[t.map[0]:t.map[1]]).rstrip("\n") for t in _BODY_MD.parse(body)
+            if t.level == 0 and t.map]
+
+
+def diff_blocks(old: str, new: str) -> list[tuple[str, str]]:
+    """old against new, block by markdown block, each rendered as a body is:
+    `=` kept, `-` gone, `+` came."""
+    # ponytail: a block is the unit, so a one-word edit shows its paragraph
+    # twice and a list is one block; mark the words inside a changed block
+    # if that bites.
+    a, b = _blocks(old), _blocks(new)
+    out = []
+    for op, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "equal":
+            out += [("=", t) for t in a[i1:i2]]
+        else:
+            out += [("-", t) for t in a[i1:i2]] + [("+", t) for t in b[j1:j2]]
+    return out
+
+
+def edited(old: str, new: str) -> bool:
+    """A rewrite a diff helps: not one that kept the old body whole, whose
+    seams mark what it added (summary.seams), and not a replacement, which a
+    diff shows all gone and all new. By words: by letters, two texts in one
+    language share a third by chance, and a 6 KB pair took 0.37 s to
+    compare, against 3 ms by words."""
+    words = [re.findall(r"\S+", t) for t in (old, new)]
+    return old not in new and SequenceMatcher(None, *words, autojunk=False).ratio() >= 0.3
 
 
 class NoteMarkdown(ui.markdown):
@@ -186,6 +221,9 @@ def check_tip(cfg, prov, state, distance) -> str:
         return f"{at}, this checkout's HEAD"
     if state == "diverged":
         return f"{at}, on another line of development than HEAD"
+    if state == "dangling":
+        return (f"{at}, which no branch or tag holds: an amend, a rebase or a deleted "
+                f"branch left it behind. Re-run the check to stamp a live commit")
     if state not in ("behind", "ahead"):
         return at
     lines = gitref.oneline(cfg, f"{sha}..HEAD" if state == "behind" else f"HEAD..{sha}",
@@ -199,18 +237,29 @@ def check_tip(cfg, prov, state, distance) -> str:
 def _check_badge(ctx, n, git_head=None) -> None:
     state, distance = api.verdict_state(ctx.cfg, n, git_head)
     text = f"{state} {distance}" if state in ("behind", "ahead") else state
+    # An age with no tip read as vague (the owner, 2026-10-07): say what it dates.
+    fixed_tip = ""
     if state == "unverifiable":
         text = f"unverifiable — {api.why_unverifiable(n.provenance)}"
     elif state == "external":
         text = f"external — {summ.age_phrase(n.provenance['at'])}"
+        fixed_tip = (f"ran {S.shown(n.provenance['at'])}, against something outside the "
+                     f"repo: no commit makes it stale, only time")
     elif state == "unstamped":
         text = f"unstamped — {summ.age_phrase(n.created_at)}"
+        fixed_tip = (f"written {S.shown(n.created_at)}, before symbion stamped checks: "
+                     f"no commit is known for it")
     cls = {"current": "sb-chip-good", "behind": "sb-chip-notable", "external": "",
            "pending": "", "unstamped": "",
            "ahead": "sb-chip-notable",
-           "diverged": "sb-chip-bad", "unverifiable": "sb-chip-bad"}[state]
+           "diverged": "sb-chip-bad", "dangling": "sb-chip-bad",
+           "unverifiable": "sb-chip-bad"}[state]
     chip = ui.label(text).classes(f"sb-chip {cls}").mark("check-state")
-    if not S.stamp_sha(n.provenance) or state in ("external", "pending"):
+    if fixed_tip:
+        with chip:
+            ui.tooltip(fixed_tip)
+        return
+    if not S.stamp_sha(n.provenance) or state == "pending":
         return
     # Filled on first hover: a `git log` per badge at render time doubled
     # the cost of a board of checks (45 badges: 1.5s to 2.9s).
@@ -378,7 +427,7 @@ def md_button(ctx, name, label: str = ""):
 def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                 base: dict | None = None, compact: bool = False, hit=(),
                 actions: bool = True, git_head: str | None = None,
-                since: int | None = None) -> None:
+                since: int | None = None, seams=(), diff_to=None) -> None:
     """One note row: a card. What it says first, then one line of where it
     points and what it is, the resolve ring on its left and star and edit
     over its corner. Every chip is a link into the filtered view -- that is
@@ -389,7 +438,9 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     `actions=False` drops the buttons: an earlier version is history, and an
     edit made from it would land on the current row. `git_head` is
     gitref.head_sha's, read once by a page of many check badges, and `since`
-    the row's gitref.commits_since, counted once by a page of many cards."""
+    the row's gitref.commits_since, counted once by a page of many cards.
+    `seams` are summary.seams' for the body; `diff_to`, the row that
+    superseded this one, shows the body as a diff against it."""
     def narrow(**kv):
         return href(**{**(base or {}), **kv})
 
@@ -403,7 +454,7 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     with ui.element("div").classes(cls + (" sb-resolvable" if resolvable else "")) \
             .props(f"data-id={n.id}").mark("note-row"):
         with ui.element("div").classes("sb-note-main"):
-            _note_content(ctx, n, compact, hit, show_target)
+            _note_content(ctx, n, compact, hit, show_target, seams, diff_to)
             _note_foot(ctx, n, status, narrow, show_target, git_head, since)
         # On the right, after the text: on the left it pushed an open row's
         # text in past a closed row's (the owner, 2026-10-01).
@@ -439,7 +490,8 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                     .tooltip("supersede / edit").mark("note-edit")
 
 
-def _note_content(ctx, n, compact: bool, hit, show_target: bool = False) -> None:
+def _note_content(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
+                  diff_to=None) -> None:
     """The body, the verdict, measurements and evidence: what the row says.
     A bare row says its target, or on that target's own page, its arc."""
     if bare(n):
@@ -467,8 +519,25 @@ def _note_content(ctx, n, compact: bool, hit, show_target: bool = False) -> None
                     .classes("sb-note-text sb-snippet").mark("note-snippet")
             else:
                 ui.label(text).classes("sb-note-text")
+    elif diff_to:
+        ui.label(f"{diff_to.author} edited this {summ.when_added(diff_to.created_at)}") \
+            .classes("sb-note-meta").tooltip(diff_to.created_at)
+        for op, text in diff_blocks(n.body, diff_to.body):
+            md = NoteMarkdown(link_ids(text, ctx.store_dir))
+            if op != "=":
+                side = "del" if op == "-" else "ins"
+                md.classes(f"sb-diff-{side}").mark(f"diff-{side}")
     elif n.body:
-        NoteMarkdown(link_ids(n.body, ctx.store_dir))   # sanitize=True default: DOMPurify
+        # Each piece on its own, a rule in the kind's colour between: an
+        # append's text after its seam, a prepend's before.
+        start = 0
+        for at, who, when, above in seams:
+            NoteMarkdown(link_ids(n.body[start:at], ctx.store_dir))
+            said = f"{who} added {'the above ' if above else ''}{summ.when_added(when)}"
+            with ui.element("div").classes("sb-seam"):
+                ui.label(said).tooltip(when).mark("seam")
+            start = at
+        NoteMarkdown(link_ids(n.body[start:], ctx.store_dir))   # sanitize=True: DOMPurify
     if n.measurements:
         with ui.row().classes("gap-3 flex-wrap").mark("measurements"):
             for k, v in n.measurements.items():

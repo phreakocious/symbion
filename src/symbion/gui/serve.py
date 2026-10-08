@@ -191,6 +191,14 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
                   f"takes {port}, which changes at each restart; --port picks a fixed one.",
                   file=sys.stderr, flush=True)
         mine = servers.record(url, ctx.store_dir)
+    restart = []
+    if top and hasattr(signal, "SIGUSR1"):
+        # `serve --restart`: stop as Ctrl-C does, then exec again below. Not
+        # SIGHUP: a closed terminal sends that to its foreground job.
+        def _restart(*_):
+            restart.append(True)
+            signal.raise_signal(signal.SIGINT)
+        signal.signal(signal.SIGUSR1, _restart)
     try:
         # Never ui.run()'s default, 0.0.0.0 outside native mode: the GUI
         # writes rows with no authentication.
@@ -208,6 +216,19 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
     finally:
         if mine:
             mine.unlink(missing_ok=True)
+    if restart:
+        # The same process, so the same terminal and Ctrl-C; the browser
+        # tab it opened at the first start reconnects on its own.
+        print("symbion serve: restarting", flush=True)
+        # multiprocessing's resource tracker, a child, exits when the exec
+        # closes its pipe, and the new image never reaps it: a zombie per
+        # restart. _stop() closes the pipe and reaps it.
+        # ponytail: private API, there from Python 3.8 through 3.14; if it
+        # goes, the getattr skips it and the zombies come back.
+        from multiprocessing import resource_tracker
+        getattr(resource_tracker._resource_tracker, "_stop", lambda: None)()
+        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:],
+                                  *(["--no-browser"] if show else [])])
     return 0
 
 

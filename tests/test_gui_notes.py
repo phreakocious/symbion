@@ -8,7 +8,7 @@ from nicegui import ui                      # noqa: E402
 from nicegui.testing import User            # noqa: E402
 
 from symbion import api, store              # noqa: E402
-from symbion.gui.notes import render_note   # noqa: E402
+from symbion.gui.notes import diff_blocks, edited, render_note   # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
 
@@ -110,6 +110,8 @@ async def test_a_check_with_no_stamp_reads_unstamped(user: User, repo, tmp_path)
     await user.open("/t")
     await user.should_see("unstamped — 5d ago")
     await user.should_not_see("unverifiable")
+    await user.should_see(f"written {store.shown(five)}, before symbion stamped checks: "
+                          f"no commit is known for it")              # the tooltip
 
 
 async def test_an_external_check_badge_reads_external(user: User, repo, tmp_path):
@@ -124,6 +126,9 @@ async def test_an_external_check_badge_reads_external(user: User, repo, tmp_path
     await user.open("/t")
     await user.should_see("external — <1d ago")
     await user.should_not_see("current")
+    # "external — 1d ago" was vague with no tooltip (the owner, 2026-10-07).
+    await user.should_see(f"ran {store.shown(n.provenance['at'])}, against something outside "
+                          f"the repo: no commit makes it stale, only time")
 
 
 async def test_tag_chip_is_a_link_into_the_filtered_view(user: User, repo, tmp_path):
@@ -156,6 +161,24 @@ async def test_a_clean_check_badge_reads_current(user: User, repo, tmp_path):
     await user.open("/t")
     await user.should_see("current")
     await user.should_not_see("unverifiable")
+
+
+async def test_a_check_whose_commit_was_amended_away_reads_dangling(user: User, repo, tmp_path):
+    import subprocess
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "check", "target": {"type": "commit", "name": "HEAD"},
+                      "checked": "x", "result": "y"}, author="ada")
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                    "--amend", "-m", "amended"], check=True, cwd=repo)
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("dangling")
+    user.find(marker="check-state").trigger("mouseenter")
+    await user.should_see(f"stamped at {n.provenance['sha'][:7]}, which no branch or tag holds")
 
 
 async def test_an_open_pre_registration_badge_reads_pending(user: User, repo, tmp_path):
@@ -1128,3 +1151,25 @@ async def test_a_since_chip_lists_the_commits_it_counts(user: User, repo, tmp_pa
     await user.should_not_see("edit 1")                     # not yet: lazy
     user.find(marker="note-since").trigger("mouseenter")
     await user.should_see("edit 1")
+
+
+def test_a_diff_compares_whole_markdown_blocks():
+    """By block, as the body renders: a fence with a blank line in it is one
+    block, so the diff never cuts one in half."""
+    old = "keep this\n\n```\na\n\nb\n```\n\nlast words"
+    new = "keep this\n\n```\na\n\nB\n```\n\nlast words"
+    assert [(op, t.strip()) for op, t in diff_blocks(old, new)] == [
+        ("=", "keep this"), ("-", "```\na\n\nb\n```"), ("+", "```\na\n\nB\n```"),
+        ("=", "last words")]
+    # The last block ends without its newline: it is still the block it was.
+    assert diff_blocks("a", "a\n\nb") == [("=", "a"), ("+", "b")]
+
+
+def test_a_rewrite_that_shares_letters_but_not_words_is_a_replacement():
+    """Two texts in one language share a third of their letters by chance:
+    rewrites at 0.3 or more by letters fell to 0.05 to 0.26 by words."""
+    old = "the upload test fails about once in twenty runs on CI"
+    assert not edited(old, "Fixed in 1234abc: a retry around the upload, now green on CI")
+    assert edited(old, "the upload test fails about once in fifty runs on CI")
+    # The old body whole inside the new one: seams mark both ends, not a diff.
+    assert not edited(old, f"a new lead\n\n{old}\n\nand a new end")

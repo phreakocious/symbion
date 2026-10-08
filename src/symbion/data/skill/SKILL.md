@@ -36,7 +36,9 @@ A kind is a label on three bits, and the bits are all symbion knows:
   saying why.
 - **`verdict`**: `--checked "pytest -k upload --count 50"` (what ran) and
   `--result "50 passed"` (what it said). The row is stamped with HEAD, and `list` reports it
-  `current`, `behind N`, `ahead N` or `diverged`. The stamp says the run was at
+  `current`, `behind N`, `ahead N` or `diverged` (on another branch), or
+  `dangling` when no branch or tag holds its commit (an amend or a rebase
+  after the run): re-run it. The stamp says the run was at
   this HEAD: a result the user reports from this tree is a `check` whose
   `--checked` says who ran it; one from another tree or day is a `note` on its
   commit. A check on something outside the repo (DNS, a host's logs, a live
@@ -44,7 +46,11 @@ A kind is a label on three bits, and the bits are all symbion knows:
   otherwise any later commit makes it read `behind N`. A supersede keeps the
   stamp, so it corrects the record of that run: a new run is a new row. A
   row migrated from a store that predates stamping reads `unstamped`, with
-  its age.
+  its age. A number a later row will be compared with also goes in
+  `--measure passed=50` (repeatable, any kind): `--json` gives it under
+  `measurements` as a number, where `--result` prose holds only text.
+  `resolve` and `supersede` take `--measure` too: a name given replaces that
+  name, and the others are inherited.
 - **`status` + `verdict`** is a pre-registration. No default kind has both:
   declare one under `[kinds]` in `symbion.toml`, e.g. `prediction = { status
   = true, verdict = true }`. That table replaces the defaults:
@@ -52,8 +58,9 @@ A kind is a label on three bits, and the bits are all symbion knows:
   before the data exists: `--checked` names the run and its control, the body
   states the prediction and what would falsify it, and `--due` is the date its
   window closes. Open with no result, it lists as `pending`; `resolve <id>
-  --result "…"` closes it and stamps the commit it was judged at, and a
-  resolve with no result is refused. Amend it with `supersede <id> --append --body-file -`, which
+  --result "…"` closes it and stamps the commit it was judged at, and
+  `--measure` there carries the counts it scored. A resolve with no result
+  is refused. Amend it with `supersede <id> --append --body-file -`, which
   keeps the registered text as an unchanged prefix. If the window closes with
   the test unrun, amend it with a new `--due` and say what did not happen; do
   not resolve it, because any result scores claims the run never reached. A
@@ -144,7 +151,8 @@ has `id`, `kind`, `target: {type, name}` (`name` is `null` on a `project`
 target), `created_at`, `author`, `body`, `status`, `checked`, `result`,
 `arc_id`, `due`, `supersedes`, `tags`, `refs`, `provenance`, `measurements`,
 `evidence`, `target_blob`. `list`, `context` and `arc todo` add
-`commits_since` (null unless the target is a file in this checkout); `list`
+`commits_since` (null unless the target is a file in this checkout) and
+`raised_by`, the author of the row's first version (`author` is its newest's); `list`
 also adds `state` and `distance` on verdict kinds, and `head` on a superseded
 row. There is no `ts` or `title`: a guessed key reads as a silent `null`.
 `list`, `arc list` and `arc todo` return a bare array; `summary` and
@@ -160,7 +168,8 @@ symbion context --target file:src/x.py --json
 ```
 
 Search with `list --grep PATTERN`, a case-insensitive regex over body, target
-name, checked, result, refs and `#tags`; `-F` takes it literally. Never
+name, checked, result, refs and `#tags`; `-F` takes it literally. A pattern
+that is an id or its tail (`412907-3be`) also lists that row. Never
 `list | grep`: text `list` is one 25-row page, so the pipe misses rows and the
 silence reads as absence. The page's first line gives the total and the flag
 that shows each hidden set; `--limit 0` shows all. `--json` is paged only by
@@ -192,7 +201,11 @@ this file.
 
 A SessionStart hook runs `symbion summary`: open counts, rows due or overdue,
 arc progress, rows tagged `priority`, the open rows outside arcs, and open
-rows someone else wrote. From there:
+rows someone else wrote. When someone else amended a row, the summary and
+`list` print the first line they added below it (`alice added 3h ago: …`). An
+answer to your question arrives this way. `alice added 3h ago, lead rewritten
+since:` means the lead changed after it: the line answered an earlier
+question, so read the row before you relay it. From there:
 
 - `symbion context --target TYPE:NAME`: every row on one object.
 - `symbion context --branch <ref>`: every row on a commit reachable from
@@ -255,8 +268,8 @@ made is refused, naming the path.
 | `add KIND --target T:N [--body …] [--tag …]… [--ref T:N]… [--due DATE] [--arc-id ID]` | append a row; prints its id |
 | `list [--kind K] [--target T:N] [--status S] [--tag T] [--arc ID] [--grep PAT [-F]] [--overdue] [--since 2h] [--all] [--limit N] [--full] [--json]` | heads, newest first; `--all` adds superseded rows |
 | `show <id>... [--json]` | rows by id, as `list --id <id>...` (an array in `--json`) |
-| `resolve <id> [--body …] [--result …] [--ref T:N] [--add-tag …]` | close a row; `--body` goes below the current body, after a blank line it inserts |
-| `supersede <id> [--body …] [--append] [--prepend] [--add-tag …] [--rm-tag …] [--tag …] [--add-ref T:N] [--ref T:N] [--checked …] [--result …] [--due DATE]` | correct a row; `--tag` and `--ref` replace the inherited ones, `--add-tag` and `--add-ref` add to them; `--append` adds the body after a blank line it inserts, `--prepend` above one |
+| `resolve <id> [--body …] [--result …] [--measure K=V]… [--ref T:N] [--add-tag …]` | close a row; `--body` goes below the current body, after a blank line it inserts |
+| `supersede <id> [--body …] [--append] [--prepend] [--add-tag …] [--rm-tag …] [--tag …] [--add-ref T:N] [--ref T:N] [--checked …] [--result …] [--measure K=V]… [--due DATE]` | correct a row; `--tag` and `--ref` replace the inherited ones, `--add-tag` and `--add-ref` add to them, `--measure` sets one name and keeps the rest; `--append` adds the body after a blank line it inserts, `--prepend` above one |
 | `commit [-m MSG]` | commit the store |
 | `push` | push the store's commits to its remote |
 | `rename <old> <new> --type T [--to-type T2]` | move every row and ref on a renamed object; `--to-type` changes its type too |

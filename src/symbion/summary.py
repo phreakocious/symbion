@@ -29,10 +29,15 @@ NAME_CHARS = 120
 LIST_CAP = 25
 LIST_BODY_CHARS = 160
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
-# `**x**`, `__x__`, and `*x*`/`_x_` when the marker is not inside a word, so
-# `arc_id` and `'*.py'` survive. Group 2 or 4 is the wrapped text.
-_EMPHASIS = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1"
-                       r"|(?<!\w)([*_])(?=\S)(.+?)(?<=\S)\3(?!\w)")
+# `**x**` and `*x*` when the opening stars follow a space, the start, a `(` or
+# a quote, and come before text or a code span, not before a space, a star or
+# a glob's `.`, `/` or `:`; and the closing stars end a word, not a path's
+# middle or a `***`. So a glob (`run-*.csv`, `'*.py'`, `app.*.gz`), a
+# cron field and a `***` marker survive, even two in one body. Underscores
+# are never emphasis here: in row bodies `_x_` and `__x__` are identifiers
+# (`__init__`, `_cache … type_`), not emphasis. Group 2 is the wrapped text.
+_EMPHASIS = re.compile(r"(?<![^\s(\"'])(\*\*?)(?=[^\s*./:,;)\]}>`]|`\S)"
+                       r"(.+?)(?<=[^\s*])\1(?![\w*]|[./-]\w)")
 
 
 def flatten(s) -> str:
@@ -49,7 +54,7 @@ def clip(s, n: int) -> str:
     truncation kept doing it (measured 2026-09-20: one head rendered
     its asterisks literal, another ended mid-word). `--body` is documented as markdown, so
     emphasis keeps arriving."""
-    s = _EMPHASIS.sub(lambda m: m.group(2) or m.group(4), flatten(s))
+    s = _EMPHASIS.sub(lambda m: m.group(2), flatten(s))
     if len(s) <= n:
         return s
     cut = s.rfind(" ", n // 2, n)      # a word boundary in the back half, else hard
@@ -64,6 +69,36 @@ def age_days(created_at: str, now: datetime | None = None) -> int:
     if created.tzinfo is None:
         created = created.astimezone()
     return max(0, ((now or datetime.now().astimezone()) - created).days)
+
+
+_UNITS = ((3600, 60, "m"), (86400, 3600, "h"), (14 * 86400, 86400, "d"),
+          (63 * 86400, 7 * 86400, "w"), (365 * 86400, 30.44 * 86400, "mo"))
+
+
+def age(stamp: str, now: datetime | None = None) -> str:
+    """How long ago, in one short unit: `now`, `40m`, `8h`, `3d`, `5w`,
+    `4mo`, `2y`. A stamp without an offset is local time, as in age_days."""
+    then = datetime.fromisoformat(stamp)
+    if then.tzinfo is None:
+        then = then.astimezone()
+    s = max(0.0, ((now or datetime.now().astimezone()) - then).total_seconds())
+    if s < 60:
+        return "now"
+    for below, size, unit in _UNITS:
+        if s < below:
+            return f"{int(s // size)}{unit}"
+    return f"{int(s // (365 * 86400))}y"
+
+
+def when_added(stamp: str) -> str:
+    """`3d ago`, or `just now`: when an amendment came, as its line says it."""
+    a = age(stamp)
+    return "just now" if a == "now" else f"{a} ago"
+
+
+def measured(m: dict) -> str:
+    """A row's measurements on one line, in the order written."""
+    return ", ".join(f"{k}={v}" for k, v in m.items())
 
 
 def age_phrase(stamp: str) -> str:
@@ -274,7 +309,8 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
                 **who(reader, root.author, n.author),
                 **({"registered": S.shown(root.created_at)[:10]}
                    if n.spec.status and n.spec.verdict else {}),
-                **({"amendments": k} if (k := _amendments(by_id, n)) else {})}
+                **({"amendments": k} if (k := _amendments(by_id, n)) else {}),
+                **added(by_id, n, reader, chars)}
 
     prereg = [n for n in heads if n.spec.verdict]
     rest = deal_by_kind([n for n in heads if not n.spec.verdict])
@@ -387,6 +423,76 @@ def _amendments(by_id, n) -> int:
                for new, old in pairwise(_chain(by_id, n)))
 
 
+def seams(by_id, n) -> list[tuple[int, str, str, bool]]:
+    """Where each amendment joins n's body, by offset: `(at, author,
+    created_at, above)`, `above` for a prepend, whose text ends at `at`. Most
+    supersedes are appends, and a diff of one is the whole old body unchanged
+    (the owner, 2026-10-08). One link can add both above and below: a
+    prepend, then an append that rewrote the uncommitted row in place. A
+    rewrite drops the seams before it, whose offsets no longer hold. An
+    in-place edit of an uncommitted row leaves no link, so no seam."""
+    out = []
+    for old, new in pairwise(reversed(list(_chain(by_id, n)))):
+        if not old.body or new.body == old.body:
+            continue
+        i = new.body.find(old.body)
+        if i < 0:
+            out = []
+            continue
+        end = i + len(old.body)
+        # A side that added only whitespace has no seam: there is no text to mark.
+        out = ([(i, new.author, new.created_at, True)] if new.body[:i].strip() else []) \
+            + [(at + i, *s) for at, *s in out] \
+            + ([(end, new.author, new.created_at, False)] if new.body[end:].strip() else [])
+    return out
+
+
+def added(by_id, n, reader, chars) -> dict:
+    """`added` and `added_by`: the first line that the newest amendment by
+    someone other than the reader added, unless the body's clip to `chars`
+    already shows it. An owner's answer appended to a question sits at the
+    body's end, and a digest prints the start: two sessions in a row relayed
+    answered decisions as pending, `last by <owner>` the only sign
+    (2026-10-07). The newest such amendment, not the head: the reader's own
+    `noted` after an answer would hide it again.
+
+    `added_at`, and `lead_rewritten_since` when a later link changed the
+    clipped lead, tell an answer to an older question: a `let's do this`
+    the reader had already acted on, under a lead rewritten twice since, was
+    briefed as a yes to the new lead's open question (2026-10-07). Only the
+    lead: the reader's `noted` after an answer changes the body, and counted
+    as a revision it made an answer nobody acted on read as handled."""
+    rewritten = False
+    for new, old in pairwise(_chain(by_id, n)):
+        if wrote_it(reader, new.author):
+            was = set(old.body.splitlines())
+            line = next((ln for ln in new.body.splitlines() if ln.strip() and ln not in was),
+                        None)
+            if line:
+                text = clip(line, chars)
+                return ({"added": text, "added_by": new.author, "added_at": new.created_at,
+                         "lead_rewritten_since": rewritten}
+                        if line in n.body and text not in clip(n.body, chars) else {})
+        rewritten |= clip(new.body, chars) != clip(old.body, chars)
+    return {}
+
+
+def added_label(a) -> str:
+    """`alice added 19h ago, lead rewritten since:`, the words before an
+    `added` line in summary and list."""
+    since = ", lead rewritten since" if a["lead_rewritten_since"] else ""
+    return f"{a['added_by']} added {when_added(a['added_at'])}{since}:"
+
+
+def json_row(n, by_id, since) -> dict:
+    """A row as `list`, `context` and `arc todo` print it in --json:
+    `read_dict` plus what they compute. `raised_by` is the author of the
+    chain's first row: `author` is the head's, so one `supersede --append` by
+    a teammate moved a row out of a consumer's filter on its raiser (an agent
+    harness, 2026-10-07)."""
+    return S.read_dict(n) | {"commits_since": since, "raised_by": _root(by_id, n).author}
+
+
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -427,8 +533,11 @@ def _labelled(paint, r) -> str:
     reg = f", registered {r['registered']}" if r.get("registered") else ""
     amd = f", +{_count(r['amendments'], 'amendment')}" if r.get("amendments") else ""
     star = f", starred {r['starred_days']}d ago" if r.get("starred_days") else ""
-    return (by and by + " ") + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
-                          label=r["kind"] + reg + amd + star)
+    line = (by and by + " ") + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
+                                        label=r["kind"] + reg + amd + star)
+    if r.get("added"):
+        line += f"\n    {paint(added_label(r), 'meta')} {paint(r['added'], 'body')}"
+    return line
 
 
 def render_summary(d: dict, paint=plain) -> str:
@@ -528,12 +637,13 @@ def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -
     `retired` tag (`supersede --add-tag retired`): a progress log or a
     "built at" marker leaves this view and stays on its object. The tag
     means nothing on a status kind here; open work is resolved, not hidden."""
+    loaded = S.load(store_dir)
     if target:
         ttype, _, tname = target.partition(":")
-        tname = gitref.canon_name(cfg, ttype, tname or None)
-        rows = S.heads_for(store_dir, ttype, tname)
+        tname = gitref.canon_name(cfg, ttype, tname or None, S.stored_names(loaded, ttype))
+        rows = S.heads_for(store_dir, ttype, tname, loaded=loaded)
     else:
-        notes = S.heads(S.load(store_dir))
+        notes = S.heads(loaded)
         if commit:
             sha = gitref.canonical_commit(cfg, commit)
             rows = S.query(notes, target_type="commit", target_name=sha)
@@ -551,9 +661,10 @@ def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -
     # client read as an object with no rows; `gui` spared a client a second
     # process only to learn the URL (2026-10-03).
     since = gitref.commits_since(cfg, rows)
+    by_id = {n.id: n for n in loaded}
     return {"store": str(store_dir) if S.exists(store_dir) else None,
             "gui": (r := servers.serving(store_dir)) and r["url"],
-            "notes": [S.read_dict(n) | {"commits_since": since[n.id]} for n in rows]}
+            "notes": [json_row(n, by_id, since[n.id]) for n in rows]}
 
 
 # ---- schema: the vocabulary, for the hook, the skill and a human ----
