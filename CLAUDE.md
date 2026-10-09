@@ -29,7 +29,9 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
 - `src/symbion/data/skill/`: `SKILL.md`, `adoption.md`, `catalogs.md` and
   `session_start.sh`, the agent surface. They ship in the package; `symbion init` links
   `~/.claude/skills/symbion` to the installed copy.
-- `README.md`: install, and the guide to adopting symbion in a project.
+- `README.md`: what symbion does, install and a quick start. `docs/guide.md`: install
+  in full and adopting symbion in a project. `docs/reference.md`: how it behaves, and
+  development.
 - `docs/superpowers/specs/`: the designs, dated.
 
 ## Setup and tests
@@ -57,8 +59,8 @@ SKILL.md's rule to run the installed `symbion` is for using symbion, not for
 developing it. A write refuses a store `init` never made, and without `--dir` a
 command uses `../<repo>-notes` beside the current repo. Run `.venv/bin/symbion init
 --yes` only when the user asks: it creates that store, it can point the user-wide skill
-and hook at this checkout (README, "Adopt in a fresh repo"), and with `--dir` it can
-write a `.symbion` pointer into the checkout. Without `--yes` it only lists them.
+and hook at this checkout (`docs/guide.md`, "Adopt in a fresh repo"), and with `--dir`
+it can write a `.symbion` pointer into the checkout. Without `--yes` it only lists them.
 
 ## If this checkout is your installed symbion
 

@@ -95,7 +95,7 @@ def _pointer(root: Path, work: Path | None = None) -> Path | None:
     being looked for. It has to sit beside the project, and it has to be a
     file rather than an env var because the thing it fixes is durable:
     measured 2026-09-11, renaming a repo DIRECTORY does not lose its store,
-    it FORKS it. `summary` prints nothing and exits 0 (the README's table
+    it FORKS it. `summary` prints nothing and exits 0 (the guide's table
     reads that as "no store yet") and the next `add` created a second store
     and printed an ordinary id. (Since 2026-09-28 that `add` refuses and names
     the path: only `init` creates a store.)

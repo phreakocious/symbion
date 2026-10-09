@@ -205,7 +205,7 @@ def test_load_refuses_a_resolver_on_a_builtin_type(repo, tmp_path):
 # ---- .symbion: the store pointer ----
 # Measured 2026-09-11 in a throwaway repo: rename the repo DIRECTORY and the
 # store is not lost, it is FORKED. `symbion summary` prints nothing and exits
-# 0 -- which the README's own table reads as "no store yet" -- and the next
+# 0 -- which the guide's own table reads as "no store yet" -- and the next
 # `symbion add` creates a second store beside the first and prints an ordinary
 # id. Two histories, no warning. A pointer beside the project is the durable
 # fix; SYMBION_DIR is per-invocation and nothing in the repo remembers it.

@@ -1,2 +1,3 @@
 graft tests
+include docs/*.md
 global-exclude *.py[cod]

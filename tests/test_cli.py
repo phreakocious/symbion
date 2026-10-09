@@ -4961,7 +4961,7 @@ def test_from_json_takes_due(tmp_path, capsys, monkeypatch):
 
 
 _DOCS = [Path(cli.__file__).parent / "data" / "skill" / f for f in ("SKILL.md", "adoption.md", "catalogs.md")] \
-    + [Path(__file__).parent.parent / "README.md"]
+    + [Path(__file__).parent.parent / f for f in ("README.md", "docs/guide.md", "docs/reference.md")]
 
 
 def _doc_flags(text):
@@ -5024,7 +5024,7 @@ def test_every_flag_a_doc_names_is_one_the_parser_takes(doc, tmp_path, capsys):
     arguments`. Each doc is read through `-h` of the command
     it names, so a flag that exists only on another verb still fails."""
     pairs = _doc_flags(doc.read_text())
-    assert len(pairs) >= {"SKILL.md": 35, "README.md": 20, "catalogs.md": 6}.get(doc.name, 1), \
+    assert len(pairs) >= {"SKILL.md": 35, "README.md": 3, "guide.md": 10, "reference.md": 18, "catalogs.md": 6}.get(doc.name, 1), \
         f"the scan read {len(pairs)} pairs: the pattern broke, not the docs"
     parser = cli._build_parser(frozenset(), frozenset(), frozenset(), tmp_path,
                                K.DEFAULT_KINDS)

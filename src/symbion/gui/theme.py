@@ -74,8 +74,8 @@ NARROW = 900
 # Two overlapping rings, one per partner, in place of NiceGUI's own icon.
 _RINGS = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"{size}>'
-    f'<circle cx="12" cy="16" r="8" fill="none" stroke="{PALETTE.accent}" stroke-width="3.5"/>'
-    f'<circle cx="20" cy="16" r="8" fill="none" stroke="{PALETTE.rare}" stroke-width="3.5"/>'
+    f'<circle cx="11.5" cy="16" r="8.5" fill="none" stroke="{PALETTE.accent}" stroke-width="3.5"/>'
+    f'<circle cx="20.5" cy="16" r="8.5" fill="none" stroke="{PALETTE.rare}" stroke-width="3.5"/>'
     '</svg>')
 FAVICON_SVG = _RINGS.format(size="")
 LOGO_SVG = _RINGS.format(size=' width="24" height="24" aria-hidden="true"')
