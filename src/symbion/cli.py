@@ -307,6 +307,15 @@ def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
         print("note: " + _old_copies_line(old))
     changed |= _record_pointer(Path(store_dir), Path(cfg.project_root), store_from_env,
                                write, repoint)
+    if sys.stdout.isatty():
+        # A person's terminal only: an agent has no tty to judge (the owner,
+        # 2026-10-06). The terminal usually does more than its TERM says.
+        from . import term
+        if term.SIXTEEN:
+            print(f"note: this terminal reports 16 colours (TERM="
+                  f"{os.environ.get('TERM', '')}), so symbion prints in plainer ones; "
+                  "most terminals do more: set COLORTERM=truecolor, or a TERM ending "
+                  "in -256color")
     if write:
         return 0
     print("nothing written: re-run with --yes to make these changes" if changed
@@ -416,37 +425,29 @@ def _write_starter_toml(p: Path, cfg) -> None:
 #                                        # MAIN worktree so every linked worktree shares one store.
 default_branch = "{cfg.default_branch}"
 # local_only = true   # no remote on purpose: `commit` stops saying "no remote"
+# git_name = "symbion-notes"          # the author of the store's own commits: set
+# git_email = "symbion-notes@local"   # yours where a remote refuses a made-up one
 
 # A catalog type is a command emitting ONE NAME PER LINE and nothing else. It
-# runs in the root of the current worktree.
-# Verify with `symbion arc seed --scope <type> --dry-run` (no arc needed) every time
-# you add one -- a catalog command's output depends on the tool's version and
-# on the project's own config, so docs and prior runs elsewhere tell you nothing:
-# `pytest --collect-only -q` emits full test node ids, but per-file counts
-# ("tests/test_x.py: 39") where the project's pytest config adds `-q` to addopts.
+# runs in the root of the current worktree. Dry-run each new one before its
+# first seed: `symbion arc seed --scope <type> --dry-run`. Why, and the resolver
+# protocol, are in catalogs.md, in the skill `init` linked, or at
+# https://github.com/phreakocious/symbion/blob/main/src/symbion/data/skill/catalogs.md
 [catalogs]
 # `--others --exclude-standard` lists files not yet committed, so a note on a
-# file made this session resolves instead of warning `stored as typed`.
-# file = "git ls-files --cached --others --exclude-standard '*.py'"   # pair with `file = "git"` under [renames] below
+# file made this session resolves instead of warning `taken as typed`.
+# file = "git ls-files --cached --others --exclude-standard"   # pair with `file = "git"` under [renames] below
 # test = "git ls-files --cached --others --exclude-standard 'tests/test_*.py'"
 # A STORE-DERIVED catalog is empty until its first row exists, and that row
 # cannot be written while the catalog is empty: it NEEDS its [resolvers]
 # entry below, which decides what a first sighting stores. Uncomment both.
 # reading = "set -o pipefail; symbion list --all --json --type reading | jq -r '.[].target.name' | sort -u"
 
-# A resolver replaces the built-in match rule (exact, else unique substring,
-# else the input) for ONE catalog type. stdin: the query on line 1, then one
-# catalog name per line. Exit 0: the first non-blank stdout line is the name
-# to store, in or out of the list. Exit 2: stdout lists the matches, one per
-# line; symbion refuses as ambiguous. Anything else is an error and stores
-# nothing. Like a catalog, it runs in the root of the current worktree, so a
-# script kept beside this file needs its path from there. It runs while the
-# store lock is held, so it must not write to the store.
-# A NUMERIC catalog without a resolver fragments: 3.1416 is not a
-# substring of 3.14159, so it silently becomes a second target.
-# `set -o pipefail` is load-bearing on a catalog that pipes: /bin/sh reports
-# the LAST command's status, so without it a failed producer reads as an
-# empty catalog and the resolver mints a fresh name.
+# A resolver picks the name to store for ONE catalog type, in place of the
+# built-in match. A NUMERIC catalog needs one, or it fragments: 3.1416 is not
+# a substring of 3.14159, so it silently becomes a second target. Keep
+# `set -o pipefail` on a catalog that pipes: without it a failed producer
+# reads as an empty catalog. Its protocol is in catalogs.md (above).
 [resolvers]
 # reading = "python3 tools/resolve_reading.py"   # required by the store-derived catalog above
 
@@ -680,7 +681,8 @@ def _measures_from_flags(flags) -> dict | None:
     out = {}
     for f in flags or ():
         k, eq, v = f.partition("=")
-        if not eq or not k.strip():
+        k, v = k.strip(), v.strip()         # `n = 5` stored the name `'n '`
+        if not eq or not k:
             raise SystemExit(f"--measure {f!r}: write KEY=VALUE, e.g. --measure passed=412")
         if k in out:
             raise SystemExit(f"--measure {k!r} is given twice; give each name once")
@@ -719,31 +721,36 @@ def _row_from_flags(args) -> dict:
 
 
 def _rows_from_json(path):
-    """[(lineno, row)] from PATH or stdin: one JSON object per line, blank
-    lines skipped. Keys outside the input shape are refused by name -- an
-    `id`, `created_at` or `provenance` in the input would otherwise be
-    silently discarded, and a typo'd key silently dropped."""
+    """([(lineno, row)], [(lineno, error)]) from PATH or stdin: one JSON
+    object per line, blank lines skipped. Keys outside the input shape are
+    refused by name -- an `id`, `created_at` or `provenance` in the input
+    would otherwise be silently discarded, and a typo'd key silently dropped."""
     text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
-    rows = []
-    for i, line in enumerate(text.splitlines(), 1):
+    rows, errors = [], []
+    for i, line in enumerate(store.jsonl_lines(text), 1):
         if not line.strip():
             continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError as e:
-            raise SystemExit(f"add: --from-json line {i}: {e}")
+            errors.append((i, f"line {i}: {e}"))
+            continue
         if isinstance(row, list):
-            raise SystemExit(f"add: --from-json line {i} is a JSON array; it reads one "
-                             f"JSON object per line")
-        if not isinstance(row, dict):
-            raise SystemExit(f"add: --from-json line {i}: expected a JSON object")
-        bad = sorted(set(row) - _ROW_KEYS)
-        if bad:
-            raise SystemExit(f"add: --from-json line {i}: unexpected key(s) {bad}; a row "
-                             f"takes only {', '.join(_ROW_KEY_ORDER)}. symbion mints id, "
-                             f"created_at, provenance and target_blob itself")
-        rows.append((i, row))
-    return rows
+            errors.append((i, f"line {i} is a JSON array; it reads one JSON object per line"))
+        elif not isinstance(row, dict):
+            errors.append((i, f"line {i}: expected a JSON object"))
+        elif bad := sorted(set(row) - _ROW_KEYS):
+            errors.append((i, f"line {i}: unexpected key(s) {bad}; a row takes only "
+                              f"{', '.join(_ROW_KEY_ORDER)}. symbion mints id, created_at, "
+                              f"provenance and target_blob itself"))
+        else:
+            rows.append((i, row))
+    if not rows and not errors:
+        # A producer that failed upstream of a pipe with no pipefail read as a
+        # bootstrap that worked: exit 0, nothing written (2026-10-09).
+        raise SystemExit(f"add: --from-json {path}: read no rows, so nothing was written; "
+                         f"check the file or the command feeding it")
+    return rows, errors
 
 
 # ---- --dir extraction: resolved before subcommand parsing ----
@@ -841,6 +848,12 @@ class _Parser(argparse.ArgumentParser):
         stray = re.match(r"argument KIND: invalid kind '([^']*)'", message)
         if stray and (pair := self._measure_hint([stray[1]])):
             message = f"{stray[1]!r} was read as KIND: {pair}"
+        elif stray and " " in stray[1]:
+            # Quoted text with no flag before it: its quotes are there, its
+            # --body is not, and then the kind is missing too (2026-10-09).
+            message = f"{stray[1]!r} was read as KIND: text goes in --body \"…\""
+            if "--kind" not in self._argv:
+                message += "; a kind is required: `add KIND`"
         elif stray and self._argv[:1] != [stray[1]]:
             # Not the word after `add`: the next word of an unquoted value
             # (`--ref item:a b`) filled the optional KIND, and the list of
@@ -863,7 +876,10 @@ class _Parser(argparse.ArgumentParser):
         ns, extras = super().parse_known_args(args, namespace)
         if extras and self._subparsers is None:
             hints = [f"{x}: use {_FLAG_HINTS[x]}" for x in extras if x in _FLAG_HINTS]
-            bare = [x for x in extras if not x.startswith("-")]
+            # A word right after an unknown flag is that flag's value: `-m x`
+            # read as an unquoted value that split (dogfood, 2026-10-09).
+            bare = [x for i, x in enumerate(extras) if not x.startswith("-")
+                    and not (i and extras[i - 1].startswith("-"))]
             if pairs := self._measure_hint(bare):
                 hints.append(pairs)
                 bare = [x for x in bare if not _PAIR.match(x)]
@@ -873,9 +889,26 @@ class _Parser(argparse.ArgumentParser):
                 if not any(" " in x for x in bare):
                     hints.append('a value with spaces needs quotes: --target "item:a b"')
                 hints.append('text goes in --body "…"')
+            hints += self._add_gaps(ns)
             self.error(f"unrecognized arguments: {' '.join(extras)}"
                        + "".join(f"; {h}" for h in hints))
         return ns, extras
+
+    def _add_gaps(self, ns):
+        """What `add` would refuse on the next run, named in this one: the
+        stray text, then the missing target, then the target's name took
+        three runs to learn (dogfood, 2026-10-09)."""
+        if self.prog != "symbion add" or ns.from_json:
+            return []
+        gaps = [] if ns.kind or ns.kind_pos else ["a kind is required: `add KIND`"]
+        if not (ns.target or ns.type):
+            return gaps + ["a target is required: --target TYPE:NAME"]
+        typ, name = ns.target.partition(":")[::2] if ns.target else (ns.type, ns.name)
+        try:
+            api.check_name(typ, name or None)
+        except ValueError as e:
+            gaps.append(str(e))
+        return gaps
 
     def _measure_hint(self, words):
         """`--measure a=1 b=2` leaves `b=2` over: a second pair, not an
@@ -909,7 +942,8 @@ _VERB_HINTS = {
 }
 _FLAG_HINTS = {"--open": "--status open", "--closed": "--status resolved",
                "--resolved": "--status resolved", "--search": "--grep",
-               "--message": "--body", "--text": "--body", "--title": "--body"}
+               "--message": "--body", "-m": "--body", "--text": "--body",
+               "--title": "--body"}
 
 
 def _choice(legal, what, where, store_dir):
@@ -924,9 +958,20 @@ def _choice(legal, what, where, store_dir):
         if v in legal or not store.exists(store_dir):
             return v
         raise argparse.ArgumentTypeError(
-            f"invalid {what} {v!r} (choose from {', '.join(legal)}); {where}")
+            f"invalid {what} {v!r} (choose from {', '.join(legal)}); {where(v)}")
     parse.choices = legal       # for _Parser.error on a bare flag
     return parse
+
+
+def _row_count(text: str) -> int:
+    """`list --limit`: `-1` sliced the oldest row off the page (2026-10-09)."""
+    try:
+        n = int(text)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a row count: give N, or 0 for all")
+    return n
 
 
 def _network(text: str):
@@ -940,8 +985,9 @@ def _network(text: str):
 def _catalog_choice(legal, what, store_dir, kinds=(), as_kind=None):
     """`kinds` and `as_kind` for a --type: a kind typed there (`--type bug`)
     is named as one, with the flag that takes it."""
-    parse = _choice(legal, what, f"catalog {what}s are declared in "
-                                 f"{store_dir / 'symbion.toml'} under [catalogs]", store_dir)
+    parse = _choice(legal, what, lambda v: config.uncomment_hint(store_dir, v) or
+                    f"catalog {what}s are declared in {store_dir / 'symbion.toml'} "
+                    f"under [catalogs]", store_dir)
     if not kinds:
         return parse
 
@@ -998,8 +1044,16 @@ def _since(v):
 
 
 def _kind_choice(kinds, store_dir):
-    return _choice(kinds, "kind", f"kinds are declared in {store_dir / 'symbion.toml'} "
-                                  f"under [kinds]", store_dir)
+    """A default the table lacks gets the line to paste: a table `init` wrote
+    keeps the defaults of its day, so a default added later never reaches it."""
+    toml = store_dir / "symbion.toml"
+
+    def where(v):
+        if v in K.DEFAULT_KINDS:
+            line = K.render_toml({v: K.DEFAULT_KINDS[v]}).splitlines()[1]
+            return f"{v!r} is a default kind: to use it here, add under [kinds] in {toml}: {line}"
+        return f"kinds are declared in {toml} under [kinds]"
+    return _choice(kinds, "kind", where, store_dir)
 
 
 _EPILOG = """\
@@ -1067,7 +1121,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                           "validated before any is written; takes no other note flags")
     a.add_argument("--name", default=None, help="target name (omit for project)")
     ab = a.add_mutually_exclusive_group()
-    ab.add_argument("--body", default="")
+    ab.add_argument("--body", default="", help="the row's text, markdown")
     ab.add_argument("--body-file", dest="body_file", default=None, metavar="PATH",
                     help="read the body from PATH ('-' for stdin): safest for prose "
                          "with backticks, $ or several paragraphs, which a shell "
@@ -1084,15 +1138,17 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                    help="verdict kinds: what was checked is outside this repo (DNS, a "
                         "host, a live db), so the row is stamped with when it ran, not "
                         "HEAD, and lists its age instead of behind N or a dirty tree")
-    a.add_argument("--arc-id", "--arc", dest="arc_id", default=None, metavar="ID")
+    a.add_argument("--arc-id", "--arc", dest="arc_id", default=None, metavar="ID",
+                   help="file the row under this arc, a step of its checklist")
     a.add_argument("--due", default=None, metavar="DATE",
                    help="YYYY-MM-DD or an ISO datetime, UTC unless TZ is set; status kinds "
                         "only. Past due, an "
                         "open row prints first at session start and in list --overdue")
-    a.add_argument("--tag", dest="tags", action="append", default=[], help="repeatable")
+    a.add_argument("--tag", dest="tags", action="append", default=[], metavar="TAG",
+                   help="repeatable")
     a.add_argument("--ref", dest="refs", action="append", default=[], metavar="TYPE:NAME",
                    help="secondary target this note also implicates (repeatable), as TYPE:NAME")
-    a.add_argument("--author", default=None)
+    a.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     li = sub.add_parser("list", help="list notes, newest first; filter by kind, target, tag, "
                                      "arc or --grep text")
@@ -1103,12 +1159,14 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     type=_catalog_choice(target_types, "type", store_dir, kinds,
                                          "`list --kind {}`"),
                     help="one of: " + ", ".join(sorted(target_types)))
-    li.add_argument("--name", default=None)
+    li.add_argument("--name", default=None, help="target name, with --type")
     li.add_argument("--target", default=None, metavar="TYPE:NAME",
                     type=_target_choice(target_types, store_dir),
                     help="the same as --type TYPE --name NAME")
-    li.add_argument("--kind", default=None, type=_kind_choice(kinds, store_dir))
-    li.add_argument("--status", default=None, choices=sorted(store.STATUSES))
+    li.add_argument("--kind", default=None, type=_kind_choice(kinds, store_dir),
+                    help="only rows of this kind")
+    li.add_argument("--status", default=None, choices=sorted(store.STATUSES),
+                    help="only open, or only resolved, rows of a status kind")
     # The guess agents made most (2026-09-21..29). Out of -h, which teaches --status.
     for flag, status in (("--open", "open"), ("--resolved", "resolved"), ("--closed", "resolved")):
         li.add_argument(flag, dest="status", action="store_const", const=status,
@@ -1130,13 +1188,15 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                          "ISO datetime, UTC unless TZ is set (a revision counts as "
                          "written when it was)")
     li.add_argument("--all", action="store_true", help="include superseded rows")
-    li.add_argument("--author")
-    li.add_argument("--limit", type=int, default=None, metavar="N",
+    li.add_argument("--author", metavar="NAME",
+                    help="only rows whose newest version NAME wrote")
+    li.add_argument("--limit", type=_row_count, default=None, metavar="N",
                     help=f"rows to show, newest first (text default {summ.LIST_CAP}; 0 for "
                          f"all). --json is whole unless this is given")
     li.add_argument("--full", action="store_true",
                     help="print bodies as stored instead of one clipped line (--id implies it)")
-    li.add_argument("--json", action="store_true")
+    li.add_argument("--json", action="store_true",
+                    help="a JSON array of rows (SKILL.md lists the keys)")
 
     # Parsed only for -h: main() rewrites `show ID` to `list --id ID` first.
     # Listed so -h and the invalid-choice error name the verb, and with its
@@ -1158,7 +1218,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     help="read the body from PATH ('-' for stdin)")
     rs.add_argument("--append", action="store_true",
                     help="the default for resolve; accepted so older calls still run")
-    rs.add_argument("--add-tag", dest="add_tags", action="append", default=[],
+    rs.add_argument("--add-tag", dest="add_tags", action="append", default=[], metavar="TAG",
                     help="add a tag to the inherited set (repeatable): adopted, retired, …")
     rs.add_argument("--ref", dest="refs", action="append", default=[], metavar="TYPE:NAME",
                     help="add a ref, e.g. the commit that closed it (repeatable); the "
@@ -1167,12 +1227,13 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     "status+verdict kind (a pre-registration)")
     rs.add_argument("--measure", dest="measures", action="append", default=[],
                     metavar="KEY=VALUE", help=_MEASURE_MERGE_HELP)
-    rs.add_argument("--author", default=None)
+    rs.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     sp = sub.add_parser("supersede", help="record a correction to a note")
     sp.add_argument("id")
     sb = sp.add_mutually_exclusive_group()
-    sb.add_argument("--body", default=None)
+    sb.add_argument("--body", default=None,
+                    help="the new body; with --append or --prepend, text added to it")
     sb.add_argument("--body-file", dest="body_file", default=None, metavar="PATH",
                     help="read the body from PATH ('-' for stdin)")
     spa = sp.add_mutually_exclusive_group()
@@ -1182,7 +1243,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     spa.add_argument("--prepend", action="store_true",
                      help="put the --body/--body-file text above the current body, as its "
                           "new lead; refused on a pre-registration")
-    sp.add_argument("--status", default=None, choices=sorted(store.STATUSES))
+    sp.add_argument("--status", default=None, choices=sorted(store.STATUSES),
+                    help="set the status; `resolve ID` is the usual way to close")
     sp.add_argument("--checked", default=None,
                     help="check: correct what was checked")
     sp.add_argument("--result", default=None,
@@ -1192,11 +1254,11 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     sp.add_argument("--external", action="store_true",
                     help="a supersede keeps the row's stamp: accepted on a row "
                          "add --external wrote, refused on any other")
-    sp.add_argument("--tag", dest="tags", action="append", default=None,
+    sp.add_argument("--tag", dest="tags", action="append", default=None, metavar="TAG",
                     help="replace the inherited tags (repeatable); omit to inherit")
-    sp.add_argument("--add-tag", dest="add_tags", action="append", default=[],
+    sp.add_argument("--add-tag", dest="add_tags", action="append", default=[], metavar="TAG",
                     help="add a tag to the inherited set (repeatable)")
-    sp.add_argument("--rm-tag", dest="rm_tags", action="append", default=[],
+    sp.add_argument("--rm-tag", dest="rm_tags", action="append", default=[], metavar="TAG",
                     help="remove a tag from the inherited set (repeatable)")
     sp.add_argument("--ref", dest="refs", action="append", default=None, metavar="TYPE:NAME",
                     help="replace the inherited refs (repeatable; '' clears them); "
@@ -1207,10 +1269,14 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     help="file this note under an arc ('' detaches it)")
     sp.add_argument("--due", default=None, metavar="DATE",
                     help="set the due date: YYYY-MM-DD or an ISO datetime ('' clears it)")
-    sp.add_argument("--author", default=None)
+    sp.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     cm = sub.add_parser("commit", help="git add -A + commit the store")
-    cm.add_argument("-m", "--message", default="update notes")
+    cm.add_argument("-m", "--message", default="update notes",
+                    help="the commit message (default: update notes)")
+    cm.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="list each pending row (its id's tail, author, kind and lead) "
+                         "and each other changed file; commit nothing")
     sub.add_parser("push", help="git push the store to its remote; commit first")
 
     rn = sub.add_parser("rename",
@@ -1224,10 +1290,12 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     type=_catalog_choice(target_types, "type", store_dir, kinds),
                     help="move the object to this type too (default: --type); "
                          "project:NAME rows from 0.1.0 move with --type project --to-type item")
-    rn.add_argument("--author", default=None)
+    rn.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     sv = sub.add_parser("serve", help="local web UI (requires: pip install 'symbion[gui]')")
-    sv.add_argument("--port", type=int, default=None)
+    sv.add_argument("--port", type=int, default=None,
+                    help="default: the store's own port, derived from its path, so a "
+                         "link to it outlives a restart")
     sv.add_argument("--host", default="127.0.0.1", metavar="ADDR",
                     help="the address to listen on (default: 127.0.0.1, this machine "
                          "only; 0.0.0.0 is every address); any other needs --allow")
@@ -1237,8 +1305,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                          "(repeatable); this machine always may. There is no login: "
                          "each writes as --author")
     sv.add_argument("--author", default=None,
-                    help="identity stamped on GUI writes (default: git user.name)")
-    sv.add_argument("--no-browser", action="store_true")
+                    help="identity stamped on GUI writes (default: $SYMBION_AUTHOR, "
+                         "else git user.name; never an agent's name)")
+    sv.add_argument("--no-browser", action="store_true", help="open no browser tab")
     sv.add_argument("--reload", action="store_true", help="dev: reload on .py changes")
     every = sv.add_mutually_exclusive_group()
     every.add_argument("--restart", action="store_true",
@@ -1255,7 +1324,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                                         "(the session-start text)")
     sm.add_argument("--full", action="store_true", help="lift the display caps")
     smgrp = sm.add_mutually_exclusive_group()
-    smgrp.add_argument("--json", action="store_true")
+    smgrp.add_argument("--json", action="store_true",
+                       help="the same as an object; `store` is null when no store exists")
     smgrp.add_argument("--hook", action="store_true",
                        help="the SessionStart hook's JSON: the text for the agent, "
                             "and one line for the person's terminal")
@@ -1272,11 +1342,17 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                                          "(--commit) or branch (--branch)")
     grp = ctx.add_mutually_exclusive_group()
     grp.add_argument("--target", default=None, metavar="TYPE:NAME",
-                     type=_target_choice(target_types, store_dir, kinds))
-    grp.add_argument("--commit", default=None, metavar="SHA")
-    grp.add_argument("--branch", default=None, metavar="REF")
-    ctx.add_argument("--since", default=None, metavar="REF", help="base ref for --branch")
-    ctx.add_argument("--json", action="store_true")
+                     type=_target_choice(target_types, store_dir, kinds),
+                     help="the rows on this object, and the rows that --ref it")
+    grp.add_argument("--commit", default=None, metavar="SHA",
+                     help="the rows on this commit")
+    grp.add_argument("--branch", default=None, metavar="REF",
+                     help="the rows on each commit REF has that the base lacks")
+    ctx.add_argument("--since", default=None, metavar="REF",
+                     help="the base for --branch (default: default_branch in symbion.toml, "
+                          "so --branch on that branch lists nothing)")
+    ctx.add_argument("--json", action="store_true",
+                     help="an object with the rows under `notes`")
 
     act = sub.add_parser(
         "arc", help="campaigns: a checklist of rows across objects",
@@ -1294,7 +1370,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     help="what the arc's rows are about (default mixed): item, project, "
                          "or a catalog type, which `arc seed` and the web UI can sweep; "
                          "one of: " + ", ".join(sorted(arc_scopes)))
-    ac.add_argument("--author", default=None)
+    ac.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     al = asub.add_parser("list", help="every live arc with its done/total")
     al.add_argument("--all", action="store_true", help="archived arcs too")
@@ -1323,7 +1399,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                      help="print the resolved names and count; create nothing")
     asd.add_argument("--kind", default="task", help="the kind to mint (default task); "
                      "it needs the status bit and neither parked nor verdict")
-    asd.add_argument("--author", default=None)
+    asd.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     atd = asub.add_parser(
         "todo",
@@ -1333,13 +1409,13 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
 
     rc = asub.add_parser(
         "reconcile",
-        help="check each open task's target against the live catalog; flag stale/renamed")
+        help="check each open row's target against the live catalog; flag stale/renamed")
     rc.add_argument("id")
     rc.add_argument("--apply", action="store_true",
                      help="re-target renamed tasks onto the live name")
     rc.add_argument("--resolve-stale", dest="resolve_stale", action="store_true",
                      help="also close tasks with no live target and no rename evidence")
-    rc.add_argument("--author", default=None)
+    rc.add_argument("--author", default=None, help=_AUTHOR_HELP)
     rc.add_argument("--json", action="store_true",
                     help="the report rows as a JSON array; --apply counts go to stderr")
 
@@ -1424,6 +1500,9 @@ def _list_header(total: int, shown: int, hidden: list[str],
 
 
 _NEIGHBOUR_CAP = 3
+_AUTHOR_HELP = ("who writes it (default: $SYMBION_AUTHOR, else the agent whose shell "
+                "runs this, else git user.name)")
+_ERROR_CAP = 10
 
 
 def _name_stale_bodies(store_dir, old: str, prefix: bool = False) -> None:
@@ -1469,13 +1548,17 @@ def _name_open_neighbours(store_dir, written) -> None:
                                    if h.id not in new and not h.spec.parked
                                    and (title is None or _title(h.body) == title))
         if open_:
-            ids = ", ".join(h.id for h in open_[:_NEIGHBOUR_CAP])
-            more = f", +{len(open_) - _NEIGHBOUR_CAP} more" if len(open_) > _NEIGHBOUR_CAP else ""
+            # Each with its lead: by id alone, a duplicate showed only after
+            # a `show` (dogfood, 2026-10-07).
+            rows = "".join(f"\n  {h.id}  {summ.clip(h.body or '', 80)}".rstrip()
+                           for h in open_[:_NEIGHBOUR_CAP])
+            more = (f"\n  +{len(open_) - _NEIGHBOUR_CAP} more"
+                    if len(open_) > _NEIGHBOUR_CAP else "")
             where = shlex.quote(f"{t.type}:{t.name or ''}")
             which = " with this title" if title else ""
-            print(f"note: {len(open_)} open on {t.type}:{t.name or ''}{which}: {ids}{more}; "
-                  f"if this row settles or revises one, resolve or supersede that one "
-                  f"(context --target {where})", file=sys.stderr)
+            print(f"note: {len(open_)} open on {t.type}:{t.name or ''}{which}; if this row "
+                  f"settles or revises one, resolve or supersede that one "
+                  f"(context --target {where}):{rows}{more}", file=sys.stderr)
 
 
 _BOLD_LEAD = re.compile(r"\s*(\*\*|__)(.+?)\1")
@@ -1519,6 +1602,8 @@ def _name_catalog_misses(cfg, written) -> None:
 # a longer token: a full id's own tail is not checked twice, and a stamp
 # (`20990101-000000Z`) or a size (`50000000-byte`) is not an id.
 _CITED = re.compile(r"(?<![\w-])(?:20\d{6}-[\dxa-f-]*[\dxa-f]|\d{6}-[0-9a-f]{3})(?![\w-])")
+# An id or tail after one dash, `-a1b` or `-123456-a1b`: no flag has the shape.
+_DASHED_ID = re.compile(r"-(?:\d+-)*[0-9a-f]{3}")
 
 
 def _name_unknown_ids(store_dir, texts) -> None:
@@ -1528,6 +1613,8 @@ def _name_unknown_ids(store_dir, texts) -> None:
     refusal, since a row may cite another store's."""
     ids = [n.id for n in store.load(store_dir)]
     for tok in dict.fromkeys(t for text in texts for t in _CITED.findall(text or "")):
+        if re.fullmatch(r"20\d{6}-\d+", tok):
+            continue      # a date-time file stamp, not a cite (dogfood, 2026-10-09)
         if not any(i.startswith(tok) if tok[8:9] == "-" else i.endswith("-" + tok)
                    for i in ids):
             print(f"note: no row in this store matches {tok}, cited in the body",
@@ -1636,8 +1723,17 @@ def _say_rewritten(store_dir, tip, note) -> None:
               f"and commits every other writer's pending rows too)", file=sys.stderr)
         return
     dropped = store.unholdable(tip) if note.kind == tip.kind else []
-    if note.status != tip.status or dropped or not store.own_draft(store_dir, tip, note.author):
+    if note.status != tip.status or dropped:
         return                                   # a new row whatever cites it
+    if not store.own_draft(store_dir, tip, note.author):
+        # The new id alone left a session to `show` the old one to learn
+        # which to cite (2026-10-09).
+        why = (f"was written by {tip.author}" if note.author != tip.author else
+               "is a pre-registration" if tip.spec.status and tip.spec.verdict else
+               "is committed")
+        print(f"note: {tip.id} {why}, so it is kept and this edit is a new row; "
+              f"it now lists as superseded -> {note.id}", file=sys.stderr)
+        return
     by = [i for i in store.citing(store.load(store_dir), tip) if i != note.id]
     if by:
         more = f", +{len(by) - _NEIGHBOUR_CAP} more" if len(by) > _NEIGHBOUR_CAP else ""
@@ -1677,13 +1773,13 @@ def _name_sweep_drops(store_dir, before: set) -> None:
 
 def _expand_id(store_dir, raw: str) -> str | None:
     """The full id for `raw`: itself when exact, else the one id ending in
-    `-<raw>` (a leading `…` or `...` dropped, as ids are cited in prose).
+    `-<raw>` (a leading `…`, `...` or `-` dropped, as ids are cited in prose).
     A miss returns `raw`, for the verb's own no-note message. A tail more
     than one id ends in prints them all and returns None: never pick one.
     A 3-hex tail does not stay unique (measured 2026-09-24: 11 shared tails
     in a 383-row store)."""
     notes = store.load(store_dir) if store.exists(store_dir) else []
-    tail = raw.removeprefix("…").removeprefix("...")
+    tail = store.id_tail(raw)
     if any(n.id == tail for n in notes):
         return tail
     hits = [n for n in notes if n.id.endswith("-" + tail)]
@@ -1788,7 +1884,7 @@ def _dispatch(args, ctx) -> int:
             if set(flag_row) - {"author"}:      # --author is the rows' default
                 print("add: --from-json takes no other note flags", file=sys.stderr)
                 return 2
-            rows = _rows_from_json(args.from_json)
+            rows, errors = _rows_from_json(args.from_json)
         else:
             if not (args.kind and args.type):
                 print(f"add: a kind and a target are required: `add KIND --target TYPE:NAME`, "
@@ -1796,17 +1892,27 @@ def _dispatch(args, ctx) -> int:
                       f"kinds: {', '.join(ctx.kinds)}; types: {', '.join(sorted(target_types))}; "
                       f"`symbion schema` says when to use each kind", file=sys.stderr)
                 return 2
-            rows = [(None, flag_row)]
+            rows, errors = [(None, flag_row)], []
         author = _resolved_author(args)
         fields = []
         for lineno, row in rows:
             try:
                 fields.append(api.fields_from_row(ctx, row, author))
             except ValueError as e:
-                where = f"--from-json line {lineno}: " if lineno else ""
+                errors.append((lineno, f"line {lineno}: {e}" if lineno else str(e), row))
+        if errors:
+            # Every failing line, in line order: the key check ran over the
+            # whole batch first, so line 3 was named before line 2 (2026-10-09).
+            errors.sort(key=lambda e: e[0] or 0)
+            where = "--from-json " if args.from_json else ""
+            for _, e, *row in errors[:_ERROR_CAP]:
                 print(f"add: {where}{e}", file=sys.stderr)
-                _name_named_project_rows(ctx, row)
-                return 1
+                if row:
+                    _name_named_project_rows(ctx, row[0])
+            if len(errors) > _ERROR_CAP:
+                print(f"add: +{len(errors) - _ERROR_CAP} more failing lines; nothing was written",
+                      file=sys.stderr)
+            return 1
         written = api.add_fields(ctx, fields)
         for note in written:
             print(note.id)
@@ -2015,6 +2121,13 @@ def _dispatch(args, ctx) -> int:
             except KeyError:
                 cur = None            # store.supersede raises it again below
             fields["tags"] = sorted(set(cur.tags if cur else ()) | set(args.add_tags))
+        if tip is not None and store.read_status(tip) == "resolved" \
+                and set(fields) == {"status"} and not measures and not args.refs:
+            # It printed `already resolved`, then `edited in place` at exit 0,
+            # which contradicted, and there was nothing to add (2026-10-09 review).
+            print(tip.id)
+            print("note: nothing to add, so nothing was written", file=sys.stderr)
+            return 0
         try:
             note = api.supersede(ctx, args.id, author=_resolved_author(args),
                                  add_refs=_refs_from_flags(args.refs),
@@ -2110,6 +2223,31 @@ def _dispatch(args, ctx) -> int:
         # the write did not touch (3 times, 2026-10-01). Unless there was none.
         if args.body is not None and not (args.append and tip is not None and tip.body):
             _echo_clipped_heads(store_dir, [note])
+        return 0
+
+    if args.cmd == "commit" and args.dry_run:
+        # A careful commit read `git diff` by hand first: `commit` takes every
+        # writer's pending rows (dogfood, 2026-10-06).
+        rows = store.pending_rows(store_dir)
+        # Each file, as `commit` names them: status shows an untracked dir as one.
+        changed = ["diff", "HEAD", "--name-only", "-z"] if gitref._git(
+            store_dir, "rev-parse", "-q", "--verify", "HEAD").returncode == 0 \
+            else ["ls-files", "-z", "--cached"]
+        files = sorted({f for cmd in (changed, ["ls-files", "-z", "--others",
+                                                "--exclude-standard"])
+                        for f in gitref._git(store_dir, *cmd).stdout.split("\0")
+                        if f and f != store.NOTES_FILE})
+        if not rows and not files:
+            print("nothing to commit")
+            return 0
+        said = ([f"rows {store.rows_by_author(rows)}"] if rows else []) + \
+            ([f"{summ._count(len(files), 'file')}"] if files else [])
+        print("would commit: " + "; ".join(said))
+        for r in rows:
+            print(f"  {(r.get('id') or '?')[-10:]}  {r.get('author') or '?'}  "
+                  f"{r.get('kind') or '?'}  {summ.clip(r.get('body') or '', 60)}".rstrip())
+        for f in files:
+            print(f"  {f}")
         return 0
 
     if args.cmd == "commit":
@@ -2623,7 +2761,15 @@ def _main(argv) -> int:
         # Agents typed `show <id>` from CLI habit and read the invalid-choice
         # error as "no such command" (2026-09-22..24).
         if rest[:1] == ["show"] and not {"-h", "--help"} & set(rest[1:]):
-            rest = ["list", "--id", *rest[1:]]
+            # A tail cited as `-a1b`, as symbion prints it, read as a flag, and
+            # `show -- 22b` as `list --id --`: the first printed nothing and
+            # exited 0 (the owner, 2026-10-09). Both are ids here.
+            ids = [store.id_tail(a) if _DASHED_ID.fullmatch(a) else a
+                   for a in rest[1:] if a != "--"]
+            if any(not a.startswith("-") for a in ids):
+                # `show --json ID`, the flag first, read as `list --id --json ID`.
+                flags = [a for a in ids if a == "--json"]
+                rest = ["list", *flags, "--id", *(a for a in ids if a != "--json")]
         args = parser.parse_args(rest)
         args.argv = argv                         # serve --reload re-runs it
         # On every read it was noise, so a real mismatch was skipped with it

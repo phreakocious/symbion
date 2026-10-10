@@ -189,6 +189,10 @@ def check_name(typ: str, name) -> None:
                              f"a named subject is item:{name}")
     elif not isinstance(name, str) or not name.strip():
         raise ValueError(f"target type {typ!r} needs a name: {typ}:NAME")
+    elif typ == "commit" and name.startswith("-"):
+        # A commit name reaches git among its arguments (2026-10-09).
+        raise ValueError(f"commit:{name} starts with '-', which git reads as an option; "
+                         f"a commit target is a sha or a ref")
     elif typ == "item" and _ROW_ID.fullmatch(name):
         # `--ref item:<row id>` meant "see this row" and minted an item by
         # that name at exit 0, three times in one session (2026-10-02).
@@ -293,6 +297,7 @@ def rename_target(ctx: Ctx, target_type: str, old: str, new: str, *,
     `item:NAME`."""
     to_type = to_type or target_type
     check_name(to_type, new)
+    check_arc_targets(ctx, [{"type": to_type, "name": new}])     # as add refuses arc:nosuch
     stored = [new]
 
     def canon(n):
@@ -482,9 +487,11 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
     if not isinstance(t, dict) or not isinstance(t.get("type"), str):
         raise ValueError(f"target is {{type, name}} or TYPE:NAME, not {t!r}")
     if t["type"] not in ctx.target_types:
+        hint = config.uncomment_hint(ctx.store_dir, t["type"])
         raise ValueError(f"unknown target type {t['type']!r} (choose from "
                          f"{', '.join(sorted(ctx.target_types))})"
-                         + kind_as_type(t["type"], ctx.kinds, "target"))
+                         + kind_as_type(t["type"], ctx.kinds, "target")
+                         + (f"; {hint}" if hint else ""))
     check_name(t["type"], t.get("name"))
     store.check_fields(row["kind"], spec, row)
     external = row.get("external", False)
@@ -745,11 +752,13 @@ def archive_arc(ctx: Ctx, arc_id: str) -> store.Arc:
     return store.archive_arc(ctx.store_dir, arc_id)
 
 
-def commit(ctx: Ctx, message: str) -> bool:
+def commit(ctx: Ctx, message: str, *, author: str | None = None) -> bool:
     """A commit is not off this disk until a push, and a bare `git push`
     needs an upstream: set it here when the store has an origin, so the
-    push hint the CLI prints works on the first try."""
-    ok = store.commit(ctx.store_dir, message, ctx.cfg)
+    push hint the CLI prints works on the first try. With `author`, only
+    that author's pending rows go in (store.commit's `keep`)."""
+    ok = store.commit(ctx.store_dir, message, ctx.cfg,
+                      keep=(lambda r: r.get("author") == author) if author else None)
     gitref.set_upstream(ctx.store_dir)
     return ok
 

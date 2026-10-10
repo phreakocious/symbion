@@ -61,7 +61,10 @@ That sets up Claude Code; `--agent codex` sets up Codex instead,
 
 This creates `../<repo>-notes`, a git repo with no remote, holding a commented
 `symbion.toml` whose every value has a default and a README.md that says what
-the store is. For Claude Code, the first
+the store is. Out of the box a note goes on a commit, an item, the project or
+an arc. For notes on files, uncomment `file =` under `[catalogs]` and `file =
+"git"` under `[renames]`; a file target refused before then names both lines,
+by number. For Claude Code, the first
 `init` on a machine also links `~/.claude/skills/symbion` to the skill directory in the installed
 package (SKILL.md, adoption.md, catalogs.md and the hook script), so an upgrade
 reaches every project. It registers the hook in `~/.claude/settings.json` when
@@ -129,9 +132,14 @@ powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$HOME\.
 Hermes Agent has no hook to run: start a session after step 3, and its first
 command should be `symbion summary`.
 
+`session_start.sh` prints one JSON line: the text in the table below is its
+`additionalContext`, what the agent reads, and its `systemMessage` is the one
+line you see at session start. The not-on-PATH line and the `error:` lines
+print as plain text, and the PowerShell hook prints all of it that way.
+
 | output | meaning |
 |---|---|
-| `symbion: open outside arcs: bug 0, task 0, question 0` (`; N open in arcs` when arcs hold any), then a line per arc and the open rows | working |
+| `symbion: open outside arcs: bug 0, task 0, question 0, prediction 0` (`; N open in arcs` when arcs hold any), then a line per arc and the open rows | working |
 | `symbion --dir ../other-notes: open outside arcs: …` | working, on a store this repo's tree does not name (`--dir`, `SYMBION_DIR`, or a cwd inside a store); the header names it, so two summaries in one session can be told apart |
 | either, then `  N notes not yet in the store's git (symbion commit)` | working; run `symbion commit` at session end |
 | either, then `  N per-project symbion copies from an older init: …` | an old `init` left the skill, hook or registration in this project; remove them (the link replaces them) |
@@ -187,7 +195,7 @@ body. `seed` mints one bodiless task per name and is for fanning out over a
 aid=$(symbion arc create --name "Adoption" --scope item --desc "Usable by someone who was not in the room.")
 symbion add task --target "item:write the README" --arc-id "$aid" --body "Done: a stranger can install and record a note."
 symbion arc todo "$aid" --json      # open items
-symbion resolve <id>                # tick one
+symbion resolve <id>                # tick one: prints the closing row's id, and <id> lists as superseded
 symbion arc list                    # done/total per arc
 symbion list --arc "$aid" --json    # every item, resolved included
 ```
@@ -202,6 +210,9 @@ symbion push         # when the store has a remote
 
 `commit` says `no remote` while the store has none. A store kept on one disk on
 purpose takes `local_only = true` in its `symbion.toml`, and `commit` stops saying so.
+With nothing to commit, `commit` exits 1, as git does, so a script's `symbion commit
+&& symbion push` stops on a clean store. The first `commit` also takes the files
+`init` wrote (`.gitignore`, `README.md`, `symbion.toml`): `init` commits nothing.
 
 ## Browse it (optional)
 
@@ -226,17 +237,21 @@ to a row stays good (`serve` prints it, and `--port` picks another). It has:
   with who added it and when, and its earlier versions show an edit as a
   diff; a tag index, and arc checklists you tick;
 - commit and push buttons, shown while there is something to commit or push.
+  The commit button takes only the rows written as you, so an agent's
+  pending rows stay for it to commit.
 
 `?` lists the keys. It writes as **you**: `SYMBION_AUTHOR`, else git
 `user.name`, shown at the foot of the sidebar, or in the top bar on a window
 too narrow for one. `--author NAME` overrides.
 
-It listens on 127.0.0.1, for this machine only. To browse it from another
+It listens on 127.0.0.1, for this machine only, and answers only at `localhost`
+or an IP address: any other name in the address bar gets a 403, because a web
+page reaches a local server under a name of its own. To browse it from another
 machine, `--host 0.0.0.0` listens on every address and `--allow` names who may
 connect, an address or a network, once each: `symbion serve --host 0.0.0.0
---allow 192.168.1.0/24`. This machine always may, and `serve` refuses a
-`--host` past loopback with no `--allow`. There is no login: every machine
-allowed writes as the serve's author.
+--allow 192.168.1.0/24`. This machine always may, and `serve` refuses a `--host`
+past loopback with no `--allow`. There is no login: every machine allowed writes
+as the serve's author.
 
 One `serve` per store: run it in each project, and each one's sidebar links
 the other stores a `serve` is running on, on this machine. Each running

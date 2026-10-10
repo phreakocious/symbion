@@ -33,7 +33,7 @@ ALLOWED_STORE_READS = {
     "load", "load_malformed", "load_arcs", "heads", "heads_for", "query",
     "tag_counts", "arc_items", "arc_progress", "read_status", "due_state", "since_cutoff",
     "exists", "newest_first", "written_at", "shown", "appended", "stamp_sha", "unholdable",
-    "notes_path", "arcs_path", "Note", "Arc", "Target",
+    "notes_path", "arcs_path", "id_tail", "pending_rows", "Note", "Arc", "Target",
     "STATUSES", "BUILTIN_TARGET_TYPES",
 }
 
@@ -109,7 +109,9 @@ def test_the_audit_skips_comments_but_not_code_after_a_hash_in_a_string():
 CLI_FILE = GUI_DIR.parent / "cli.py"
 CLI_STORE_CALLS = ALLOWED_STORE_READS | {
     "note_from_dict", "read_dict", "reconcile_arc",      # reads
+    "jsonl_lines",                                        # a text helper
     "citing", "own_draft",                                # reads: why an edit was a new row
+    "pending_rows", "rows_by_author", "NOTES_FILE",       # reads: what commit would take
     "ensure_store", "apply_reconciliation",               # the two writes
 }
 
@@ -210,6 +212,7 @@ def test_serve_listens_on_loopback_only(monkeypatch, tmp_path):
     seen = {}
     monkeypatch.setattr(serve, "build_page", lambda ctx, author: None)
     monkeypatch.setattr(serve.ui, "run", lambda **kw: seen.update(kw))
+    monkeypatch.setattr(serve.app, "add_middleware", lambda *a, **k: None)  # the global app
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))   # not the user's records
     store.ensure_store(tmp_path)
     serve.main(api.resolve(str(tmp_path)), author="t", port=1, show=False)

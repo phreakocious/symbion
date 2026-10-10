@@ -4,7 +4,7 @@ A kind is a label plus three bits. `status`: the row carries open/resolved
 and counts in every open view. `parked`: it carries a status but is hidden
 from every open view (requires status). `verdict`: it carries --checked and
 --result, is stamped with provenance at write, and has a state derived
-against HEAD. status + verdict is a pre-registration. The seven labels below
+against HEAD. status + verdict is a pre-registration. The eight labels below
 are the defaults; a [kinds] table in symbion.toml replaces them entirely.
 """
 from __future__ import annotations
@@ -35,6 +35,7 @@ DEFAULT_KINDS: dict[str, Kind] = {
     "question": Kind(status=True, when="needs the owner's answer before work can proceed; resolve --body adds the answer below it"),
     "idea": Kind(status=True, parked=True, when="a parked thought; resolve --add-tag adopted or retired, --body says why"),
     "check": Kind(verdict=True, when="a dated verification: --checked what ran, --result what it said"),
+    "prediction": Kind(status=True, verdict=True, when="a pre-registration: the prediction and what would falsify it, written before the data; resolve --result closes it"),
 }
 
 BITS = ("status", "parked", "verdict")

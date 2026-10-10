@@ -50,13 +50,18 @@ the session-start hook finds `symbion` through PATH.
 From your project's root:
 
 ```bash
-symbion init          # lists what it would do, and does nothing
+symbion init          # lists each change and makes none (exit 1 if there are any)
 symbion init --yes    # creates the store, ../<repo>-notes, and links the agent skill
 ```
 
 `init --yes` registers the session-start hook too when `~/.claude/settings.json`
 does not exist. When it does, `init` prints the entry to add, or says the hook is
 already there.
+
+A new store takes notes on a commit, an item, the project or an arc. For notes
+on files, open `../<repo>-notes/symbion.toml` and uncomment `file =` under
+`[catalogs]` and `file = "git"` under `[renames]`. A file target refused before
+then names both lines.
 
 Then add one line to `CLAUDE.md`, and start a session:
 
@@ -76,7 +81,8 @@ agents, which take a step more: see the
 - [Reference](https://github.com/phreakocious/symbion/blob/main/docs/reference.md):
   kinds and arcs, catalogs, conventions, where things live, and development.
 - [SKILL.md](https://github.com/phreakocious/symbion/blob/main/src/symbion/data/skill/SKILL.md):
-  what the agent reads, and the most complete command reference.
+  what the agent reads, with a table of the common commands. `symbion VERB -h`
+  lists every flag of a verb.
 - [Design](https://github.com/phreakocious/symbion/blob/main/docs/superpowers/specs/2026-09-04-symbion-design.md):
   why symbion is built as it is.
 

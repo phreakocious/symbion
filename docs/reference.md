@@ -5,9 +5,10 @@ How symbion behaves. To set it up, start with the [guide](guide.md).
 ## Notes, kinds and arcs
 
 A note is dated, attributed, retractable, and attached to something stable: a
-commit, a file, a free-form item, or the whole project. Seven kinds by default:
-`check` (a dated verification), `decision` (an ADR), `bug`, `task`, `question`
-(needs the owner's answer), `idea` (parked) and `note`. A kind is a label on
+commit, a file, a free-form item, an arc, or the whole project. Eight kinds by
+default: `check` (a dated verification), `prediction` (a pre-registration,
+written before the data), `decision` (an ADR), `bug`, `task`,
+`question` (needs the owner's answer), `idea` (parked) and `note`. A kind is a label on
 three bits (`status`, `parked`, `verdict`); declare your own under `[kinds]` in
 `symbion.toml`, and `symbion schema` prints the table. An **arc** is a named
 line of work (an epic), shown as a checklist of rows across objects. The store is
@@ -21,7 +22,7 @@ store's `symbion.toml`:
 
 ```toml
 [catalogs]
-file = "git ls-files --cached --others --exclude-standard '*.py'"
+file = "git ls-files --cached --others --exclude-standard"
 test = "git ls-files --cached --others --exclude-standard 'tests/test_*.py'"
 
 [renames]
@@ -38,8 +39,8 @@ ambiguous substring. Keep `--others --exclude-standard`: without it, a note on
 a file made this session warns `taken as typed` on a correct name, and that
 warning is the only thing that catches a typo.
 
-**Dry-run the first seed of every catalog type.** What a command prints depends
-on the tool's version and the project's config:
+**Dry-run the first seed of every catalog type**
+([catalogs.md](../src/symbion/data/skill/catalogs.md#seed-add-unless-there-is-a-catalog) says why):
 
 ```bash
 symbion arc seed --scope file --dry-run     # no arc needed; writes nothing
@@ -51,19 +52,10 @@ case, else as typed. `parser.py` matches both `src/parser.py` and
 a name the store already holds as itself, so a deleted file's rows stay
 readable by its old name.
 
-A catalog of **measured** names (a reading, a serial) needs a resolver, or a
-near-miss mints a second target: substring matching cannot see that `3.1416`
-is `3.14159`. So does every **store-derived** catalog
-(`symbion list … --type X | jq …`): it is empty until its first `X` row
-exists, so without a resolver that first `add` is refused.
-
-```toml
-[resolvers]
-reading = "python3 tools/resolve_reading.py"   # stdin: query, then names; exit 2 = ambiguous
-```
-
-The starter `symbion.toml` documents the protocol. A failing resolver stores
-nothing; it never falls back to substring matching.
+A catalog of **measured** names (a reading, a serial) needs a resolver, and
+so does every **store-derived** one (`symbion list … --type X | jq …`).
+[catalogs.md](../src/symbion/data/skill/catalogs.md#resolvers-when-substring-is-the-wrong-match) says why, and
+gives the protocol.
 
 Within one write (`add --from-json`, `arc seed --name …`), names resolved by
 earlier rows are candidates for later ones. A batch naming `src/parser.py` and
@@ -87,7 +79,9 @@ where two separate adds would store both.
 - **Kinds are the project's.** Add or rename labels under `[kinds]` in
   `symbion.toml`; renaming one that has rows also takes a one-line `sed` over
   `notes.jsonl`, which `init` writes into the toml. A kind with both `status`
-  and `verdict` is a pre-registration, closed by `resolve --result`. A kind
+  and `verdict` is a pre-registration, closed by `resolve --result`: the
+  default `prediction` is one, and a store whose table predates it adds
+  `prediction = { status = true, verdict = true }`. A kind
   can pick its colour by a palette name, `color = "teal"`, in the terminal
   and in `serve`; a declared kind without one shares lavender, and a name
   outside the palette is refused with the list. symbion 0.3.0 and older
@@ -103,7 +97,7 @@ where two separate adds would store both.
 - **Time is UTC.** Rows are stamped in UTC, and symbion prints times and reads
   a bare date in UTC. Set `TZ` to print and read them in that zone instead.
 - **Author.** `claude` inside a Claude Code session, `codex` inside a Codex
-  one, `hermes` inside a Hermes Agent one, else git `user.name`; `--author`
+  one, `hermes` inside a Hermes Agent one, else git `user.name`, else `user`; `--author`
   or `SYMBION_AUTHOR` overrides. A person typing `! symbion add …` in a
   session is recorded as the agent unless they pass one. Session start lists
   the open rows someone other than the reader raised or amended, parked ones
@@ -116,8 +110,10 @@ where two separate adds would store both.
   after the age says the row's lead changed after that line, so it answered
   an earlier question.
 - **Record finished work as a resolved task**:
-  `add task --target … --status resolved --body "done: …"` for work done
-  before it had a ticket.
+  `add task --target … --status resolved --body "done: …"` for this
+  session's work that had no ticket, when a later session would otherwise
+  redo or misread it. A bootstrap mints no row for work git history already
+  shows closed (`adoption.md`, step 3).
 
 ## Where things live
 
@@ -128,8 +124,8 @@ where two separate adds would store both.
   run says so on stderr.
   `init` inside a store refuses.
 - **A store not named after its repo:** put its path in a `.symbion` file in
-  the repo root (first non-blank line; relative to the main checkout, or
-  absolute; a file, not a link to the store). A linked worktree's pointer
+  the repo root (first non-blank line; relative to the main checkout,
+  absolute, or under `~/`; a file, not a link to the store). A linked worktree's pointer
   counts while the main checkout has none, as on a branch that adopts symbion.
   `symbion --dir ../other-notes init --yes` writes it. If the repo already
   reads a store that exists, init creates the new store and leaves the
@@ -142,7 +138,23 @@ where two separate adds would store both.
   claims, by its name or by a pointer.
 - **Files:** `notes.jsonl` (append-only once committed: a correction is a
   new row that supersedes the old one; before `symbion commit`, an edit to
-  your own row rewrites it), `arcs.jsonl`, `symbion.toml`.
+  your own row rewrites it), `arcs.jsonl`, `symbion.toml`, and the
+  `README.md` and `.gitignore` that `init` writes. `archive/` holds files
+  copied in to keep (`adoption.md`); `commit` names any path there git ignores.
+- **Settings:** besides the tables above, `symbion.toml` takes
+  `default_branch`, `local_only = true` (no remote on purpose: `commit` stops
+  saying "no remote"), `command_timeout` (the seconds a configured command
+  may run, default 30; raise it when a slow catalog is killed), `git_name`
+  and `git_email` (the author of the store's own commits, default
+  `symbion-notes` and `symbion-notes@local`; set your own where a remote
+  refuses a made-up author), and `[provenance] command`, which stamps a
+  verdict row with the JSON object it prints instead of HEAD. That command
+  must exit 0; an object with a `sha` reads `behind N` as a HEAD stamp does.
+- **Trust:** the commands in `[catalogs]`, `[resolvers]`, `[renames]` and
+  `[provenance]` run as shell at every write and many reads, and the
+  session-start hook runs `summary` in every project with a store. A store
+  cloned beside a repo runs its author's commands from then on: read its
+  `symbion.toml` as you would code you clone.
 - **Secrets:** a store is a git repo, so any pre-commit hook guards it;
   symbion ships none. [gitleaks](https://github.com/gitleaks/gitleaks), for
   one, scans only what a commit adds, from the store's `.git/hooks/pre-commit`:

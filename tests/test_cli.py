@@ -327,7 +327,7 @@ def test_add_names_the_open_heads_already_on_its_target(tmp_path, capsys):
 
     run("add", "note", "--target", "item:x", store_dir=tmp_path)
     err = capsys.readouterr().err
-    assert f"1 open on item:x: {task}" in err and "supersede" in err, err
+    assert "1 open on item:x; " in err and "supersede" in err and f"\n  {task}\n" in err, err
     for target in ("item:fresh", "project"):
         run("add", "task", "--target", target, store_dir=tmp_path)
         assert "open on" not in capsys.readouterr().err, target
@@ -696,6 +696,15 @@ def test_a_partial_page_ends_with_what_it_left_out(tmp_path, capsys):
     assert capsys.readouterr().out.splitlines()[-1] == "  +2 more not shown (--limit 0 for all)"
     run("list", "--limit", "0", store_dir=tmp_path)
     assert "more not shown" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad", ["-1", "x"])
+def test_list_limit_takes_a_count(tmp_path, capsys, bad):
+    """`--limit -1` sliced the oldest row off the page."""
+    run("add", "note", "--target", "item:x", "--body", "b", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("list", "--limit", bad, store_dir=tmp_path) == 2
+    assert f"{bad!r} is not a row count: give N, or 0 for all" in capsys.readouterr().err
 
 
 def test_a_batch_add_ends_with_its_catalog_misses(tmp_path, capsys, monkeypatch):
@@ -1102,6 +1111,32 @@ def tty(monkeypatch):
 def _screen(out):
     """What the terminal shows: one entry per line, colour codes dropped."""
     return [_ANSI.sub("", ln) for ln in out.splitlines()]
+
+
+def test_a_16_colour_terminal_tells_kinds_and_states_apart(tmp_path):
+    """At 16 colours rich's nearest match printed bug, task, question,
+    decision and note, and a check's current and dangling, all as white
+    (measured 2026-10-06, TERM=xterm). Each prints in its own ANSI colour
+    there, and the palette the GUI's CSS reads stays hex."""
+    store.ensure_store(tmp_path)
+    for kind in ("bug", "task", "question", "decision", "note"):
+        store.add(tmp_path, kind=kind, target={"type": "item", "name": kind}, status=None
+                  if kind in ("decision", "note") else "open")
+    env = {k: v for k, v in os.environ.items() if k not in ("COLORTERM", "NO_COLOR")}
+    env.update(TERM="xterm", FORCE_COLOR="1", COLUMNS="80")
+    script = (f"import sys; sys.stdout.isatty = lambda: True\n"
+              f"from symbion import cli, term\n"
+              f"assert all(c.startswith('#') for c in (term.TEXT, term.GOOD, *term.KIND.values()))\n"
+              f"cli.main(['--dir', {str(tmp_path)!r}, 'list'])\n"
+              f"p = term.painter()\n"
+              f"print(repr(p('x', 'good')), repr(p('x', 'bad')))\n")
+    r = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True,
+                       text=True, encoding="utf-8")
+    assert r.returncode == 0, r.stderr
+    kind_code = dict(m.groups()[::-1] for m in re.finditer(
+        r"\x1b\[(\d+)m(bug|task|question|decision|note) ", r.stdout))
+    assert len(kind_code) == len(set(kind_code.values())) == 5, (kind_code, r.stdout)
+    assert "'\\x1b[32mx\\x1b[0m' '\\x1b[91mx\\x1b[0m'" in r.stdout, r.stdout
 
 
 def test_list_on_a_tty_lines_up_columns_inside_the_width(repo, tmp_path, capsys, tty):
@@ -1635,6 +1670,11 @@ def test_summary_json_on_an_absent_store_is_a_valid_empty_object(repo, tmp_path,
     assert run("summary", "--json", store_dir=store_dir) == 0
     data = json.loads(capsys.readouterr().out)
     assert data == summ.empty_summary()
+    # The same keys as a store's: `named_store` was a KeyError on `store: null`
+    # (2026-10-09 review).
+    store.ensure_store(store_dir)
+    assert run("summary", "--json", store_dir=store_dir) == 0
+    assert set(json.loads(capsys.readouterr().out)) == set(data)
 
 
 # ---- THE BLOCKER: cli.main must resolve HEAD/dirty against the worktree the
@@ -1784,6 +1824,23 @@ def test_a_dirty_stamp_names_what_was_dirty(repo, tmp_path, capsys):
     assert sorted(dirty["dirty_paths"]) == ["CLAUDE.md", "scratch"], dirty
 
 
+
+def test_a_dirty_stamp_keeps_each_path_as_itself(repo, tmp_path):
+    """git quotes a path with a space or a non-ASCII byte in its line form,
+    and the stamp kept `"caf\\303\\251.txt"`, quotes and all (2026-10-09
+    review). A rename is stamped by its new name."""
+    store_dir = tmp_path / "store"
+    for name in ("café.txt", "has space.txt", "old.txt"):
+        (repo / name).write_text("x")
+    _git(repo, "add", "old.txt")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "old")
+    _git(repo, "mv", "old.txt", "new name.txt")
+    run("add", "check", "--target", "project", "--checked", "x", "--result", "y",
+        store_dir=store_dir)
+    stamp = store.load(store_dir)[0].provenance
+    assert sorted(stamp["dirty_paths"]) == ["café.txt", "has space.txt", "new name.txt"], stamp
+
+
 def test_catalog_choice_error_names_where_a_catalog_is_declared(repo, tmp_path, capsys):
     """A store with no catalogs rejects `--type file`; argparse's bare
     'invalid choice' told nobody that [catalogs] in symbion.toml is the fix.
@@ -1920,6 +1977,43 @@ def test_add_from_json_reads_stdin_and_a_bad_row_writes_nothing(tmp_path, capsys
     assert store.load(tmp_path) == []
 
 
+def test_add_from_json_names_every_failing_line_in_order(tmp_path, capsys, monkeypatch):
+    """Keys were checked over every line before kinds, so a bad kind on
+    line 2 and a bad key on line 3 named line 3, and line 2 only on the
+    re-run (2026-10-09 review)."""
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        '{"kind": "note", "target": {"type": "project"}}\n'
+        '{"kind": "nope", "target": {"type": "project"}}\n'
+        '{"kind": "note", "target": {"type": "project"}, "title": "x"}\n'
+        '[1]\n'))
+    assert run("add", "--from-json", "-", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err.splitlines()
+    assert [re.match(r"add: --from-json line (\d)", e)[1] for e in err] == ["2", "3", "4"], err
+    assert store.load(tmp_path) == []
+
+
+@pytest.mark.parametrize("piped", ["", " \n\n"])
+def test_add_from_json_that_reads_no_rows_is_refused(tmp_path, capsys, monkeypatch, piped):
+    """`jq … | symbion add --from-json -` with a jq that failed (no pipefail)
+    read nothing and exited 0, a bootstrap that wrote nothing reading as one
+    that worked. The twin of the --body-file guard."""
+    monkeypatch.setattr("sys.stdin", io.StringIO(piped))
+    assert run("add", "--from-json", "-", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert "--from-json -: read no rows, so nothing was written" in err
+    assert store.load(tmp_path) == []
+
+
+def test_add_from_json_reads_a_line_separator_inside_a_string(tmp_path, capsys, monkeypatch):
+    """jq and json.dumps(ensure_ascii=False) leave U+2028, U+2029 and U+0085
+    raw, and the line split refused the row as two halves."""
+    body = "a b c\x85d"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+        {"kind": "note", "target": {"type": "project"}, "body": body}, ensure_ascii=False)))
+    assert run("add", "--from-json", "-", store_dir=tmp_path) == 0, capsys.readouterr().err
+    assert [n.body for n in store.load(tmp_path)] == [body]
+
+
 @pytest.mark.parametrize("key,bad,said", [
     ("kind", [1], "kind must be a string"), ("body", 5, "body must be a string"),
     ("status", 5, "status must be a string"), ("status", "done", "status is open or resolved"),
@@ -1945,20 +2039,26 @@ def test_from_json_refuses_a_key_of_the_wrong_type_before_it_writes(
 
 def test_measure_stores_numbers_as_numbers_and_shows_them(tmp_path, capsys):
     """Counts in `--result` prose cannot be compared across rows; as
-    measurements they can, through `list --json | jq`."""
+    measurements they can, through `list --json | jq`. Every reader lists
+    them by name, any case, so two rows' numbers line up (the owner,
+    2026-10-09)."""
     assert run("add", "note", "--target", "item:x", "--measure", "passed=412",
                "--measure", "seconds=3.2", "--measure", "host=a.example",
-               "--measure", "big=1e3", store_dir=tmp_path) == 0
+               "--measure", "big=1e3", "--measure", "Mb=5", store_dir=tmp_path) == 0
     nid = capsys.readouterr().out.strip()
-    assert store.load(tmp_path)[0].measurements == {
-        "passed": 412, "seconds": 3.2, "host": "a.example", "big": 1000.0}
+    assert list(store.load(tmp_path)[0].measurements.items()) == [
+        ("big", 1000.0), ("host", "a.example"), ("Mb", 5), ("passed", 412), ("seconds", 3.2)]
     assert run("show", nid, store_dir=tmp_path) == 0
-    assert "    measured: passed=412, seconds=3.2, host=a.example, big=1000.0\n" in \
+    assert "    measured: big=1000.0, host=a.example, Mb=5, passed=412, seconds=3.2\n" in \
         capsys.readouterr().out
     with pytest.MonkeyPatch.context() as mp:                  # and at a terminal
         mp.setattr(sys.stdout, "isatty", lambda: True)
         assert run("show", nid, store_dir=tmp_path) == 0
-    assert "measured: passed=412, seconds=3.2" in _ANSI.sub("", capsys.readouterr().out)
+    assert "measured: big=1000.0, host=a.example, Mb=5" in \
+        _ANSI.sub("", capsys.readouterr().out)
+    assert run("show", nid, "--json", store_dir=tmp_path) == 0
+    assert list(json.loads(capsys.readouterr().out)[0]["measurements"]) == [
+        "big", "host", "Mb", "passed", "seconds"]
     _commit(tmp_path, capsys)
     assert run("supersede", nid, "--add-tag", "t", store_dir=tmp_path) == 0
     assert store.heads(store.load(tmp_path))[0].measurements["passed"] == 412
@@ -1980,10 +2080,19 @@ def test_measure_says_when_a_number_will_not_print_back_as_typed(tmp_path, capsy
     assert "tag" not in err and "n=412" not in err, err
 
 
+def test_measure_takes_spaces_around_its_name_and_value(tmp_path, capsys):
+    """`--measure "n = 5"` stored the name `'n '`, and its note said to write
+    `--measure 'n =" 5"'`."""
+    assert run("add", "note", "--target", "item:x", "--measure", "n = 5",
+               "--measure", 'label = " a "', store_dir=tmp_path) == 0
+    assert store.load(tmp_path)[0].measurements == {"n": 5, "label": " a "}
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.parametrize("flags,said", [
     (["n"], "KEY=VALUE"), (["=5"], "KEY=VALUE"), (["n="], "empty"), (['n=""'], "empty"),
     (["n=nan"], "finite"), (["n=inf"], "finite"), (["n=-Infinity"], "finite"),
-    (["n=1", "n=2"], "twice")])
+    (["n=1", "n=2"], "twice"), (["n = 1", "n=2"], "twice")])
 def test_measure_refuses_what_cannot_be_compared(tmp_path, capsys, flags, said):
     """`--measure n=$count` with count unset stored "" at exit 0, and NaN is
     a float that equals nothing, itself included."""
@@ -2322,6 +2431,21 @@ def test_rename_to_another_type_resolves_the_name_as_that_type(repo, tmp_path, c
                store_dir=s) == 0
     assert capsys.readouterr().out.endswith(f"item:the fix -> commit:{sha}\n")
     assert [n.target for n in store.heads(store.load(s))] == [store.Target("commit", sha)]
+
+
+def test_rename_onto_an_arc_needs_the_arc(tmp_path, capsys):
+    """`rename … --to-type arc` moved rows onto an arc no page reaches, where
+    `add --target arc:nosuch` is refused."""
+    run("add", "note", "--target", "item:thing", store_dir=tmp_path)
+    assert run("rename", "thing", "nosuch", "--type", "item", "--to-type", "arc",
+               store_dir=tmp_path) == 1
+    assert "no arc 'nosuch'" in capsys.readouterr().err
+    assert [n.target for n in store.load(tmp_path)] == [store.Target("item", "thing")]
+    run("arc", "create", "--name", "real", "--scope", "item", store_dir=tmp_path)
+    aid = capsys.readouterr().out.strip()
+    assert run("rename", "thing", aid, "--type", "item", "--to-type", "arc",
+               store_dir=tmp_path) == 0
+    assert [n.target for n in store.heads(store.load(tmp_path))] == [store.Target("arc", aid)]
 
 
 def test_arc_list_aligns_the_progress_column_on_the_longest_id(tmp_path, capsys):
@@ -2781,6 +2905,24 @@ def test_prepend_puts_a_new_lead_above_the_body_but_never_a_pre_registrations(
     assert len(store.load(tmp_path)) == 2
 
 
+def test_a_fresh_store_keeps_a_predictions_registered_text(repo, tmp_path, capsys):
+    """A cold-start store had no status + verdict kind. Asked to write its
+    expected counts down before a run, an agent filed a `note` and appended
+    the result before the first commit, which rewrote the row in place: the
+    store could no longer show the prediction came first (2026-10-09). The
+    defaults carry `prediction`, and an edit never rewrites one."""
+    run("add", "note", "--target", "item:n", "--body", "x rises", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    run("add", "prediction", "--target", "item:p", "--checked", "run x",
+        "--body", "x rises", store_dir=tmp_path)
+    pid = capsys.readouterr().out.strip()
+    for rid in (nid, pid):
+        assert run("supersede", rid, "--append", "--body", "x rose", store_dir=tmp_path) == 0
+    rows = {n.id: n.body for n in store.load(tmp_path)}
+    assert rows[nid] == "x rises\n\nx rose"             # a note's draft is rewritten
+    assert rows[pid] == "x rises" and len(rows) == 3    # a prediction keeps its text
+
+
 def test_add_kind_choices_come_from_the_table_and_the_error_names_it(tmp_path, capsys):
     _declare(tmp_path, '[kinds]\nanomaly = { status = true }\n')
     assert run("add", "--kind", "anomaly", "--type", "project", store_dir=tmp_path) == 0
@@ -2788,6 +2930,11 @@ def test_add_kind_choices_come_from_the_table_and_the_error_names_it(tmp_path, c
     rc = run("add", "--kind", "bug", "--type", "project", store_dir=tmp_path)
     err = capsys.readouterr().err
     assert rc == 2 and "invalid kind 'bug'" in err and "anomaly" in err and "[kinds]" in err
+    # A default the table lacks names the line to paste: an older table has
+    # no `prediction`.
+    assert run("add", "prediction", "--target", "item:p", store_dir=tmp_path) == 2
+    err = capsys.readouterr().err
+    assert "add under [kinds]" in err and "prediction = { status = true, verdict = true" in err
 
 
 _VOCAB = '[kinds]\nanomaly = { status = true }\nnote = {}\n[catalogs]\nfile = "echo a.py"\n'
@@ -2874,6 +3021,19 @@ def test_an_item_named_like_a_row_id_is_refused(tmp_path, capsys, argv):
     assert run("add", "idea", "--target", "item:build 123456", store_dir=tmp_path) == 0
 
 
+@pytest.mark.parametrize("argv", [
+    ["add", "note", "--target", "commit:--output=x"],
+    ["add", "note", "--target", "item:x", "--ref", "commit:-p"],
+])
+def test_a_commit_name_that_reads_as_an_option_is_refused(tmp_path, capsys, argv):
+    """A commit name reaches git among its arguments; `--output=PATH` was
+    stored at exit 0, and every later `list` wrote the log to PATH."""
+    assert run(*argv, store_dir=tmp_path) == 1
+    assert "starts with '-', which git reads as an option" in capsys.readouterr().err
+    assert store.load(tmp_path) == []
+    assert run("add", "note", "--target", "item:--json flag", store_dir=tmp_path) == 0
+
+
 def test_show_is_list_id(tmp_path, capsys):
     """Agents typed `symbion show <id>` from CLI habit and read the
     invalid-choice error as "no such command"."""
@@ -2884,6 +3044,10 @@ def test_show_is_list_id(tmp_path, capsys):
     want = capsys.readouterr().out
     assert json.loads(want)[0]["id"] == nid
     assert run("show", nid, "--json", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out == want
+    # The flag first, as agents type it, read as `list --id --json ID`: a
+    # usage error (2026-10-09).
+    assert run("show", "--json", nid, store_dir=tmp_path) == 0
     assert capsys.readouterr().out == want
     assert run("show", "nope", store_dir=tmp_path) == 1
     capsys.readouterr()
@@ -2922,6 +3086,11 @@ def test_a_unique_id_tail_stands_for_the_id_on_every_verb_that_takes_one(tmp_sto
     for tail in ("def", "000003-def", "…def", "...def", c.id):
         assert run("show", tail, "--json", store_dir=tmp_path) == 0, tail
         assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [c.id], tail
+    # As symbion prints a tail ("rows end in -abc"), and past a `--`: `show
+    # -def` printed nothing and exited 0 (the owner, 2026-10-09).
+    for argv in (["-def"], ["-000003-def"], ["--", "def"], ["--", "-def"]):
+        assert run("show", *argv, "--json", store_dir=tmp_path) == 0, argv
+        assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [c.id], argv
     assert run("list", "--id", "000001-abc", "--json", store_dir=tmp_path) == 0
     assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [a.id]
     assert run("show", "ef", store_dir=tmp_path) == 1, "a tail ends on a `-` boundary"
@@ -3147,6 +3316,17 @@ def test_the_status_aliases_stay_out_of_list_help(tmp_path, capsys):
     (["search", "x"], "`list --grep TEXT`"),
     (["due", "--help"], "`list --overdue`"),         # an adopter's agent, 2026-09-25
     (["add", "bug", "--target", "item:x", "login times out"], 'text goes in --body "…"'),
+    # three runs taught three rules (dogfood, 2026-10-09): one names them all
+    (["add", "task", "login times out", "--tag", "x"],
+     'text goes in --body "…"; a target is required: --target TYPE:NAME'),
+    (["add", "task", "login times out", "--target", "project:login"],
+     'text goes in --body "…"; a project target takes no name'),
+    # quoted text fills KIND: its quotes are there, its --body is not
+    (["add", "--target", "item:x", "login times out"],
+     "'login times out' was read as KIND: text goes in --body \"…\"; "
+     "a kind is required: `add KIND`"),
+    (["add", "--target", "item:x", "--kind", "bug", "login times out"],
+     "'login times out' was read as KIND: text goes in --body \"…\"\n"),
     # an unquoted value that split (dogfood, 2026-09-27: the hint above sent
     # its author to --body when the target lacked quotes)
     (["add", "task", "--target", "item:leak", "list", "coverage"],
@@ -3164,6 +3344,9 @@ def test_the_status_aliases_stay_out_of_list_help(tmp_path, capsys):
     (["add", "--type", "bug", "--body", "x"], "'bug' is a kind: `add bug --target TYPE:NAME`"),
     (["list", "--type", "task"], "'task' is a kind: `list --kind task`"),
     (["add", "bug", "--target", "login page"], "--target 'item:login page'"),
+    # reported as `symbion list: error: argument --id` (2026-10-09 review)
+    (["show"], "symbion show: error: the following arguments are required: id"),
+    (["show", "--json"], "symbion show: error: the following arguments are required: id"),
 ])
 def test_a_first_guess_that_fails_names_the_command_that_works(tmp_path, capsys, argv, says):
     """A first-day user's guesses, each met by an error that named no way
@@ -3173,6 +3356,14 @@ def test_a_first_guess_that_fails_names_the_command_that_works(tmp_path, capsys,
     assert run(*argv, store_dir=tmp_path) == 2
     err = capsys.readouterr().err
     assert says in err, err
+
+
+def test_an_unknown_flags_value_is_not_read_as_a_split_value(tmp_path, capsys):
+    """`add … -m x`, typed from `git commit` habit, was told "a value with
+    spaces needs quotes": `x` is the value of `-m`, not half of another."""
+    assert run("add", "note", "--target", "item:x", "-m", "x", store_dir=tmp_path) == 2
+    err = capsys.readouterr().err
+    assert "-m: use --body" in err and "spaces" not in err, err
 
 
 @pytest.mark.parametrize("argv", [
@@ -3199,8 +3390,8 @@ def test_a_body_that_cites_no_row_says_so(tmp_path, capsys):
     real = capsys.readouterr().out.strip()
     bad = ("20990101-123xxx", "20990102-000000-000000-000", "123456-abc")
     body = (f"see {real} and …{real[-10:]}, not {bad[0]}, {bad[1]} or `{bad[2]}`; "
-            f"2026-09-27 is a date, {real[:15]} a prefix, 20990101-000000Z a stamp and "
-            f"50000000-byte a size")
+            f"2026-09-27 is a date, {real[:15]} a prefix, 20990101-000000Z a stamp, "
+            f"20991009-131946 and 20991009-1319 file stamps and 50000000-byte a size")
     assert run("add", "note", "--target", "project", "--body", body, store_dir=tmp_path) == 0
     err = capsys.readouterr().err
     assert [ln for ln in err.splitlines() if "matches" in ln] == \
@@ -3230,8 +3421,16 @@ def test_a_write_to_an_old_id_names_the_row_it_changed(tmp_path, capsys):
     assert run("resolve", head.id, store_dir=tmp_path) == 0
     assert capsys.readouterr().err == "", "a live open head: nothing to say"
     head = store.heads(store.load(tmp_path))[0]
+    rows = len(store.load(tmp_path))
     assert run("resolve", head.id, store_dir=tmp_path) == 0
-    assert f"note: {head.id} is already resolved" in capsys.readouterr().err
+    out, err = capsys.readouterr()
+    assert f"note: {head.id} is already resolved" in err
+    # It went on to say `edited in place`: with nothing to add, nothing is
+    # written, and the id printed is the row's own (2026-10-09 review).
+    assert "nothing to add, so nothing was written" in err and "in place" not in err, err
+    assert out.strip() == head.id and len(store.load(tmp_path)) == rows
+    assert run("resolve", head.id, "--body", "and why", store_dir=tmp_path) == 0
+    assert "nothing to add" not in capsys.readouterr().err
 
 
 def test_text_a_human_reads_says_what_it_means(tmp_path, capsys, monkeypatch):
@@ -3335,12 +3534,14 @@ def test_a_project_row_that_repeats_an_open_rows_first_line_names_it(tmp_path, c
     _, err = add("Done.")
     assert "open on project" not in err, "a short first line is not a title"
     _, err = add("The cache never expires on RESTART.\n\nrevised detail")
-    assert f"note: 1 open on project: with this title: {first}" in err, err
+    assert "note: 1 open on project: with this title; " in err, err
+    # each row with its lead, so a duplicate shows without a `show` (2026-10-07)
+    assert f"\n  {first}  The cache never expires on restart. detail one\n" in err, err
     # The measured pair: a bold title with its detail on the same line, then
     # the same title alone. The title is the bold lead, else the first sentence.
     lead, _ = add("**Handoffs keep symbion workarounds after the fix.** one handoff still says X.")
     _, err = add("**Handoffs keep symbion workarounds after the fix.**\n\nDone: a, b.")
-    assert f"with this title: {lead}" in err, err
+    assert f"\n  {lead}  Handoffs keep symbion workarounds" in err, err
 
 
 def test_context_on_a_commit_git_does_not_know_says_so(repo, tmp_path, capsys):
@@ -3353,6 +3554,24 @@ def test_context_on_a_commit_git_does_not_know_says_so(repo, tmp_path, capsys):
     assert "git does not know commit 'deadbeef'" in capsys.readouterr().err
     run("context", "--commit", "HEAD", store_dir=store_dir)
     assert capsys.readouterr().err == ""
+
+
+def test_a_write_on_a_commit_git_does_not_know_says_so(repo, tmp_path, capsys):
+    """`add --target commit:<typo>` stored the typed string with nothing
+    said, where `context --commit` names the miss (2026-10-09 review)."""
+    store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
+    note = "note: git does not know commit 'deadbeef' here; taken as typed"
+    assert run("add", "note", "--target", "commit:deadbeef", store_dir=store_dir) == 0
+    assert note in capsys.readouterr().err
+    assert run("add", "note", "--target", "project", "--ref", "commit:deadbeef",
+               store_dir=store_dir) == 0
+    assert note in capsys.readouterr().err
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                          text=True).stdout.strip()
+    for name in ("HEAD", head):
+        assert run("add", "note", "--target", f"commit:{name}", store_dir=store_dir) == 0
+        assert "git does not know" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("argv", [["list", "--json"], ["context", "--json"],
@@ -3795,7 +4014,7 @@ def test_schema_on_an_absent_store_names_it_in_text_and_prints_defaults_in_json(
     assert capsys.readouterr().err == f"symbion: no store at {tmp_path / 'nowhere'}; run `symbion init`\n"
     assert run("schema", "--json", store_dir=tmp_path / "nowhere") == 0
     d = json.loads(capsys.readouterr().out)
-    assert d["declared"] is False and len(d["kinds"]) == 7
+    assert d["declared"] is False and len(d["kinds"]) == 8
 
 
 def test_schema_toml_prints_the_table_to_paste(tmp_path, capsys):
@@ -4091,6 +4310,39 @@ def test_commit_names_the_files_it_takes_beside_the_rows(tmp_path, capsys):
     assert run("commit", store_dir=tmp_path) == 0
     assert ("committed: 4 files: tools/a ä.md, tools/b.md, tools/c.md, +1 more\n"
             in capsys.readouterr().out)
+
+def test_commit_dry_run_lists_what_commit_would_take_and_takes_nothing(tmp_path, capsys):
+    """A careful commit read `git diff` by hand first, since `commit` takes
+    every writer's pending rows (dogfood, 2026-10-06)."""
+    run("add", "--kind", "note", "--type", "project", "--body", "w", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("commit", "--dry-run", store_dir=tmp_path) == 0
+    out = capsys.readouterr().out                 # before the first commit
+    assert out.startswith("would commit: rows ") and "note  w\n" in out, out
+    run("commit", store_dir=tmp_path)
+    run("add", "--kind", "bug", "--type", "project", "--body", "**Login fails.** detail",
+        "--author", "ada", store_dir=tmp_path)
+    run("add", "--kind", "note", "--type", "project", "--body", "x", "--author", "codex",
+        store_dir=tmp_path)
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "measure.py").write_text("print(1)\n")
+    ada, codex = (n.id for n in store.newest_first(store.load(tmp_path))[1::-1])
+    head = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout
+    capsys.readouterr()
+    assert run("commit", "--dry-run", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out == (
+        "would commit: rows ada 1, codex 1; 1 file\n"
+        f"  {ada[-10:]}  ada  bug  Login fails. detail\n"
+        f"  {codex[-10:]}  codex  note  x\n"
+        "  tools/measure.py\n")
+    assert subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout == head
+    run("commit", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("commit", "--dry-run", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out == "nothing to commit\n"
+
 
 def test_commit_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capsys):
     """The other direction, which printed only `committed` -- the same as a
@@ -4721,7 +4973,7 @@ def test_the_summary_header_counts_what_the_arcs_hold(tmp_path, capsys):
     head = capsys.readouterr().out.splitlines()[0]
     # A --dir store is labelled (test_summary_names_a_store_...); the counts
     # are this test's claim.
-    assert head.endswith(": open outside arcs: bug 0, task 0, question 0; "
+    assert head.endswith(": open outside arcs: bug 0, task 0, question 0, prediction 0; "
                          "2 open in arcs"), head
 
 
@@ -5090,6 +5342,8 @@ def test_an_edit_before_a_commit_says_it_changed_the_row_itself(tmp_path, capsys
     assert run("supersede", nid, "--body", "v3", store_dir=tmp_path) == 0
     out, err = capsys.readouterr()
     assert out.strip() != nid and "edited in place" not in err
+    assert (f"note: {nid} is committed, so it is kept and this edit is a new row; "
+            f"it now lists as superseded -> {out.strip()}") in err, err
 
 
 def test_an_edit_a_citation_keeps_from_the_row_itself_says_why(tmp_path, capsys):
@@ -5107,7 +5361,8 @@ def test_an_edit_a_citation_keeps_from_the_row_itself_says_why(tmp_path, capsys)
     assert f"note: {mine} is cited by {cite}, so it is kept and this edit is a new row" in err, err
     # Another author's edit, and a resolve, are new rows whether or not a row cites them.
     assert run("supersede", theirs, "--body", "v2", "--author", "sam", store_dir=tmp_path) == 0
-    assert "is cited by" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "is cited by" not in err and f"note: {theirs} was written by " in err, err
     assert run("resolve", shut, store_dir=tmp_path) == 0
     assert "is cited by" not in capsys.readouterr().err
     assert run("supersede", cite, "--body", "v2", store_dir=tmp_path) == 0

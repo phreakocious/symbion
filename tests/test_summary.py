@@ -448,7 +448,7 @@ def test_summary_line_reads_the_same_shape_on_a_default_store(tmp_path):
     cfg = Config(project_root=tmp_path)
     store.add(tmp_path, kind="bug", target={"type": "project", "name": None})
     line = summary.render_summary(summary.summary(tmp_path, cfg)).splitlines()[0]
-    assert line == "symbion: open outside arcs: bug 1, task 0, question 0"
+    assert line == "symbion: open outside arcs: bug 1, task 0, question 0, prediction 0"
 
 
 def test_summary_line_with_no_status_kinds_declared(tmp_path):

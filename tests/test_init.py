@@ -4,7 +4,9 @@ user, from package data. Per-project copies drifted within the hour
 install cannot drift."""
 import json
 import os
+import re
 import subprocess
+import sys
 from importlib import resources
 from pathlib import Path
 
@@ -209,6 +211,46 @@ def test_init_starter_toml_carries_a_resolvers_block_that_parses(repo, tmp_path)
     text = (store / "symbion.toml").read_text()
     assert "[resolvers]" in text and "pipefail" in text and "fragment" in text
     assert tomllib.loads(text).get("resolvers", {}) == {}
+
+
+def test_a_file_target_on_a_new_store_names_the_lines_that_declare_it(repo, tmp_path, capsys):
+    """A new store refused `--target file:…` with "catalog types are declared
+    in … under [catalogs]", and the README leads with file notes (2026-10-09).
+    The refusal names the commented lines; uncommenting exactly those makes a
+    note on any file land, not only a `.py` one."""
+    store = tmp_path / "store"
+    assert run("init", "--yes", store_dir=store) == 0
+    capsys.readouterr()
+    (repo / "main.rs").write_text("x")
+    assert run("add", "note", "--target", "file:main.rs", store_dir=store) == 2
+    err = capsys.readouterr().err
+    m = re.search(r"uncomment `file =` in \S+: line (\d+) under \[catalogs\], "
+                  r"line (\d+) under \[renames\]", err)
+    assert m, err
+    toml = store / "symbion.toml"
+    lines = toml.read_text().splitlines()
+    for n in m.groups():
+        lines[int(n) - 1] = lines[int(n) - 1].removeprefix("# ")
+    toml.write_text("\n".join(lines) + "\n")
+    assert run("add", "note", "--target", "file:main.rs", store_dir=store) == 0
+    assert "taken as typed" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("term, tty, says", [
+    ("xterm", True, True), ("xterm-256color", True, False), ("xterm", False, False)])
+def test_init_at_a_16_colour_terminal_names_the_fix(repo, tmp_path, term, tty, says):
+    """At 16 colours the palette falls back to plainer colours, and the
+    terminal usually does more than its TERM says: init, run by a person,
+    names the fix. An agent has no tty, so it hears nothing (the owner,
+    2026-10-06)."""
+    env = {k: v for k, v in os.environ.items() if k not in ("COLORTERM", "NO_COLOR")}
+    env.update(TERM=term, FORCE_COLOR="1", HOME=str(tmp_path))
+    script = ("import sys; sys.stdout.isatty = lambda: True\n" if tty else "") + \
+        "from symbion import cli; cli.main(['init'])"
+    r = subprocess.run([sys.executable, "-c", script], cwd=repo, env=env,
+                       capture_output=True, text=True, encoding="utf-8")
+    assert ("set COLORTERM=truecolor, or a TERM ending in -256color" in r.stdout) is says, \
+        r.stdout + r.stderr
 
 
 def test_skill_documents_resolvers_next_to_catalogs():

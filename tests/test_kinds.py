@@ -5,12 +5,13 @@ import pytest
 from symbion import kinds as K
 
 
-def test_defaults_are_the_seven_in_order():
+def test_defaults_are_the_eight_in_order():
     assert list(K.DEFAULT_KINDS) == ["note", "decision", "bug", "task",
-                                     "question", "idea", "check"]
+                                     "question", "idea", "check", "prediction"]
     assert K.DEFAULT_KINDS["idea"] == K.Kind(status=True, parked=True,
                                              when=K.DEFAULT_KINDS["idea"].when)
     assert K.DEFAULT_KINDS["check"].verdict and not K.DEFAULT_KINDS["check"].status
+    assert K.DEFAULT_KINDS["prediction"].status and K.DEFAULT_KINDS["prediction"].verdict
     assert all(k.when for k in K.DEFAULT_KINDS.values()), "every default carries its moment"
 
 

@@ -51,11 +51,11 @@ A kind is a label on three bits, and the bits are all symbion knows:
   `measurements` as a number, where `--result` prose holds only text.
   `resolve` and `supersede` take `--measure` too: a name given replaces that
   name, and the others are inherited.
-- **`status` + `verdict`** is a pre-registration. No default kind has both:
-  declare one under `[kinds]` in `symbion.toml`, e.g. `prediction = { status
-  = true, verdict = true }`. That table replaces the defaults:
-  `symbion schema --toml` prints the current one to paste and extend. File it
-  before the data exists: `--checked` names the run and its control, the body
+- **`status` + `verdict`** is a pre-registration, and `prediction` is the
+  default kind with both. A `[kinds]` table written before it may hold none:
+  if `symbion schema` lists no kind with both bits, add
+  `prediction = { status = true, verdict = true }` under `[kinds]` in
+  `symbion.toml`. File it before the data exists: `--checked` names the run and its control, the body
   states the prediction and what would falsify it, and `--due` is the date its
   window closes. Open with no result, it lists as `pending`; `resolve <id>
   --result "…"` closes it and stamps the commit it was judged at, and
@@ -72,8 +72,9 @@ being context (a progress log, a "built at" marker), `supersede <id> --add-tag
 retired` takes it out of the default `context` view.
 
 `--due DATE` (`YYYY-MM-DD` or an ISO datetime) goes on any status row. A date
-is due through the end of its day. `--json` gives `due` as written, a date or
-an offset datetime, so let `list --overdue` compare them. An open
+is due through the end of its day. `--json` gives `due` as a date, or as a
+datetime with its offset (UTC's, or TZ's when set, if none was typed), not
+as typed, so let `list --overdue` compare them. An open
 row past due or due within 7 days opens the session-start summary, parked or
 not, so it is also how an `idea` gets a revisit date. A date only in the body
 reaches nothing. `supersede <id> --due ''` clears it. Dates and times are UTC,
@@ -89,6 +90,11 @@ test failed with the fix reverted, the suite passed on Linux too.
 
 **Search before you write, and before you say the store lacks something:**
 `list --grep 'a|b'`.
+
+**A job still running needs an open row.** A verdict-only row (`check`)
+reaches no open view, so one that records a launch (a day-long capture, a
+long benchmark) is forgotten when the job ends. Pair it with a `task` whose
+`--due` is the expected finish, and resolve that with the result.
 
 **A revision updates its head.** `add` names the rows already open on its
 target, on stderr. If the new row settles or revises one, `resolve` or
@@ -122,10 +128,9 @@ store's). `--tag` is repeatable and matches exactly. `--ref TYPE:NAME`
 that object finds it: use it instead of naming the object in prose. `resolve
 <id> --ref commit:SHA` records the commit that closed a row.
 
-Many rows: `add --from-json -`, one JSON object per line. The keys are
-`list --json`'s, less the ones symbion mints (`id`, `created_at`,
-`provenance`) and the ones it computes; `add -h` lists them. Nothing is
-written unless every line passes.
+Many rows: `add --from-json -`, one JSON object per line, with the keys
+`add -h` lists. Nothing is written unless every line passes, and every
+failing line is named.
 
 ```bash
 symbion add --from-json - <<'EOF'
@@ -140,6 +145,15 @@ tail (`412907-3be`); 3 characters are often shared.
 
 ## Reading
 
+**Find rows with `list --grep PATTERN`, and read one with `show <id>`.**
+`--grep` is a case-insensitive regex over body, target name, checked, result,
+refs and `#tags`; `-F` takes it literally. A pattern that is an id or its
+tail (`412907-3be`) also lists that row. Never `list | grep`: text `list` is
+one 25-row page, so the pipe misses rows and the silence reads as absence.
+The page's first line gives the total and the flag that shows each hidden
+set; `--limit 0` shows all. `--json` is paged only by `--limit`. `context
+--target TYPE:NAME` is every row on one object.
+
 **A row is what was true when it was written.** A `check` says how far HEAD
 has moved since (`behind N`). A row on a file in this checkout says how many
 commits have changed that file since the row saw it (`commits_since`, printed
@@ -150,7 +164,7 @@ Use `--json` on `list`, `summary`, `context`, `arc list` and `arc todo`. A row
 has `id`, `kind`, `target: {type, name}` (`name` is `null` on a `project`
 target), `created_at`, `author`, `body`, `status`, `checked`, `result`,
 `arc_id`, `due`, `supersedes`, `tags`, `refs`, `provenance`, `measurements`,
-`evidence`, `target_blob`. `list`, `context` and `arc todo` add
+`target_blob`. `list`, `context` and `arc todo` add
 `commits_since` (null unless the target is a file in this checkout) and
 `raised_by`, the author of the row's first version (`author` is its newest's); `list`
 also adds `state` and `distance` on verdict kinds, and `head` on a superseded
@@ -166,14 +180,6 @@ symbion list --status open --json
 symbion show <id> --json                 # list --id <id>: one row, superseded or not
 symbion context --target file:src/x.py --json
 ```
-
-Search with `list --grep PATTERN`, a case-insensitive regex over body, target
-name, checked, result, refs and `#tags`; `-F` takes it literally. A pattern
-that is an id or its tail (`412907-3be`) also lists that row. Never
-`list | grep`: text `list` is one 25-row page, so the pipe misses rows and the
-silence reads as absence. The page's first line gives the total and the flag
-that shows each hidden set; `--limit 0` shows all. `--json` is paged only by
-`--limit`.
 
 A person may browse the same store at `symbion serve`. Rows retain their
 authors whether written through the GUI, a terminal, or another agent. While
@@ -245,7 +251,7 @@ place for symbion reports, use that.
   `symbion.toml` sets `local_only = true`). It takes every
   pending row, another writer's too, and every other changed file in the
   store, and names them: `committed: rows claude 2, codex 4; 1 file:
-  tools/x.py`.
+  tools/x.py`. `commit --dry-run` lists them first and commits nothing.
 - **A catalog miss stores your typed string.** A name that matches nothing
   becomes its own target, with only a note on stderr and exit 0.
 
@@ -270,7 +276,7 @@ made is refused, naming the path.
 | `show <id>... [--json]` | rows by id, as `list --id <id>...` (an array in `--json`) |
 | `resolve <id> [--body …] [--result …] [--measure K=V]… [--ref T:N] [--add-tag …]` | close a row; `--body` goes below the current body, after a blank line it inserts |
 | `supersede <id> [--body …] [--append] [--prepend] [--add-tag …] [--rm-tag …] [--tag …] [--add-ref T:N] [--ref T:N] [--checked …] [--result …] [--measure K=V]… [--due DATE]` | correct a row; `--tag` and `--ref` replace the inherited ones, `--add-tag` and `--add-ref` add to them, `--measure` sets one name and keeps the rest; `--append` adds the body after a blank line it inserts, `--prepend` above one |
-| `commit [-m MSG]` | commit the store |
+| `commit [-m MSG] [--dry-run]` | commit the store; `--dry-run` lists what it would take |
 | `push` | push the store's commits to its remote |
 | `rename <old> <new> --type T [--to-type T2]` | move every row and ref on a renamed object; `--to-type` changes its type too |
 | `summary`, `schema [--toml]`, `tags`, `context` | read |

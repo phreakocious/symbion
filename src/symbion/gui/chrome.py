@@ -106,7 +106,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
             ui.space()
             # Left of New note, so that button stays put as these come and go
             # (the owner, 2026-10-02).
-            _git_buttons(ctx)
+            _git_buttons(ctx, author)
             _new_note_button(ctx, author, *new)
             _search_box(q, keep or {})
             with ui.element("div").classes("sb-who-top sb-narrow") \
@@ -179,32 +179,35 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
             with ui.column().classes("gap-0"):
                 ui.label(name).classes("sb-brand-name").mark("brand")
                 ui.label(f"symbion · {summ._count(len(heads), 'note')}").classes("sb-brand-sub")
-        with ui.element("nav").classes("sb-nav").props('aria-label="places"'):
-            for label, path, icon in _PLACES:
-                with ui.link(target=path).classes(
-                        "sb-nav-item" + (" sb-on" if path == here else "")) \
-                        .mark(f"place-{path.strip('/') or 'home'}"):
-                    ui.icon(icon)
-                    ui.label(label)
-        for head, parked in (("open", False), ("parked", True)):
-            kinds = [k for k, spec in ctx.kinds.items() if spec.status and spec.parked == parked]
-            if not kinds:
-                continue
-            with ui.element("div").classes("sb-nav"):
-                ui.label(head).classes("sb-nav-head")
-                for k in kinds:
-                    _kind_item(k, len(summ.open_notes(heads, k)),
-                               href(kind=k, status="open"), f"open-{k}")
-        # The kinds with no status, which showed nowhere here (the owner,
-        # 2026-10-02): no open count, so each shows its rows.
-        plain = [k for k, spec in ctx.kinds.items() if not spec.status]
-        if plain:
-            with ui.element("div").classes("sb-nav"):
-                ui.label("records").classes("sb-nav-head")
-                for k in plain:
-                    _kind_item(k, sum(h.kind == k for h in heads), href(kind=k), f"kind-{k}")
-        _closed(heads)
-        _other_stores(ctx)
+        # Only the groups scroll: the badge sat below them, cut off in an
+        # 800px window once the RECORDS group came (2026-10-06).
+        with ui.element("div").classes("sb-scroll"):
+            with ui.element("nav").classes("sb-nav").props('aria-label="places"'):
+                for label, path, icon in _PLACES:
+                    with ui.link(target=path).classes(
+                            "sb-nav-item" + (" sb-on" if path == here else "")) \
+                            .mark(f"place-{path.strip('/') or 'home'}"):
+                        ui.icon(icon)
+                        ui.label(label)
+            for head, parked in (("open", False), ("parked", True)):
+                kinds = [k for k, spec in ctx.kinds.items() if spec.status and spec.parked == parked]
+                if not kinds:
+                    continue
+                with ui.element("div").classes("sb-nav"):
+                    ui.label(head).classes("sb-nav-head")
+                    for k in kinds:
+                        _kind_item(k, len(summ.open_notes(heads, k)),
+                                   href(kind=k, status="open"), f"open-{k}")
+            # The kinds with no status, which showed nowhere here (the owner,
+            # 2026-10-02): no open count, so each shows its rows.
+            plain = [k for k, spec in ctx.kinds.items() if not spec.status]
+            if plain:
+                with ui.element("div").classes("sb-nav"):
+                    ui.label("records").classes("sb-nav-head")
+                    for k in plain:
+                        _kind_item(k, sum(h.kind == k for h in heads), href(kind=k), f"kind-{k}")
+            _closed(heads)
+            _other_stores(ctx)
         with ui.element("div").classes("sb-who"):
             ui.label((author or "?")[:1]).classes("sb-avatar")
             ui.label(f"writing as {author}").classes("sb-badge").mark("author-badge") \
@@ -296,18 +299,23 @@ def _search_box(q: str, keep: dict) -> None:
 _GIT_EVERY = 5
 
 
-def _git_buttons(ctx) -> None:
+def _git_buttons(ctx, author: str) -> None:
     """Commit and push, read again every `_GIT_EVERY` seconds and redrawn
     when a count moves: a commit or push made at a terminal left them on the
     page, and rows written there never showed the commit button (the owner,
-    2026-10-01)."""
+    2026-10-01). The button counts and commits `author`'s rows only: it took
+    an agent's pending rows under its own message (the owner, 2026-10-10:
+    "serve should only be allowed to commit its own rows")."""
     def read():
-        return (*gitref.uncommitted(ctx.store_dir), gitref.unpushed(ctx.store_dir))
+        rows = S.pending_rows(ctx.store_dir)
+        mine = sum(r.get("author") == author for r in rows)
+        return (mine, len(rows) - mine, gitref.uncommitted(ctx.store_dir)[1],
+                gitref.unpushed(ctx.store_dir))
 
     @ui.refreshable
     def buttons(state):
-        _commit_button(ctx, *state[:2])
-        _push_button(ctx, state[2])
+        _commit_button(ctx, author, *state[:3])
+        _push_button(ctx, state[3])
 
     shown = [read()]
     buttons(shown[0])
@@ -320,7 +328,7 @@ def _git_buttons(ctx) -> None:
     ui.timer(_GIT_EVERY, tick, immediate=False)    # the page has just read it
 
 
-def _commit_button(ctx, n: int, registry: bool) -> None:
+def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> None:
     """The store is a sibling git repo. A GUI that writes but cannot commit
     only grows the number the SessionStart hook nags about."""
     if not n and not registry:
@@ -328,7 +336,7 @@ def _commit_button(ctx, n: int, registry: bool) -> None:
 
     def _do():
         try:
-            ok = api.commit(ctx, "notes: via symbion serve")
+            ok = api.commit(ctx, "notes: via symbion serve", author=author)
         except RuntimeError as e:     # a hook refused: no reload, so it stays read
             ui.notify(str(e), type="negative", multi_line=True,
                       close_button="dismiss", timeout=0)
@@ -339,7 +347,9 @@ def _commit_button(ctx, n: int, registry: bool) -> None:
     # On a phone the word goes and the count stays: the icon says commit.
     with ui.button(icon="save", on_click=_do).props("outline dense no-caps color=notable") \
             .classes("px-2 sb-commit").mark("commit-button") \
-            .tooltip("git commit the note store"):
+            .tooltip(f"git commit {author}'s rows" + (
+                f"; {summ._count(others, 'row')} by other writers stay pending for them"
+                if others else "")):
         ui.label("commit").classes("sb-btn-word")
         ui.label(str(n) if n else "registry")
 

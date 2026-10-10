@@ -44,14 +44,7 @@ class AllowOnly:
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] in ("http", "websocket") and not self._allowed(scope.get("client")):
-            if scope["type"] == "websocket":
-                await send({"type": "websocket.close", "code": 1008})
-            else:
-                await send({"type": "http.response.start", "status": 403,
-                            "headers": [(b"content-type", b"text/plain")]})
-                await send({"type": "http.response.body",
-                            "body": b"symbion serve: not in its --allow\n"})
-            return
+            return await _refuse(scope, send, b"symbion serve: not in its --allow\n")
         await self.app(scope, receive, send)
 
     def _allowed(self, client) -> bool:
@@ -62,6 +55,38 @@ class AllowOnly:
         # A dual-stack bind (`::`) sees an IPv4 client as ::ffff:a.b.c.d.
         ip = getattr(ip, "ipv4_mapped", None) or ip
         return ip.is_loopback or any(ip in n for n in self.nets)
+
+
+class HostIsAddress:
+    """ASGI: a loopback serve answers only to a Host of `localhost` or an IP
+    address. A web page reaches it by DNS rebinding: the page's own name,
+    re-pointed at 127.0.0.1, passes every peer check, and the serve's port
+    follows from the store's name. No page is named by an address."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            host = dict(scope.get("headers") or []).get(b"host", b"").decode("latin-1")
+            try:
+                name = urlsplit("//" + host).hostname or ""
+            except ValueError:                      # `[::1` with no `]`
+                name = ""
+            if name != "localhost" and not _ip(name):
+                return await _refuse(scope, send, b"symbion serve: open it at localhost or "
+                                                  b"an IP address; a web page reaches it "
+                                                  b"under any other name\n")
+        await self.app(scope, receive, send)
+
+
+async def _refuse(scope, send, body: bytes) -> None:
+    if scope["type"] == "websocket":
+        await send({"type": "websocket.close", "code": 1008})
+    else:
+        await send({"type": "http.response.start", "status": 403,
+                    "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": body})
 
 
 def _ip(host: str):
@@ -131,6 +156,9 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
         # the default handler, which ended the process before the finally
         # below took the record off. It stops as Ctrl-C does instead.
         signal.signal(signal.SIGBREAK, signal.default_int_handler)
+    # SIGTERM (`kill`, launchd, systemd, a shutdown) the same way: under the
+    # default handler the record outlived the serve (2026-10-09).
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     # With --reload, uvicorn spawns a worker that re-runs main(); its port is
     # unused, and it must neither announce the URL nor re-exec. The worker's
     # __main__ is still spawn's stub while this runs, so only the process
@@ -157,6 +185,12 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
         own = _ip(host)
         app.add_middleware(AllowOnly, nets=[*allow, ipaddress.ip_network(own)] if own
                            else [*allow])
+    else:
+        # ponytail: a wide serve checks the peer, not the Host: a name for
+        # this machine is fair there and unknowable here. A page in an
+        # allowed client's browser can still rebind; a Host list flag
+        # closes that if a wide serve ever faces untrusted browsing.
+        app.add_middleware(HostIsAddress)
     # The store's own port, so a link to it outlives a restart (the owner,
     # 2026-10-02). `--port` overrides it and is never warned about.
     want = servers.port(ctx.store_dir) if port is None else None

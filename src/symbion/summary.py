@@ -97,7 +97,7 @@ def when_added(stamp: str) -> str:
 
 
 def measured(m: dict) -> str:
-    """A row's measurements on one line, in the order written."""
+    """A row's measurements on one line, by name (store.note_from_dict)."""
     return ", ".join(f"{k}={v}" for k, v in m.items())
 
 
@@ -269,6 +269,9 @@ def empty_summary() -> dict:
         "full": False,
         "rows": 0,
         "gui": None,
+        "skill": None,
+        "leftovers": [],
+        "named_store": None,
     }
 
 

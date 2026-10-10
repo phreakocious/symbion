@@ -79,6 +79,54 @@ def diff_blocks(old: str, new: str) -> list[tuple[str, str]]:
     return out
 
 
+def word_diff(old: str | None, new: str | None) -> str:
+    """old against new word by word, escaped for HTML: what went in <del>,
+    what came in <ins>. A `checked` is one line, which a block diff shows
+    whole twice: a path changed inside a long one, and nothing said where."""
+    a, b = (re.findall(r"\S+\s*", t or "") for t in (old, new))
+    out = []
+    for op, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        gone, came = html.escape("".join(a[i1:i2])), html.escape("".join(b[j1:j2]))
+        if op == "equal":
+            out.append(gone)
+            continue
+        if gone:
+            out.append(f"<del>{gone}</del>")
+        if came:
+            out.append(f"<ins>{came}</ins>")
+    return "".join(out) or "—"
+
+
+def changes(old, new) -> list[str]:
+    """What `new`, the version after `old`, changed: a phrase each. An
+    earlier version said nothing of it, so a change to one field of a long
+    row read as no change at all (the owner, 2026-10-09). The body, checked
+    and result are only named: the card under the line shows them."""
+    def name(t):
+        return summ.ref_label(t) if t.name else t.type
+
+    out = []
+    if old.kind != new.kind:
+        out.append(f"kind {old.kind} → {new.kind}")
+    if old.target != new.target:
+        out.append(f"target {name(old.target)} → {name(new.target)}")
+    if old.status != new.status:
+        out.append(f"{old.status or 'no status'} → {new.status or 'no status'}")
+    out += [f for f in ("body", "checked", "result") if getattr(old, f) != getattr(new, f)]
+    a, b = old.measurements or {}, new.measurements or {}
+    out += [f"{k} {a[k]} → {b[k]}" if k in a and k in b else f"+{k} {b[k]}" if k in b
+            else f"−{k}" for k in sorted(a.keys() | b.keys(), key=str.casefold)
+            if a.get(k) != b.get(k)]
+    for f, label in (("due", "due"), ("arc_id", "arc")):
+        if getattr(old, f) != getattr(new, f):
+            out.append(f"{label} {getattr(old, f) or 'none'} → {getattr(new, f) or 'none'}")
+    out += [f"−#{t}" for t in old.tags if t not in new.tags]
+    out += [f"+#{t}" for t in new.tags if t not in old.tags]
+    out += [f"−↗ {name(r)}" for r in old.refs if r not in new.refs]
+    out += [f"+↗ {name(r)}" for r in new.refs if r not in old.refs]
+    return out
+
+
 def edited(old: str, new: str) -> bool:
     """A rewrite a diff helps: not one that kept the old body whole, whose
     seams mark what it added (summary.seams), and not a replacement, which a
@@ -439,8 +487,9 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     edit made from it would land on the current row. `git_head` is
     gitref.head_sha's, read once by a page of many check badges, and `since`
     the row's gitref.commits_since, counted once by a page of many cards.
-    `seams` are summary.seams' for the body; `diff_to`, the row that
-    superseded this one, shows the body as a diff against it."""
+    `seams` are summary.seams' for the body. `diff_to` is the row that
+    superseded this one: the card says what it changed, marks the words of a
+    changed checked or result, and shows a rewritten body as a diff."""
     def narrow(**kv):
         return href(**{**(base or {}), **kv})
 
@@ -492,8 +541,13 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
 
 def _note_content(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
                   diff_to=None) -> None:
-    """The body, the verdict, measurements and evidence: what the row says.
+    """The body, the verdict and measurements: what the row says.
     A bare row says its target, or on that target's own page, its arc."""
+    if diff_to:
+        what = changes(n, diff_to)
+        ui.label(f"{diff_to.author} edited this {summ.when_added(diff_to.created_at)}"
+                 + (f": {', '.join(what)}" if what else "")) \
+            .classes("sb-note-meta").tooltip(diff_to.created_at).mark("changes")
     if bare(n):
         if show_target:
             target_headline(n)
@@ -503,8 +557,13 @@ def _note_content(ctx, n, compact: bool, hit, show_target: bool = False, seams=(
         # Clipped on a board like the body: a check's `checked` ran to
         # three lines and pushed the next row off the screen.
         fit = (lambda t: summ.clip(t, summ.HEAD_CHARS)) if compact else (lambda t: t)
-        ui.label(f"checked: {fit(n.checked) or '—'}   →   result: {fit(n.result) or '—'}") \
-            .classes("sb-verdict").mark("note-verdict")
+        if diff_to and (n.checked, n.result) != (diff_to.checked, diff_to.result):
+            ui.html(f"checked: {word_diff(n.checked, diff_to.checked)}   →   "
+                    f"result: {word_diff(n.result, diff_to.result)}", sanitize=False) \
+                .classes("sb-verdict").mark("note-verdict")
+        else:
+            ui.label(f"checked: {fit(n.checked) or '—'}   →   result: {fit(n.result) or '—'}") \
+                .classes("sb-verdict").mark("note-verdict")
     if n.body and compact and (hit or len(summ.flatten(n.body)) > summ.BODY_CHARS):
         # A list to scan, not a page to read: one bug's four paragraphs
         # filled the boards (seen in the browser, 2026-09-27). A search
@@ -519,9 +578,7 @@ def _note_content(ctx, n, compact: bool, hit, show_target: bool = False, seams=(
                     .classes("sb-note-text sb-snippet").mark("note-snippet")
             else:
                 ui.label(text).classes("sb-note-text")
-    elif diff_to:
-        ui.label(f"{diff_to.author} edited this {summ.when_added(diff_to.created_at)}") \
-            .classes("sb-note-meta").tooltip(diff_to.created_at)
+    elif diff_to and edited(n.body, diff_to.body):
         for op, text in diff_blocks(n.body, diff_to.body):
             md = NoteMarkdown(link_ids(text, ctx.store_dir))
             if op != "=":
@@ -542,10 +599,6 @@ def _note_content(ctx, n, compact: bool, hit, show_target: bool = False, seams=(
         with ui.row().classes("gap-3 flex-wrap").mark("measurements"):
             for k, v in n.measurements.items():
                 ui.label(f"{k}: {v}").classes("sb-note-meta")
-    if n.evidence:
-        # Text only. Serving store-relative paths over HTTP buys nothing a
-        # file manager does not, and makes the store a static file host.
-        ui.label("evidence: " + ", ".join(n.evidence)).classes("sb-note-meta")
 
 
 def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) -> None:

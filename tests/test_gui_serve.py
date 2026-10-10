@@ -19,6 +19,15 @@ pytest.importorskip("nicegui")
 
 from symbion import store     # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _no_real_middleware(monkeypatch):
+    """serve.main adds middleware to nicegui's global app: a real add reaches
+    every later GUI test, and raises once an earlier test has started the app.
+    _main_host records what it would add instead."""
+    from symbion.gui import serve
+    monkeypatch.setattr(serve.app, "add_middleware", lambda *a, **k: None)
+
 # The console script beside this venv's python (test_hook.py says why not
 # shutil.which): its `__main__` guard is half of what broke --reload.
 SYMBION = str(Path(sysconfig.get_path("scripts")) / "symbion")
@@ -115,11 +124,13 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     assert 'querySelectorAll(".darkreader--fallback").forEach(e => e.remove())' in page, page[:2000]
 
 
-def test_ctrl_c_stops_a_serve_quietly(tmp_path):
+@pytest.mark.parametrize("stop", [CTRL_C, STOP], ids=["ctrl-c", "term"])
+def test_ctrl_c_stops_a_serve_quietly(tmp_path, stop):
     """Ctrl-C is how a person stops a serve. uvicorn shuts down cleanly, then
     re-raises the SIGINT it caught, and the KeyboardInterrupt came out of
     ui.run() as a 48-line traceback and exit 1. --reload's supervisor already
-    exits 0 on it."""
+    exits 0 on it. A SIGTERM (`kill`, launchd, a shutdown) died under the
+    default handler and left the serve's record behind (2026-10-09)."""
     store.ensure_store(tmp_path)
     port = _free_port()
     env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
@@ -130,7 +141,7 @@ def test_ctrl_c_stops_a_serve_quietly(tmp_path):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, **GROUP)
     try:
         status, _ = _get_page(p, port)
-        p.send_signal(CTRL_C)
+        p.send_signal(stop)
         out = p.communicate(timeout=15)[0].decode()
     finally:
         if p.poll() is None:
@@ -465,6 +476,34 @@ def test_a_wide_serve_lets_in_this_machine_and_allow_only():
         == [403, 403, 1008, 1008]
 
 
+def test_a_loopback_serve_answers_only_to_an_address_or_localhost():
+    """DNS rebinding: a web page re-points its own name at 127.0.0.1, and
+    every peer check passes. The Host header still carries that name, and no
+    page can be named by an IP literal or `localhost`. Both scopes, as above."""
+    import asyncio
+    from symbion.gui.serve import HostIsAddress
+    reached, sent = [], []
+
+    async def app(scope, receive, send):
+        reached.append((scope["type"], dict(scope.get("headers", [])).get(b"host")))
+
+    async def send(m):
+        sent.append(m)
+
+    mw = HostIsAddress(app)
+    asyncio.run(mw({"type": "lifespan"}, None, send))
+    good = [b"127.0.0.1:5", b"localhost:5", b"LocalHost", b"[::1]:5", b"192.0.2.7"]
+    bad = [b"rebind.example:5", b"127.0.0.1.rebind.example", b"[::1", b"", None]
+    for typ in ("http", "websocket"):
+        for h in good + bad:
+            asyncio.run(mw({"type": typ, "headers": [] if h is None else [(b"host", h)]},
+                           None, send))
+    assert reached == [("lifespan", None)] + [(t, h) for t in ("http", "websocket")
+                                              for h in good]
+    assert [m.get("status", m.get("code")) for m in sent if "body" not in m] \
+        == [403] * len(bad) + [1008] * len(bad)
+
+
 def test_a_serve_names_the_address_this_machine_reaches():
     """The recorded and printed URL: the summary's link and the other
     stores' sidebars use it. A serve on every address answers on loopback;
@@ -487,7 +526,8 @@ def _main_host(tmp_path, monkeypatch, **kw):
     monkeypatch.setattr(serve, "build_page", lambda ctx, author: None)
     seen, added = {}, []
     monkeypatch.setattr(serve.ui, "run", lambda **k: seen.update(k))
-    monkeypatch.setattr(serve.app, "add_middleware", lambda cls, **k: added.append(k))
+    monkeypatch.setattr(serve.app, "add_middleware",
+                        lambda cls, **k: added.append({"cls": cls.__name__, **k}))
     store.ensure_store(tmp_path / "s-notes")
     kw.setdefault("port", _free_port())
     rc = serve.main(api.resolve(str(tmp_path / "s-notes")), author="t", show=False, **kw)
@@ -503,11 +543,12 @@ def test_a_serve_past_loopback_needs_allow(tmp_path, monkeypatch, capsys):
     net = ipaddress.ip_network("10.1.0.0/16")
     rc, seen, added = _main_host(tmp_path, monkeypatch, host="0.0.0.0", allow=[net])
     assert rc == 0 and seen["host"] == "0.0.0.0"
-    assert net in added[0]["nets"]
+    assert [a["cls"] for a in added] == ["AllowOnly"] and net in added[0]["nets"]
     assert "10.1.0.0/16" in capsys.readouterr().out
 
     rc, seen, added = _main_host(tmp_path, monkeypatch)
-    assert rc == 0 and seen["host"] == "127.0.0.1" and not added
+    assert rc == 0 and seen["host"] == "127.0.0.1"
+    assert [a["cls"] for a in added] == ["HostIsAddress"]
 
     # On one address, this machine connects from that address, not loopback.
     rc, seen, added = _main_host(tmp_path, monkeypatch, host="192.0.2.7", allow=[net])

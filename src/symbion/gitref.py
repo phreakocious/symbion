@@ -95,16 +95,29 @@ def canon_name(cfg, target_type, name, stored=()):
                       f"the catalog resolves it to {got!r}", file=sys.stderr)
         return q
     if target_type == "commit":
-        return canonical_commit(cfg, name)
+        sha = canonical_commit(cfg, name)
+        if sha == name and _git(cfg, "cat-file", "-e", f"{name}^{{commit}}").returncode:
+            # A typo stored silently, where `context --commit` says so (2026-10-09).
+            print(f"note: git does not know commit {name!r} here; taken as typed",
+                  file=sys.stderr)
+        return sha
     if target_type in catalog.NON_CANONICAL_TYPES:
         return catalog.nfc(name)
     return catalog.canonical(cfg, target_type, name)
 
 
 def _dirty_paths(cfg) -> list[str]:
-    """`git status --porcelain` paths, a rename's new name."""
-    lines = _git(cfg, "status", "--porcelain").stdout.splitlines()
-    return [ln[3:].split(" -> ")[-1] for ln in lines if ln.strip()]
+    """`git status --porcelain -z` paths, a rename's new name. Split on NUL:
+    the line form quotes a path with a space or a non-ASCII byte, and the
+    stamp kept `"caf\\303\\251.txt"`, quotes and all (2026-10-09 review)."""
+    fields = iter(_git(cfg, "status", "--porcelain", "-z").stdout.split("\0"))
+    out = []
+    for f in fields:
+        if f:
+            out.append(f[3:])
+            if "R" in f[:2] or "C" in f[:2]:
+                next(fields, None)               # -z puts the old name after the new
+    return out
 
 
 
@@ -118,6 +131,11 @@ def provenance_stamp(cfg, spec):
         return None
     if cfg.provenance_command:
         r = catalog.run_configured(cfg, cfg.provenance_command)
+        if r.returncode:
+            # A stamp printed before a failure was written at exit 0, where
+            # a catalog's exit status is checked first (2026-10-09 review).
+            raise ValueError(f"provenance command {cfg.provenance_command!r} exited "
+                             f"{r.returncode}: {r.stderr.strip()[:400]}")
         try:
             prov = json.loads(r.stdout)
         except ValueError:
@@ -260,11 +278,15 @@ def subjects(cfg, shas) -> dict:
     module anticipate) exits 128 with EMPTY stdout, blanking every subject in
     the batch, not just the missing one. With the flag, unknown shas are
     dropped and every known sha in the same batch still resolves; a caller
-    then renders a bare sha only for the ones actually missing."""
+    then renders a bare sha only for the ones actually missing.
+
+    `--end-of-options` too: a commit name git does not know is stored as
+    typed, and `--output=PATH` among the shas wrote the log to PATH."""
     out = {}
     if not shas:
         return out
-    r = _git(cfg, "log", "--no-walk", "--ignore-missing", "--format=%H%x00%s", *shas)
+    r = _git(cfg, "log", "--no-walk", "--ignore-missing", "--format=%H%x00%s",
+             "--end-of-options", *shas)
     if r.returncode != 0:
         return out
     for line in r.stdout.splitlines():
@@ -311,7 +333,30 @@ def target_blobs(cfg, ttype, names) -> dict:
     return dict(zip(paths, out)) if len(out) == len(paths) else {}
 
 
-def _file_history(cfg, paths) -> tuple[dict, float]:
+# (repo, HEAD's sha, the question) -> git's answer, for changed_since: a file
+# history read back from one commit, and the commits from an anchor to it,
+# are the same for good. A serve page of 100 cards asked again on every load,
+# a quarter second of it on a store whose repo has a merge (the owner,
+# 2026-10-09). A failure is not kept.
+# ponytail: grows with each HEAD and set of files a process asks about, as
+# _RELATIONS does; bound it if a serve's memory ever shows it.
+_HISTORY: dict = {}
+
+
+def _cached_git(cfg, key, *args):
+    """`_git(cfg, *args)`'s stdout, or None when git failed; kept under
+    `key` when `key` names a commit (an unborn HEAD names none)."""
+    full = (str(_root(cfg)), *key)
+    if key[0] and full in _HISTORY:
+        return _HISTORY[full]
+    r = _git(cfg, *args)
+    out = r.stdout if r.returncode == 0 else None
+    if key[0] and out is not None:
+        _HISTORY[full] = out
+    return out
+
+
+def _file_history(cfg, paths, head: str) -> tuple[dict, float]:
     """(path -> [(sha, committer time, blob after, position)], the position
     of the first merge), in one walk in topological order: a commit before
     its parents. A merge has no `--raw` record, so no path lists one; the
@@ -320,27 +365,28 @@ def _file_history(cfg, paths) -> tuple[dict, float]:
     and the path. No paths, no walk: an empty pathspec reads every commit."""
     if not paths:
         return {}, math.inf
-    r = _git(cfg, "log", "-z", "--topo-order", "--no-renames", "--raw", "--no-abbrev",
-             "--format=%H %ct %P", "HEAD", "--", *(f":(literal){p}" for p in paths))
-    toks = r.stdout.split("\0") if r.returncode == 0 else []
-    hist, head, merge, i = {}, None, None, 0
+    out = _cached_git(cfg, (head, "log", *paths), "log", "-z", "--topo-order", "--no-renames",
+                      "--raw", "--no-abbrev", "--format=%H %ct %P", head or "HEAD", "--",
+                      *(f":(literal){p}" for p in paths))
+    toks = out.split("\0") if out is not None else []
+    hist, top, merge, i = {}, None, None, 0
     while i < len(toks):
         t = toks[i].lstrip("\n")
-        if t.startswith(":") and head and i + 1 < len(toks):
-            hist.setdefault(toks[i + 1], []).append((*head, t.split()[3], pos))
+        if t.startswith(":") and top and i + 1 < len(toks):
+            hist.setdefault(toks[i + 1], []).append((*top, t.split()[3], pos))
             i += 2
             continue
         if t:
             sha, ct, *parents = t.split()
-            pos = 0 if head is None else pos + 1
-            head = (sha, int(ct))
+            pos = 0 if top is None else pos + 1
+            top = (sha, int(ct))
             if len(parents) > 1 and merge is None:
                 merge = pos
         i += 1
     return hist, math.inf if merge is None else merge
 
 
-def changed_since(cfg, notes) -> dict:
+def changed_since(cfg, notes, head: str | None = None) -> dict:
     """id -> the commits, newest first, that changed the row's target file
     after the content the row saw; None when the target is no file in this
     checkout.
@@ -353,16 +399,18 @@ def changed_since(cfg, notes) -> dict:
     stamp (written before stamping), or whose content no commit holds (edited
     again before the commit, or rewritten by a rebase), gets the commits
     dated after its chain's first row: a revision inherits the stamp, and
-    a row with none keeps the time the target was read.
-    # ponytail: the walk reads each file's whole history on every read and
-    # serve page of cards, plus a rev-list per (file, anchor) below a merge;
-    # cache across calls if a page turns slow."""
+    a row with none keeps the time the target was read. `head` is
+    head_sha(cfg), passed by a caller that has it; git's answers are kept
+    for it (_HISTORY)."""
     files = {n.id: _file(cfg, n.target.type, n.target.name) for n in notes}
     paths = sorted({p for p in files.values() if p})
     r = _git(cfg, "hash-object", "--", *paths) if paths else None
     now = dict(zip(paths, r.stdout.split())) if r and r.returncode == 0 else {}
-    hist, merge = _file_history(cfg, sorted({files[n.id] for n in notes if files[n.id]
-                                             and now.get(files[n.id]) != n.target_blob}))
+    moved = sorted({files[n.id] for n in notes if files[n.id]
+                    and now.get(files[n.id]) != n.target_blob})
+    if moved and head is None:
+        head = head_sha(cfg)
+    hist, merge = _file_history(cfg, moved, head)
     anchored, out = {}, {}
     for n in notes:
         path = files[n.id]
@@ -380,18 +428,19 @@ def changed_since(cfg, notes) -> dict:
             out[n.id] = [sha for sha, _, _, pos in commits if pos < at]
             continue
         if anchor and (path, anchor) not in anchored:
-            c = _git(cfg, "rev-list", "--no-merges", f"{anchor}..HEAD",
-                     "--", f":(literal){path}")
-            anchored[path, anchor] = c.stdout.split() if c.returncode == 0 else None
+            c = _cached_git(cfg, (head, "rev-list", anchor, path), "rev-list", "--no-merges",
+                            f"{anchor}..{head or 'HEAD'}", "--", f":(literal){path}")
+            anchored[path, anchor] = c.split() if c is not None else None
         if anchored.get((path, anchor)) is not None:
             out[n.id] = anchored[path, anchor]
     return out
 
 
-def commits_since(cfg, notes) -> dict:
+def commits_since(cfg, notes, head: str | None = None) -> dict:
     """id -> how many commits changed_since lists, None where it has none:
     the count every read prints."""
-    return {k: None if v is None else len(v) for k, v in changed_since(cfg, notes).items()}
+    return {k: None if v is None else len(v)
+            for k, v in changed_since(cfg, notes, head).items()}
 
 
 def uncommitted(store) -> tuple[int, bool]:

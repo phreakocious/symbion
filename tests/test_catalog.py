@@ -71,6 +71,14 @@ def test_item_type_is_never_canonicalized(tmp_path):
     assert catalog.canonical(c, "item", "  anything typed ") == "  anything typed "
 
 
+def test_output_that_is_not_utf8_names_the_command(tmp_path):
+    """A catalog printing Latin-1 ended in `error: 'utf-8' codec can't
+    decode byte`, naming no command (2026-10-09 review)."""
+    c = cfg(tmp_path, thing="printf 'caf\\351\\n'")
+    with pytest.raises(catalog.CatalogError, match=r"not UTF-8 \(byte 3\): printf"):
+        catalog.names(c, "thing")
+
+
 def test_command_exceeding_timeout_raises_catalog_error(tmp_path):
     c = Config(project_root=tmp_path, catalogs={"thing": "sleep 5"}, command_timeout=1)
     with pytest.raises(catalog.CatalogError):

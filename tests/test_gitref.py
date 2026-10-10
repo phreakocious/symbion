@@ -272,6 +272,16 @@ def test_a_provenance_override_that_prints_no_object_refuses(repo, printed):
     assert gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"]) == {"schema": 7}
 
 
+def test_a_provenance_override_that_fails_refuses_whatever_it_printed(repo):
+    """A command that printed a stamp and then exited 1 stamped the row at
+    exit 0: a catalog's exit status is checked first, this one's was not
+    (2026-10-09 review)."""
+    cfg = Config(project_root=repo,
+                 provenance_command="""echo '{"sha": "x"}'; echo broke >&2; exit 1""")
+    with pytest.raises(ValueError, match=r"provenance command .* exited 1: broke"):
+        gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])
+
+
 def test_provenance_override_timeout_raises_catalog_error(repo):
     """Proves the override is routed through catalog.run_configured and not a
     bare subprocess.run: a bare subprocess.run on the override has no
@@ -324,6 +334,16 @@ def test_subjects_batch_with_one_missing_sha_still_resolves_the_valid_ones(repo)
     bogus = "0" * 40
     result = gitref.subjects(cfg, [head, bogus, parent])
     assert result == {head: "c1", parent: "c0"}
+
+
+def test_subjects_never_reads_a_stored_name_as_an_option(repo, tmp_path):
+    """A commit target is stored as typed when git does not know it, and
+    `--output=PATH` among the shas made every `list` write the log there."""
+    cfg = Config(project_root=repo)
+    head = _run(repo, "rev-parse", "HEAD")
+    planted = tmp_path / "planted"
+    assert gitref.subjects(cfg, [f"--output={planted}", head]) == {head: "c1"}
+    assert not planted.exists()
 
 
 def test_uncommitted_counts_appended_rows_exactly(tmp_path):
@@ -502,6 +522,10 @@ def test_a_merged_commit_dated_before_the_row_counts_and_the_merge_does_not(repo
                    capture_output=True, env={**os.environ,
                                              "GIT_COMMITTER_DATE": "2030-01-04T00:00:00+00:00"})
     assert _since(cfg, row) == 2, "main's commit and side's; by date, side's is before the row"
+    # git's answers are kept per HEAD (gitref._HISTORY): a new one asks again
+    (repo / "f0").write_text("A\nb\nc\nd\nE\nf\n")
+    _commit_at(repo, "after the merge", "2030-01-05T00:00:00+00:00")
+    assert _since(cfg, row) == 3
 
 
 def test_without_a_commit_holding_the_stamp_the_count_falls_back_to_dates(repo):
@@ -515,6 +539,10 @@ def test_without_a_commit_holding_the_stamp_the_count_falls_back_to_dates(repo):
     _commit_at(repo, "after", "2030-01-04T00:00:00+00:00")
     assert _since(cfg, stamped) == 1
     assert _since(cfg, unstamped) == 1
+    (repo / "f0").write_text("and again")         # a new HEAD is a new walk
+    _commit_at(repo, "after that", "2030-01-05T00:00:00+00:00")
+    assert _since(cfg, stamped) == 2
+    assert _since(cfg, unstamped) == 2
     assert _since(cfg, _file_row(cfg, "f1", "2030-01-03T00:00:00+00:00", stamp=False)) == 0
 
 

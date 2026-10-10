@@ -152,7 +152,10 @@ a { text-decoration: none; }
 /* The drawer aligns its content flex-start, so the inner box took its
    content's width: a closed row's one line made it 800px (2026-10-01). */
 .sb-side-inner { display: flex; flex-direction: column; gap: 24px; padding: 11px 14px 18px;
-                 min-height: 100%; width: 100%; box-sizing: border-box; }
+                 height: 100%; width: 100%; box-sizing: border-box; }
+/* the groups between the brand and the badge: they scroll, the badge stays */
+.sb-scroll { display: flex; flex-direction: column; gap: 24px; flex: 1; min-height: 0;
+             overflow-y: auto; margin: 0 -14px; padding: 0 14px; }
 .sb-brand  { display: flex; align-items: center; gap: 10px; padding: 0 8px; color: var(--q-emph); }
 .sb-brand-name { font-weight: 600; font-size: 15px; line-height: 1.2; color: var(--q-emph);
                  overflow-wrap: anywhere; }
@@ -347,6 +350,11 @@ a.sb-tag:hover { color: var(--q-primary); }
                background: color-mix(in srgb, var(--q-bad) 7%, transparent); }
 .sb-diff-ins { border-color: var(--q-good);
                background: color-mix(in srgb, var(--q-good) 7%, transparent); }
+/* the same inside a checked or result, word by word; struck and underlined
+   as well as tinted, so the colour is not the only sign */
+.sb-verdict del { color: var(--q-muted);
+                  background: color-mix(in srgb, var(--q-bad) 14%, transparent); }
+.sb-verdict ins { background: color-mix(in srgb, var(--q-good) 14%, transparent); }
 a.sb-id { color: var(--q-muted); }
 a.sb-id:hover { color: var(--q-primary); }
 /* copy the id: shown with the card's other buttons */

@@ -132,7 +132,23 @@ async def test_the_git_buttons_follow_commits_and_pushes_made_elsewhere(
     await user.should_not_see(marker="push-button", retries=40)
     api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
                              "body": "gamma"}, author="sam")
+    api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
+                             "body": "delta"}, author="ada")
     await user.should_see(marker="commit-button", retries=40)
+    (button,) = user.find(marker="commit-button").elements
+    assert "1" in [e.text for e in button.default_slot.children], "sam's is not ada's"
+
+
+async def test_the_commit_button_commits_only_its_authors_rows(user: User, ctx_with_notes,
+                                                              tmp_path):
+    """It took an agent's pending rows under the GUI's message (2026-10-09);
+    the owner: "serve should only be allowed to commit its own rows"."""
+    await user.open("/notes")
+    (button,) = user.find(marker="commit-button").elements
+    assert "1" in [e.text for e in button.default_slot.children]
+    user.find(marker="commit-button").click()
+    await user.should_see("committed: rows ada 1")
+    assert [r["author"] for r in store.pending_rows(tmp_path)] == ["sam"]
 
 
 async def test_the_push_button_shows_gits_refusal(user: User, ctx_with_notes, tmp_path,
@@ -182,6 +198,10 @@ async def test_a_superseded_id_opens_its_current_row(user: User, ctx_with_notes)
     await user.open(f"/notes?q={old.rsplit('-', 1)[1]}")
     await user.should_see("beta revised")
     assert _count(user).startswith("1 of 2 notes match")
+    # and says why it came: the search showed the current row and nothing
+    # of the id that brought it (the owner, 2026-10-09)
+    (said,) = user.find(marker="superseded-by").elements
+    assert said.text == f"{old} was superseded; this is its current row"
 
 
 async def test_shift_enter_adds_a_note_and_keeps_the_composer_open(
@@ -304,6 +324,27 @@ async def test_earlier_versions_show_an_edit_as_a_diff(user: User, ctx_with_note
     (gone,) = user.find(marker="diff-del").elements
     (came,) = user.find(marker="diff-ins").elements
     assert "the old wording" in gone.content and "the new wording" in came.content
+
+
+async def test_an_earlier_version_says_what_the_next_changed(user: User, ctx_with_notes):
+    """A version that changed one path in a long `checked` and nothing else
+    showed both versions whole, and nothing said what differed (the owner,
+    2026-10-09)."""
+    ctx = ctx_with_notes
+    nid = api.add(ctx, {"kind": "check", "target": {"type": "item", "name": "w"},
+                        "checked": "pytest tmp/a.py -k b", "result": "3 passed",
+                        "measurements": {"passed": 3, "failed": 1}}, author="ada").id
+    api.commit(ctx, "c")
+    last = api.supersede(ctx, nid, author="sam", checked="pytest tests/a.py -k b",
+                         add_measurements={"failed": 2}, tags=["t"]).id
+    await user.open(f"/notes?id={last}")
+    user.find(marker="history").click()
+    (said,) = user.find(marker="changes").elements
+    assert said.text == "sam edited this just now: checked, failed 1 → 2, +#t"
+    verdicts = [e.content for e in user.find(marker="note-verdict").elements
+                if hasattr(e, "content")]
+    assert verdicts == ["checked: pytest <del>tmp/a.py </del><ins>tests/a.py </ins>"
+                        "-k b   →   result: 3 passed"]
 
 
 async def test_a_note_never_superseded_has_no_history(user: User, ctx_with_notes):
@@ -443,6 +484,30 @@ async def test_a_recent_board_holds_young_rows_and_those_current_at_head(
     await user.should_not_see("old behind")
     (aside,) = user.find(marker="board-aside").elements
     assert (aside.text, aside.props["href"]) == ("· 1 more", "/notes?kind=check")
+
+
+async def test_a_board_past_its_cap_keeps_the_newest_and_every_due_row(
+        user: User, repo, tmp_path, monkeypatch):
+    """`/` drew every open row (the owner, 2026-10-09). A board now draws
+    its newest few, and a row due soon or past due wherever it falls: a cut
+    must not hide a reminder."""
+    from datetime import date
+    monkeypatch.setitem(build_page.__globals__, "BOARD_ROWS", 2)   # why: the PAGE_ROWS test
+    ctx = api.resolve(str(tmp_path))
+    for body, due in (("oldest, due today", date.today().isoformat()), ("second", None),
+                      ("third", None), ("newest", None)):
+        api.add(ctx, {"kind": "task", "target": {"type": "item", "name": body}, "body": body,
+                      **({"due": due} if due else {})}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    for body in ("newest", "third", "oldest, due today"):
+        await user.should_see(body)
+    await user.should_not_see("second")
+    (aside,) = user.find(marker="board-aside").elements
+    assert (aside.text, aside.props["href"]) == ("· 1 more", "/notes?kind=task&status=open")
+    (count,) = [e for e in user.find(marker="board-count").elements
+                if e.parent_slot.parent.default_slot.children[0].text == "open task"]
+    assert count.text == "3"
 
 
 async def test_home_renders_one_board_per_visible_status_kind_and_per_verdict_kind(
@@ -836,7 +901,7 @@ async def test_the_keys_list_names_the_shortcuts_and_the_kinds(user: User, ctx_w
     await user.should_see(marker="keys-list")
     await user.should_see("!kind")
     await user.should_see("in a note: sets its kind, one of note, decision, bug, task, "
-                          "question, idea, check; its first letters do, while one kind "
+                          "question, idea, check, prediction; its first letters do, while one kind "
                           "alone starts with them")
 
 

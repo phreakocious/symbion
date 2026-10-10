@@ -184,6 +184,26 @@ def test_load_refuses_a_local_only_that_is_not_a_boolean(repo, tmp_path):
     assert config.load(store, project_root=repo).local_only is True
 
 
+@pytest.mark.parametrize("toml, says", [
+    ('command_timeout = "5"\n', "command_timeout"),
+    ("command_timeout = 0\n", "command_timeout"),
+    ("command_timeout = true\n", "command_timeout"),
+    ("[catalogs]\nt = 5\n", "[catalogs]"),
+    ('[catalogs]\nt = "x"\n[resolvers]\nt = ["x"]\n', "[resolvers]"),
+    ("[renames]\nfile = true\n", "[renames]"),
+    ("[provenance]\ncommand = 1\n", "[provenance]"),
+])
+def test_load_refuses_a_command_or_timeout_of_the_wrong_type(repo, tmp_path, toml, says):
+    """`command_timeout = "5"` and `[catalogs] t = 5` reached subprocess as
+    they were and ended in a TypeError traceback there (2026-10-09 review)."""
+    store = tmp_path / "myproj-notes"
+    store.mkdir()
+    (store / "symbion.toml").write_text(toml)
+    with pytest.raises(ValueError) as e:
+        config.load(store, project_root=repo)
+    assert says in str(e.value) and str(store / "symbion.toml") in str(e.value)
+
+
 def test_load_refuses_a_resolver_on_a_builtin_type(repo, tmp_path):
     """A `[resolvers]` key on a built-in type (`commit`, `item`, `project`,
     `arc`) loads silently today and never runs: `canonical` returns before

@@ -107,6 +107,9 @@ def run_configured(cfg, cmd: str, input: str | None = None):
             if isinstance(e, subprocess.TimeoutExpired):
                 raise CatalogError(
                     f"command exceeded its timeout and was killed: {cmd}") from None
+            if isinstance(e, UnicodeDecodeError):
+                raise CatalogError(f"command printed bytes that are not UTF-8 "
+                                   f"(byte {e.start}): {cmd}") from None
             raise
     return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import tomllib
@@ -205,6 +206,27 @@ def _claims(cand: Path, store: Path) -> Path | None:
     return root
 
 
+def uncomment_hint(store, name: str) -> str | None:
+    """The commented `name =` lines that would declare catalog type `name`,
+    or None. The starter toml ships its catalogs commented out, and "catalog
+    types are declared in ... under [catalogs]" left a new store's owner to
+    find the line and the [renames] pair (2026-10-09)."""
+    p = Path(store) / CONFIG_FILE
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    section, found = None, []
+    for n, line in enumerate(lines, 1):
+        head = re.match(r"\s*\[([^\]]+)\]", line)
+        if head:
+            section = head[1].strip()
+        elif section in ("catalogs", "renames") and re.match(
+                rf"\s*#\s*{re.escape(name)}\s*=", line):
+            found.append(f"line {n} under [{section}]")
+    return f"uncomment `{name} =` in {p}: {', '.join(found)}" if found else None
+
+
 def load(store, project_root: Path, work_root: Path | None = None) -> Config:
     """`work_root` param is the current worktree the caller resolved (e.g.
     `config.work_root()`); omit it and it falls back to `project_root`,
@@ -247,6 +269,19 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
     local_only = d.get("local_only", False)
     if not isinstance(local_only, bool):
         raise ValueError(f"local_only in {p} is {local_only!r}: write true or false, unquoted")
+    # These reached subprocess as they were, and a quoted number or a bare
+    # one ended in a TypeError traceback there (2026-10-09 review).
+    timeout = d.get("command_timeout", 30)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ValueError(f"command_timeout in {p} is {timeout!r}: write seconds as a "
+                         f"positive number, unquoted")
+    for table, entries in (("catalogs", catalogs), ("resolvers", resolvers),
+                           ("renames", d.get("renames") or {}),
+                           ("provenance", {"command": prov.get("command", "")})):
+        bad = [f"{k} = {v!r}" for k, v in entries.items() if not isinstance(v, str)]
+        if bad:
+            raise ValueError(f"[{table}] in {p} has {', '.join(bad)}: a command is a "
+                             f"quoted string")
     return Config(
         project_root=resolved_root,
         work_root=resolved_work,
@@ -258,7 +293,7 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
         renames=dict(d.get("renames") or {}),
         resolvers=resolvers,
         provenance_command=prov.get("command"),
-        command_timeout=d.get("command_timeout", 30),
+        command_timeout=timeout,
         local_only=local_only,
         store=Path(store).resolve(),
     )

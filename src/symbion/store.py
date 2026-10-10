@@ -16,6 +16,7 @@ except ImportError:                     # Windows
     import errno
     import msvcrt
 import json
+from collections import Counter
 import os
 import re
 import secrets
@@ -64,7 +65,6 @@ class Note:
     refs: tuple = ()           # secondary (Target) objects this note also implicates
     provenance: dict | None = None  # domain stamp: what this note was measured against
     measurements: dict | None = None  # flat: finite float/int/str values only
-    evidence: tuple = ()              # store-relative paths, never absolute
     target_blob: str | None = None    # the target file's blob id when written (gitref.target_blob)
     spec: K.Kind = K.Kind()           # the kind's bits, set at read time; NEVER serialized
     # Its chain's first created_at, set at read time on a revision; NEVER
@@ -245,7 +245,7 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
     """The write-side invariants, determined by the kind's bits and shared by
     `add_many`, `_supersede_unlocked` and `api.fields_from_row` -- a
     correction (or `resolve`, which is `supersede` with a fixed status) must
-    not reach a state `add` itself would have refused. Four rules:
+    not reach a state `add` itself would have refused. The rules:
 
     1. `status` only on a kind with the status bit.
     2. `checked`/`result` only on a kind with the verdict bit.
@@ -256,6 +256,8 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
        past due -- and only in a form `canon_due` reads.
     5. No `checked`/`result` that is a null's spelling (`None`, `null`): the
        word passed rule 3 as a verdict (measured 2026-09-26).
+    6. `status` is open or resolved, and `tags` is not one string: a script
+       stored `wontfix`, a row in no view, and "abc" as three tags (2026-10-09).
 
     The reader never calls this: a row already on disk loads as written."""
     for key in ("checked", "result"):
@@ -267,6 +269,11 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
                          f"there is nothing to open or resolve. A plain row leaves the "
                          f"default views with `supersede <id> --add-tag retired`; "
                          f"`symbion schema` lists each kind's bits")
+    if d.get("status") not in (None, *STATUSES):
+        raise ValueError(f"status {d['status']!r} is neither open nor resolved, so no view "
+                         f"would show the row")
+    if isinstance(d.get("tags"), str):
+        raise ValueError(f"tags must be a list of strings, not the string {d['tags']!r}")
     if not spec.verdict and (d.get("checked") is not None or d.get("result") is not None):
         raise ValueError(f"--checked/--result are not valid for kind {kind!r}: "
                          f"it has no verdict bit; put the evidence in --body "
@@ -318,6 +325,9 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
                          f"{_VOCAB_HINT}; rename it in notes.jsonl")
     if target_types is not None and target.type not in target_types:
         raise ValueError(f"unknown target type: {target.type!r}")
+    # By name, whatever order they were written in, so every reader lists
+    # them alike and two rows' numbers line up (the owner, 2026-10-09).
+    m = d.get("measurements")
     return Note(
         id=d["id"], kind=d["kind"], target=target,
         created_at=d["created_at"], author=d.get("author", "unknown"),
@@ -328,8 +338,7 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
         refs=tuple(r if isinstance(r, Target) else Target(type=r["type"], name=r.get("name"))
                    for r in (d.get("refs") or ())),
         provenance=d.get("provenance"),
-        measurements=d.get("measurements"),
-        evidence=tuple(d.get("evidence") or ()),
+        measurements=dict(sorted(m.items(), key=lambda kv: kv[0].casefold())) if m else m,
         target_blob=d.get("target_blob"),
         spec=kinds[d["kind"]],
     )
@@ -354,7 +363,6 @@ def note_to_dict(note: Note) -> dict:
         "refs": [{"type": r.type, "name": r.name} for r in note.refs],
         "provenance": note.provenance,
         "measurements": note.measurements,
-        "evidence": list(note.evidence),
         "target_blob": note.target_blob,
     }
 
@@ -363,6 +371,13 @@ def _dumps(obj) -> str:
     # ensure_ascii=False keeps diacritics readable in the JSONL; names are
     # NFC-normalized on the way in, so the bytes are stable.
     return json.dumps(obj, ensure_ascii=False)
+
+
+def jsonl_lines(text: str) -> list[str]:
+    """The lines of a JSONL text. Not str.splitlines(): it also splits at
+    U+2028, U+2029 and U+0085, which _dumps leaves raw inside a string, so a
+    row holding one read back as two unreadable halves (2026-10-09)."""
+    return text.removesuffix("\n").split("\n")
 
 
 # ==========================================================================
@@ -456,6 +471,13 @@ def new_id(_clock=None, _rand=None) -> str:
         now = _last_minted + timedelta(microseconds=1)
     _last_minted = now
     return f"{now.strftime('%Y%m%d-%H%M%S-%f')}-{rand():03x}"
+
+
+def id_tail(raw: str) -> str:
+    """An id or tail as people cite one, bare: `…a1b`, `...a1b` and `-a1b`
+    are `a1b`. symbion itself prints "rows end in -a1b", and a search for
+    `-a1b` found nothing (the owner, 2026-10-09)."""
+    return raw.strip().removeprefix("…").removeprefix("...").lstrip("-")
 
 
 # ---- store paths & bootstrap ----
@@ -572,16 +594,28 @@ def ensure_store(store) -> bool:
 
 
 # ---- notes I/O ----
+# file -> (text, kinds, notes, malformed), its last parse. A serve page parsed
+# the store two or three times and `summary` twice, at 40 ms a parse on a large
+# one (the owner, 2026-10-09). The file is read every time and its parse kept only for an
+# equal text, so no write, git checkout or hand edit can leave it stale.
+# ponytail: one entry per store path a process reads, each a copy of the file.
+_PARSED: dict = {}
+
+
 def _read_notes(file: Path, kinds):
     """Returns (notes, malformed) where malformed is a list of
     (lineno, raw, error). The error travels with the row so a reader that
     skips it can still say WHY -- an un-migrated or hand-edited store must
-    not read as an empty one."""
+    not read as an empty one. Each call gets its own lists: callers append."""
     file = Path(file)
     if not file.exists():
         return [], []
+    text = file.read_text(encoding="utf-8")
+    hit = _PARSED.get(file)
+    if hit and hit[0] == text and hit[1] == kinds:
+        return list(hit[2]), list(hit[3])
     good, bad = [], []
-    for i, raw in enumerate(file.read_text(encoding="utf-8").splitlines(), 1):
+    for i, raw in enumerate(jsonl_lines(text), 1):
         if not raw.strip():
             continue
         try:
@@ -596,7 +630,8 @@ def _read_notes(file: Path, kinds):
         if n.supersedes in first:
             good[i] = n = replace(n, first_written=first[n.supersedes])
         first[n.id] = n.first_written or n.created_at
-    return good, bad
+    _PARSED[file] = (text, kinds, good, bad)
+    return list(good), list(bad)
 
 
 def _load_unlocked(store):
@@ -619,8 +654,15 @@ def load_malformed(store):
 
 
 def _append_line_unlocked(file, line: str) -> None:
-    with open(file, "a", encoding="utf-8", newline="\n") as f:     # LF, as above
-        f.write(line + "\n")
+    # Bytes, so LF on every platform. A last line with no newline (ENOSPC, a
+    # killed write, an editor that drops it) is ended first: the row was
+    # written onto it, and neither read back (2026-10-09).
+    with open(file, "ab+") as f:
+        if f.seek(0, os.SEEK_END):
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                line = "\n" + line
+        f.write((line + "\n").encode("utf-8"))
 
 
 def _append_note_unlocked(store, note: Note) -> None:
@@ -898,7 +940,7 @@ def _committed_ids(store) -> set | None:
         return set()
     r = subprocess.run([*git, "show", f"HEAD:{NOTES_FILE}"], capture_output=True, text=True,
                        encoding="utf-8")
-    return {_line_id(raw) for raw in r.stdout.splitlines()} if r.returncode == 0 else None
+    return {_line_id(raw) for raw in jsonl_lines(r.stdout)} if r.returncode == 0 else None
 
 
 def _line_id(raw: str):
@@ -914,7 +956,7 @@ def _rewrite_note_unlocked(store, note: Note) -> None:
     path = notes_path(store)
     line = _dumps(note_to_dict(note))
     rows = [line if _line_id(raw) == note.id else raw
-            for raw in path.read_text(encoding="utf-8").splitlines()]
+            for raw in jsonl_lines(path.read_text(encoding="utf-8"))]
     _replace_atomically(path, "\n".join(rows) + "\n")
 
 
@@ -1087,18 +1129,55 @@ def rename_target(store, target_type, old, new, author=None,
                                 target_type, old, new, author, new_type)
 
 
-def commit(store, message: str, cfg) -> bool:
+def added_rows(diff: str) -> list[dict]:
+    """The rows a notes.jsonl diff adds, an in-place rewrite included. A
+    line that does not parse is `{}`: a hand edit must not block a commit."""
+    out = []
+    for line in jsonl_lines(diff):
+        if line.startswith("+{"):
+            try:
+                row = json.loads(line[1:])
+            except ValueError:
+                row = None
+            out.append(row if isinstance(row, dict) else {})
+    return out
+
+
+def rows_by_author(rows) -> str:
+    """`claude 2, codex 4`: the commit's `Rows:` trailer."""
+    by = Counter(r.get("author") or "?" for r in rows)
+    return ", ".join(f"{a} {n}" for a, n in sorted(by.items()))
+
+
+def pending_rows(store) -> list[dict]:
+    """What `commit` would take from notes.jsonl: the rows added or
+    rewritten since HEAD, or every row before the first commit."""
+    git = ["git", "-C", str(store)]
+    if subprocess.run([*git, "rev-parse", "-q", "--verify", "HEAD"],
+                      capture_output=True).returncode:
+        f = Path(store) / NOTES_FILE
+        text = f.read_text(encoding="utf-8") if f.exists() else ""
+        return added_rows("".join(f"+{ln}\n" for ln in jsonl_lines(text)))
+    return added_rows(subprocess.run([*git, "diff", "HEAD", "-U0", "--", NOTES_FILE],
+                                     capture_output=True, text=True, encoding="utf-8").stdout)
+
+
+def commit(store, message: str, cfg, keep=None) -> bool:
     """git add -A + commit the store. Hermetic identity so it works in CI/tmp.
     The lock is here because `add -A` would otherwise stage whatever another
     writer has half-written. Returns True on a commit, False when nothing
     changed, and raises RuntimeError with git's words when git refuses: a
     hook's refusal (a secret scanner's catch) once read as 'nothing to
-    commit', its output dropped (2026-09-28)."""
+    commit', its output dropped (2026-09-28).
+
+    `keep(row) -> bool`, when given, takes only the pending rows it accepts,
+    and the registry; every other row and file stays pending (_stage_kept)."""
     store = Path(store)
     require_store(store)
     git = ["git", "-C", str(store)]
     with _lock(store):
-        r = subprocess.run([*git, "add", "-A"], capture_output=True, text=True, encoding="utf-8")
+        r = (subprocess.run([*git, "add", "-A"], capture_output=True, text=True, encoding="utf-8")
+             if keep is None else _stage_kept(store, keep))
         if r.returncode == 0:
             r = subprocess.run([*git, "diff", "--cached", "--quiet"],
                                capture_output=True, text=True, encoding="utf-8")
@@ -1110,15 +1189,7 @@ def commit(store, message: str, cfg) -> bool:
                 # The trailer says whose they are.
                 diff = subprocess.run([*git, "diff", "--cached", "-U0", "--", NOTES_FILE],
                                       capture_output=True, text=True, encoding="utf-8").stdout
-                by: dict[str, int] = {}
-                for line in diff.splitlines():
-                    if line.startswith("+{"):
-                        try:                      # a hand edit must not block a commit
-                            a = json.loads(line[1:]).get("author") or "?"
-                        except ValueError:
-                            a = "?"
-                        by[a] = by.get(a, 0) + 1
-                rows = ", ".join(f"{a} {n}" for a, n in sorted(by.items()))
+                rows = rows_by_author(added_rows(diff))
                 r = subprocess.run(
                     [*git, "-c", f"user.name={cfg.git_name}",
                      "-c", f"user.email={cfg.git_email}", "commit", "-q", "-m", message,
@@ -1129,6 +1200,45 @@ def commit(store, message: str, cfg) -> bool:
         raise RuntimeError(f"git refused the commit; the notes are on disk, "
                            f"not committed. git said:\n{said}")
     return True
+
+
+def _stage_kept(store: Path, keep) -> subprocess.CompletedProcess:
+    """Stage HEAD's rows plus the pending rows `keep` takes, in file order,
+    and arcs.jsonl. A kept revision brings its pending base: a commit must
+    not hold a revision of a row it lacks. The worktree is not touched, so
+    the rows left out still read as lines added since HEAD.
+    # ponytail: rows a second keep-commit takes land after the first's in
+    # HEAD but not on disk, so the file reads as reordered; when the CLI
+    # commits by writer too, rewrite the file as HEAD's rows + the rest."""
+    git = ["git", "-C", str(store)]
+    head = subprocess.run([*git, "show", f"HEAD:{NOTES_FILE}"], capture_output=True,
+                          text=True, encoding="utf-8")
+    old = [ln for ln in jsonl_lines(head.stdout) if ln] if head.returncode == 0 else []
+    path = notes_path(store)
+    seen = set(old)
+    # A line that does not parse reads as {}, as in added_rows, and stays out.
+    pending = [(ln, (added_rows(f"+{ln}") or [{}])[0])
+               for ln in (jsonl_lines(path.read_text(encoding="utf-8")) if path.exists() else [])
+               if ln and ln not in seen]
+    ids = {r.get("id") for _, r in pending} - {None}
+    take = set()
+    for _, r in reversed(pending):          # a base is written before its revision
+        if r.get("id") and (keep(r) or r["id"] in take):
+            take.add(r["id"])
+            if r.get("supersedes") in ids:
+                take.add(r["supersedes"])
+    text = "".join(ln + "\n" for ln in old + [ln for ln, r in pending if r.get("id") in take])
+    blob = subprocess.run([*git, "hash-object", "-w", "--stdin"], input=text,
+                          capture_output=True, text=True, encoding="utf-8")
+    if blob.returncode:
+        return blob
+    r = subprocess.run([*git, "update-index", "--add", "--cacheinfo",
+                        f"100644,{blob.stdout.strip()},{NOTES_FILE}"],
+                       capture_output=True, text=True, encoding="utf-8")
+    if r.returncode == 0 and (store / ARCS_FILE).exists():
+        r = subprocess.run([*git, "add", "--", ARCS_FILE], capture_output=True, text=True,
+                           encoding="utf-8")
+    return r
 
 
 # ==========================================================================
@@ -1175,7 +1285,7 @@ def _read_arcs(store) -> tuple[list, list]:
     if not file.exists():
         return [], []
     good, bad = [], []
-    for i, raw in enumerate(file.read_text(encoding="utf-8").splitlines(), 1):
+    for i, raw in enumerate(jsonl_lines(file.read_text(encoding="utf-8")), 1):
         if not raw.strip():
             continue
         try:

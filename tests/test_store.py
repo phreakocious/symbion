@@ -37,6 +37,20 @@ def test_add_then_load_round_trips(tmp_path):
     assert len(notes) == 1 and notes[0].body == "b"
 
 
+def test_a_load_reads_a_hand_edit_of_the_same_length_and_gives_its_own_list(tmp_path):
+    """store._PARSED keeps a parse only for an equal text: a same-length
+    edit can keep the size and, on a coarse clock, the mtime. A caller
+    appends to what load returns, and the next load must not see it."""
+    store.add(tmp_path, kind="decision", target={"type": "project", "name": None}, body="aaaa")
+    store.load(tmp_path)
+    rows = store.load(tmp_path)                 # the kept parse
+    rows.append(rows[0])
+    assert len(store.load(tmp_path)) == 1
+    p = store.notes_path(tmp_path)
+    p.write_text(p.read_text(encoding="utf-8").replace("aaaa", "bbbb"), encoding="utf-8")
+    assert store.load(tmp_path)[0].body == "bbbb"
+
+
 def test_supersede_collapses_to_one_head(tmp_path):
     a = store.add(tmp_path, kind="bug", target={"type": "project", "name": None})
     b = store.supersede(tmp_path, a.id, status="resolved")
@@ -136,6 +150,37 @@ def test_malformed_line_does_not_break_the_read(tmp_path):
         f.write("{not json\n")
     assert len(store.load(tmp_path)) == 1
     assert len(store.load_malformed(tmp_path)) == 1
+
+
+def test_an_append_after_a_torn_last_line_starts_its_own_line(tmp_path):
+    """ENOSPC, a killed write or an editor that drops the final newline leaves
+    the last line unterminated, and the next row was written onto it: an id
+    printed at exit 0, then read as neither row (2026-10-09)."""
+    project = {"type": "project", "name": None}
+    a = store.add(tmp_path, kind="note", target=project, body="a")
+    path = store.notes_path(tmp_path)
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
+    b = store.add(tmp_path, kind="note", target=project, body="b")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write('{"torn')
+    c = store.add(tmp_path, kind="note", target=project, body="c")
+    assert [n.id for n in store.load(tmp_path)] == [a.id, b.id, c.id]
+    assert [raw for _, raw, _ in store.load_malformed(tmp_path)] == ['{"torn']
+
+
+def test_a_status_or_tags_the_store_cannot_read_are_refused(tmp_path):
+    """The CLI and GUI offer only open and resolved; a script against the
+    store stored `wontfix`, a row that then sat in no view, and `tags="abc"`
+    stored the tags a, b and c."""
+    item = {"type": "item", "name": "s"}
+    with pytest.raises(ValueError, match="status 'wontfix'"):
+        store.add(tmp_path, kind="bug", target=item, status="wontfix")
+    with pytest.raises(ValueError, match="tags must be a list"):
+        store.add(tmp_path, kind="bug", target=item, tags="abc")
+    n = store.add(tmp_path, kind="bug", target=item)
+    with pytest.raises(ValueError, match="status 'bogus'"):
+        store.supersede(tmp_path, n.id, status="bogus")
+    assert [(r.status, r.tags) for r in store.load(tmp_path)] == [("open", ())]
 
 
 def test_query_status_open_excludes_a_null_status_row(tmp_path):
@@ -771,6 +816,79 @@ def test_an_edit_keeps_the_old_row_where_its_history_matters(tmp_path, case):
     assert next(n for n in store.load(tmp_path) if n.id == a.id).body == "v1"
 
 
+# json.dumps(ensure_ascii=False) leaves these raw, and str.splitlines() splits
+# on each: a body holding one was written as one line and read back as none.
+SEPARATORS = "a b c\x85d"
+
+
+def test_a_line_separator_in_a_body_reads_back_whole(tmp_path):
+    n = store.add(tmp_path, kind="note", target={"type": "project", "name": None},
+                  body=SEPARATORS)
+    a = store.create_arc(tmp_path, "arc", SEPARATORS, "item")
+    assert [r.body for r in store.load(tmp_path)] == [SEPARATORS], store.load_malformed(tmp_path)
+    assert [r.description for r in store.load_arcs(tmp_path)] == [SEPARATORS]
+    assert (n.id, a.id) == (store.load(tmp_path)[0].id, store.load_arcs(tmp_path)[0].id)
+
+
+def test_an_in_place_edit_keeps_a_line_separator_row_whole(tmp_path):
+    """The rewrite rebuilt the file from split lines joined by "\\n", so the
+    separator became a real newline on disk."""
+    project = {"type": "project", "name": None}
+    a = store.add(tmp_path, kind="note", target=project, body=SEPARATORS, author="ann")
+    b = store.add(tmp_path, kind="note", target=project, body="v1", author="ann")
+    assert store.supersede(tmp_path, b.id, author="ann", body="v2").id == b.id
+    assert [(n.id, n.body) for n in store.load(tmp_path)] == [(a.id, SEPARATORS), (b.id, "v2")]
+
+
+def test_a_committed_line_separator_row_reads_as_committed(tmp_path):
+    """A committed row split in two read as uncommitted, so its author's next
+    edit rewrote it in place, and the commit trailer counted it as `?`."""
+    from types import SimpleNamespace
+    a = store.add(tmp_path, kind="note", target={"type": "project", "name": None},
+                  body=SEPARATORS, author="ann")
+    assert store.commit(tmp_path, "c", SimpleNamespace(git_name="t", git_email="t@t"))
+    import subprocess
+    msg = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%B"],
+                         capture_output=True, text=True, encoding="utf-8").stdout
+    assert "Rows: ann 1" in msg, msg
+    assert store.supersede(tmp_path, a.id, author="ann", body="v2").id != a.id
+
+
+def test_a_commit_with_keep_leaves_the_other_rows_pending(tmp_path):
+    """The GUI's commit button took an agent's pending rows under the GUI's
+    message (2026-10-09). With `keep`, the other rows stay pending for their
+    writer, and so does any file but the registry; a kept revision brings
+    its pending base, or the commit would hold a revision of no row."""
+    import subprocess
+    from types import SimpleNamespace
+    from symbion import gitref
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    store.add(tmp_path, kind="note", target=project, body="old", author="ann")
+    assert store.commit(tmp_path, "c", cfg)
+    bob = store.add(tmp_path, kind="note", target=project, body="bob's", author="bob")
+    store.add(tmp_path, kind="note", target=project, body="ann's", author="ann")
+    (tmp_path / "plan.md").write_text("bob's plan")
+    ann = lambda r: r.get("author") == "ann"
+    assert store.commit(tmp_path, "c2", cfg, keep=ann)
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(tmp_path), *a], capture_output=True,
+                              text=True, encoding="utf-8").stdout
+    assert "Rows: ann 1" in git("log", "-1", "--format=%B")
+    assert [r["body"] for r in store.pending_rows(tmp_path)] == ["bob's"]
+    assert gitref.uncommitted(tmp_path) == (1, False)
+    assert "plan.md" in git("status", "--porcelain")
+    assert not store.commit(tmp_path, "c3", cfg, keep=ann), "nothing of ann's is pending"
+
+    task = store.add(tmp_path, kind="task", target=project, body="t", author="bob",
+                     status="open")
+    store.supersede(tmp_path, task.id, author="ann", status="resolved")
+    assert store.commit(tmp_path, "c4", cfg, keep=ann)
+    assert "Rows: ann 1, bob 1" in git("log", "-1", "--format=%B")
+    assert [r["id"] for r in store.pending_rows(tmp_path)] == [bob.id]
+
+
 def test_a_store_is_written_lf_on_every_platform(tmp_path):
     """Text mode on Windows writes CRLF, and a store is shared by clones on
     every platform."""
@@ -779,3 +897,17 @@ def test_a_store_is_written_lf_on_every_platform(tmp_path):
     store._replace_atomically(tmp_path / "x", "a\nb\n")
     for f in (store.notes_path(tmp_path), tmp_path / ".gitignore", tmp_path / "x"):
         assert b"\r" not in f.read_bytes(), f
+
+
+def test_a_row_written_with_evidence_loads_and_drops_it(tmp_path):
+    """`evidence` never had a writer, and no row in any store held a path:
+    deleted 2026-10-09. Every row written before carries `"evidence": []`,
+    and still loads; nothing writes the key again."""
+    store.ensure_store(tmp_path)
+    n = store.add(tmp_path, kind="note", target={"type": "project", "name": None}, body="x")
+    path = store.notes_path(tmp_path)
+    row = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps(row | {"evidence": ["a.log"]}) + "\n", encoding="utf-8")
+    loaded = store.load(tmp_path)
+    assert [x.id for x in loaded] == [n.id] and not store.load_malformed(tmp_path)
+    assert "evidence" not in store.note_to_dict(loaded[0])

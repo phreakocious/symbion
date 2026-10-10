@@ -57,8 +57,8 @@ reading = "python3 tools/resolve_reading.py"
 ```
 
 The resolver reads the query on stdin line 1 and one catalog name per line
-after it. Exit 0 and print the name to store, in the list or not: that is how
-a first sighting mints its canonical form. Exit 2 and print the matches to
+after it. Exit 0 and print the name to store, in the list or not, as the first
+non-blank line: that is how a first sighting mints its canonical form. Exit 2 and print the matches to
 refuse as ambiguous. Anything else is an error and stores nothing; a resolver
 never falls back to the substring rule. Like a catalog, it runs in the root of
 the current worktree: `tools/resolve_reading.py` above is the project's

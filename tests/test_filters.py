@@ -91,8 +91,10 @@ def test_a_blank_search_is_no_filter():
 
 
 def test_an_id_or_its_printed_tail_is_a_hit():
+    """`-a1b` too: symbion prints "rows end in -a1b", and a search for one
+    found nothing (the owner, 2026-10-09)."""
     nid = "20260101-120000-123456-a1b"
-    for q in (nid, "a1b", "…a1b", "...a1b", "123456-a1b"):
+    for q in (nid, "a1b", "…a1b", "...a1b", "123456-a1b", "-a1b", "-123456-a1b"):
         assert filters.id_hit(nid, q), q
     for q in ("1b", "a1", "", "a1b x", "120000"):
         assert not filters.id_hit(nid, q), q

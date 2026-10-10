@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from urllib.parse import urlencode
 
+from .. import store
+
 # URL name -> store.query kwarg. `type`/`name` are shortened in the URL because
 # they are the pair a human types; the rest match store.query exactly.
 _URL_TO_KWARG = {
@@ -46,7 +48,7 @@ def id_hit(note_id: str, q: str) -> bool:
     """Whether `q` is this note's id or its tail as summary and list print it
     (`…a1b`, `123456-a1b`). The search reads text, not ids, so a pasted id
     read 0 and looked like a row that was gone."""
-    tail = q.strip().removeprefix("…").removeprefix("...")
+    tail = store.id_tail(q)
     return bool(tail) and not any(c.isspace() for c in tail) and \
         (note_id == tail or note_id.endswith("-" + tail))
 

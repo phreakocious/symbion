@@ -6,12 +6,13 @@ it."""
 from __future__ import annotations
 
 from markdown_it import MarkdownIt
+from rich.color import ColorSystem
 from rich.console import COLOR_SYSTEMS, Console
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.style import Style
 from rich.syntax import SyntaxTheme
-from rich.text import Text
+from rich.text import Span, Text
 from rich.theme import Theme
 
 from . import api, store
@@ -26,8 +27,41 @@ from . import summary as summ
 TEXT, BODY, META, FADED = "#cdd6f4", "#a6adc8", "#7f849c", "#6c7086"
 GOOD, WARN, BAD = "#a6e3a1", "#f9e2af", "#f38ba8"
 KIND = {"bug": "#eba0ac", "task": "#89b4fa", "question": "#cba6f7", "idea": "#f5c2e7",
-        "decision": "#fab387", "check": "#94e2d5", "note": "#a6adc8"}
+        "decision": "#fab387", "check": "#94e2d5", "prediction": "#89dceb", "note": "#a6adc8"}
 OWN_KIND = "#b4befe"        # a kind this store's [kinds] table declares
+
+
+def _color_system():
+    """rich's reading of this terminal, or None where it prints no colour:
+    NO_COLOR, a dumb terminal, and a legacy Windows console, which rich
+    colours through an API rather than codes."""
+    con = Console()
+    return None if con.no_color or con.legacy_windows else COLOR_SYSTEMS.get(con.color_system)
+
+
+# At 16 colours rich's nearest match printed bug, task, question, decision,
+# note, GOOD and BAD all as white, so a kind and a state said nothing
+# (measured 2026-10-06). There each palette colour takes an ANSI one picked
+# by hand, as it prints: the constants stay hex, since the GUI's CSS reads
+# them.
+ANSI16 = {TEXT: "default", BODY: "default", META: "bright_black", FADED: "bright_black",
+          GOOD: "green", WARN: "yellow", BAD: "bright_red", OWN_KIND: "bright_blue",
+          "#eba0ac": "red", "#89b4fa": "blue", "#cba6f7": "magenta",
+          "#f5c2e7": "bright_magenta", "#fab387": "yellow", "#94e2d5": "cyan",
+          "#89dceb": "bright_cyan", "#74c7ec": "bright_cyan", "#f5e0dc": "bright_white",
+          "#f2cdcd": "bright_red"}
+SIXTEEN = _color_system() == ColorSystem.STANDARD
+_fit = (lambda c: ANSI16.get(c, c)) if SIXTEEN else str
+
+
+def _fitted(t: Text) -> Text:
+    """`t` with each colour as this terminal should print it."""
+    if SIXTEEN:
+        fit = (lambda st: _fit(st) if isinstance(st, str) else
+               st + Style(color=_fit(st.color.name)) if st.color else st)
+        t.style = fit(t.style)
+        t.spans[:] = [Span(sp.start, sp.end, fit(sp.style)) for sp in t.spans]
+    return t
 
 
 def kind_hex(kind: str, spec=None) -> str:
@@ -41,15 +75,16 @@ ROLE = {"text": TEXT, "body": BODY, "meta": META, "faded": FADED,
 # Catppuccin's twin for each ANSI hue that rich's markdown colours with by
 # default: its design, in this palette.
 HUE = {"yellow": WARN, "blue": "#89b4fa", "magenta": "#cba6f7", "cyan": "#89dceb"}
+_HUE = {k: _fit(v) for k, v in HUE.items()}       # as a terminal prints it
 # A body's prose is BODY, as under a `list` row; code loses rich's black box.
 MARKDOWN = Theme({
-    "markdown.paragraph": BODY,
-    "markdown.code": f"bold {HUE['cyan']}", "markdown.code_block": HUE["cyan"],
-    "markdown.list": HUE["cyan"], "markdown.item.number": HUE["cyan"],
-    "markdown.table.border": HUE["cyan"], "markdown.table.header": f"not bold {HUE['cyan']}",
-    "markdown.block_quote": HUE["magenta"], "markdown.h2": f"underline {HUE['magenta']}",
-    "markdown.h3": f"bold {HUE['magenta']}", "markdown.h4": f"italic {HUE['magenta']}",
-    "markdown.link": HUE["blue"], "markdown.link_url": f"underline {HUE['blue']}"})
+    "markdown.paragraph": _fit(BODY),
+    "markdown.code": f"bold {_HUE['cyan']}", "markdown.code_block": _HUE["cyan"],
+    "markdown.list": _HUE["cyan"], "markdown.item.number": _HUE["cyan"],
+    "markdown.table.border": _HUE["cyan"], "markdown.table.header": f"not bold {_HUE['cyan']}",
+    "markdown.block_quote": _HUE["magenta"], "markdown.h2": f"underline {_HUE['magenta']}",
+    "markdown.h3": f"bold {_HUE['magenta']}", "markdown.h4": f"italic {_HUE['magenta']}",
+    "markdown.link": _HUE["blue"], "markdown.link_url": f"underline {_HUE['blue']}"})
 
 
 def _underscore(state, silent: bool) -> bool:
@@ -78,10 +113,10 @@ def body_parser(highlight=None) -> MarkdownIt:
 BODY_MD = body_parser()
 # --help: what you type in code's colour, prose as a row body, headings and
 # the program in the hues argparse 3.14 gives them.
-HELP = {"argparse.args": HUE["cyan"], "argparse.syntax": HUE["cyan"],
-        "argparse.help": BODY, "argparse.text": BODY, "argparse.metavar": META,
-        "argparse.default": f"italic {META}", "argparse.groups": f"bold {HUE['blue']}",
-        "argparse.prog": f"bold {HUE['magenta']}"}
+HELP = {"argparse.args": _HUE["cyan"], "argparse.syntax": _HUE["cyan"],
+        "argparse.help": _fit(BODY), "argparse.text": _fit(BODY),
+        "argparse.metavar": _fit(META), "argparse.default": f"italic {_fit(META)}",
+        "argparse.groups": f"bold {_HUE['blue']}", "argparse.prog": f"bold {_HUE['magenta']}"}
 # The id's microsecond digits and 3 hex. `show` takes a tail and refuses
 # one that two ids share, so the short form is always safe to type.
 ID_TAIL = 10
@@ -95,18 +130,10 @@ class _CodeTheme(SyntaxTheme):
     default, monokai, paints its own background box."""
     def get_style_for_token(self, token_type):
         comment = token_type[:1] == ("Comment",)       # pygments' Comment.*
-        return Style(color=FADED if comment else HUE["cyan"])
+        return Style(color=_fit(FADED) if comment else _HUE["cyan"])
 
     def get_background_style(self):
         return Style.null()
-
-
-def _color_system():
-    """rich's reading of this terminal, or None where it prints no colour:
-    NO_COLOR, a dumb terminal, and a legacy Windows console, which rich
-    colours through an API rather than codes."""
-    con = Console()
-    return None if con.no_color or con.legacy_windows else COLOR_SYSTEMS.get(con.color_system)
 
 
 def help_formatter(plain):
@@ -140,7 +167,7 @@ def painter(kinds=None):
     def paint(text: str, role: str) -> str:
         kind = role.removeprefix("kind:")
         c = ROLE[role] if kind == role else kind_hex(kind, (kinds or {}).get(kind))
-        return Style(color=c).render(text, color_system=system)
+        return Style(color=_fit(c)).render(text, color_system=system)
     return paint
 
 
@@ -273,14 +300,14 @@ def print_note(n, *, status, state, due, subject, head, full, gui=None, since=No
     line, indent = _head(n, status=status, state=state, due=due, subject=subject,
                          head=head, width=width, gui=gui, since=since)
     if not full:
-        con.print(line, no_wrap=True, overflow="ellipsis", crop=True)
+        con.print(_fitted(line), no_wrap=True, overflow="ellipsis", crop=True)
         teaser = _teaser(n, status == "resolved" or head is not None, indent, width)
         if teaser is not None:
-            con.print(teaser, no_wrap=True, overflow="ellipsis", crop=True)
+            con.print(_fitted(teaser), no_wrap=True, overflow="ellipsis", crop=True)
         return
-    con.print(line)
+    con.print(_fitted(line))
     for t in _details(n, head, state):
-        con.print(t)
+        con.print(_fitted(t))
     if n.body:
         md = Markdown(n.body, code_theme=_CodeTheme())
         # ponytail: sets rich's own attribute; test_a_tag_in_a_body_prints_on_a_tty
