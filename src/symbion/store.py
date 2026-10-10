@@ -1228,8 +1228,11 @@ def _stage_kept(store: Path, keep) -> subprocess.CompletedProcess:
             if r.get("supersedes") in ids:
                 take.add(r["supersedes"])
     text = "".join(ln + "\n" for ln in old + [ln for ln, r in pending if r.get("id") in take])
-    blob = subprocess.run([*git, "hash-object", "-w", "--stdin"], input=text,
-                          capture_output=True, text=True, encoding="utf-8")
+    # Bytes: text mode on Windows wrote each \n as \r\n, so every kept line
+    # differed from HEAD's and the commit read as a rewrite of every row.
+    blob = subprocess.run([*git, "hash-object", "-w", "--stdin"], input=text.encode("utf-8"),
+                          capture_output=True)
+    blob.stdout, blob.stderr = (b.decode("utf-8", "replace") for b in (blob.stdout, blob.stderr))
     if blob.returncode:
         return blob
     r = subprocess.run([*git, "update-index", "--add", "--cacheinfo",

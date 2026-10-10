@@ -85,17 +85,18 @@ def run_configured(cfg, cmd: str, input: str | None = None):
             raise CatalogError(f"a configured command runs in sh, and no `sh` is on PATH "
                                f"or beside git; install Git for Windows: {cmd}")
         args, shell = [sh, "-c", cmd], False
+    # Bytes both ways. Text mode on Windows wrote the resolver's lines as
+    # CRLF, and a query read with `read q` kept the CR and matched nothing.
+    # It also decodes in communicate()'s reader threads there, where a
+    # UnicodeDecodeError dies with the thread and stdout reads as None.
     with subprocess.Popen(
-            args, shell=shell, cwd=str(cfg.work_root), env=env, text=True, encoding="utf-8",
+            args, shell=shell, cwd=str(cfg.work_root), env=env,
             stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as p:
-        if p.stdin:
-            # Text mode on Windows wrote the resolver's lines as CRLF, and a
-            # query read with `read q` kept the CR and matched nothing.
-            p.stdin.reconfigure(newline="\n")
         try:
             out, err = p.communicate(
-                input, timeout=getattr(cfg, "command_timeout", None) or DEFAULT_COMMAND_TIMEOUT)
+                None if input is None else input.encode("utf-8"),
+                timeout=getattr(cfg, "command_timeout", None) or DEFAULT_COMMAND_TIMEOUT)
         except BaseException as e:
             if os.name == "nt":                # no process groups: kill the tree
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
@@ -107,10 +108,14 @@ def run_configured(cfg, cmd: str, input: str | None = None):
             if isinstance(e, subprocess.TimeoutExpired):
                 raise CatalogError(
                     f"command exceeded its timeout and was killed: {cmd}") from None
-            if isinstance(e, UnicodeDecodeError):
-                raise CatalogError(f"command printed bytes that are not UTF-8 "
-                                   f"(byte {e.start}): {cmd}") from None
             raise
+    try:
+        # text=True's newlines: \r\n and a lone \r read as \n.
+        out, err = (b.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+                    for b in (out, err))
+    except UnicodeDecodeError as e:
+        raise CatalogError(f"command printed bytes that are not UTF-8 "
+                           f"(byte {e.start}): {cmd}") from None
     return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
 

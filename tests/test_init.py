@@ -237,7 +237,10 @@ def test_a_file_target_on_a_new_store_names_the_lines_that_declare_it(repo, tmp_
 
 
 @pytest.mark.parametrize("term, tty, says", [
-    ("xterm", True, True), ("xterm-256color", True, False), ("xterm", False, False)])
+    pytest.param("xterm", True, True, marks=pytest.mark.skipif(
+        os.name == "nt", reason="rich reads a piped Windows console as legacy, which "
+                                "takes no ANSI codes, so term prints no colour")),
+    ("xterm-256color", True, False), ("xterm", False, False)])
 def test_init_at_a_16_colour_terminal_names_the_fix(repo, tmp_path, term, tty, says):
     """At 16 colours the palette falls back to plainer colours, and the
     terminal usually does more than its TERM says: init, run by a person,

@@ -1113,6 +1113,8 @@ def _screen(out):
     return [_ANSI.sub("", ln) for ln in out.splitlines()]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="rich reads a piped Windows console as "
+                    "legacy, which takes no ANSI codes, so term prints no colour")
 def test_a_16_colour_terminal_tells_kinds_and_states_apart(tmp_path):
     """At 16 colours rich's nearest match printed bug, task, question,
     decision and note, and a check's current and dangling, all as white

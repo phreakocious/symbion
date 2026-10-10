@@ -162,6 +162,12 @@ def test_run_configured_input_reaches_stdin(tmp_path):
     assert catalog.run_configured(c, "wc -c", input="x\ny\n").stdout.strip() == "4"
 
 
+def test_run_configured_reads_crlf_and_a_lone_cr_as_newlines(tmp_path):
+    """Its output is read as bytes, so text mode no longer does this."""
+    c = Config(project_root=tmp_path)
+    assert catalog.run_configured(c, "printf 'a\\r\\nb\\rc\\n'").stdout == "a\nb\nc\n"
+
+
 def test_resolver_exit_0_stores_the_printed_name_even_outside_the_catalog(tmp_path):
     """A miss is the resolver's business: printing a name not in the list is
     how a first sighting mints its canonical form."""
