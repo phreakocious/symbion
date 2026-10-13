@@ -37,7 +37,9 @@ Scope the command to where notes attach: no pathspec when docs and results
 matter, a glob when only code does. A broad catalog costs only a refusal on an
 ambiguous substring. Keep `--others --exclude-standard`: without it, a note on
 a file made this session warns `taken as typed` on a correct name, and that
-warning is the only thing that catches a typo.
+warning is the only thing that catches a typo. A gitignored file (a local
+`CLAUDE.md`) still misses, and its note adds `it is a gitignored file in this
+worktree`.
 
 **Dry-run the first seed of every catalog type**
 ([catalogs.md](../src/symbion/data/skill/catalogs.md#seed-add-unless-there-is-a-catalog) says why):
@@ -66,7 +68,16 @@ where two separate adds would store both.
 
 - **Bodies are markdown.** `list --full`, `show` and `context` render them on a
   terminal and print them as written on a pipe; a plain `list` page and
-  `summary` flatten each to one clipped line.
+  `summary` flatten each to one clipped line. `list --full` and `show` put a
+  line where each amendment joined the body, naming who added it and when
+  (`-- ada added below, 2026-10-10 04:22:11Z --`); `--json` gives the body as
+  stored.
+- **A row's id in a body is a link.** `show` ends a row with a line for each
+  row of this store its body cites, by whole id or its 10- or 17-character
+  tail, read through that row's head (`cites 412907-3be -> 520114-a1b bug
+  [resolved]: …`), then a line for each row whose body cites any version of
+  it (`cited by …`). Another store's id, or a tail two rows share, names no
+  row.
 - **A terminal and a pipe get different text.** A terminal gets columns: the
   id's last 10 characters (which `show` takes), age, a `○`/`✓` status mark,
   kind, target, tags, a ref count, and one body line cut to fit. A pipe, which
@@ -92,23 +103,39 @@ where two separate adds would store both.
   its age.
 - **Due dates.** `--due 2026-10-01` (or an ISO datetime) on any status row. An
   open row past due or due within 7 days leads the session-start summary
-  (`overdue 2d`, `due in 3d`). `list --overdue` lists those past due, and
-  `supersede <id> --due ''` clears one.
+  (`overdue 2d`, `due in 3d`). `list --overdue` lists those past due, `list
+  --due-by DATE` those due by then, past due included, and `supersede <id>
+  --due ''` clears one.
 - **Time is UTC.** Rows are stamped in UTC, and symbion prints times and reads
   a bare date in UTC. Set `TZ` to print and read them in that zone instead.
 - **Author.** `claude` inside a Claude Code session, `codex` inside a Codex
   one, `hermes` inside a Hermes Agent one, else git `user.name`, else `user`; `--author`
-  or `SYMBION_AUTHOR` overrides. A person typing `! symbion add …` in a
+  or `SYMBION_AUTHOR` overrides. The default names the harness, not the model:
+  no harness tells its shell which model runs, so a review by another model
+  passes `--author` to read apart. A person typing `! symbion add …` in a
   session is recorded as the agent unless they pass one. Session start lists
   the open rows someone other than the reader raised or amended, parked ones
-  included, so the owner's word reaches the agent: `from <author>` names who
+  included, so the owner's word reaches the agent. The header counts neither
+  a parked row nor one in an arc, so such a row says so in its brackets
+  (`[idea, parked]`, `[task, arc release]`), as a due one does. `from <author>` names who
   raised a row, and `last by <author>` who wrote its newest version when that
   is someone else. An answer appended to a row sits below the line the
   summary prints, so the summary and `list` print the first line the newest
-  amendment by someone else added below the row (`alice added 3h ago: …`).
-  They skip it when the clipped line already shows it. `lead rewritten since`
+  amendment by someone else added below the row (`alice added 3h ago: …`),
+  or `alice edited 3h ago: …` and the first line it changed when it wrote no
+  paragraph of its own (a rewrite, a sentence fixed in place); the amendment
+  count counts only the first. They skip it when the clipped line already
+  shows it. `lead rewritten since`
   after the age says the row's lead changed after that line, so it answered
-  an earlier question.
+  an earlier question. A resolved row the reader raised or closed prints as
+  `closed by <author>`, with that line, when someone else resolved it or
+  wrote to its body after the reader's newest row: an answer given by
+  `resolve --body` closes the question, a correction can follow a close, and
+  every other block lists open rows only. A re-tag is neither. A reply that
+  lands mid-session reaches the agent on its next write: `add`, `resolve`
+  and `supersede` end by naming, on stderr and in the summary's form, each
+  row someone else wrote or amended since the writer's previous write, or
+  since the session's start summary if that came later.
 - **Record finished work as a resolved task**:
   `add task --target … --status resolved --body "done: …"` for this
   session's work that had no ticket, when a later session would otherwise
@@ -136,11 +163,39 @@ where two separate adds would store both.
   `no store at ../<new-name>-notes` until a `.symbion` names the old store.
   A note under that error names any store beside the repo that no project
   claims, by its name or by a pointer.
-- **Files:** `notes.jsonl` (append-only once committed: a correction is a
-  new row that supersedes the old one; before `symbion commit`, an edit to
-  your own row rewrites it), `arcs.jsonl`, `symbion.toml`, and the
+- **Files:** `notes.jsonl` (an edit appends the new version under the
+  row's id, and the version it replaces stays on its line under a new id
+  stamped with that version's own time;
+  before `symbion commit`, an edit to a row you wrote in this session
+  rewrites it), `arcs.jsonl`,
+  `symbion.toml`, and the
   `README.md` and `.gitignore` that `init` writes. `archive/` holds files
   copied in to keep (`adoption.md`); `commit` names any path there git ignores.
+- **Two copies of one store:** writes in both between pulls conflict in
+  `notes.jsonl`, since each appends at its end. Keep both sides. If both
+  copies edited one row, two lines then share its id: `summary` names the
+  later one as unreadable, reads skip it, and a write to that id is refused.
+  Change the last 3 characters of one line's id to other hex digits, and
+  both edits read as rows.
+- **Undo:** each write first copies `notes.jsonl`, `arcs.jsonl` and the
+  sessions file into the store's git dir (`symbion-undo/`, which git never
+  sees). `symbion undo ID` puts them back: the whole of the store's last
+  write (a batch too), if ID is a row or arc it touched, the write was yours
+  (this agent session's, or with no session your author's), no commit has run
+  since, and nothing outside symbion changed the files. One level: an undo
+  leaves nothing more to undo. In the GUI, an undo icon sits in the top bar
+  while the store's last write is yours and uncommitted; it asks first,
+  showing each row the undo removes or puts back.
+- **Session end:** `symbion commit --wrap -m MSG` marks the commit that ends a
+  session, with a `Wrap: <author>` trailer beside `Rows:`; it refuses without
+  `-m`. With nothing pending it commits the message alone (`committed: the
+  message alone, no rows or files`), where a plain `commit` exits 1. `summary` prints the newest such message as `last wrap by <author>,
+  <age>, N commits since: <first line>` and its paragraph below, before the
+  `symbion serve` line; `--json` gives it as `wrap: {gist, body, author, at,
+  commits_since}`, `null` when no commit carries the trailer, and
+  `commits_since` is `null` outside a repo. The store's git log
+  is the journal: `git -C <store> log --grep '^Wrap: '`. The procedure is
+  `wrap.md` in the skill.
 - **Settings:** besides the tables above, `symbion.toml` takes
   `default_branch`, `local_only = true` (no remote on purpose: `commit` stops
   saying "no remote"), `command_timeout` (the seconds a configured command
@@ -152,7 +207,8 @@ where two separate adds would store both.
   must exit 0; an object with a `sha` reads `behind N` as a HEAD stamp does.
 - **Trust:** the commands in `[catalogs]`, `[resolvers]`, `[renames]` and
   `[provenance]` run as shell at every write and many reads, and the
-  session-start hook runs `summary` in every project with a store. A store
+  session-start hook runs `summary` in every project with a store (and writes
+  the gotcha hook's list, `~/.cache/symbion/gotchas/<session>`). A store
   cloned beside a repo runs its author's commands from then on: read its
   `symbion.toml` as you would code you clone.
 - **Secrets:** a store is a git repo, so any pre-commit hook guards it;
@@ -166,8 +222,18 @@ where two separate adds would store both.
   A refusal names a line of `notes.jsonl`, and `symbion commit` commits
   nothing. `symbion supersede <id> --body …` rewrites your own uncommitted row
   in place, so the secret never reaches history. A row someone else wrote, or
-  one another row cites, gets a new row instead: edit that line out of
-  `notes.jsonl` by hand.
+  one another row cites, keeps its earlier version on its line: edit that line
+  out of `notes.jsonl` by hand.
+
+  A committed secret stays in the store's history. Rotate it first: a
+  rewrite does not reach a copy someone already has. Then
+  [git filter-repo](https://github.com/newren/git-filter-repo)
+  `--replace-text` replaces it with `***REMOVED***` in every commit. The row
+  keeps its id, so each cite of it still holds. If the store has a remote,
+  force-push it and re-clone each other copy. Last, add a `decision` row that
+  cites the row and says who removed what, when and why, without the secret.
+  `show` on the row lists that decision, so a reader who finds `***REMOVED***`
+  finds the reason too.
 - **Reading:** `symbion summary` (what the hook prints),
   `symbion context --target TYPE:NAME`, `symbion context --branch REF`,
   `symbion list --json`.
@@ -177,7 +243,7 @@ where two separate adds would store both.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui]'
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest -q -n auto
 ```
 
 On Windows, in PowerShell:

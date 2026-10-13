@@ -24,12 +24,14 @@ import signal
 import socket
 import subprocess
 import sys
+from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from nicegui import app, ui
 from nicegui.helpers import format_url
 
+from .. import gitref
 from . import servers
 from .pages import build_page
 from .theme import FAVICON_SVG
@@ -146,6 +148,10 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
          argv=(), host: str = "127.0.0.1", allow=()) -> int:
     """`argv` is the CLI's own, `--dir` included: --reload re-runs it.
     `allow` is ip_network objects: who besides this machine may connect."""
+    # The person's rows belong to no agent session, though the shell that
+    # started the serve may run in one (store.session_key).
+    for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        os.environ.pop(k, None)
     if not loopback(host) and not allow:
         print(f"error: --host {host} lets other machines connect, and the GUI writes "
               "with no login: name the ones that may with --allow (an address or a "
@@ -224,7 +230,8 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
             print(f"warning: this store's port, {want}, is held by {who}. This serve "
                   f"takes {port}, which changes at each restart; --port picks a fixed one.",
                   file=sys.stderr, flush=True)
-        mine = servers.record(url, ctx.store_dir)
+        mine = servers.record(url, ctx.store_dir,
+                              gitref.own_commit() or metadata.version("symbion"))
     restart = []
     if top and hasattr(signal, "SIGUSR1"):
         # `serve --restart`: stop as Ctrl-C does, then exec again below. Not

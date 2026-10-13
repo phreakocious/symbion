@@ -15,11 +15,11 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from urllib.parse import quote
 
-from nicegui import ui
+from nicegui import app, ui
 from nicegui.elements.mixins.value_element import ValueElement
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
-from pygments.lexers import get_lexer_by_name
+from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
 from pygments.util import ClassNotFound
 
 from .. import api, catalog, gitref, term
@@ -148,22 +148,18 @@ class NoteMarkdown(ui.markdown):
         self._props["innerHTML"] = _body_html(content)
 
 
-# store.new_id's shape, or the 10-character tail SKILL.md says to cite.
-# Bodies cite rows by id ("settled by <id>"), and the GUI had no way to
-# follow one but pasting it into the search.
-_NOTE_ID = re.compile(r"(?<![\w/=[-])(\d{8}-\d{6}-\d{6}-[0-9a-f]{3}|\d{6}-[0-9a-f]{3})(?![\w-])")
+# A cite as `show` reads one (summary._CITE), not inside a URL or a link
+# already made. Bodies cite rows by id ("settled by <id>"), and the GUI had
+# no way to follow one but pasting it into the search.
+_NOTE_ID = re.compile(r"(?<![/=[])" + summ._CITE.pattern)
 _CODE = re.compile(r"(```.*?```|`[^`\n]*`)", re.S)
 
 
 @functools.lru_cache(maxsize=8)
 def _tails(store_dir: str, _stamp) -> dict:
-    """Each 10-character tail -> the one id in the store that ends in it, or
-    None when several do. `_stamp` is the notes file's mtime and size, so a
-    row written while the server runs is seen on the next render."""
-    out = {}
-    for n in S.load(store_dir):
-        out[n.id[-10:]] = None if n.id[-10:] in out else n.id
-    return out
+    """summary.cite_ids of the store. `_stamp` is the notes file's mtime and
+    size, so a row written while the server runs is seen on the next render."""
+    return summ.cite_ids([n.id for n in S.load(store_dir)])
 
 
 def link_ids(body: str, store_dir) -> str:
@@ -172,7 +168,7 @@ def link_ids(body: str, store_dir) -> str:
     print as literal brackets. A tail of no row here stays text: rows cite
     other stores' rows too."""
     def link(m):
-        nid = m[1] if len(m[1]) > 10 else tails().get(m[1])
+        nid = m[1] if len(m[1]) > 17 else tails().get(m[1])
         return f"[{m[1]}](/notes?id={nid})" if nid else m[1]
 
     def tails():
@@ -429,27 +425,46 @@ def id_link(n) -> None:
         .tooltip("copy the full id").mark("note-copy-id")
 
 
-def md_path(ctx, name):
-    """The checkout's markdown file `name` names, or None. A target name is
-    typed text, so the file must resolve inside the checkout: `..` and a
-    symlink out of it read nothing."""
+@functools.lru_cache(maxsize=256)
+def _lexer(filename: str):
+    """pygments' lexer for a file name, or None."""
+    try:
+        return get_lexer_for_filename(filename)
+    except ClassNotFound:
+        return None
+
+
+def view_path(ctx, name):
+    """The checkout's file `name` names, when the viewer shows its kind:
+    markdown, or a file pygments names a language for; else None. A target
+    name is typed text, so the file must resolve inside the checkout: `..`
+    and a symlink out of it read nothing."""
     root = ctx.cfg.work_root
-    if not root or not name or not name.lower().endswith(".md"):
+    if not root or not name:
         return None
     root = root.resolve()
     path = (root / name).resolve()
-    return path if path.is_relative_to(root) and path.is_file() else None
-
-
-def md_button(ctx, name, label: str = ""):
-    """A button that shows the markdown file `name` rendered, in a dialog
-    (the owner, 2026-10-02); None when `name` is not one. Read on the click,
-    so the dialog shows the file as it is then."""
-    if md_path(ctx, name) is None:
+    if not (path.is_relative_to(root) and path.is_file()):
         return None
+    return path if path.suffix.lower() == ".md" or _lexer(path.name) else None
+
+
+# ponytail: the whole file in one dialog; page it if a large one is slow.
+VIEW_CHARS = 500_000
+
+
+def view_button(ctx, name, label: str = ""):
+    """A button that shows the file `name` in a dialog: markdown rendered
+    (the owner, 2026-10-02), anything else pygments knows coloured, code
+    most of all (the owner, 2026-10-11). None when the viewer cannot show
+    it. Read on the click, so the dialog shows the file as it is then."""
+    path = view_path(ctx, name)
+    if path is None:
+        return None
+    md = path.suffix.lower() == ".md"
 
     def _open():
-        path = md_path(ctx, name)
+        path = view_path(ctx, name)
         try:
             text = path.read_text(encoding="utf-8", errors="replace") if path else None
         except OSError:
@@ -457,19 +472,30 @@ def md_button(ctx, name, label: str = ""):
         if text is None:
             ui.notify(f"cannot read {name}", type="warning")
             return
+        if "\0" in text or len(text) > VIEW_CHARS:
+            ui.notify(f"{name} is not text, or is over {VIEW_CHARS:,} characters",
+                      type="warning")
+            return
         with ui.dialog() as dialog, ui.card().classes("bg-panel sb-md-card"):
             with ui.row(wrap=False).classes("items-center w-full"):
                 ui.label(name).classes("sb-subtitle sb-mono")     # a path: its case is its name
                 ui.space()
                 ui.button(icon="close", on_click=dialog.close) \
                     .props('flat dense round size=sm aria-label="close"')
-            ui.markdown(text, extras=FILE_MD_EXTRAS).mark("md-view")
+            if md:
+                ui.markdown(text, extras=FILE_MD_EXTRAS).mark("file-view")
+            else:
+                # One fenced block, as a body's is coloured. A fence longer
+                # than any run of backticks in the file is one it cannot close.
+                fence = "`" * max(3, 1 + max(map(len, re.findall("`+", text)), default=0))
+                lang = (_lexer(path.name).aliases or ["text"])[0]
+                NoteMarkdown(f"{fence}{lang}\n{text}\n{fence}").mark("file-view")
         dialog.open()
 
-    return ui.button(label, icon="article", on_click=_open) \
+    return ui.button(label, icon="article" if md else "code", on_click=_open) \
         .props("flat dense no-caps color=muted aria-label=read"
                + ("" if label else " round size=xs")) \
-        .tooltip(f"read {name}").mark("md-open")
+        .tooltip(f"read {name}").mark("file-open")
 
 
 def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
@@ -616,7 +642,7 @@ def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) 
         if show_target:
             if not bare(n):                 # else the headline says it
                 target_link(n)
-            md_button(ctx, n.target.name)
+            view_button(ctx, n.target.name)
         if since:
             _since_chip(ctx, n, since)
         if n.arc_id and (show_target or not bare(n)):
@@ -626,7 +652,7 @@ def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) 
             ui.link(f"↗ {summ.ref_label(r)}",
                     f"/object?type={quote(r.type)}&name={quote(r.name or '', safe='')}") \
                 .classes("sb-chip sb-ref").mark("note-ref")
-            md_button(ctx, r.name)
+            view_button(ctx, r.name)
         for t in n.tags:
             ui.link(f"#{t}", narrow(tag=t)).classes("sb-tag").mark(f"tag-{t}")
         with ui.element("span").classes("sb-note-by"):
@@ -636,12 +662,74 @@ def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) 
             id_link(n)
 
 
+_SAID = "sb-said"
+
+
+def say_after_reload(text: str) -> None:
+    """A notice for the page a reload brings: one made before the reload
+    died with the page, so `committed …` never showed (2026-10-13)."""
+    app.storage.tab[_SAID] = text
+
+
+def show_said() -> None:
+    """Once the page connects, what the write before its reload said."""
+    client = ui.context.client
+
+    def _show():
+        with client:
+            if said := app.storage.tab.pop(_SAID, None):
+                ui.notify(said)
+    client.on_connect(_show)
+
+
+def undo_dialog(ctx, author: str) -> None:
+    """The top bar's undo asks first, with what it changes: each row the
+    last write added goes, and each row it changed gets its earlier version
+    back (the owner, 2026-10-13). It replaced a timed notice, which set a
+    deadline the store does not have, and whose undo did nothing as it
+    faded."""
+    try:
+        u = api.undo(ctx, None, author=author, apply=False)
+    except S.UndoRefused as e:
+        ui.notify(str(e), type="warning", multi_line=True)
+        return
+    now = {r["id"]: S.note_from_dict(r, kinds=ctx.kinds) for r in u["rows"]}
+    with ui.dialog() as dialog, ui.card().classes("bg-panel"):
+        ui.label("undo your last write").classes("sb-stat-label")
+        for i in u["removed"]:
+            ui.label(f"removes {short_id(i)} · {summ.clip(now[i].body or '', 80)}")
+        for i in u["changed"]:
+            was = S.note_from_dict(u["before"][i], kinds=ctx.kinds)
+            what = changes(now[i], was) if i in now else []
+            ui.label(f"{short_id(i)} · {', '.join(what) or 'its earlier version'} · "
+                     f"{summ.clip(was.body or '', 80)}")
+        for a in u["arcs"]:
+            ui.label(f"arc {a} as it was before")
+
+        def _do():
+            dialog.close()
+            try:
+                done = api.undo(ctx, (u["removed"] + u["changed"] + u["arcs"] + [None])[0],
+                                author=author)
+            except S.UndoRefused as e:        # a write landed since the dialog opened
+                ui.notify(str(e), type="warning", multi_line=True)
+                return
+            say_after_reload(f"undone: {S.undo_words(done)}")
+            ui.navigate.reload()
+
+        with ui.row():
+            ui.button("undo", on_click=_do).props("unelevated color=primary") \
+                .mark("undo-confirm")
+            ui.button("cancel", on_click=dialog.close).props("flat")
+    dialog.open()
+
+
 def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> None:
     """Supersede with edits. `resolving=True` is the resolve path for a
     status+verdict row: the result is required and the row closes on save."""
     with ui.dialog() as dialog, ui.card().classes("bg-panel"):
         ui.label("resolve — the result is the verdict" if resolving
-                 else "edit — not yet committed, so the row itself changes"
+                 else "edit — this version is not yet committed, so it changes in place"
                  if api.rewritable(ctx, n.id, author=author)
                  else "supersede — the old row is kept").classes("sb-stat-label")
         body = ui.textarea("body", value=n.body).props("outlined") \
@@ -670,10 +758,12 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
         # visibility binding the way add_form's kind select does.
         # Text, not a native date input: that cannot hold a datetime, so it
         # would render empty and the next save would clear the date.
-        due = ui.input("due", value=n.due or "",
-                       placeholder="YYYY-MM-DD or 2026-10-01T22:30Z") \
-            .props("dense outlined").classes("w-full").mark("edit-due") \
-            if n.spec.status else None
+        due = None
+        if n.spec.status:
+            due = ui.input("due", value=n.due or "",
+                           placeholder="YYYY-MM-DD or 2026-10-01T22:30Z") \
+                .props("dense outlined").classes("w-full").mark("edit-due")
+            date_menu(due, "edit-due-pick")
         checked = res = None
         if n.spec.verdict:
             checked = ui.input("checked", value=n.checked or "") \
@@ -774,6 +864,21 @@ def tags_field(ctx, value: str = ""):
     return field
 
 
+def date_menu(field, marker: str) -> None:
+    """A calendar on a due field, dates only (the owner, 2026-10-12). The
+    field stays text, so a typed datetime still goes in. A picked date
+    replaces the field's value. The calendar shows the field's date part,
+    and that date is never written back, so opening it keeps a time."""
+    with field.add_slot("append"), ui.icon("event").classes("cursor-pointer"), \
+            ui.menu() as menu:
+        def _pick(e):
+            if e.value and e.value != (field.value or "")[:10]:
+                field.value = e.value
+                menu.close()
+        ui.date(on_change=_pick).props("minimal") \
+            .bind_value_from(field, "value", backward=lambda v: (v or "")[:10]).mark(marker)
+
+
 def target_names(ctx, typ: str) -> list:
     """What the name field offers for `typ`: the catalog's names for a catalog
     type, else the names this store's rows have used for it, newest first. A
@@ -792,14 +897,15 @@ def target_names(ctx, typ: str) -> list:
 
 
 def add_form(ctx, target_type, target_name, refresh, *, author: str,
-             arc_id: str | None = None, another=None) -> None:
+             arc_id: str | None = None, another=None, start_kind: str | None = None) -> None:
     """Writes go through api.add, which canonicalizes the target name, stamps
     provenance on checks, and takes author keyword-only. `arc_id` is the arc
     the form starts on. With `another`, Shift Enter adds the note and keeps
     the form, cleared, for the next one, and calls `another` in place of
     `refresh`. The target starts on (target_type, target_name), and the
     header changes it: the GUI put a note only on the project or on the page's
-    object (the owner, 2026-10-01). Not an arc: the arc select puts a note in one."""
+    object (the owner, 2026-10-01). Not an arc: the arc select puts a note in one.
+    `start_kind` is the kind it starts as, when this store has it."""
     kinds = ctx.kinds
     labels = list(kinds)
     types = ["project", *sorted(ctx.target_types - {"project", "arc"})]
@@ -828,7 +934,9 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
             .props('borderless autogrow autofocus aria-label="body"') \
             .classes("w-full sb-compose-body").mark("note-body")
         with ui.row().classes("items-center gap-2 w-full"):
-            kind = ui.select(labels, value="note" if "note" in labels else labels[0]) \
+            start = start_kind if start_kind in labels else "note" if "note" in labels \
+                else labels[0]
+            kind = ui.select(labels, value=start) \
                 .props('dense outlined options-dense aria-label="kind"') \
                 .mark("note-kind-select")
             opts = arc_options(ctx)
@@ -843,6 +951,7 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
             result.bind_visibility_from(kind, "value", backward=lambda v: kinds[v].verdict)
             due = ui.input("due", placeholder="YYYY-MM-DD").props("dense outlined") \
                 .classes("w-[130px]").mark("note-due")
+            date_menu(due, "note-due-pick")
             due.bind_visibility_from(kind, "value", backward=lambda v: kinds[v].status)
             tags = tags_field(ctx).classes("col sb-compose-tags") \
                 .style("min-width:120px").mark("note-tags")

@@ -12,7 +12,9 @@ what a session learned is still there when the next one starts.
 
 - **Each session starts where the last one stopped.** A session-start hook
   gives the agent the open bugs, tasks and questions, the rows due soon, and
-  the ones you wrote or answered. You do not brief it again.
+  the ones you wrote or answered. `/symbion wrap` ends a session: the rows it
+  owes, then a store commit whose message is the next session's handoff. You
+  do not brief it again.
 - **A result knows its age.** A `check` records what ran, what it said, and
   the commit it ran at. Once the code moves on, it reads `behind 12`, not
   "tests pass".
@@ -54,9 +56,12 @@ symbion init          # lists each change and makes none (exit 1 if there are an
 symbion init --yes    # creates the store, ../<repo>-notes, and links the agent skill
 ```
 
-`init --yes` registers the session-start hook too when `~/.claude/settings.json`
-does not exist. When it does, `init` prints the entry to add, or says the hook is
-already there.
+`init --yes` registers its hooks too when `~/.claude/settings.json` does not
+exist: one at session start, and one that gives the agent a file's `gotcha` rows
+the first time it touches that file. When the file exists, `init` prints each
+entry to add, or says the hook is already there. `symbion init --merge-hook` adds the entry for you and keeps the
+rest of the file. If your agent's own edit of that file is denied, run it yourself:
+in Claude Code, type `! symbion init --merge-hook` at the prompt.
 
 A new store takes notes on a commit, an item, the project or an arc. For notes
 on files, open `../<repo>-notes/symbion.toml` and uncomment `file =` under
@@ -90,7 +95,7 @@ agents, which take a step more: see the
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui]'
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest -q -n auto
 ```
 
 Windows, and making a clone your installed symbion:

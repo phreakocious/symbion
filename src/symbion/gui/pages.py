@@ -15,7 +15,7 @@ from .. import store as S
 from .. import summary as summ
 from . import arcs, filters
 from .chrome import shell
-from .notes import md_button, render_note, target_href
+from .notes import render_note, target_href, view_button
 from .theme import FONTS_DIR, FONTS_URL
 
 # /notes renders this many rows before "show all": every row is a few dozen
@@ -82,8 +82,7 @@ def _error_pages(ctx, author: str) -> None:
     """NiceGUI's own error pages: its sad-face art, and no header to get
     back from. These keep symbion's chrome and say what went wrong."""
     def body(code: int, what: str) -> None:
-        shell(ctx, author, [("Notebook", "/"),
-                            ("no such page" if code == 404 else "this page failed", None)])
+        shell(ctx, author, [("No such page" if code == 404 else "This page failed", None)])
         with ui.column().classes("sb-main gap-2"):
             ui.label(what).classes("sb-subtitle text-bad").mark("error-detail")
             ui.link("back to the notebook", "/").classes("text-body")
@@ -189,7 +188,7 @@ def build_page(ctx, *, author: str) -> None:
         via: dict[str, list[str]] = {}
 
         def tip(i: str) -> str:
-            t = api._chain_tip(every, i).id
+            t = S.chain_tip(every, i).id
             if t != i:
                 via.setdefault(t, []).append(i)
             return t
@@ -219,8 +218,8 @@ def build_page(ctx, *, author: str) -> None:
             rows += [n for n in rest if n.id not in got and n.id in tips]
         rows = S.newest_first(rows)
         git_head = gitref.head_sha(ctx.cfg)
-        shell(ctx, author, [("Notebook", "/"), (filters.describe(kwargs, q), None)], q=q,
-              keep=base, here="" if base or old else "/notes")
+        shell(ctx, author, [(filters.describe(kwargs, q), None)], q=q,
+              keep=base, here="" if base or old else "/notes", kind=kwargs.get("kind"))
         with ui.column().classes("sb-main gap-4"):
             if len(hits) > 1:
                 ui.label(f"{len(hits)} rows end in -{old}; open the one you mean") \
@@ -260,7 +259,7 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/targets")
     def targets_page():
-        shell(ctx, author, [("Notebook", "/"), ("Targets", None)], here="/targets")
+        shell(ctx, author, [("Targets", None)], here="/targets")
         git_head = gitref.head_sha(ctx.cfg)
         newest = S.newest_first(S.heads(S.load(ctx.store_dir)))
         # Each target with every row on or referencing it, as /object counts
@@ -298,7 +297,7 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/tags")
     def tags_page():
-        shell(ctx, author, [("Notebook", "/"), ("Tags", None)], here="/tags")
+        shell(ctx, author, [("Tags", None)], here="/tags")
         counts = S.tag_counts(S.load(ctx.store_dir))
         with ui.column().classes("sb-main gap-2"):
             ui.label(f"{len(counts)} in use — near-synonyms are drift, not vocabulary") \
@@ -320,7 +319,7 @@ def build_page(ctx, *, author: str) -> None:
         if not type or not name:
             ui.navigate.to("/notes")
             return
-        shell(ctx, author, [("Notebook", "/"), (f"{type}: {name}", None)],
+        shell(ctx, author, [(f"{type}: {name}", None)],
               new=(type, name, None))
         # Open work first, then the newest; a resolved row is history and
         # reads clipped (one file's page held 50 rows in full, 2026-09-27).
@@ -332,7 +331,7 @@ def build_page(ctx, *, author: str) -> None:
             with ui.row().classes("items-center gap-3"):
                 ui.label(f"{summ._count(len(rows), 'note')} on or referencing this object") \
                     .classes("sb-subtitle")
-                md_button(ctx, name, "read the file")
+                view_button(ctx, name, "read the file")
             since = gitref.commits_since(ctx.cfg, rows, git_head)
             for n in rows:
                 # The page names the object: a row only referring to it names its own.
@@ -343,7 +342,7 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/arcs")
     def arcs_page():
-        shell(ctx, author, [("Notebook", "/"), ("Arcs", None)], here="/arcs")
+        shell(ctx, author, [("Arcs", None)], here="/arcs")
         with ui.column().classes("sb-main gap-4"):
             arcs.index(ctx, author=author)
 
@@ -353,7 +352,7 @@ def build_page(ctx, *, author: str) -> None:
             ui.navigate.to("/arcs")
             return
         act = next((a for a in S.load_arcs(ctx.store_dir) if a.id == id), None)
-        shell(ctx, author, [("Notebook", "/"), ("Arcs", "/arcs"), (act.name if act else id, None)],
+        shell(ctx, author, [("Arcs", "/arcs"), (act.name if act else id, None)],
               here="/arcs", new=("project", None, id))
         if act is None:
             ui.label(f"no arc '{id}'").classes("sb-main text-bad")

@@ -13,7 +13,7 @@ from .. import store as S
 from .. import summary as summ
 from . import servers
 from .filters import href
-from .notes import add_form, ago, kind_class
+from .notes import add_form, ago, kind_class, say_after_reload, show_said, undo_dialog
 from .theme import (DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, kind_css, quasar_colors,
                     root_vars_css)
 
@@ -36,9 +36,12 @@ document.addEventListener('keydown', e => {
   if (e.key === '/') { el.focus(); el.select(); } else el.click();
 });
 function sbFilter(text, expand) {
-  const words = (text || '').toLowerCase().split(/\\s+/).filter(Boolean);
+  // A "quoted phrase" is one word, as filters.search_pattern reads the box.
+  const words = [...(text || '').toLowerCase().matchAll(/"([^"]*)"?|([^\\s"]+)/g)]
+    .map(m => (m[1] ?? m[2]).trim().split(/\\s+/).join(' ')).filter(Boolean);
   for (const card of document.querySelectorAll('.sb-main .sb-note')) {
-    const hay = (card.textContent + ' ' + (card.dataset.id || '')).toLowerCase();
+    const hay = (card.textContent + ' ' + (card.dataset.id || ''))
+      .toLowerCase().replace(/\\s+/g, ' ');
     card.classList.toggle('sb-filtered', !words.every(w => hay.includes(w)));
   }
   for (const board of document.querySelectorAll('.sb-board'))
@@ -59,13 +62,16 @@ _KEYS = (("/", "filter this page"), ("Enter", "in the filter: search the whole s
 
 
 def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
-          here: str = "", new=("project", None, None)) -> None:
+          here: str = "", new=("project", None, None), kind: str | None = None) -> None:
     """`crumbs` end in the page's title, which the top bar shows: a title of
     its own under the bar left a band of nothing above it (the owner,
-    2026-10-01). `q` is the search being shown, `keep` the filters a new
+    2026-10-01). A parent comes before it only on a page one level down (an
+    arc); a "Notebook" before every title said nothing the sidebar does not
+    (the owner, 2026-10-13). `q` is the search being shown, `keep` the filters a new
     search keeps: on /notes a search narrows the list in view, elsewhere it
     starts one. `here` is the sidebar place this page is (`/`, `/notes`,
-    `/tags`, `/arcs`), and `new` the (type, name, arc) a new note starts on."""
+    `/tags`, `/arcs`), `new` the (type, name, arc) a new note starts on, and
+    `kind` the kind it starts as."""
     ui.dark_mode().enable()
     root = ctx.cfg.project_root
     name = root.name if root else ctx.store_dir.name   # named from outside any repo: no project
@@ -97,7 +103,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
             ui.button(icon="menu", on_click=drawer.toggle, color=None) \
                 .props('flat dense round aria-label="menu"').classes("sb-narrow text-body") \
                 .mark("menu")
-            with ui.row(wrap=False).classes("items-center gap-2 sb-crumbs"):
+            with ui.row(wrap=False).classes("items-center gap-2 sb-crumbs").mark("crumbs"):
                 for i, (label, to) in enumerate(crumbs):
                     if i:
                         ui.label("›").classes("sb-sep")
@@ -107,7 +113,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
             # Left of New note, so that button stays put as these come and go
             # (the owner, 2026-10-02).
             _git_buttons(ctx, author)
-            _new_note_button(ctx, author, *new)
+            _new_note_button(ctx, author, *new, kind=kind)
             _search_box(q, keep or {})
             with ui.element("div").classes("sb-who-top sb-narrow") \
                     .tooltip(f"writing as {author}: identity stamped on every write made here"):
@@ -116,6 +122,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     # The sidebar runs the full height; the top bar sits beside it. After
     # both: creating a header or drawer rewrites the layout's view.
     ui.context.client.layout.props('view="lHh LpR lFf"')
+    show_said()
 
 
 def _once(build):
@@ -130,21 +137,26 @@ def _once(build):
     return _open
 
 
-def _new_note_button(ctx, author: str, target_type, target_name, arc_id) -> None:
+def _new_note_button(ctx, author: str, target_type, target_name, arc_id,
+                     kind: str | None = None) -> None:
     """The composer, from every page: on the page's object, or the project
-    where a page has none. It sat on two pages, as the page's top."""
+    where a page has none. It sat on two pages, as the page's top. From a
+    kind= view it starts as that kind and says so (the owner, 2026-10-11)."""
+    kind = kind if kind in ctx.kinds else None
+    word = kind or "note"
     def build():
         added = []                  # by Shift Enter: the page shows them on close
         with ui.dialog() as dialog, ui.card().classes("bg-panel sb-new-card"):
             add_form(ctx, target_type, target_name, lambda: ui.navigate.reload(),
-                     author=author, arc_id=arc_id, another=lambda: added.append(1))
+                     author=author, arc_id=arc_id, another=lambda: added.append(1),
+                     start_kind=kind)
         dialog.on_value_change(lambda e: added and not e.value and ui.navigate.reload())
         return dialog
 
     with ui.button(icon="add", on_click=_once(build)) \
-            .props('unelevated dense no-caps color=primary aria-label="new note"') \
-            .classes("px-2 sb-new").mark("new-note").tooltip("new note (n)"):
-        ui.label("New note").classes("sb-btn-word")
+            .props(f'unelevated dense no-caps color=primary aria-label="new {word}"') \
+            .classes("px-2 sb-new").mark("new-note").tooltip(f"new {word} (n)"):
+        ui.label(f"New {word}").classes("sb-btn-word")
 
 
 def _keys_dialog(ctx):
@@ -292,7 +304,8 @@ def _search_box(q: str, keep: dict) -> None:
     box.on("keydown.enter", _go, js_handler="(e) => emit(e.target.value)")
     box.tooltip("typing filters this page, and searches the store when nothing here "
                 "matches; Enter searches the store: every word, in any case, in body, "
-                "target, checked, result, refs or tags; or a note id")
+                'target, checked, result, refs or tags; a "quoted phrase" as one word; '
+                "or a note id")
 
 
 # Seconds between reads of the store's git state for the two buttons.
@@ -300,7 +313,7 @@ _GIT_EVERY = 5
 
 
 def _git_buttons(ctx, author: str) -> None:
-    """Commit and push, read again every `_GIT_EVERY` seconds and redrawn
+    """Undo, commit and push, read again every `_GIT_EVERY` seconds and redrawn
     when a count moves: a commit or push made at a terminal left them on the
     page, and rows written there never showed the commit button (the owner,
     2026-10-01). The button counts and commits `author`'s rows only: it took
@@ -308,12 +321,18 @@ def _git_buttons(ctx, author: str) -> None:
     "serve should only be allowed to commit its own rows")."""
     def read():
         rows = S.pending_rows(ctx.store_dir)
-        mine = sum(r.get("author") == author for r in rows)
+        keep = S.with_bases(rows, lambda r: r.get("author") == author)
+        mine = sum(keep(r) for r in rows)
         return (mine, len(rows) - mine, gitref.uncommitted(ctx.store_dir)[1],
-                gitref.unpushed(ctx.store_dir))
+                gitref.unpushed(ctx.store_dir), S.undoable(ctx.store_dir))
 
     @ui.refreshable
     def buttons(state):
+        if state[4]:
+            # No label to compute: the dialog says what the undo takes back.
+            ui.button(icon="undo", on_click=lambda: undo_dialog(ctx, author)) \
+                .props('flat dense round aria-label="undo your last write"') \
+                .classes("sb-undo").mark("undo-button").tooltip("undo your last write")
         _commit_button(ctx, author, *state[:3])
         _push_button(ctx, state[3])
 
@@ -341,7 +360,7 @@ def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> Non
             ui.notify(str(e), type="negative", multi_line=True,
                       close_button="dismiss", timeout=0)
             return
-        ui.notify(gitref.committed(ctx.store_dir) if ok else "nothing to commit")
+        say_after_reload(gitref.committed(ctx.store_dir) if ok else "nothing to commit")
         ui.navigate.reload()
 
     # On a phone the word goes and the count stays: the icon says commit.
@@ -368,7 +387,7 @@ def _push_button(ctx, n: int | None) -> None:
             ui.notify(r.stderr.strip() or f"git push exited {r.returncode}", type="negative",
                       multi_line=True, close_button="dismiss", timeout=0)
             return
-        ui.notify("pushed")
+        say_after_reload("pushed")
         ui.navigate.reload()
 
     with ui.button(icon="cloud_upload", on_click=_do).props("flat dense no-caps color=muted") \

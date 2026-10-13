@@ -185,7 +185,7 @@ def test_retag_adds_and_removes(repo, tmp_path):
 
     assert set(out.tags) == {"keep", "new"}
     assert out.author == "t"
-    assert out.supersedes == n.id
+    assert out.id == n.id and out.supersedes not in (None, n.id)
 
 
 def test_retag_reads_tags_from_the_chain_TIP_not_the_named_row(repo, tmp_path):
@@ -197,10 +197,10 @@ def test_retag_reads_tags_from_the_chain_TIP_not_the_named_row(repo, tmp_path):
     tip = store.supersede(tmp_path, first.id, author="t", tags=["a", "b"])
     api.commit(ctx, "c")                     # so the retag appends (store.rewritable)
 
-    out = api.retag(ctx, first.id, add=["c"], author="t")
+    out = api.retag(ctx, tip.supersedes, add=["c"], author="t")     # the version first wrote
 
     assert set(out.tags) == {"a", "b", "c"}, "tip's tags must survive"
-    assert out.supersedes == tip.id
+    assert out.id == tip.id == first.id
 
 
 def test_retag_on_a_missing_id_raises_keyerror(repo, tmp_path):
@@ -241,14 +241,14 @@ def test_chain_tip_returns_the_tip_not_the_named_row(repo, tmp_path):
     first = store.add(tmp_path, kind="note", target=target, body="b")
     tip = store.supersede(tmp_path, first.id, author="t", body="c")
 
-    out = api._chain_tip(store.load(tmp_path), first.id)
+    out = store.chain_tip(store.load(tmp_path), first.id)
 
     assert out.id == tip.id
 
 
 def test_chain_tip_on_a_missing_id_raises_keyerror(repo, tmp_path):
     with pytest.raises(KeyError):
-        api._chain_tip(store.load(tmp_path), "nope")
+        store.chain_tip(store.load(tmp_path), "nope")
 
 
 def test_cli_combined_add_tag_on_a_cyclic_chain_errors_instead_of_hanging(repo, tmp_path):
@@ -292,6 +292,7 @@ _NON_WRITERS = {
     "rename_arc",   # writes, but to the arc record -- no note row
     "archive_arc",  # ditto
     "commit",            # writes git, not a note
+    "own_rows",          # a read: which pending rows `commit` would take
     "push",              # ditto
 }
 
@@ -342,6 +343,7 @@ def test_every_write_requires_author_by_keyword(repo, tmp_path):
         (api.seed,            (ctx, "actid", "item", ["x"])),
         (api.create_arc, (ctx, "n", "d", "item")),
         (api.rename_target,   (ctx, "item", "old", "new")),
+        (api.undo,            (ctx, "someid")),
     ]
     assert sorted(fn.__name__ for fn, _ in cases) == sorted(writers), \
         "cases must cover every author-required writer api.py actually has"
@@ -521,6 +523,18 @@ def test_cli_list_author_filters(repo, tmp_path, capsys):
 def test_harvest_pulls_hashtags_out_of_the_body():
     assert api.harvest_hashtags("#gui replace the art") == (["gui"], "replace the art")
     assert api.harvest_hashtags("be creative :) #gui") == (["gui"], "be creative :)")
+    assert api.harvest_hashtags("do #gui the thing") == (["gui"], "do the thing")
+
+
+def test_harvest_keeps_the_body_s_own_spacing():
+    """A traceback pasted into a fence was stored with each run of spaces cut
+    to one: the tidy after a harvest ran over the whole body, code included,
+    and the GUI's edit dialog runs the harvest on every save."""
+    fenced = '```\n  File "x.py", line 1\n    ctx = f()\n\n\n\ndef g():\n```'
+    nested = "- a\n  - b\n\nline  \nbreak"
+    for body in (fenced, nested):
+        assert api.harvest_hashtags(body) == ([], body)
+        assert api.harvest_hashtags(body + " #gui") == (["gui"], body)
 
 
 def test_harvest_leaves_a_markdown_heading_alone():

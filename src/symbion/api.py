@@ -16,7 +16,7 @@ import os
 import re
 import subprocess
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import catalog, config, gitref, kinds as K, store
@@ -40,8 +40,13 @@ class Ctx:
     store_from_env: bool = False
     # The store was named and belongs to a project other than the cwd's
     # (config.store_owner), so both roots are that project's. The CLI says
-    # so on stderr: check state computed elsewhere must not read as local.
+    # so on stderr when that repo decided something in `consulted`.
     followed_owner: bool = False
+    # What the project's repo decided in this command: `catalog` (a name
+    # resolved), `commit` (one peeled), `stamp` (a verdict's HEAD). Warning
+    # on every write was noise: one session's 6 writes on `item:` rows and a
+    # commit each warned, and the repo decided none of them (2026-10-12).
+    consulted: set = field(default_factory=set, compare=False)
     # The store the CWD's own tree names (config.tree_store), or None outside
     # a repo. `store_dir != tree_default` means the store was named rather
     # than stood in: two summaries read back to back in one session were
@@ -168,15 +173,6 @@ def gui_author() -> str:
 
 
 # ---- name canonicalization at the I/O boundary ----
-def canon(cfg, target_type, name, notes=()):
-    """The READ-side wrapper (`list --name`, `context --target`): the
-    stored/queried form of a target name, so an abbreviation typed on read
-    matches what write stored, and a name `notes` hold verbatim is itself.
-    The write side is `_canonicalizer`, which also runs the catalog/resolver
-    under the lock; this one never does."""
-    return gitref.canon_name(cfg, target_type, name, store.stored_names(notes, target_type))
-
-
 def check_name(typ: str, name) -> None:
     """A project target has no name and every other target has one. Every
     writer of a target or ref name passes here: add, --from-json, --ref,
@@ -254,6 +250,8 @@ def _canonicalizer(ctx: Ctx):
         if t is None:
             return None
         typ, name = t["type"], t.get("name")
+        if name is not None and (typ == "commit" or typ in ctx.cfg.catalogs):
+            ctx.consulted.add("commit" if typ == "commit" else "catalog")
         if name is None or typ in catalog.NON_CANONICAL_TYPES or typ not in ctx.cfg.catalogs:
             return {"type": typ, "name": gitref.canon_name(ctx.cfg, typ, name)}
         if typ not in pools:
@@ -375,10 +373,15 @@ def _harvest(body, rx, name_of):
         if tag not in tags:
             tags.append(tag)
     out = body or ""
+    if not spans:
+        return tags, out
+    # A name goes with the space before it, so `do #gui it` reads `do it`.
+    # The rest is the author's: a tidy over the whole body cut each run of
+    # spaces in a fenced traceback to one.
     for start, end in reversed(spans):     # right-to-left keeps earlier spans valid
+        if out[start - 1:start] in (" ", "\t"):
+            start -= 1
         out = out[:start] + out[end:]
-    out = re.sub(r"[ \t]{2,}", " ", out)
-    out = re.sub(r"\n{3,}", "\n\n", out)
     return tags, out.strip()
 
 
@@ -399,6 +402,8 @@ def _stamp(ctx: Ctx, kind: str, spec, external: bool = False) -> dict | None:
         raise ValueError(f"kind {kind!r} is stamped with provenance at write, and "
                          f"{os.getcwd()} is in no git repository to stamp it from; "
                          f"run from inside the project")
+    if spec.verdict:
+        ctx.consulted.add("stamp")
     return gitref.provenance_stamp(ctx.cfg, spec)
 
 
@@ -535,6 +540,7 @@ def seed_names(ctx: Ctx, scope: str, names) -> list[str]:
         if not names:
             raise ValueError(_ITEM_NEEDS_NAMES)
         return [catalog.nfc(n) for n in names]
+    ctx.consulted.add("catalog")
     if not names:
         return catalog.names(ctx.cfg, scope)
     return canonicalize_names(ctx, scope, [catalog.nfc(n) for n in names])
@@ -568,36 +574,12 @@ def why_unverifiable(prov) -> str:
     return "commit unavailable"
 
 
-def _chain_tip(notes, note_id: str) -> store.Note:
-    """The live head of note_id's supersede chain. Pure -- no I/O, no write.
-
-    Shared by retag (which then merges tags and writes) and cli's combined
-    --add-tag path (which merges into fields and lets store.supersede write),
-    so the two cannot drift apart on the guard again. Raises KeyError(note_id)
-    when nothing matches, and ValueError on a repeat -- same message shape as
-    store._supersede_unlocked's own fast-forward, which this mirrors: without
-    the `seen` guard a hand-edited or racing-add()-produced cycle spins the
-    walk forever instead of erroring."""
-    by_supersedes = {n.supersedes: n for n in notes if n.supersedes}
-    cur = next((n for n in notes if n.id == note_id), None)
-    if cur is None:
-        raise KeyError(note_id)
-    seen = {cur.id}
-    while cur.id in by_supersedes:
-        nxt = by_supersedes[cur.id]
-        if nxt.id in seen:
-            raise ValueError(f"cycle in supersede chain at {nxt.id}")
-        seen.add(nxt.id)
-        cur = nxt
-    return cur
-
-
 def rewritable(ctx: Ctx, note_id: str, *, author: str) -> bool:
     """Whether `author`'s edit of note_id's chain changes its tip in place
     (store.rewritable). Read outside the lock: for words shown before a
     write, never to decide one."""
     notes = store.load(ctx.store_dir)
-    return store.rewritable(ctx.store_dir, notes, _chain_tip(notes, note_id), author)
+    return store.rewritable(ctx.store_dir, notes, store.chain_tip(notes, note_id), author)
 
 
 def retag(ctx: Ctx, note_id: str, *, add=(), rm=(), author) -> store.Note:
@@ -615,7 +597,7 @@ def retag(ctx: Ctx, note_id: str, *, add=(), rm=(), author) -> store.Note:
     add = [add] if isinstance(add, str) else add
     rm = [rm] if isinstance(rm, str) else rm
     notes = store.load(ctx.store_dir)
-    cur = _chain_tip(notes, note_id)
+    cur = store.chain_tip(notes, note_id)
     tags = (set(cur.tags) | set(add)) - set(rm)
     return store.supersede(ctx.store_dir, cur.id, author=author, tags=sorted(tags))
 
@@ -700,7 +682,7 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
     if add_measurements:
         check_measurements(add_measurements)
     if fields.get("status") == "resolved":
-        tip = _chain_tip(store.load(ctx.store_dir), note_id)
+        tip = store.chain_tip(store.load(ctx.store_dir), note_id)
         if tip.spec.status and tip.spec.verdict and store.read_status(tip) == "open":
             fields["provenance"] = _stamp(ctx, tip.kind, tip.spec,
                                          bool((tip.provenance or {}).get("external")))
@@ -723,6 +705,7 @@ def seed(ctx: Ctx, arc_id: str, target_type: str, names=None, *, author: str,
             raise ValueError(_ITEM_NEEDS_NAMES)
         return store.seed_arc(ctx.store_dir, arc_id, "item", [catalog.nfc(n) for n in names],
                               author=author, kind=kind)
+    ctx.consulted.add("catalog")
     stamp = lambda ns: gitref.target_blobs(ctx.cfg, target_type, ns)     # noqa: E731
     if not names:
         return store.seed_arc(ctx.store_dir, arc_id, target_type,
@@ -752,13 +735,39 @@ def archive_arc(ctx: Ctx, arc_id: str) -> store.Arc:
     return store.archive_arc(ctx.store_dir, arc_id)
 
 
-def commit(ctx: Ctx, message: str, *, author: str | None = None) -> bool:
+def own_rows(ctx: Ctx):
+    """keep() for the CLI's `commit`: this session's pending rows (store.own_rows)."""
+    return store.own_rows(ctx.store_dir, author_default())
+
+
+def undo(ctx: Ctx, note_id: str | None, *, author: str, apply: bool = True) -> dict:
+    """Take back the store's last write if it is the caller's (store.undo),
+    by the rule `own_rows` commits by: in an agent session, a write that
+    session made; with none, a write no session made, of rows `author` wrote.
+    # ponytail: an arc-only write carries no writer (an archive keeps the
+    # arc's creator), so with no session any caller may undo one; record the
+    # writer in the undo level if two people share a store without sessions."""
+    key = store.session_key()
+
+    def mine(last, rows):
+        if key:
+            return last.get("session") == key
+        return not last.get("session") and all(r.get("author") == author for r in rows)
+    return store.undo(ctx.store_dir, note_id, mine, apply)
+
+
+def commit(ctx: Ctx, message: str, *, author: str | None = None,
+           everyone: bool = False, wrap: bool = False) -> bool:
     """A commit is not off this disk until a push, and a bare `git push`
     needs an upstream: set it here when the store has an origin, so the
-    push hint the CLI prints works on the first try. With `author`, only
-    that author's pending rows go in (store.commit's `keep`)."""
-    ok = store.commit(ctx.store_dir, message, ctx.cfg,
-                      keep=(lambda r: r.get("author") == author) if author else None)
+    push hint the CLI prints works on the first try. With `author` (the
+    GUI), only that author's pending rows go in; with `everyone`, every
+    row; else the caller's own rows (store.own_rows) and every file. `wrap`
+    marks a session's end: the message is the next session's handoff."""
+    keep = (None if everyone else (lambda r: r.get("author") == author) if author
+            else own_rows(ctx))
+    ok = store.commit(ctx.store_dir, message, ctx.cfg, keep=keep, files=not author,
+                      wrap=(author or author_default()) if wrap else None)
     gitref.set_upstream(ctx.store_dir)
     return ok
 

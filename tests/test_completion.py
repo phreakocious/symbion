@@ -76,7 +76,7 @@ def test_resolve_offers_open_rows_and_show_every_head(tmp_path):
     got = tab(f"symbion --dir {d.as_posix()} resolve ", tmp_path)
     assert got == {ids["open bug"]: "[bug] item:x  open bug"}
     assert set(tab(f"symbion --dir {d.as_posix()} show ", tmp_path)) == set(ids.values())
-    assert fixed not in ids.values()                 # superseded by its resolution
+    assert ids["fixed bug"] == fixed                 # a resolve keeps the row's id
 
 
 def test_a_target_completes_its_type_then_names_from_targets_and_refs(tmp_path):

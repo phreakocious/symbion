@@ -234,7 +234,8 @@ def match(cfg, target_type: str, query: str, candidates) -> str:
     if got not in candidates:
         from . import gitref            # late: gitref imports this module
         b = gitref.only_on_default_branch(cfg, got)
-        where = f"; it is on {b}, not in this worktree" if b else ""
+        where = (f"; it is on {b}, not in this worktree" if b else
+                 "; it is a gitignored file in this worktree" if gitref.ignored_here(cfg, got) else "")
         # 0.9: a typo scored 0.97 to 0.98 against its file in this repo, and a
         # new file 0.84 against its siblings, which share its directory. Case
         # is folded: 'load balancer' scored 0.85 against 'Load Balancer'.

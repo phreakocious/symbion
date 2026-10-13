@@ -44,7 +44,8 @@ def _isolated_home(tmp_path_factory, monkeypatch):
     for k in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
         monkeypatch.setenv(k, "t@t")
     # The agent running pytest must not be the author a test reads.
-    for k in ("SYMBION_AUTHOR", "CLAUDECODE", "CODEX_THREAD_ID", "HERMES_AGENT"):
+    for k in ("SYMBION_AUTHOR", "CLAUDECODE", "CODEX_THREAD_ID", "HERMES_AGENT",
+              "CLAUDE_CODE_SESSION_ID"):
         monkeypatch.delenv(k, raising=False)
 
 

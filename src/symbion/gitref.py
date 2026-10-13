@@ -6,6 +6,7 @@ import math
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import catalog, store
@@ -30,6 +31,17 @@ def _git(cfg_or_path, *args):
 def _root(cfg_or_path):
     return getattr(cfg_or_path, "work_root", None) or \
         getattr(cfg_or_path, "project_root", cfg_or_path)
+
+
+def own_commit(here: Path = Path(__file__).parent) -> str | None:
+    """The commit this symbion runs from (`git describe --always --dirty`),
+    or None for an install: the metadata version never moves in a checkout.
+    It asks whether THIS file is tracked, not whether a repo encloses it: a
+    venv inside a project sits in that project's work tree, and its HEAD is
+    not symbion's."""
+    if _git(here, "ls-files", "--error-unmatch", "cli.py").returncode != 0:
+        return None
+    return _git(here, "describe", "--always", "--dirty").stdout.strip()
 
 
 def canonical_commit(cfg, ref: str) -> str:
@@ -58,6 +70,17 @@ def only_on_default_branch(cfg, name) -> str | None:
         return None
     b = cfg.default_branch
     return b if _git(cfg, "cat-file", "-e", f"{b}:{name}").returncode == 0 else None
+
+
+def ignored_here(cfg, name) -> bool:
+    """`name` is a file in this worktree that git ignores. The default file
+    catalog (`--exclude-standard`) drops it, so a task on a gitignored
+    CLAUDE.md got the typo's note (2026-10-12). Both halves are tested: an
+    ignore pattern matches paths that do not exist, and a filtering catalog
+    leaves out files git does not ignore."""
+    root = getattr(cfg, "work_root", None)
+    return bool(root and name and Path(root, name).exists()
+                and _git(cfg, "check-ignore", "-q", "--", name).returncode == 0)
 
 
 def canon_name(cfg, target_type, name, stored=()):
@@ -179,6 +202,28 @@ _RELATIONS: dict = {}
 def head_sha(cfg) -> str:
     """HEAD's full id; "" on an unborn branch or outside a repository."""
     return _git(cfg, "rev-parse", "--verify", "-q", "HEAD").stdout.strip()
+
+
+def unmerged(cfg, shas) -> dict:
+    """{sha: a branch that holds it} for each commit HEAD cannot reach. One
+    walk for all: a merge-base a sha took 0.6 s over one target's resolved
+    rows (2026-10-13). A commit no branch holds is left out: a squash
+    or rebase merge leaves the fix's own commit on none once its branch is
+    deleted, and it would read "not merged" for good. A name that is no
+    commit id, or an object this clone lacks, is skipped."""
+    shas = [s for s in dict.fromkeys(shas) if _HEX.fullmatch(s)]
+    r = _git(cfg, "rev-list", "--ignore-missing", *shas, "--not", "HEAD", "--") \
+        if shas else None
+    if not r or r.returncode:
+        return {}
+    out, found = r.stdout.split(), {}
+    for s in shas:
+        if any(o.startswith(s.lower()) for o in out):
+            b = _git(cfg, "for-each-ref", "--count=1", "--contains", s,
+                     "--format=%(refname:short)", "refs/heads", "refs/remotes").stdout.strip()
+            if b:
+                found[s] = b
+    return found
 
 
 def check_state(cfg, prov, head: str | None = None):
@@ -446,10 +491,12 @@ def commits_since(cfg, notes, head: str | None = None) -> dict:
 def uncommitted(store) -> tuple[int, bool]:
     """(new note rows, registry modified).
 
-    notes.jsonl is append-only, so ADDED LINES are new notes — a count git
-    status cannot give, since 200 appends are one changed path. arcs.jsonl
-    is rewritten in place, so a line delta there is meaningless; it is a
-    boolean. Computed unconditionally, never only after a write."""
+    Lines added less lines removed in notes.jsonl are new notes — a count
+    git status cannot give, since 200 appends are one changed path. An edit
+    keeps the row's id and moves the version it replaces to a new line, so
+    it reads +2 -1. arcs.jsonl is rewritten in place, so a line delta there
+    is meaningless; it is a boolean. Computed unconditionally, never only
+    after a write."""
     store = Path(store)
     notes, registry = 0, False
     for args in (["diff", "--numstat"], ["diff", "--cached", "--numstat"]):
@@ -458,9 +505,9 @@ def uncommitted(store) -> tuple[int, bool]:
             parts = line.split("\t")
             if len(parts) != 3:
                 continue
-            added, _removed, path = parts
-            if path.endswith("notes.jsonl") and added.isdigit():
-                notes += int(added)
+            added, removed, path = parts
+            if path.endswith("notes.jsonl") and added.isdigit() and removed.isdigit():
+                notes += int(added) - int(removed)
             elif path.endswith("arcs.jsonl"):
                 registry = True
     untracked = _git(store, "ls-files", "--others", "--exclude-standard").stdout.split()
@@ -480,14 +527,37 @@ def committed(store_dir) -> str:
     that named only the rows (2026-10-02, 2026-10-05). `-z`: a name git
     would quote prints as written."""
     rows = _git(store_dir, "log", "-1", "--format=%(trailers:key=Rows,valueonly)").stdout.strip()
-    files = [p for p in _git(store_dir, "show", "-z", "--name-only", "--format=", "HEAD")
-             .stdout.split("\0") if p.strip() and p not in (store.NOTES_FILE, store.ARCS_FILE)]
+    paths = [p for p in _git(store_dir, "show", "-z", "--name-only", "--format=", "HEAD")
+             .stdout.split("\0") if p.strip()]
+    if not paths:                                 # a wrap with nothing pending
+        return "committed: the message alone, no rows or files"
+    files = [p for p in paths if p not in (store.NOTES_FILE, store.ARCS_FILE)]
     said = [f"rows {rows}"] if rows else []
     if files:
         more = f", +{len(files) - 3} more" if len(files) > 3 else ""
         said.append(f"{len(files)} file{'' if len(files) == 1 else 's'}: "
                     f"{', '.join(files[:3])}{more}")
     return "committed" + (": " + "; ".join(said) if said else "")
+
+
+def last_wrap(store_dir, cfg) -> dict | None:
+    """The newest store commit a wrap made (`commit --wrap`, a `Wrap:`
+    trailer), as summary prints it: subject, body without the trailers, who
+    wrapped, when, and how many commits the repo's HEAD gained since (None
+    outside a repo). None when no commit carries the trailer. `--since` is
+    inclusive to the second, so a repo commit in the wrap's own second
+    counts."""
+    out = _git(store_dir, "log", "-1", "--grep=^Wrap: ",
+               "--format=%cI%x00%(trailers:key=Wrap,valueonly)%x00%(trailers)%x00%B").stdout
+    if "\0" not in out:
+        return None
+    at, who, trailers, full = out.split("\0", 3)
+    gist, _, body = full.strip().removesuffix(trailers.strip()).strip().partition("\n")
+    n = _git(cfg, "rev-list", "--count", "HEAD", f"--since={at}").stdout.strip()
+    # %cI is in the committer's offset; rows are stamped in UTC, so this is too.
+    at = datetime.fromisoformat(at).astimezone(timezone.utc).isoformat(timespec="seconds")
+    return {"gist": gist, "body": body.strip(), "author": who.strip(), "at": at,
+            "commits_since": int(n) if n.isdigit() else None}
 
 
 def unpushed(store) -> int | None:

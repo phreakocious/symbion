@@ -1,7 +1,9 @@
 # Symbion wrap: the session end, and a handoff kept in the store
 
 **Date:** 2026-10-10
-**Status:** Approved design, not implemented.
+**Status:** Approved design. Amended 2026-10-12: built without the handoff file (see the dated notes).
+
+**Amended 2026-10-12, no handoff file.** The owner chose to try the wrap with no file in the store. Under this design's own routing table the file would hold nothing a row or the commit does not: "start here" is the wrap commit's first line, which `summary` prints; "read first" is static and belongs in the instructions once; a practice to move into the instructions is a `task` for the person on that instruction file, listed at every session start until they move it, with a close path the file lacked. A blank commit message each wrap has no inertia, where the file still grew by the mechanism this design names. What ships: `commit --wrap -m` marks the commit with a `Wrap: <author>` trailer beside `Rows:`, `summary` prints the newest such message with its author, age and the repo commits since (`wrap` in `--json`), and `wrap.md` holds the procedure. Step 0, step 2, "The handoff in the store", C1, C2, the move recipe and rollout steps 2 and 3 fall away; the sections stay below as the record. On a machine with continuity, that tool keeps its own handoff file where it always did, and nothing here names it (amended later the same day: see "With continuity on the same machine"). Measured 2026-10-12 in continuity 0.20.0: its handoff scan stops at the git root, so a file in the store would have been invisible to it, and its ownership rule reads the assistant stamp, not a keeper sentence, so C1 and C2 were each real work there.
 **Amends:** SKILL.md's "Session end, and a handoff file" section, which this design replaces with a procedure of its own.
 **Relates to:** the continuity plugin (`/wrap`, `/next`, https://github.com/nullphase-net/enfurbish). This design changes nothing there; it states what symbion expects of a session-continuity tool on the same machine, and that tool decides how.
 
@@ -50,13 +52,13 @@ Neither tool names the other in its code. symbion's skill acts on "a wrap" by na
 
 A procedure in `src/symbion/data/skill/wrap.md`, beside `adoption.md` and `catalogs.md`. SKILL.md sends the agent there when the person asks for a wrap (`/symbion wrap` in Claude Code), and when any tool's wrap runs. It is skill text only. The one code change it relies on is the summary's handoff line (below).
 
-0. **Find the handoff.** A `NEXT_SESSION.md` in the store is this project's handoff: keep it in step 2. If the store has none and the repo root has one, the project keeps its handoff there, by another tool or until someone moves it: skip step 2 and say so in the report. If neither exists, step 2 creates the store's file when there is anything to say.
+0. *Dropped 2026-10-12 with the file.* **Find the handoff.** A `NEXT_SESSION.md` in the store is this project's handoff: keep it in step 2. If the store has none and the repo root has one, the project keeps its handoff there, by another tool or until someone moves it: skip step 2 and say so in the report. If neither exists, step 2 creates the store's file when there is anything to say.
 1. **The end-of-day question.** What did this session learn, decide, find broken or start, that no row holds yet? Search first (`list --grep`). Then:
    - `add` each one on its object: a trap on the file it concerns (`--tag gotcha`), a decision, a bug, a task (with `--due` when a job is still running).
    - `supersede` each row the session changed the truth of.
    - `resolve` each row the session finished, with `--body` saying how.
-2. **Rewrite the handoff,** prose only. The store's git keeps every version, so cut hard. The routing table below says what stays and where the rest goes.
-3. **Name the learnings for the person.** A learning that should change how future sessions work goes to the person with its cheapest home, the first of these that closes the loop: the environment (an install, an alias, a config), a hook (a shape a program can detect), a scoped rule, an always-on instruction. The wrap does not edit instruction files. Most sessions have none.
+2. *Dropped 2026-10-12 with the file.* **Rewrite the handoff,** prose only. The store's git keeps every version, so cut hard. The routing table below says what stays and where the rest goes.
+3. *Amended 2026-10-12: each becomes a `task` for the person on the instruction file it belongs in, tagged `practice`; the report names them once.* **Name the learnings for the person.** A learning that should change how future sessions work goes to the person with its cheapest home, the first of these that closes the loop: the environment (an install, an alias, a config), a hook (a shape a program can detect), a scoped rule, an always-on instruction. The wrap does not edit instruction files. Most sessions have none.
 4. **Commit the store, with the day as its message.** First `symbion commit --dry-run`, in a call of its own, to see what will go in. Then:
 
    ```bash
@@ -68,10 +70,12 @@ A procedure in `src/symbion/data/skill/wrap.md`, beside `adoption.md` and `catal
    )"
    ```
 
-   The quoted heredoc keeps backticks and `$` literal. symbion appends the `Rows:` trailer. Until `commit` can take only one session's rows, it also takes another live session's pending rows; the paragraph describes this session only, and the trailer names every author. The wrap does not push unless the project's instructions say to.
+   The quoted heredoc keeps backticks and `$` literal. symbion appends the `Rows:` trailer. Until `commit` can take only one session's rows, it also takes another live session's pending rows; the paragraph describes this session only, and the trailer names every author. The wrap does not push unless the project's instructions say to. *Amended 2026-10-12:* `commit` now takes only the rows this session wrote, and names the rows it left; `--all` takes those too.
 5. **Report.** Rows added, superseded and resolved; the handoff (written, unchanged, or kept at the repo root); the commit; the learnings for the person.
 
 ## The handoff in the store
+
+*Dropped 2026-10-12: no file. The routing table below still holds; its last row is the whole handoff.*
 
 `NEXT_SESSION.md` at the store root, tracked in the store's git. The first wrap creates it; `init` does not. Its shape:
 
@@ -108,6 +112,8 @@ The last section makes the pile visible. The mechanism that grows a handoff is u
 
 ## Session start
 
+*Amended 2026-10-12: the line is `last wrap by <author>, <age>, N commits since: <first line>`, with the message's paragraph indented below it, and `--json` gives `wrap: {gist, body, author, at, commits_since}`. The person's one line does not change. Written, below, is what the file version would have printed.*
+
 `symbion summary` names the handoff when the store has one:
 
 ```
@@ -129,6 +135,10 @@ The journal is the store's git log. Each wrap leaves one commit holding that day
 On a machine with both tools, a session writes two narratives of its day: continuity's retro ("What happened") and the store commit's message. That is accepted (the owner, 2026-10-10). They serve different loops, the tooling and the project, and a past-tense record does not go stale.
 
 ## With continuity on the same machine
+
+*Amended 2026-10-12: with no file, symbion expects nothing of continuity. C1 and C2 fall away; C3 holds.*
+
+*Amended later on 2026-10-12: the owner wants symbion's wrap to replace continuity's `/wrap -q`, and the full `/wrap` (retro and journal) to keep working beside it. So continuity no longer "keeps its own handoff file where it always did" (the amendment above): from 0.21.0, `/wrap -j` writes the retro and the journal and no handoff file, and with no handoff file in the cwd and another tool's list or last wrap in the session, a bare `/wrap` or `-q` asks first which was meant. That is continuity's change, made in its own repo; it names no tool, writes into none, and leaves continuity users without symbion where they were. A first cut skipped the handoff on its own whenever the hook printed a `last wrap` line; it was replaced the same day, because a flag says what the hook only implied. symbion still expects nothing of continuity. SKILL.md says what continuity does, and `adoption.md` retires a project's file.*
 
 `/wrap` stays one command. continuity writes its retro and its journal entry. symbion's steps run because SKILL.md acts on any wrap. symbion expects three things of continuity. They are continuity's to design, and none of them names symbion:
 
@@ -159,6 +169,8 @@ A project that keeps its handoff at the repo root, under continuity, keeps it th
 
 ## Rollout
 
+*Amended 2026-10-12: step 1 is the whole rollout.*
+
 1. **symbion:** the summary line, `wrap.md`, SKILL.md and the docs. This step ships alone: a project with symbion only gets the whole design here.
 2. **continuity:** C1 and C2, in its own repo, by its own design.
 3. **This project:** move `NEXT_SESSION.md` into the store and set C1. Not before step 2: until then, continuity's hook finds no handoff here, and its `/wrap` would start a new one at the repo root.
@@ -172,6 +184,6 @@ A project that keeps its handoff at the repo root, under continuity, keeps it th
 
 ## Known weak points
 
-- The handoff still grows for the same reason as before. This design makes the growth visible and cheap to cut. It does not make the file smaller by force.
+- The handoff still grows for the same reason as before. This design makes the growth visible and cheap to cut. It does not make the file smaller by force. *Amended 2026-10-12: moot without the file. The new weak point: a commit message is read through `summary` or `git log`, not a file, so a person browsing the store sees no handoff until the GUI shows the journal.*
 - The procedure is skill text. Only the fresh-agent run and later transcripts can show whether agents follow it.
-- `commit` takes every writer's pending rows, so a wrap's commit can hold another session's rows under a message that does not describe them.
+- `commit` takes every writer's pending rows, so a wrap's commit can hold another session's rows under a message that does not describe them. *Amended 2026-10-12:* no longer; `commit` takes only this session's rows unless given `--all`.

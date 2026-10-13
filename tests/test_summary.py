@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 
 from datetime import datetime, timedelta, timezone
@@ -599,8 +600,27 @@ def test_render_labels_the_priority_block_not_a_bare_star(tmp_path):
               arc_id=aid, tags=["priority"])
     text = summary.render_summary(summary.summary(tmp_path, cfg))
     assert "task 0" in text.splitlines()[0]
-    assert any(ln.startswith("  priority [task] item:in-arc") for ln in text.splitlines()), text
+    assert any(ln.startswith("  priority [task, arc a] item:in-arc") for ln in text.splitlines()), text
     assert not any(ln.startswith("  * ") for ln in text.splitlines())
+
+
+def test_a_printed_row_the_header_leaves_out_says_why(tmp_path):
+    """The header counts open non-parked rows outside active arcs; the due
+    and `from` blocks print parked rows and arc rows too. A session summed
+    the rows against the header and reported a counting bug (2026-10-12).
+    A head never carries either label: it is what the header counts."""
+    cfg = Config(project_root=tmp_path)
+    aid = store.create_arc(tmp_path, "Release", "", "item").id
+    for name, kind, arc in (("idea", "idea", None), ("boxed", "task", aid),
+                            ("loose", "task", None)):
+        store.add(tmp_path, kind=kind, target={"type": "item", "name": name},
+                  author="owner", arc_id=arc)
+    data = summary.summary(tmp_path, cfg, reader="claude")
+    assert data["open"]["task"] == 1
+    lines = summary.render_summary(data).splitlines()
+    assert any("[idea, parked] item:idea" in ln for ln in lines), lines
+    assert any("[task, arc release] item:boxed" in ln for ln in lines), lines
+    assert any("[task] item:loose" in ln for ln in lines), lines
 
 
 def test_a_star_says_how_long_it_has_been_on(tmp_path, monkeypatch):
@@ -792,7 +812,7 @@ def test_the_due_block_lists_past_due_and_due_soon_open_rows_once(tmp_path):
     assert not listed & {d["id"] for d in data["due"]}, "a due row prints once"
     assert far in {h["id"] for h in data["heads"]}
     text = summary.render_summary(data)
-    assert text.splitlines()[1].startswith("  overdue 2d [task] item:in-arc"), \
+    assert text.splitlines()[1].startswith("  overdue 2d [task, arc a] item:in-arc"), \
         "the due block leads, right under the header"
 
 
@@ -844,15 +864,69 @@ def test_seams_mark_where_each_append_and_prepend_joins_the_heads_body():
         ["top\n\n", "lead", "\n\nmore"]
 
 
-def test_a_rewrite_drops_the_seams_before_it_and_an_unchanged_body_keeps_them():
+def test_a_rewrite_drops_the_seams_whose_words_it_cut_and_an_unchanged_body_keeps_them():
+    t2 = "2026-10-02T00:00:00+00:00"
     kept = _versions(("ada", "a"), ("sam", "a\n\nb"), ("kim", "a\n\nb"))
-    assert summary.seams(*kept) == [(1, "sam", "2026-10-02T00:00:00+00:00", False)]
-    rewritten = _versions(("ada", "a"), ("sam", "a\n\nb"), ("kim", "A\n\nb"))
+    assert summary.seams(*kept) == [(1, "sam", t2, False)]
+    # A seam stays beside the kept words on either side of it.
+    above = _versions(("ada", "one two three"), ("sam", "one two three\n\nfour five six seven"),
+                      ("kim", "one two three\n\nFour five six seven"))
+    assert summary.seams(*above) == [(13, "sam", t2, False)]
+    below = _versions(("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
+                      ("kim", "one two THREE\n\nfour five six"))
+    assert summary.seams(*below) == [(13, "sam", t2, False)]
+    rewritten = _versions(("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
+                          ("kim", "One Two three\n\nFour Five six"))
     assert summary.seams(*rewritten) == []
+    # One word in common is chance, not kept text.
+    chance = _versions(("ada", "q one two"), ("sam", "q one two\n\nthe answer here"),
+                       ("kim", "a fresh text with the rest new"))
+    assert summary.seams(*chance) == []
+    # An append that went on with the sentence put its seam inside a word.
+    inside = _versions(("ada", "filter as you type"), ("sam", "filter as you type, then search"),
+                       ("kim", "Filter as you type, then search\n\nok"))
+    assert summary.seams(*inside) == [(18, "sam", t2, False),
+                                      (31, "kim", "2026-10-03T00:00:00+00:00", False)]
+    # The edit took back what the seam marked.
+    taken = _versions(("ada", "one two three"), ("sam", "one two three #gui\n"),
+                      ("kim", "one two three"))
+    assert summary.seams(*taken) == []
     after = _versions(("ada", "a"), ("sam", "x"), ("kim", "x\n\nc"))
     assert summary.seams(*after) == [(1, "kim", "2026-10-03T00:00:00+00:00", False)]
     # A body written into an empty row is its first text, not an amendment.
     assert summary.seams(*_versions(("ada", ""), ("sam", "b"))) == []
+
+
+def test_an_edit_that_also_writes_a_paragraph_below_gets_a_seam_before_it():
+    """The owner cut a sentence from an agent's question and answered below
+    it in one save: read as a rewrite, the answer joined the question."""
+    t2, t3 = "2026-10-02T00:00:00+00:00", "2026-10-03T00:00:00+00:00"
+    by_id, head = _versions(("ada", "Pick a or b. Answer with resolve.\n"),
+                            ("sam", "Pick a or b.\n\nb, since a misleads."))
+    assert summary.seams(by_id, head) == [(12, "sam", t2, False)]
+    # An edit in the middle, then a paragraph below.
+    by_id, head = _versions(("ada", "teh first part\n\nsome more text"),
+                            ("sam", "the first part\n\nsome more text\n\nan answer"))
+    assert summary.seams(by_id, head) == [(30, "sam", t2, False)]
+    # A fix inside the last paragraph writes no paragraph of its own.
+    assert summary.seams(*_versions(("ada", "one two three\n\nteh end of it"),
+                                    ("sam", "one two three\n\nthe end of it"))) == []
+    assert summary.seams(*_versions(("ada", "one two three\n\nthe end ned"),
+                                    ("sam", "one two three\n\nthe end end"))) == []
+    # The text below an earlier seam rewritten: the new seam takes its place.
+    by_id, head = _versions(("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
+                            ("kim", "one two three\n\nseven eight nine"))
+    assert summary.seams(by_id, head) == [(13, "kim", t3, False)]
+
+
+def test_the_amendment_count_is_the_seams_below_the_body():
+    """A question the owner trimmed and answered in one save read `+1
+    amendment` beside the two seams `show` marked (2026-10-11)."""
+    assert summary._amendments(*_versions(
+        ("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
+        ("kim", "One two three\n\nfour five six\n\nseven eight"))) == 2
+    # Text above shows in the digest, and a newline is no text.
+    assert summary._amendments(*_versions(("ada", "x"), ("sam", "top\n\nx\n"))) == 0
 
 
 def test_one_link_that_adds_above_and_below_gets_a_seam_at_each_end():
@@ -867,3 +941,40 @@ def test_one_link_that_adds_above_and_below_gets_a_seam_at_each_end():
     assert summary.seams(by_id, head) == [(5, "sam", "2026-10-02T00:00:00+00:00", True)]
     by_id, head = _versions(("ada", "x"), ("sam", "\n\nx\n\nend"))
     assert summary.seams(by_id, head) == [(3, "sam", "2026-10-02T00:00:00+00:00", False)]
+
+
+def test_summary_names_the_last_wrap_and_the_repo_commits_since(tmp_path):
+    """A wrap's commit message is the handoff: at session start the next
+    session reads its gist and paragraph, who wrapped, how long ago, and how
+    many repo commits landed after it. A plain commit is not a wrap, and the
+    trailers are not prose."""
+    r = tmp_path / "p"
+    r.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True)
+    old = {**os.environ, "GIT_COMMITTER_DATE": "2020-01-01T00:00:00Z"}
+    (r / "f").write_text("x")
+    _run(r, "add", "-A")
+    subprocess.run(["git", "-C", str(r), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "old"], check=True, env=old)
+    cfg = Config(project_root=r)
+    s = tmp_path / "store"
+    store.ensure_store(s)
+    store.add(s, kind="note", target={"type": "project", "name": None}, body="x", author="ada")
+    assert summary.summary(s, cfg)["wrap"] is None
+    assert "wrap" not in summary.render_summary(summary.summary(s, cfg))
+    store.commit(s, "a plain commit", cfg)
+    assert summary.summary(s, cfg)["wrap"] is None
+    store.add(s, kind="note", target={"type": "project", "name": None}, body="y", author="ada")
+    assert store.commit(s, "the gist\n\nthe day, in a paragraph", cfg, wrap="ada")
+    (r / "g").write_text("y")
+    _run(r, "add", "-A")
+    _run(r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "after")
+    d = summary.summary(s, cfg)
+    w = d["wrap"]
+    assert w["gist"] == "the gist" and w["body"] == "the day, in a paragraph"
+    assert w["author"] == "ada" and w["commits_since"] == 1
+    assert w["at"].endswith("+00:00"), "a stamp in the row's zone, not the committer's"
+    text = summary.render_summary(d)
+    assert "  last wrap by ada, just now, 1 commit since: the gist\n    the day, in a paragraph" in text
+    assert "Rows:" not in text and "Wrap:" not in text
+    assert summary.empty_summary()["wrap"] is None

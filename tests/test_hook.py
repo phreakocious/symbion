@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from symbion import store
+from symbion.config import Config
 from symbion.catalog import posix_sh
 
 HOOK = Path(__file__).resolve().parents[1] / "src/symbion/data/skill/session_start.sh"
@@ -110,6 +111,21 @@ def test_hook_shows_the_person_one_line_and_the_agent_the_summary(git_repo, tmp_
     r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
                        env={**env, "SYMBION_AUTHOR": "codex"})
     assert list(json.loads(r.stdout)) == ["hookSpecificOutput"]
+
+
+def test_hook_carries_the_last_wrap(git_repo, tmp_path):
+    """The handoff is the wrap commit's message, so the hook hands it to the
+    agent where a handoff file would have been read."""
+    store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
+    store.add(store_dir, kind="note", target={"type": "project", "name": None}, body="x")
+    store.commit(store_dir, "the gist\n\nread this first", Config(project_root=git_repo),
+                 wrap="ada")
+    env = {**SRC_ENV, "PATH": TOOLS, "SYMBION_DIR": str(store_dir)}
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env)
+    assert r.returncode == 0 and r.stderr == ""
+    text = _context(r.stdout)
+    assert "last wrap by ada, just now" in text and "    read this first" in text, text
 
 
 def test_hook_names_the_absent_store(git_repo, tmp_path):
@@ -377,3 +393,64 @@ def test_hook_in_a_linked_worktree_reads_the_main_checkouts_store(git_repo, tmp_
         assert "bug 1" in _context(r.stdout), f"skipped the main checkout's store: {r.stdout!r}"
     else:
         assert r.stdout == ""
+
+
+# ---- the gotcha hook ----
+GOTCHAS = HOOK.with_name("gotchas.sh")
+
+
+def _touch(env, payload):
+    r = subprocess.run([SH, str(GOTCHAS)], input=payload if isinstance(payload, str)
+                       else json.dumps(payload), capture_output=True, text=True, env=env)
+    assert r.returncode == 0 and r.stderr == "", r
+    if not r.stdout:
+        return ""
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    assert out["hookEventName"] == "PostToolUse"
+    return out["additionalContext"]
+
+
+def test_a_files_gotcha_reaches_a_session_the_first_time_it_touches_the_file(git_repo,
+                                                                            tmp_path):
+    """A trap recorded on a file reached a session only if it ran `context
+    --target` on that file first, and four sessions did not, each at a cost
+    (2026-10-02 to 10-10). Session start lists the session's #gotcha rows on
+    catalog names, and the tool hook prints a row the first time a tool call
+    names its file: once per session, until the next session start (a
+    compaction drops what the agent read)."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    serve, other = ({"type": "file", "name": n} for n in ("src/serve.py", "src/other.py"))
+    hit = store.add(s, kind="note", target=serve, author="ann", tags=["gotcha"],
+                    body="**Start a scratch serve with XDG_CACHE_HOME.** Or a sidebar lists it.")
+    via_ref = store.add(s, kind="note", target={"type": "project", "name": None}, author="ann",
+                        tags=["gotcha"], refs=[other], body="ref trap")
+    for target, tags, body in ((serve, [], "not a trap"), (serve, ["gotcha", "retired"], "old"),
+                               ({"type": "item", "name": "windows"}, ["gotcha"], "item trap")):
+        store.add(s, kind="note", target=target, author="ann", tags=tags, body=body)
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
+
+    def start(sid):
+        r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                           env=env, input=json.dumps({"session_id": sid,
+                                                      "hook_event_name": "SessionStart"}))
+        assert r.returncode == 0 and "bug" in _context(r.stdout), r
+
+    start("s1")
+    read = {"session_id": "s1", "tool_name": "Read",
+            "tool_input": {"file_path": f"{git_repo}/src/serve.py"},
+            "tool_response": {"file": {"content": "import other  # src/other.py, windows"}}}
+    said = _touch(env, read)
+    assert hit.id[-10:] in said and "Start a scratch serve with XDG_CACHE_HOME." in said, said
+    assert not any(t in said for t in ("ref trap", "not a trap", "old", "item trap")), said
+    assert _touch(env, read) == "", "once per session"
+    windows = {"session_id": "s1", "tool_name": "Edit",
+               "tool_input": {"file_path": "C:\\proj\\src\\other.py", "old_string": "a"}}
+    assert via_ref.id[-10:] in _touch(env, windows), "a ref names the file too"
+    bash = {"session_id": "s1", "tool_name": "Bash",
+            "tool_input": {"command": "sed -n 1,20p src/serve.py  # windows"}}
+    assert _touch(env, bash) == ""
+    start("s1")                                   # compacted: the agent read it before
+    assert hit.id[-10:] in _touch(env, bash)
+    assert _touch(env, {**bash, "session_id": "s2"}) == "", "no session start, no list"
+    assert _touch(env, "") == "" and _touch(env, "not json") == ""

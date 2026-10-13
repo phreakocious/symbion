@@ -11,13 +11,14 @@ import sys
 import sysconfig
 import time
 import urllib.request
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("nicegui")
 
-from symbion import store     # noqa: E402
+from symbion import gitref, store     # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -193,7 +194,11 @@ def test_restart_re_execs_every_serve_in_its_own_terminal(tmp_path):
             _kill(p)
             p.communicate()
     assert restart.returncode == 0, restart
-    assert f"restarted {(tmp_path / 's').resolve()}: http://127.0.0.1:{port}" in restart.stdout
+    # the build it now runs: the re-exec keeps the pid, so only this says
+    # whether the restart took
+    assert after["build"] == (gitref.own_commit() or version("symbion")), after
+    assert (f"restarted {(tmp_path / 's').resolve()}: http://127.0.0.1:{port} "
+            f"at {after['build']}\n") in restart.stdout, restart.stdout
     assert status == 200 and after["pid"] == before["pid"] == p.pid, (before, after)
     assert after["started"] > before["started"]
     assert command[-1] == "--no-browser", command
@@ -259,6 +264,22 @@ def test_restart_signals_no_process_that_is_not_a_serve(tmp_path, monkeypatch, c
     assert other.returncode == -signal.SIGKILL, "a process that is no serve got the signal"
     assert "/x/other" not in out and not (servers._dir() / f"{other.pid}.json").exists()
     assert f"/x/old: pid {old} exited instead of restarting" in out, out
+
+
+def test_a_serve_writes_in_no_agent_session(tmp_path, monkeypatch):
+    """A serve started from an agent's shell inherits its session key, so the
+    person's rows would read as that session's, and its `commit` would take
+    them. The serve drops the key, --reload's child too."""
+    from symbion import api
+    from symbion.gui import serve
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(serve, "build_page", lambda ctx, author: None)
+    monkeypatch.setattr(serve.ui, "run", lambda **kw: None)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    monkeypatch.setenv("CODEX_THREAD_ID", "t1")
+    store.ensure_store(tmp_path / "s")
+    serve.main(api.resolve(str(tmp_path / "s")), author="t", port=1111, show=False)
+    assert store.session_key() is None
 
 
 def test_a_second_serve_on_a_store_takes_its_links_when_the_first_stops(tmp_path, monkeypatch,
@@ -567,3 +588,20 @@ def test_a_bad_allow_is_a_usage_error(tmp_path, capsys):
     store.ensure_store(tmp_path)
     assert cli.main(["--dir", str(tmp_path), "serve", "--allow", "lan"]) == 2
     assert "--allow: 'lan' does not appear to be" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name == "nt", reason="--restart refuses on Windows")
+def test_restart_ends_with_a_count_so_a_cut_pipe_shows(monkeypatch, capsys):
+    """`serve --restart | tail -5` hid a serve, which went unprobed
+    (2026-10-11); a session here cut it with `| tail -1` (2026-10-12). The
+    last line counts them, and the ones that did not restart."""
+    from symbion import cli
+    from symbion.gui import servers
+    r = {"store": "/s", "url": "http://127.0.0.1:1", "pid": 7}
+    monkeypatch.setattr(servers, "signal_all",
+                        lambda restart: [("restarted", r), ("restarted", r), ("timeout", r)])
+    assert cli._serve_all(restart=True) == 1
+    assert capsys.readouterr().out.splitlines()[-1] == "restarted 2 of 3 serves"
+    monkeypatch.setattr(servers, "signal_all", lambda restart: [("stopped", r)])
+    assert cli._serve_all(restart=False) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "stopped 1 of 1 serve"

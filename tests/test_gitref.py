@@ -245,6 +245,26 @@ def test_a_catalog_miss_says_when_the_path_is_on_the_default_branch(repo, capsys
     assert "taken as typed\n" in err and "worktree" not in err, err
 
 
+def test_a_catalog_miss_says_when_the_path_is_a_gitignored_file_here(repo, capsys):
+    """`git ls-files --others --exclude-standard` drops an ignored file, so a
+    task on a gitignored CLAUDE.md got the typo's note, and the agent spent a
+    sentence of its report explaining it (2026-10-12).
+
+    Both halves are probed: an ignored pattern with no file behind it is an
+    ordinary miss, and a file a filtering catalog leaves out is not ignored."""
+    (repo / ".gitignore").write_text("CLAUDE.md\n*.log\n")
+    (repo / "CLAUDE.md").write_text("x")
+    cfg = Config(project_root=repo, catalogs={"file": "true"})
+
+    catalog.match(cfg, "file", "CLAUDE.md", ["f1"])
+    err = capsys.readouterr().err
+    assert "taken as typed; it is a gitignored file in this worktree" in err, err
+    for plain in ("absent.log", "f0"):
+        catalog.match(cfg, "file", plain, ["f1"])
+        err = capsys.readouterr().err
+        assert "taken as typed\n" in err and "gitignored" not in err, (plain, err)
+
+
 def test_provenance_is_stamped_only_for_verdict_kinds(repo):
     cfg = Config(project_root=repo)
     assert gitref.provenance_stamp(cfg, K.Kind()) is None

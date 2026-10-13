@@ -177,7 +177,7 @@ def why_unverifiable(prov) -> str
 | route | read call |
 |---|---|
 | `/` | boards: open anomalies, standalone followups, `#priority`, recent audits — via the shared predicates below (Amended 2026-09-10: one board per non-parked status kind and one per verdict kind, from the kinds table.) |
-| `/notes?tag=&kind=&status=&type=&name=&activity=&author=&structured=` | `store.query()` over `heads()` |
+| `/notes?tag=&kind=&status=&type=&name=&activity=&author=&structured=` | `store.query()` over `heads()` (Amended 2026-10-10: `structured=` removed; no link or doc built it.) |
 | `/object?type=&name=` | `heads_for()` — includes notes that **ref** the object |
 | `/tags` | `tag_counts()`, each entry a link to `/notes?tag=` |
 | `/activities` | `load_activities()` + progress + new-activity form |

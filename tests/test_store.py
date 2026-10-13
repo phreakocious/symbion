@@ -73,9 +73,11 @@ def test_supersede_fast_forwards_a_stale_old_id_to_the_live_tip(tmp_path):
     a = store.add(tmp_path, kind="bug", target={"type": "project", "name": None})
     b = store.supersede(tmp_path, a.id, status="resolved")
     c = store.supersede(tmp_path, a.id, body="second correction")
-    hs = store.heads(store.load(tmp_path))
-    assert [h.id for h in hs] == [c.id]
-    assert c.supersedes == b.id
+    rows = store.load(tmp_path)
+    by = {n.id: n for n in rows}
+    assert [h.id for h in store.heads(rows)] == [c.id] == [b.id] == [a.id]
+    assert [by[c.supersedes].status, by[by[c.supersedes].supersedes].status] == \
+        ["resolved", "open"], "c chains onto b's version, which chains onto a's"
 
 
 @pytest.mark.parametrize("old, want", [
@@ -141,7 +143,6 @@ def test_query_filters_on_every_field(tmp_path):
     assert len(store.query(notes, status="open")) == 1
     assert len(store.query(notes, arc_id="act1")) == 1
     assert len(store.query(notes, tag="x")) == 1
-    assert len(store.query(notes, structured=True)) == 0
 
 
 def test_malformed_line_does_not_break_the_read(tmp_path):
@@ -410,9 +411,9 @@ def test_renaming_a_used_label_with_the_documented_sed_keeps_ids_and_chains(tmp_
     notes = store.load(tmp_path)
     assert len(notes) == 2
     heads = store.heads(notes)
-    assert [h.id for h in heads] == [r.id]
+    assert [h.id for h in heads] == [r.id] == [b.id]
     assert heads[0].kind == "anomaly"
-    assert heads[0].supersedes == b.id
+    assert heads[0].supersedes == next(n.id for n in notes if n.id != b.id)
 
 
 # ---- canonicalize= runs under the lock, over everything, before any write ----
@@ -531,7 +532,7 @@ def test_a_supersede_that_drops_a_field_never_edits_in_place(tmp_path):
     path.write_text(path.read_text(encoding="utf-8")
                     .replace('"checked": null', '"checked": "ran it"'), encoding="utf-8")
     new = store.supersede(tmp_path, n.id, author="claude", tags=["x"])
-    assert new.id != n.id and new.checked is None
+    assert new.supersedes is not None and new.checked is None
     assert [r.checked for r in store.load(tmp_path)] == ["ran it", None]
 
 
@@ -698,7 +699,7 @@ def test_rename_moves_targets_and_repoints_refs_one_case_per_shape(tmp_path):
     assert store.rename_target(tmp_path, "item", "old", "new") == (3, 4)
 
     notes = store.load(tmp_path)
-    head = {n.supersedes or n.id: n for n in store.heads(notes)}
+    head = {n.id: n for n in store.heads(notes)}
     T = store.Target
     assert head[on].target == T("item", "new")
     assert head[ref_only].refs == (T("item", "new"),)
@@ -789,9 +790,10 @@ def test_an_edit_git_never_saw_rewrites_the_row_in_place(tmp_path):
     _commit(tmp_path)
     b = store.supersede(tmp_path, a.id, author="ann", body="v2")         # a is in git
     c = store.supersede(tmp_path, a.id, author="ann", body="v3", tags=["x"])
-    assert (c.id, c.created_at, c.supersedes) == (b.id, b.created_at, a.id)
+    assert (c.id, c.created_at, c.supersedes) == (a.id, b.created_at, b.supersedes)
     on_disk = store.load(tmp_path)
-    assert [(n.id, n.body, n.tags) for n in on_disk] == [(a.id, "v1", ()), (b.id, "v3", ("x",))]
+    assert [(n.id, n.body, n.tags) for n in on_disk] == \
+        [(b.supersedes, "v1", ()), (a.id, "v3", ("x",))]
 
 
 @pytest.mark.parametrize("case", ["committed", "other author", "cited", "resolve",
@@ -812,8 +814,9 @@ def test_an_edit_keeps_the_old_row_where_its_history_matters(tmp_path, case):
     edit = {"status": "resolved"} if case == "resolve" else {"body": "v2"}
     b = store.supersede(tmp_path, a.id, author="bob" if case == "other author" else "ann",
                         **edit)
-    assert b.id != a.id and b.supersedes == a.id
-    assert next(n for n in store.load(tmp_path) if n.id == a.id).body == "v1"
+    assert b.id == a.id and b.supersedes not in (None, a.id)
+    kept = next(n for n in store.load(tmp_path) if n.id == b.supersedes)
+    assert (kept.body, kept.created_at, kept.author) == ("v1", a.created_at, "ann")
 
 
 # json.dumps(ensure_ascii=False) leaves these raw, and str.splitlines() splits
@@ -851,7 +854,7 @@ def test_a_committed_line_separator_row_reads_as_committed(tmp_path):
     msg = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%B"],
                          capture_output=True, text=True, encoding="utf-8").stdout
     assert "Rows: ann 1" in msg, msg
-    assert store.supersede(tmp_path, a.id, author="ann", body="v2").id != a.id
+    assert store.supersede(tmp_path, a.id, author="ann", body="v2").supersedes is not None
 
 
 def test_a_commit_with_keep_leaves_the_other_rows_pending(tmp_path):
@@ -889,6 +892,236 @@ def test_a_commit_with_keep_leaves_the_other_rows_pending(tmp_path):
     assert [r["id"] for r in store.pending_rows(tmp_path)] == [bob.id]
 
 
+def test_own_rows_are_the_sessions_and_with_none_the_authors(tmp_path, monkeypatch):
+    """`commit` swept a live session's rows into another's commit four times
+    (2026-10-06 to 10-10). Every Claude session writes as `claude`, so the
+    session key decides: a row this session wrote is its own, whoever it is
+    written as (`/symbion KIND` writes as the person). With no key, the
+    author's rows that no session wrote."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    store.add(tmp_path, kind="note", target=project, body="old", author="ann")
+    assert store.commit(tmp_path, "c", cfg)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    mine = store.add(tmp_path, kind="note", target=project, body="mine", author="claude")
+    as_ann = store.add(tmp_path, kind="idea", target=project, body="ann's words", author="ann")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
+    theirs = store.add(tmp_path, kind="note", target=project, body="theirs", author="claude")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    by_hand = store.add(tmp_path, kind="note", target=project, body="by hand", author="ann")
+
+    rows = store.pending_rows(tmp_path)
+    def own(key, author):
+        if key:
+            monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", key)
+        else:
+            monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        keep = store.own_rows(tmp_path, author)
+        return {r["id"] for r in rows if keep(r)}
+    assert own("s1", "claude") == {mine.id, as_ann.id}
+    assert own("s2", "claude") == {theirs.id}
+    assert own(None, "ann") == {by_hand.id}
+    assert own(None, "claude") == set()
+    monkeypatch.setenv("CODEX_THREAD_ID", "s2")         # the innermost agent's key
+    assert own("s1", "codex") == {theirs.id}
+
+
+def test_a_commit_forgets_the_sessions_of_the_rows_it_took(tmp_path, monkeypatch):
+    """The record of which session wrote a row matters only while the row is
+    pending, so a commit keeps the entries of the rows it left and no more."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    a = store.add(tmp_path, kind="note", target=project, body="a", author="claude")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
+    b = store.add(tmp_path, kind="note", target=project, body="b", author="claude")
+    assert set(store.sessions(tmp_path)) == {a.id, b.id}
+    assert store.commit(tmp_path, "c", cfg, keep=store.own_rows(tmp_path, "claude"))
+    assert store.sessions(tmp_path) == {a.id: "s1"}
+    assert [r["id"] for r in store.pending_rows(tmp_path)] == [a.id]
+
+
+def test_another_sessions_draft_is_not_rewritten_in_place(tmp_path, monkeypatch):
+    """`own_draft` checked the author only, so one Claude session could
+    rewrite another's uncommitted `claude` row and leave no earlier version
+    of what that session may still be reading."""
+    project = {"type": "project", "name": None}
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    a = store.add(tmp_path, kind="task", target=project, body="v1", author="claude")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
+    b = store.supersede(tmp_path, a.id, author="claude", body="v2")
+    assert b.supersedes, "s2's edit kept s1's version"
+    # The version s2's edit kept is still s1's to commit; the edit is s2's.
+    rows = store.pending_rows(tmp_path)
+    assert {r["body"] for r in rows if store.own_rows(tmp_path, "claude")(r)} == {"v2"}
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    assert {r["body"] for r in rows if store.own_rows(tmp_path, "claude")(r)} == {"v1"}
+    c = store.supersede(tmp_path, b.id, author="claude", body="v3")
+    assert c.supersedes != b.supersedes and len(store.load(tmp_path)) == 3
+    # An edit outside any session is no session's, and the author's own.
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    store.supersede(tmp_path, a.id, author="ann", body="v4")
+    rows = store.pending_rows(tmp_path)
+    assert {r["body"] for r in rows if store.own_rows(tmp_path, "ann")(r)} == {"v4"}
+
+
+def test_interleaved_keep_commits_leave_the_right_rows_pending(tmp_path, monkeypatch):
+    """Two sessions commit their own rows out of file order. A moved line
+    must not read as pending, and the file takes HEAD's order, with the rows
+    a commit left after it: a commit wrote its rows after HEAD's, but left
+    them among the others on disk, and git read the difference as moved
+    lines that no later commit stages (2026-10-12)."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    store.add(tmp_path, kind="note", target=project, body="old", author="ann")
+    assert store.commit(tmp_path, "c", cfg)
+    ids = {}
+    for key, body in (("s1", "a1"), ("s2", "b1"), ("s1", "a2"), ("s2", "b2")):
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", key)
+        ids[body] = store.add(tmp_path, kind="note", target=project, body=body,
+                              author="claude").id
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
+    assert store.commit(tmp_path, "c2", cfg, keep=store.own_rows(tmp_path, "claude"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s3")
+    store.add(tmp_path, kind="note", target=project, body="c1", author="claude")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    assert store.commit(tmp_path, "c3", cfg, keep=store.own_rows(tmp_path, "claude"))
+    import subprocess
+    head = subprocess.run(["git", "-C", str(tmp_path), "show", "HEAD:notes.jsonl"],
+                          capture_output=True, text=True).stdout.splitlines()
+    disk = (tmp_path / "notes.jsonl").read_text().splitlines()
+    assert disk[:len(head)] == head, "the file is in HEAD's order"
+    assert [json.loads(ln)["body"] for ln in disk[len(head):]] == ["c1"]
+    assert [r["body"] for r in store.pending_rows(tmp_path)] == ["c1"]
+
+
+def test_a_keep_commit_leaves_no_line_moved_against_head(tmp_path, monkeypatch):
+    """A version another session's edit kept stays where its row's line is,
+    and a pure move, which no commit stages, is put back by the next one."""
+    import subprocess
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    path = tmp_path / "notes.jsonl"
+    old = store.add(tmp_path, kind="note", target=project, body="old", author="ann")
+    x = store.add(tmp_path, kind="task", target=project, body="x", author="ann", status="open")
+    assert store.commit(tmp_path, "c", cfg)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
+    kept = store.supersede(tmp_path, x.id, author="claude", body="x2").supersedes
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    y = store.add(tmp_path, kind="note", target=project, body="y", author="claude")
+    assert store.commit(tmp_path, "c2", cfg, keep=store.own_rows(tmp_path, "claude"))
+    ids = lambda: [json.loads(ln)["id"] for ln in path.read_text().splitlines()]
+    assert ids() == [old.id, kept, y.id, x.id]
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
+    assert store.commit(tmp_path, "c3", cfg, keep=store.own_rows(tmp_path, "claude"))
+    head = lambda: subprocess.run(["git", "-C", str(tmp_path), "show", "HEAD:notes.jsonl"],
+                                  capture_output=True, text=True).stdout
+    assert path.read_text() == head()
+
+    lines = path.read_text().splitlines()
+    path.write_text("\n".join([lines[1], lines[0], *lines[2:]]) + "\n")
+    assert not store.commit(tmp_path, "c4", cfg, keep=lambda r: False), "nothing to take"
+    assert path.read_text() == head()
+
+
+def test_an_edit_keeps_the_rows_id_and_the_earlier_version_takes_a_new_one(tmp_path):
+    """A row went through three ids in one session, and cites, commit
+    messages and chat went stale within the hour (2026-10-11). The head keeps
+    the id; the version it replaces keeps its line, its time and its author
+    under a new id, so the chain every reader walks is whole."""
+    project = {"type": "project", "name": None}
+    a = store.add(tmp_path, kind="task", target=project, body="v1", author="ann")
+    z = store.add(tmp_path, kind="note", target=project, body="after", author="ann")
+    _commit(tmp_path)
+    b = store.supersede(tmp_path, a.id, author="bob", append_body="more")
+    rows = store.load(tmp_path)
+    assert [(n.id, n.body, n.author, n.created_at) for n in rows] == [
+        (b.supersedes, "v1", "ann", a.created_at), (z.id, "after", "ann", z.created_at),
+        (a.id, "v1\n\nmore", "bob", b.created_at)]
+    assert [h.id for h in store.heads(rows)] == [z.id, a.id]
+    assert len({n.id for n in rows}) == len(rows)
+
+
+def test_a_duplicate_id_reads_as_unreadable_and_its_row_refuses_a_write(tmp_path):
+    """Two copies of a store edited one row, and a merge that kept both sides
+    left two heads under one id: `list` printed both, and a resolve closed
+    one (2026-10-13). The later line is skipped and named, and a write to
+    that id is refused, since it would rewrite both lines."""
+    a = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
+                  body="v1", author="ann")
+    path = store.notes_path(tmp_path)
+    line = path.read_text().splitlines()[0]
+    path.write_text(line + "\n" + line.replace('"v1"', '"v2"') + "\n")
+    assert [n.body for n in store.load(tmp_path)] == ["v1"]
+    (lineno, _, err), = store.load_malformed(tmp_path)
+    assert lineno == 2 and err.startswith(f"duplicate id {a.id}: line 1 has it too"), err
+    before = path.read_text()
+    with pytest.raises(ValueError, match=r"is on lines 1 and 2"):
+        store.supersede(tmp_path, a.id, author="bob", append_body="more")
+    assert path.read_text() == before
+
+
+def test_a_kept_versions_id_carries_its_own_time(tmp_path, monkeypatch):
+    """An id read as a date names the version it is on. The kept version's
+    new id took the edit's time, so a reader took two versions' times for
+    each other's (2026-10-13)."""
+    from datetime import timezone
+    clock = [datetime(2026, 10, 13, 4, 10, 30, 123456, tzinfo=timezone.utc)]
+    monkeypatch.setattr(store, "_utcnow", lambda: clock[0])
+    a = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
+                  body="v1", author="ann")
+    clock[0] = datetime(2026, 10, 13, 4, 10, 32, 654321, tzinfo=timezone.utc)
+    b = store.supersede(tmp_path, a.id, author="bob", append_body="more")
+    assert (b.id, b.supersedes[:15]) == (a.id, "20261013-041030")
+
+
+def test_a_kept_version_is_not_a_pending_row(tmp_path):
+    """The earlier version's line moved to a new id, and read as a row its
+    author had written: `Rows: ann 1, bob 1` for bob's one edit."""
+    import subprocess
+    from types import SimpleNamespace
+    from symbion import gitref
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    a = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
+                  body="v1", author="ann")
+    assert store.commit(tmp_path, "c", cfg)
+    store.supersede(tmp_path, a.id, author="bob", body="v2")
+    assert [r["author"] for r in store.pending_rows(tmp_path)] == ["bob"]
+    assert gitref.uncommitted(tmp_path) == (1, False)
+    assert not store.commit(tmp_path, "c2", cfg, keep=lambda r: r.get("author") == "ann")
+    assert store.commit(tmp_path, "c3", cfg, keep=lambda r: r.get("author") == "bob")
+    git = ["git", "-C", str(tmp_path)]
+    assert "Rows: bob 1" in subprocess.run([*git, "log", "-1", "--format=%B"],
+                                           capture_output=True, text=True).stdout
+    assert subprocess.run([*git, "status", "--porcelain"], capture_output=True,
+                          text=True).stdout == ""
+
+
+def test_of_rows_written_in_one_second_the_later_write_lists_first(tmp_path, monkeypatch):
+    """A stamp is to the second, and the id broke the tie. An edit keeps the
+    row's id, so an edit of an older row sorted behind a row it followed."""
+    monkeypatch.setattr(store, "_now_iso", lambda: "2026-10-11T00:00:00+00:00")
+    project = {"type": "project", "name": None}
+    a = store.add(tmp_path, kind="task", target=project, body="a", author="ann")
+    b = store.add(tmp_path, kind="task", target=project, body="b", author="ann")
+    store.supersede(tmp_path, a.id, author="bob", body="a2")
+    assert [n.id for n in store.newest_first(store.heads(store.load(tmp_path)))] == [a.id, b.id]
+
+
+def test_a_rename_sweep_keeps_every_rows_id(tmp_path):
+    item = {"type": "item", "name": "old"}
+    a = store.add(tmp_path, kind="task", target=item, body="a")
+    b = store.add(tmp_path, kind="note", target=item, body="b")
+    assert store.rename_target(tmp_path, "item", "old", "new", author="ann") == (2, 0)
+    rows = store.load(tmp_path)
+    assert len({n.id for n in rows}) == len(rows) == 4
+    assert {h.id: h.target.name for h in store.heads(rows)} == {a.id: "new", b.id: "new"}
+
+
 def test_a_store_is_written_lf_on_every_platform(tmp_path):
     """Text mode on Windows writes CRLF, and a store is shared by clones on
     every platform."""
@@ -911,3 +1144,91 @@ def test_a_row_written_with_evidence_loads_and_drops_it(tmp_path):
     loaded = store.load(tmp_path)
     assert [x.id for x in loaded] == [n.id] and not store.load_malformed(tmp_path)
     assert "evidence" not in store.note_to_dict(loaded[0])
+
+
+def test_undo_takes_back_the_last_write_whole(tmp_path, monkeypatch):
+    """One level: an add, an edit of a committed row, an in-place edit
+    (whose earlier text is on no disk), a batch and an arc each come back as
+    they were, sessions file included (the owner, 2026-10-01)."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    yes = lambda last, rows: True
+    files = lambda: [(tmp_path / f).read_text() for f in ("notes.jsonl", "arcs.jsonl")]
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    x = store.add(tmp_path, kind="task", target=project, body="v1", author="ann", status="open")
+    assert store.commit(tmp_path, "c", cfg)
+    with pytest.raises(store.UndoRefused, match="nothing to undo"):
+        store.undo(tmp_path, x.id, yes)
+
+    was = files()
+    store.supersede(tmp_path, x.id, author="claude", status="resolved")
+    u = store.undo(tmp_path, x.id, yes)
+    assert (u["changed"], u["removed"]) == ([x.id], []) and [r["author"] for r in u["rows"]] == ["claude"]
+    assert files() == was
+
+    d = store.add(tmp_path, kind="note", target=project, body="draft1", author="claude")
+    was, known = files(), store.sessions(tmp_path)
+    store.supersede(tmp_path, d.id, author="claude", body="draft2")      # in place
+    assert store.undo(tmp_path, d.id, yes)["changed"] == [d.id]
+    assert files() == was and store.sessions(tmp_path) == known
+
+    rows = store.add_many(tmp_path, [dict(kind="note", target=project, body=b, author="claude")
+                                     for b in ("a", "b")])
+    with pytest.raises(KeyError):           # refused under the lock: the level stands
+        store.supersede(tmp_path, "no-such-row", author="claude", body="x")
+    assert store.undo(tmp_path, rows[1].id, yes)["removed"] == sorted(r.id for r in rows)
+    assert files() == was and store.sessions(tmp_path) == known
+
+    arc = store.create_arc(tmp_path, "Arc", "", "item", author="claude")
+    assert store.undo(tmp_path, arc.id, yes)["arcs"] == [arc.id] and files() == was
+
+
+def test_undo_refuses_what_it_should_not_take_back(tmp_path):
+    """It names the last write in each refusal, so the caller sees what they
+    would have taken back."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    a = store.add(tmp_path, kind="note", target=project, body="a", author="ann")
+    b = store.add(tmp_path, kind="note", target=project, body="b", author="bob")
+    with pytest.raises(store.UndoRefused, match=f"did not touch {a.id}.*the add of {b.id} by bob"):
+        store.undo(tmp_path, a.id, lambda last, rows: True)
+    with pytest.raises(store.UndoRefused, match=f"not yours: it was the add of {b.id} by bob"):
+        store.undo(tmp_path, b.id, lambda last, rows: False)
+    with open(tmp_path / "notes.jsonl", "a") as f:         # a hand edit since
+        f.write("\n")
+    with pytest.raises(store.UndoRefused, match="changed after its last write, outside symbion"):
+        store.undo(tmp_path, b.id, lambda last, rows: True)
+    store.add(tmp_path, kind="note", target=project, body="c", author="ann")
+    assert store.commit(tmp_path, "c", cfg)
+    with pytest.raises(store.UndoRefused, match="nothing to undo"):
+        store.undo(tmp_path, b.id, lambda last, rows: True)
+
+
+def test_an_undo_preview_changes_nothing_and_names_each_earlier_version(tmp_path, monkeypatch):
+    """The GUI's undo button asks first, showing what the undo changes: a
+    preview (`apply=False`, no id) runs every check and writes nothing.
+    `undoable` is the button's own read, every page and every few seconds:
+    the caller's session's write, as that write left the files."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    yes = lambda last, rows: True
+    files = lambda: [(tmp_path / f).read_text() for f in ("notes.jsonl", "arcs.jsonl")]
+    x = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
+                  body="b", author="ann", status="open")
+    assert store.commit(tmp_path, "c", cfg) and not store.undoable(tmp_path)
+    store.supersede(tmp_path, x.id, author="ann", status="resolved")
+    assert store.undoable(tmp_path)
+    was = files()
+    u = store.undo(tmp_path, None, yes, apply=False)
+    assert files() == was and store.undoable(tmp_path)
+    assert u["changed"] == [x.id] and u["before"][x.id]["status"] == "open"
+    with pytest.raises(store.UndoRefused, match="not yours"):
+        store.undo(tmp_path, None, lambda last, rows: False, apply=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    assert not store.undoable(tmp_path), "another session's write"
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    with open(tmp_path / "notes.jsonl", "a") as f:
+        f.write("\n")
+    assert not store.undoable(tmp_path), "the files changed outside symbion"

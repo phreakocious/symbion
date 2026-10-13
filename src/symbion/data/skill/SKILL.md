@@ -14,10 +14,32 @@ https://github.com/phreakocious/symbion.
 `symbion VERB -h` lists a verb's flags.
 
 At the start of a session, run `symbion summary` if no summary was supplied
-by the hook, including after compaction. Read relevant rows before starting
-work. If a write is blocked because the sibling store is outside the writable
+by the hook, including after compaction. A `last wrap by …` line in it is the
+previous session's handoff: read its paragraph first, then the relevant rows,
+before starting work. If a write is blocked because the sibling store is outside the writable
 workspace, use the runtime's approval mechanism or have the owner add that
 store to the workspace permissions; a `.symbion` pointer does not grant access.
+
+## `/symbion KIND TEXT`: a row from chat
+
+When the skill loads with arguments and their first word is a kind that
+`symbion schema` lists (`/symbion idea retries should back off`), file one
+row of that kind now, with no round trip to confirm. With any other first
+word, the arguments are an ordinary request (`/symbion what is open`), except
+`wrap`: `/symbion wrap` is the session end, in `wrap.md` beside this file.
+
+- **Author: the person who typed it**, never you: `--author "$(git config
+  user.name)"` (PowerShell: `--author (git config user.name)`). The words are
+  theirs, and a parked row you write as yourself never prints at your own
+  session start.
+- **Body: their text, verbatim.** Context you add goes after a blank line,
+  opened with your name and the UTC date the row is stamped with
+  (`Claude, 2026-10-11: …`).
+- **Target: the file or item under discussion**, else `project`.
+- **A verdict kind** (`check`) also needs `--checked` and `--result`: ask the
+  person for both, never make them up.
+- **Report it in one line**: the kind, the target and the id, so a wrong
+  target shows at once.
 
 ## Kinds
 
@@ -74,7 +96,7 @@ retired` takes it out of the default `context` view.
 `--due DATE` (`YYYY-MM-DD` or an ISO datetime) goes on any status row. A date
 is due through the end of its day. `--json` gives `due` as a date, or as a
 datetime with its offset (UTC's, or TZ's when set, if none was typed), not
-as typed, so let `list --overdue` compare them. An open
+as typed, so let `list --overdue` or `list --due-by DATE` compare them. An open
 row past due or due within 7 days opens the session-start summary, parked or
 not, so it is also how an `idea` gets a revisit date. A date only in the body
 reaches nothing. `supersede <id> --due ''` clears it. Dates and times are UTC,
@@ -88,6 +110,14 @@ row that restates what the commit says is noise: a suite run that only says
 for a claim, dated and re-checkable: the flaky test passed 50 runs, the new
 test failed with the fix reverted, the suite passed on Linux too.
 
+**A claim about why names what showed it:** the file and line you read, or
+the command you ran. Why a thing breaks is a cause. Why the project is as it
+is (a choice, a policy, "deliberate") is an intent, and only the owner can
+say it: name the file that says so, or ask it as a `question`. A cause you
+reasoned to and did not test goes in with `untested:` before it and the run
+that would test it. This holds in a wrap message too. A later session reads
+a row as fact, so a wrong row costs more than a missing one.
+
 **Search before you write, and before you say the store lacks something:**
 `list --grep 'a|b'`.
 
@@ -95,6 +125,13 @@ test failed with the fix reverted, the suite passed on Linux too.
 reaches no open view, so one that records a launch (a day-long capture, a
 long benchmark) is forgotten when the job ends. Pair it with a `task` whose
 `--due` is the expected finish, and resolve that with the result.
+
+**A trap goes on the file it concerns, tagged `gotcha`.** A trap is what a
+session pays for learning late: a test that passes alone and fails in its
+file's run, a step that must come before an edit. In Claude Code, the first
+time a session's Read, Edit, Write or Bash call names that file, a hook gives
+the agent the row's first 200 characters, so lead with the trap. It matches a
+target or `--ref` of a catalog type such as `file`, never an `item`.
 
 **A revision updates its head.** `add` names the rows already open on its
 target, on stderr. If the new row settles or revises one, `resolve` or
@@ -105,10 +142,21 @@ row's first 100 characters. Evidence and provenance follow the point.
 Text added with `--append` never reaches that line, which then reads `+1
 amendment`. To correct the lead of a row that is not a pre-registration,
 put a new one above it with `supersede <id> --prepend --body …`, or rewrite
-the whole body with `--body`. Until `symbion commit`, a supersede
-of your own row that no other row cites changes that row and keeps its id; a
-resolve, and any edit after the commit, adds a row. To keep the earlier
-version, commit first; that commits every other writer's pending rows too.
+the whole body with `--body`. Every edit keeps the row's id. Until
+`symbion commit`, a supersede of a row you wrote in this session that no
+other row cites changes it in place; a resolve, and any other edit, keeps
+the earlier version under a new id. To keep your draft's earlier version,
+commit first. `undo <id>` takes back your last write whole, an edit in place
+included, while it is the store's last write and no commit has run since.
+
+**A review you hand to another model or a subagent writes under its own
+name.** The default author names the harness (`claude`, `codex`), never the
+model, so its rows and the rows of the session that checks them read alike.
+Tell it to pass `--author` (`--author sonnet-review`).
+
+**While your question is open, the user's instructions decide** whether the
+decision it asks about waits for the answer or ships with a default. If it
+ships, lead the question with what shipped and how to flip it.
 
 `--body` is markdown. A body with backticks or `$` goes through `--body-file -`
 and a quoted heredoc (`<<'EOF'`): in `--body "…"` or an unquoted `<<EOF` the
@@ -140,16 +188,20 @@ EOF
 
 `add`, `resolve`, `supersede`, `arc create` and `arc seed` print the ids
 they wrote on stdout: capture them (`nid=$(symbion add …)`). `show`, `list --id`,
-`resolve` and `supersede` take a unique tail of an id. Cite the 10-character
-tail (`412907-3be`); 3 characters are often shared.
+`resolve` and `supersede` take a unique tail of an id, and an earlier
+version's id acts on its chain's head, so a cited id does not go stale. Cite the
+10-character tail (`412907-3be`); 3 characters are often shared. To link a
+row to another row, cite its id in the body: `show` lists each cited row
+with its current status, and each row that cites this one.
 
 ## Reading
 
 **Find rows with `list --grep PATTERN`, and read one with `show <id>`.**
 `--grep` is a case-insensitive regex over body, target name, checked, result,
 refs and `#tags`; `-F` takes it literally. A pattern that is an id or its
-tail (`412907-3be`) also lists that row. Never `list | grep`: text `list` is
-one 25-row page, so the pipe misses rows and the silence reads as absence.
+tail (`412907-3be`), or several joined by `|`, also lists each row. Never
+`list | grep`: text `list` is one 25-row page, so the pipe misses rows and the
+silence reads as absence.
 The page's first line gives the total and the flag that shows each hidden
 set; `--limit 0` shows all. `--json` is paged only by `--limit`. `context
 --target TYPE:NAME` is every row on one object.
@@ -166,7 +218,8 @@ target), `created_at`, `author`, `body`, `status`, `checked`, `result`,
 `arc_id`, `due`, `supersedes`, `tags`, `refs`, `provenance`, `measurements`,
 `target_blob`. `list`, `context` and `arc todo` add
 `commits_since` (null unless the target is a file in this checkout) and
-`raised_by`, the author of the row's first version (`author` is its newest's); `list`
+`raised_by` and `raised_at`, the author and time of the row's first version
+(`author` and `created_at` are its newest's); `list`
 also adds `state` and `distance` on verdict kinds, and `head` on a superseded
 row. There is no `ts` or `title`: a guessed key reads as a silent `null`.
 `list`, `arc list` and `arc todo` return a bare array; `summary` and
@@ -177,7 +230,7 @@ exists: gate on it, not on counts or the exit code.
 
 ```bash
 symbion list --status open --json
-symbion show <id> --json                 # list --id <id>: one row, superseded or not
+symbion show <id> --json                 # list --id <id>: its current row; --all, that version
 symbion context --target file:src/x.py --json
 ```
 
@@ -199,19 +252,28 @@ symbion list --arc "$aid" --json   # every row in the arc, resolved included
 
 Any unparked status row in the arc is a box, a `bug` too, and several may
 share a target. `arc archive ID` takes an arc off the session-start summary.
-`arc seed` mints one bodiless task per name of a catalog; before seeding,
-reconciling, or configuring a catalog or resolver, read `catalogs.md` beside
-this file.
+Leave a finished arc for the person to archive: its done line there is how
+they see it finish. `arc seed` mints one bodiless task per name of a catalog;
+before seeding, reconciling, or configuring a catalog or resolver, read
+`catalogs.md` beside this file.
 
 ## The read loop
 
 A SessionStart hook runs `symbion summary`: open counts, rows due or overdue,
-arc progress, rows tagged `priority`, the open rows outside arcs, and open
-rows someone else wrote. When someone else amended a row, the summary and
-`list` print the first line they added below it (`alice added 3h ago: …`). An
-answer to your question arrives this way. `alice added 3h ago, lead rewritten
-since:` means the lead changed after it: the line answered an earlier
-question, so read the row before you relay it. From there:
+arc progress, rows tagged `priority`, resolved rows you raised or closed that
+someone else resolved or wrote to since your last write (`closed by alice`),
+the open rows outside arcs, and open rows
+someone else wrote. When someone else amended or resolved a row, the summary
+and `list` print the first line they added below it (`alice added 3h ago:
+…`), or the first line they changed when they wrote no paragraph of their own
+(`alice edited 3h ago: …`). An answer to your question arrives this way. `alice added 3h ago, lead
+rewritten since:` means the lead changed after it: the line answered an
+earlier question, so read the row before you relay it.
+
+An open row someone else wrote is a request to you. Name it to the user
+before other work, even when the prompt asks for another kind of row.
+
+To read further:
 
 - `symbion context --target TYPE:NAME`: every row on one object.
 - `symbion context --branch <ref>`: every row on a commit reachable from
@@ -223,18 +285,21 @@ question, so read the row before you relay it. From there:
   on, the summary prints each star's age (`starred 12d ago`): unstar a
   stale one.
 
-## Session end, and a handoff file
+## Session end
 
-The store is the open list; a handoff file (`NEXT_SESSION.md`, or whatever a
-session-continuity tool writes) is orientation. At the end of a session, or
-whenever a wrap runs: `resolve <id> --body …` what the session finished, `add`
-what it opened, then `symbion commit`. The handoff keeps its prose (start
-here, read first), and where its open-threads section would be, it says the
-list lives in the store and how to read it (`symbion summary`, `symbion list
---status open`). Never write the list into the file, and never copy its
-bullets into rows a second time: with two copies, the stale one gets read as
-the truth. The `/wrap` and `/next` of the continuity plugin (0.8.5 and later,
-https://github.com/nullphase-net/enfurbish) honour a file that says so.
+The store is the open list, and the last wrap's commit message is the
+handoff. The person decides when a session ends. When they ask for a wrap
+(`/symbion wrap`), or whenever any tool's wrap runs, follow `wrap.md`,
+beside this file: rows for what the session learned, changed and
+finished, then `symbion commit --wrap -m` with the day as its message. A
+session-continuity tool's handoff file (`NEXT_SESSION.md`) is that tool's.
+Never write the open list into it, and never copy its bullets into rows a
+second time: with two copies, the stale one gets read as the truth. With the
+continuity plugin (https://github.com/nullphase-net/enfurbish), its `/wrap -j`
+writes the retro and the journal and no handoff file (0.21.0 and later). With
+no handoff file in the cwd, its bare `/wrap` asks first which was meant, and
+its `/next` briefs from the summary (0.8.5 and later). To retire a project's
+file, see `adoption.md`, "The handoff file".
 
 A workaround for symbion itself ("`show` does not exist") goes in neither the
 handoff nor the project's agent instructions: it outlives the fix. Draft an
@@ -248,10 +313,13 @@ place for symbion reports, use that.
 - **A write is not in git history until `symbion commit`, and not off this
   disk until `symbion push`.** `commit` never pushes; it says how many
   commits are not on the remote, or that the store has none (unless its
-  `symbion.toml` sets `local_only = true`). It takes every
-  pending row, another writer's too, and every other changed file in the
-  store, and names them: `committed: rows claude 2, codex 4; 1 file:
-  tools/x.py`. `commit --dry-run` lists them first and commits nothing.
+  `symbion.toml` sets `local_only = true`). It takes your pending rows (the
+  ones this agent session wrote, as whoever; outside a session, your
+  author's) and every changed file in the store, and names them:
+  `committed: rows claude 2; 1 file: tools/x.py`. It names the rows it left
+  too, and how new the newest is: another session's, still running or
+  ended. `commit --all` takes them as well; use it for a session that has
+  ended. `commit --dry-run` lists both first and commits nothing.
 - **A catalog miss stores your typed string.** A name that matches nothing
   becomes its own target, with only a note on stderr and exit 0.
 
@@ -272,12 +340,13 @@ made is refused, naming the path.
 | command | does |
 |---|---|
 | `add KIND --target T:N [--body …] [--tag …]… [--ref T:N]… [--due DATE] [--arc-id ID]` | append a row; prints its id |
-| `list [--kind K] [--target T:N] [--status S] [--tag T] [--arc ID] [--grep PAT [-F]] [--overdue] [--since 2h] [--all] [--limit N] [--full] [--json]` | heads, newest first; `--all` adds superseded rows |
-| `show <id>... [--json]` | rows by id, as `list --id <id>...` (an array in `--json`) |
+| `list [--kind K] [--target T:N] [--status S] [--tag T] [--arc ID] [--grep PAT [-F]] [--overdue] [--due-by DATE] [--since 2h] [--all] [--limit N] [--full] [--json]` | heads, newest first; `--all` adds superseded rows |
+| `show <id>... [--json] [--all]` | rows by id, as `list --id <id>...` (an array in `--json`); a superseded id shows its head, `--all` that version |
 | `resolve <id> [--body …] [--result …] [--measure K=V]… [--ref T:N] [--add-tag …]` | close a row; `--body` goes below the current body, after a blank line it inserts |
 | `supersede <id> [--body …] [--append] [--prepend] [--add-tag …] [--rm-tag …] [--tag …] [--add-ref T:N] [--ref T:N] [--checked …] [--result …] [--measure K=V]… [--due DATE]` | correct a row; `--tag` and `--ref` replace the inherited ones, `--add-tag` and `--add-ref` add to them, `--measure` sets one name and keeps the rest; `--append` adds the body after a blank line it inserts, `--prepend` above one |
-| `commit [-m MSG] [--dry-run]` | commit the store; `--dry-run` lists what it would take |
+| `commit [-m MSG] [--dry-run] [--all]` | commit your rows and the store's files; `--all` every writer's rows; `--dry-run` lists what it would take |
 | `push` | push the store's commits to its remote |
+| `undo <id>` | take back your last write, before a commit (one level) |
 | `rename <old> <new> --type T [--to-type T2]` | move every row and ref on a renamed object; `--to-type` changes its type too |
 | `summary`, `schema [--toml]`, `tags`, `context` | read |
 | `arc create`, `list`, `todo`, `archive`, `seed`, `reconcile` | campaigns (`catalogs.md` for the last two) |

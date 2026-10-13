@@ -263,14 +263,15 @@ def _teaser(n, faded: bool, indent: int, width: int) -> Text | None:
     return line
 
 
-def _details(n, head, state) -> list[Text]:
+def _details(n, head, state, written=None) -> list[Text]:
     """The full view's lines between the head and the body."""
     def labelled(label, value):
         t = Text("    ")
         t.append(label, META)
         t.append(value, BODY)
         return t
-    who = Text(f"    {n.id} · written {store.shown(n.created_at)} by {n.author}", META)
+    who = Text(f"    {n.id} · " + " · ".join(
+        written or [f"written {store.shown(n.created_at)} by {n.author}"]), META)
     if n.supersedes:
         who.append(f" · revises {n.supersedes}", META)
     out = [who]
@@ -290,11 +291,12 @@ def _details(n, head, state) -> list[Text]:
     return out
 
 
-def print_note(n, *, status, state, due, subject, head, full, gui=None, since=None) -> None:
+def print_note(n, *, status, state, due, subject, head, full, gui=None, since=None,
+               seams=(), links=(), written=None) -> None:
     """`status` is the chain head's, `state` api.verdict_state's pair and
     `due` store.due_state's pair for an open row, all computed by the caller
     the same way for the pipe line. `gui` is the URL of a serve on the row's
-    store."""
+    store; `seams` summary.seams' for the body; `links` summary.links'."""
     con = Console(highlight=False, markup=False, emoji=False, theme=MARKDOWN)
     width = None if full else con.width
     line, indent = _head(n, status=status, state=state, due=due, subject=subject,
@@ -306,11 +308,15 @@ def print_note(n, *, status, state, due, subject, head, full, gui=None, since=No
             con.print(_fitted(teaser), no_wrap=True, overflow="ellipsis", crop=True)
         return
     con.print(_fitted(line))
-    for t in _details(n, head, state):
+    for t in _details(n, head, state, written):
         con.print(_fitted(t))
-    if n.body:
-        md = Markdown(n.body, code_theme=_CodeTheme())
+    for piece, seam in summ.at_seams(n.body, seams) if n.body else ():
+        md = Markdown(piece, code_theme=_CodeTheme())
         # ponytail: sets rich's own attribute; test_a_tag_in_a_body_prints_on_a_tty
         # fails if rich renames it.
-        md.parsed = BODY_MD.parse(n.body)
+        md.parsed = BODY_MD.parse(piece)
         con.print(Padding(md, (0, 0, 0, 4)))
+        if seam:
+            con.print(_fitted(Text(f"    {seam}", META)))
+    for line in links:
+        con.print(_fitted(Text(f"    {line}", META)))

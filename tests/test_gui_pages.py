@@ -96,7 +96,7 @@ def _commit_with_origin(ctx, tmp_path_factory):
     subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
     subprocess.run(["git", "-C", str(ctx.store_dir), "remote", "add", "origin", str(bare)],
                    check=True)
-    api.commit(ctx, "notes")
+    api.commit(ctx, "notes", everyone=True)
 
 
 async def test_the_push_button_shows_unpushed_commits_and_pushes_them(
@@ -191,17 +191,17 @@ async def test_a_superseded_id_opens_its_current_row(user: User, ctx_with_notes)
     """Rows cite ids that were superseded since; /notes?id= read "0 notes"
     for them, and so did a search for one."""
     old = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
-    api.supersede(ctx_with_notes, old, author="ada", body="beta revised")
-    await user.open(f"/notes?id={old}")
+    kept = api.supersede(ctx_with_notes, old, author="ada", body="beta revised").supersedes
+    await user.open(f"/notes?id={kept}")
     await user.should_see("beta revised")
-    await user.should_see(f"{old} was superseded")
-    await user.open(f"/notes?q={old.rsplit('-', 1)[1]}")
+    await user.should_see(f"{kept} was superseded")
+    await user.open(f"/notes?q={kept.rsplit('-', 1)[1]}")
     await user.should_see("beta revised")
     assert _count(user).startswith("1 of 2 notes match")
     # and says why it came: the search showed the current row and nothing
     # of the id that brought it (the owner, 2026-10-09)
     (said,) = user.find(marker="superseded-by").elements
-    assert said.text == f"{old} was superseded; this is its current row"
+    assert said.text == f"{kept} was superseded; this is its current row"
 
 
 async def test_shift_enter_adds_a_note_and_keeps_the_composer_open(
@@ -232,10 +232,11 @@ async def test_a_cited_tail_opens_its_row(user: User, ctx_with_notes):
     await user.open(f"/notes?id={old.split('-', 2)[2]}")
     await user.should_see("beta body")
     assert _count(user) == "1 note"
-    api.supersede(ctx_with_notes, old, author="ada", body="beta revised")
+    kept = api.supersede(ctx_with_notes, old, author="ada", body="beta revised").supersedes
     await user.open(f"/notes?id={old.split('-', 2)[2]}")
-    await user.should_see("beta revised")
-    await user.should_see(f"{old} was superseded")
+    await user.should_see("beta revised")                # an edit keeps the row's id
+    await user.open(f"/notes?id={kept.split('-', 2)[2]}")
+    await user.should_see(f"{kept} was superseded")
 
 
 async def test_a_tail_several_ids_end_in_lists_each(user: User, repo, tmp_path, monkeypatch):
@@ -256,9 +257,9 @@ async def test_a_tail_several_ids_end_in_lists_each(user: User, repo, tmp_path, 
 async def test_a_notes_own_view_lists_its_earlier_versions(user: User, ctx_with_notes):
     """Every version is kept; the GUI showed only the last one."""
     first = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
-    api.commit(ctx_with_notes, "c")          # each edit its own row (store.rewritable)
+    api.commit(ctx_with_notes, "c", everyone=True)          # each edit its own row (store.rewritable)
     mid = api.supersede(ctx_with_notes, first, author="ada", body="beta two").id
-    api.commit(ctx_with_notes, "c")
+    api.commit(ctx_with_notes, "c", everyone=True)
     last = api.supersede(ctx_with_notes, mid, author="ada", body="beta three").id
     await user.open(f"/notes?id={last}")
     await user.should_see("earlier versions (2)")
@@ -274,9 +275,9 @@ async def test_earlier_versions_show_their_target(user: User, ctx_with_notes):
     ctx = ctx_with_notes
     nid = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "old-name"}},
                   author="ada").id
-    api.commit(ctx, "c")
+    api.commit(ctx, "c", everyone=True)
     api.rename_target(ctx, "item", "old-name", "new-name", author="ada")
-    head = next(n for n in store.heads(store.load(ctx.store_dir)) if n.supersedes == nid)
+    head = next(n for n in store.heads(store.load(ctx.store_dir)) if n.id == nid)
     await user.open(f"/notes?id={head.id}")
     await user.should_see("new-name")
     user.find(marker="history").click()
@@ -289,9 +290,9 @@ async def test_a_rows_page_marks_each_amendment_with_who_added_it(user: User, ct
     only, for now."""
     ctx = ctx_with_notes
     first = next(n.id for n in store.load(ctx.store_dir) if n.body == "beta body")
-    api.commit(ctx, "c")
+    api.commit(ctx, "c", everyone=True)
     mid = api.supersede(ctx, first, author="sam", append_body="gamma line").id
-    api.commit(ctx, "c")
+    api.commit(ctx, "c", everyone=True)
     last = api.supersede(ctx, mid, author="kim", prepend_body="new lead").id
     await user.open(f"/notes?id={last}")
     # .elements is a set: summary.seams' tests hold the order
@@ -313,10 +314,10 @@ async def test_earlier_versions_show_an_edit_as_a_diff(user: User, ctx_with_note
     ctx = ctx_with_notes
     nid = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
                         "body": "a kept paragraph stays\n\nthe old wording"}, author="ada").id
-    api.commit(ctx, "c")
+    api.commit(ctx, "c", everyone=True)
     mid = api.supersede(ctx, nid, author="sam",
                         body="a kept paragraph stays\n\nthe new wording").id
-    api.commit(ctx, "c")
+    api.commit(ctx, "c", everyone=True)
     last = api.supersede(ctx, mid, author="kim", body="Fixed in 1234abc.").id
     await user.open(f"/notes?id={last}")
     user.find(marker="history").click()
@@ -334,7 +335,7 @@ async def test_an_earlier_version_says_what_the_next_changed(user: User, ctx_wit
     nid = api.add(ctx, {"kind": "check", "target": {"type": "item", "name": "w"},
                         "checked": "pytest tmp/a.py -k b", "result": "3 passed",
                         "measurements": {"passed": 3, "failed": 1}}, author="ada").id
-    api.commit(ctx, "c")
+    api.commit(ctx, "c", everyone=True)
     last = api.supersede(ctx, nid, author="sam", checked="pytest tests/a.py -k b",
                          add_measurements={"failed": 2}, tags=["t"]).id
     await user.open(f"/notes?id={last}")
@@ -368,7 +369,7 @@ async def test_a_search_result_shows_and_marks_a_hit_past_the_clip(user: User, r
 async def test_the_header_search_keeps_the_filters_in_view(user: User, ctx_with_notes):
     await user.open("/notes?kind=bug")
     user.find(marker="search").type("widget").trigger("keydown.enter")
-    await user.should_see('search "widget" · kind=bug')
+    await user.should_see("search: widget · kind=bug")
     assert _count(user).startswith("1 of 1 note match")
 
 
@@ -600,8 +601,8 @@ async def test_a_chip_or_a_search_on_a_notes_own_page_starts_a_filter(
     assert _hrefs(user, "note-kind") == {"/notes?kind=bug"}
     assert _hrefs(user, "tag-blue") == {"/notes?tag=blue"}
     user.find(marker="search").type("alpha").trigger("keydown.enter")
-    await user.should_see('search "alpha"')       # the new page; then the whole title
-    assert {e.text for e in user.find(marker="page-title").elements} == {'search "alpha"'}
+    await user.should_see("search: alpha")       # the new page; then the whole title
+    assert {e.text for e in user.find(marker="page-title").elements} == {"search: alpha"}
 
 
 async def test_a_note_under_an_arc_links_to_it_and_the_arc_page_lists_its_notes(
@@ -828,14 +829,21 @@ async def test_the_fonts_ship_in_the_package_and_load_from_the_gui(user: User, c
 
 # ---- the owner's GUI rows of 2026-10-01 ----
 
+def _crumbs(user: User) -> list[str]:
+    (row,) = user.find(marker="crumbs").elements
+    return [e.text for e in row.default_slot.children]
+
+
 async def test_the_top_bar_ends_in_the_pages_title(user: User, ctx_with_notes):
-    """A title under the bar left a band of nothing above it."""
+    """A title under the bar left a band of nothing above it. A "Notebook"
+    crumb before each title was one level deep (the owner, 2026-10-13)."""
     for path, title in (("/", "Notebook"), ("/tags", "Tags"), ("/arcs", "Arcs"),
                         ("/object?type=item&name=widget", "item: widget"),
                         ("/notes?kind=bug", "kind=bug")):
         await user.open(path)
         (here,) = user.find(marker="page-title").elements
         assert here.text == title, path
+        assert _crumbs(user) == [title], path
 
 
 async def test_new_note_opens_on_the_pages_object(user: User, ctx_with_notes, tmp_path):
@@ -890,9 +898,27 @@ async def test_new_note_on_an_arc_page_starts_in_that_arc(user: User, repo, tmp_
     await user.open(f"/arc?id={aid}")
     (here,) = user.find(marker="page-title").elements
     assert here.text == "Release"
+    assert _crumbs(user) == ["Arcs", "›", "Release"]        # the one page a level down
     user.find(marker="new-note").click()
     await user.should_see(marker="note-arc-select")
     assert user.find(marker="note-arc-select").elements.pop().value == aid
+
+
+async def test_new_note_from_a_kind_view_starts_as_that_kind(user: User, ctx_with_notes):
+    """The owner, 2026-10-11: a note added from a kind= view should be that
+    kind, and the button should say so. A kind this store lacks (a stale
+    bookmark) leaves the default."""
+    await user.open("/notes?kind=task")
+    await user.should_see("New task")
+    await user.should_not_see("New note")
+    user.find(marker="new-note").click()
+    await user.should_see(marker="note-body")
+    assert user.find(marker="note-kind-select").elements.pop().value == "task"
+    await user.open("/notes?kind=nosuch")
+    await user.should_see("New note")
+    user.find(marker="new-note").click()
+    await user.should_see(marker="note-body")
+    assert user.find(marker="note-kind-select").elements.pop().value == "note"
 
 
 async def test_the_keys_list_names_the_shortcuts_and_the_kinds(user: User, ctx_with_notes):
@@ -957,26 +983,30 @@ async def test_the_sidebar_lists_the_kinds_with_no_status_under_records(
     assert note.default_slot.children[-1].text == "0"
 
 
-def test_the_viewer_reads_only_markdown_inside_the_checkout(repo, tmp_path):
-    """A target name is typed text: the viewer must not read through it."""
-    from symbion.gui.notes import md_path
+def test_the_viewer_reads_only_text_it_knows_inside_the_checkout(repo, tmp_path):
+    """A target name is typed text: the viewer must not read through it. It
+    shows markdown, and a file pygments names a language for."""
+    from symbion.gui.notes import view_path
     ctx = api.resolve(str(tmp_path))
     (repo / "docs").mkdir()
     (repo / "docs" / "a.md").write_text("# A")
-    (repo / "notes.txt").write_text("x")
+    (repo / "x.py").write_text("x = 1")
+    (repo / "Makefile").write_text("all:")
+    (repo / "logo.png").write_bytes(b"\x89PNG")
     (tmp_path / "out.md").write_text("outside")
-    assert md_path(ctx, "docs/a.md") == (repo / "docs" / "a.md").resolve()
-    for name in ("../out.md", str(tmp_path / "out.md"), "notes.txt",
+    for name in ("docs/a.md", "x.py", "Makefile"):
+        assert view_path(ctx, name) == (repo / name).resolve(), name
+    for name in ("../out.md", str(tmp_path / "out.md"), "logo.png",
                  "gone.md", "docs", None):
-        assert md_path(ctx, name) is None, name
+        assert view_path(ctx, name) is None, name
 
 
 def test_the_viewer_refuses_symlinks_outside_the_checkout(repo, tmp_path, symlink):
-    from symbion.gui.notes import md_path
+    from symbion.gui.notes import view_path
     ctx = api.resolve(str(tmp_path))
     (tmp_path / "out.md").write_text("outside")
     symlink(repo / "link.md", tmp_path / "out.md")
-    assert md_path(ctx, "link.md") is None
+    assert view_path(ctx, "link.md") is None
 
 
 async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
@@ -993,14 +1023,37 @@ async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
             author="ada")
     build_page(ctx, author="ada")
     await user.open("/notes")
-    assert len(user.find(marker="md-open").elements) == 2    # a target, a ref; not other.md
-    user.find(marker="md-open").click()
-    await user.should_see(marker="md-view")
-    (view,) = user.find(marker="md-view").elements
+    assert len(user.find(marker="file-open").elements) == 2    # a target, a ref; not other.md
+    user.find(marker="file-open").click()
+    await user.should_see(marker="file-view")
+    (view,) = user.find(marker="file-view").elements
     assert "the *whole* file" in view.content
     await user.open("/object?type=item&name=README.md")
-    labels = [b.props.get("label") for b in user.find(marker="md-open").elements]
+    labels = [b.props.get("label") for b in user.find(marker="file-open").elements]
     assert sorted(labels, key=str) == ["", "read the file"]   # the page's own, the ref's
+
+
+async def test_a_code_target_opens_coloured_in_a_dialog(user: User, repo, tmp_path):
+    """The owner, 2026-10-11: as markdown opens in a viewer, so should the
+    other files we can read, code most of all. A fence in the file stays
+    inside the one block."""
+    ctx = api.resolve(str(tmp_path))
+    (repo / "x.py").write_text('def f():\n    return """\n```\n"""\n')
+    (repo / "blob.py").write_text("a\0b")
+    for name in ("x.py", "blob.py"):
+        api.add(ctx, {"kind": "note", "target": {"type": "item", "name": name},
+                      "body": "about it"}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/object?type=item&name=x.py")
+    user.find(marker="file-open").click()
+    await user.should_see(marker="file-view")
+    (view,) = user.find(marker="file-view").elements
+    html = view.props["innerHTML"]
+    assert html.count('<pre class="codehilite">') == 1, html
+    assert "return" in html and "```" in html, html
+    await user.open("/object?type=item&name=blob.py")
+    user.find(marker="file-open").click()
+    assert user.notify.contains("blob.py is not text")
 
 
 async def test_the_sidebar_links_the_source(user: User, ctx_with_notes):
@@ -1085,7 +1138,7 @@ async def test_a_page_of_check_badges_reads_head_once(user: User, repo, tmp_path
     aid = api.create_arc(ctx, "A", "", "mixed", author="ada").id
     api.add(ctx, {"kind": "check", "target": {"type": "arc", "name": aid},
                   "checked": "about the arc", "result": "ok"}, author="ada")
-    api.commit(ctx, "c")                     # each edit its own row (store.rewritable)
+    api.commit(ctx, "c", everyone=True)                     # each edit its own row (store.rewritable)
     last = api.supersede(ctx, ids[0], author="ada", result="still ok").id
     build_page(ctx, author="ada")
     calls = []
@@ -1180,3 +1233,47 @@ async def test_a_page_of_boards_counts_commits_since_once(user: User, repo, tmp_
         calls.clear()
         await user.open(url)
         assert calls.count("hash-object") == 1, (url, calls)
+
+
+async def test_the_undo_button_asks_with_what_it_takes_back(user: User, repo, tmp_path,
+                                                           monkeypatch):
+    """A misclick on resolve or the star takes two clicks to take back (the
+    owner, 2026-10-01), and so does a note added to the wrong store, which
+    took a `git restore` (2026-10-13). An undo icon in the top bar while the
+    store's last write is yours and uncommitted; its dialog says what the
+    undo changes. A timed notice set a deadline the store does not have, and
+    a click on it as it faded did nothing."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "b"}, author="ada")
+    api.commit(ctx, "c", author="ada")
+    build_page(ctx, author="ada")
+    head = lambda: store.chain_tip(store.load(tmp_path), n.id)
+    await user.open("/notes")
+    await user.should_not_see(marker="undo-button")       # a commit ends the level
+    user.find(marker="note-resolve").click()
+    await user.should_see(marker="undo-button")
+    user.find(marker="undo-button").click()
+    await user.should_see("resolved → open")
+    assert store.read_status(head()) == "resolved", "asking writes nothing"
+    user.find(marker="undo-confirm").click()
+    await user.should_see(f"undone: the edit of {n.id} by ada")
+    assert store.read_status(head()) == "open"
+    await user.should_not_see(marker="undo-button")       # one level
+
+    user.find(marker="new-note").click()
+    user.find(marker="note-body").type("wrong store").trigger("keydown.meta.enter")
+    await user.should_see(marker="undo-button")
+    nid = next(r.id for r in store.load(tmp_path) if r.body == "wrong store")
+    user.find(marker="undo-button").click()
+    await user.should_see(f"removes {nid[-10:]}")
+    user.find(marker="undo-confirm").click()
+    await user.should_see(f"undone: the add of {nid} by ada")
+    assert "wrong store" not in {r.body for r in store.load(tmp_path)}
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")    # an agent's write
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "body": "theirs"}, author="claude")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    await user.open("/notes")
+    await user.should_not_see(marker="undo-button")

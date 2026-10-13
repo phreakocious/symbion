@@ -27,7 +27,7 @@ _URL_TO_KWARG = {
     "author": "author",
 }
 _KWARG_TO_URL = {v: k for k, v in _URL_TO_KWARG.items()}
-FILTER_KEYS = tuple(_URL_TO_KWARG) + ("structured", "q")
+FILTER_KEYS = tuple(_URL_TO_KWARG) + ("q",)
 
 
 def search_pattern(q: str):
@@ -35,13 +35,16 @@ def search_pattern(q: str):
     any case, taken literally. A person types `reload serve` meaning both
     words and pastes `$HOME` meaning `$HOME`; `list --grep`'s regex reads the
     first as one phrase and the second as an end-of-line anchor, a silent 0
-    both times. `\\A` pins the
+    both times. Double quotes make a phrase, its words in order across any
+    whitespace; an unclosed one runs to the end. `sbFilter` in chrome.py
+    reads the box the same way. `\\A` pins the
     lookaheads to one attempt per row instead of one per character."""
-    words = q.split()
-    if not words:
+    terms = [r"\s+".join(map(re.escape, (p or w).split()))
+             for p, w in re.findall(r'"([^"]*)"?|([^\s"]+)', q)]
+    terms = [t for t in terms if t]
+    if not terms:
         return None
-    return re.compile(r"\A" + "".join(f"(?=[\\s\\S]*?{re.escape(w)})" for w in words),
-                      re.I)
+    return re.compile(r"\A" + "".join(f"(?=[\\s\\S]*?{t})" for t in terms), re.I)
 
 
 def id_hit(note_id: str, q: str) -> bool:
@@ -61,9 +64,6 @@ def from_params(params) -> dict:
         v = (params.get(url_key) or "").strip()
         if v:
             out[kwarg] = v
-    s = (params.get("structured") or "").strip().lower()
-    if s in ("true", "false"):
-        out["structured"] = (s == "true")
     grep = search_pattern(params.get("q") or "")
     if grep is not None:
         out["grep"] = grep
@@ -80,7 +80,7 @@ def href(**overrides) -> str:
 def describe(kwargs: dict, q: str = "") -> str:
     """Human-readable summary of active filters, for the page heading. The
     search is named by what was typed: its compiled `grep` is not."""
-    parts = [f'search "{" ".join(q.split())}"'] if q.strip() else []
+    parts = [f"search: {' '.join(q.split())}"] if q.strip() else []
     parts += [f"{_KWARG_TO_URL.get(k, k)}={v}" for k, v in sorted(kwargs.items())
               if k != "grep"]
-    return " · ".join(parts) or "all notes"
+    return " · ".join(parts) or "All notes"

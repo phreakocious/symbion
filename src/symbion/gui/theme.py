@@ -239,8 +239,9 @@ a { text-decoration: none; }
 .sb-md-card .nicegui-markdown > *:first-child { margin-top: 0; }
 .sb-md-card code { font-family: var(--mono); font-size: 12.5px; padding: 1px 5px;
                    border-radius: 4px; background: var(--q-raise); }
-.sb-md-card pre { background: var(--q-raise); padding: 8px 12px; border-radius: 6px;
-                  overflow-x: auto; }
+/* a long code line scrolls in its block; a traceback in a note ran past its card */
+.sb-md-card pre, .sb-note pre { background: var(--q-raise); padding: 8px 12px;
+                                border-radius: 6px; overflow-x: auto; }
 .sb-md-card pre code { padding: 0; background: none; }
 .sb-md-card :is(th, td) { border: 1px solid var(--q-border); padding: 4px 8px; }
 .sb-md-card table { border-collapse: collapse; }
@@ -518,6 +519,13 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 }
 .sb-commit .q-btn__content, .sb-push .q-btn__content, .sb-new .q-btn__content {
   flex-wrap: nowrap; white-space: nowrap; gap: 6px; }
+/* A Material glyph draws inside its 24px box: `add` 5px in from the left,
+   `save`, `archive` and `article` 3px, `code` and `playlist_add` 2px.
+   Beside a label, a button read 2 to 4px heavier on the left (measured
+   2026-10-13). `on-left` is the icon of a button given a label. New's word
+   goes on a narrow screen, and its icon alone is centred already. */
+.sb-commit .q-icon, .q-btn .q-icon.on-left { margin-left: -2px; }
+@media (min-width: @WIDE@px) { .sb-new .q-icon { margin-left: -4px; } }
 @media (max-width: 600px) {
   /* a phone's top bar: the title alone says where you are, and there is
      no key to press `/` with */
@@ -532,7 +540,7 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   .sb-topbar > .sb-who-top { order: 2; }
   .sb-topbar::after { content: ""; order: 3; flex-basis: 100%; margin-top: 8px; }
   .sb-topbar > .sb-new { order: 4; }
-  .sb-topbar > .sb-commit, .sb-topbar > .sb-push { order: 5; }
+  .sb-topbar > .sb-undo, .sb-topbar > .sb-commit, .sb-topbar > .sb-push { order: 5; }
   .sb-topbar > .sb-search { order: 6; flex: 1; min-width: 0; max-width: none; }
 }
 """.replace("@WIDE@", str(NARROW + 1)).replace("@NARROW@", str(NARROW)).replace("@TRAILW@", str(_TRAIL_W)) \

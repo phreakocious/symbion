@@ -49,8 +49,10 @@ def _scratch(path) -> bool:
     return any(p.is_relative_to(r.resolve()) for r in _temp_roots())
 
 
-def record(url: str, store) -> Path | None:
+def record(url: str, store, build: str = "") -> Path | None:
     """This process's record; the caller removes the path when it stops.
+    `build` is the commit or version it runs, which `serve --restart`
+    prints: a re-exec keeps the pid, so only this tells new code from old.
     None for a scratch store when the cache is not scratch too: a scratch
     serve started without XDG_CACHE_HOME was listed in the owner's sidebar
     (2026-10-05). A test's cache is under a temp root, so it still records."""
@@ -61,7 +63,7 @@ def record(url: str, store) -> Path | None:
     path = d / f"{os.getpid()}.json"
     path.write_text(json.dumps({"pid": os.getpid(), "url": url,
                                 "store": str(Path(store).resolve()),
-                                "started": time.time()}), encoding="utf-8")
+                                "started": time.time(), "build": build}), encoding="utf-8")
     return path
 
 

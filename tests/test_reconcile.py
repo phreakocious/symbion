@@ -163,6 +163,6 @@ def test_apply_moves_every_row_on_a_renamed_name_not_only_the_arc_item(tmp_path)
                                live_for=lambda t: {"renamed.py"},
                                rename_map={"moved.py": "renamed.py"}, catalog_types={"file"})
     assert store.apply_reconciliation(tmp_path, rows) == (2, 1, 0)
-    hs = {n.supersedes: n for n in store.heads(store.load(tmp_path))}
+    hs = {n.id: n for n in store.heads(store.load(tmp_path))}
     assert hs[outside.id].target.name == "renamed.py"
     assert hs[referrer.id].refs == (store.Target("file", "renamed.py"),)

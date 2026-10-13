@@ -289,6 +289,13 @@ async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
     (md,) = user.find(ui.markdown).elements
     assert f'href="/notes?id={later.id}"' in md.props["innerHTML"]
 
+    # The 17-character tail `show` takes is a cite too, as `show` reads one.
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": f"per {later.id[-17:]}"}, author="ada")
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    assert f'href="/notes?id={later.id}"' in md.props["innerHTML"], md.props["innerHTML"]
+
 
 async def test_a_tag_in_a_body_prints_as_text(user: User, repo, tmp_path):
     """A body is read at a terminal too, where `<pre>` is five characters.
@@ -891,7 +898,7 @@ async def test_the_edit_dialog_stars_a_row_in_the_same_write(user: User, repo, t
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
                       "body": "first", "tags": ["ux"]}, author="ada")
-    api.commit(ctx, "notes")                  # an edit after a commit adds a row
+    api.commit(ctx, "notes", everyone=True)   # an edit after a commit adds a row
     flip = lambda: user.find(marker="edit-priority").click()     # noqa: E731
     head = await _append_in_dialog(user, ctx, n, "more", meanwhile=flip)
     assert (head.body, list(head.tags)) == ("first\n\nmore", ["ux", "priority"])
@@ -927,6 +934,33 @@ async def test_edit_dialog_sets_and_clears_due(user: User, repo, tmp_path):
         user.find(marker="edit-due").elements.pop().set_value(value)
         user.find(marker="edit-save").click()
         assert store.heads(store.load(tmp_path))[0].due == want
+
+
+async def test_a_picked_date_fills_the_due_field(user: User, repo, tmp_path):
+    """Both due fields carry a calendar (the owner, 2026-10-12): a date
+    picked there is the row's due, in the add form and in the edit dialog."""
+    from symbion.gui.notes import add_form
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+        for n in store.heads(store.load(tmp_path)):
+            render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-kind-select").elements.pop().set_value("task")
+    user.find(marker="note-due-pick").elements.pop().set_value("2026-10-05")
+    user.find(marker="note-body").type("picked")
+    user.find(marker="note-add").click()
+    assert store.load(tmp_path)[0].due == "2026-10-05"
+
+    await user.open("/t")
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-due")
+    user.find(marker="edit-due-pick").elements.pop().set_value("2026-11-01")
+    user.find(marker="edit-save").click()
+    assert store.heads(store.load(tmp_path))[0].due == "2026-11-01"
 
 
 async def test_edit_dialog_offers_due_only_on_a_status_kind(user: User, repo, tmp_path):
@@ -1114,7 +1148,7 @@ async def test_the_edit_dialog_says_whether_the_row_itself_changes(user: User, r
     def page(who: str):
         render_note(ctx, rows[who], lambda: None, author="ada")
 
-    for who, words in (("ada", "not yet committed, so the row itself changes"),
+    for who, words in (("ada", "this version is not yet committed, so it changes in place"),
                        ("sam", "the old row is kept")):
         await user.open(f"/t/{who}")
         user.find(marker="note-edit").click()

@@ -22,12 +22,6 @@ def test_empty_values_are_dropped():
     assert filters.from_params({"tag": "", "kind": "note"}) == {"kind": "note"}
 
 
-def test_structured_parses_as_a_bool_predicate():
-    assert filters.from_params({"structured": "true"}) == {"structured": True}
-    assert filters.from_params({"structured": "false"}) == {"structured": False}
-    assert filters.from_params({"structured": "maybe"}) == {}
-
-
 def test_href_round_trips_through_from_params():
     url = filters.href(tag="pri ority", kind="check")
     assert url.startswith("/notes?")
@@ -48,7 +42,7 @@ def test_every_filter_key_is_a_real_store_query_kwarg():
 
     from symbion import store
     accepted = set(inspect.signature(store.query).parameters) - {"notes"}
-    params = dict.fromkeys(filters.FILTER_KEYS, "x") | {"structured": "true"}
+    params = dict.fromkeys(filters.FILTER_KEYS, "x")
     emitted = set(filters.from_params(params))
     assert len(emitted) == len(filters.FILTER_KEYS), \
         f"a FILTER_KEY produced no kwarg: {emitted}"
@@ -57,7 +51,7 @@ def test_every_filter_key_is_a_real_store_query_kwarg():
 
 def test_describe_names_filters_in_url_words_not_kwarg_words():
     """The heading has to match the URL the reader is looking at."""
-    assert filters.describe({}) == "all notes"
+    assert filters.describe({}) == "All notes"
     assert filters.describe({"target_type": "file"}) == "type=file"
     assert filters.describe({"kind": "check", "tag": "ci"}) == "kind=check · tag=ci"
 
@@ -84,6 +78,18 @@ def test_search_takes_regex_characters_literally():
     assert not p.search("runs from HOME")
 
 
+def test_double_quotes_make_a_phrase():
+    """`"read only"` matched a literal `"read` and `only"`, so no row held it
+    (the owner, 2026-10-12). An unclosed quote runs to the end, as the filter
+    reads it while the closing one is still to be typed."""
+    p = filters.search_pattern('"read only" store')
+    assert p.search("a read\nonly store")          # any whitespace between
+    assert not p.search("only read store")        # in order, adjacent
+    assert filters.search_pattern('"read on').search("read only")
+    assert filters.search_pattern('"') is None
+    assert filters.search_pattern("owner's").search("the owner's call")
+
+
 def test_a_blank_search_is_no_filter():
     assert filters.search_pattern("  ") is None
     assert filters.from_params({"q": " "}) == {}
@@ -101,5 +107,7 @@ def test_an_id_or_its_printed_tail_is_a_hit():
 
 
 def test_describe_names_a_search_by_what_was_typed():
+    """Unwrapped: quotes around words read as a phrase search."""
     kw = filters.from_params({"q": "a  b", "kind": "bug"})
-    assert filters.describe(kw, "a  b") == 'search "a b" · kind=bug'
+    assert filters.describe(kw, "a  b") == "search: a b · kind=bug"
+    assert filters.describe({}, '"read  only"') == 'search: "read only"'

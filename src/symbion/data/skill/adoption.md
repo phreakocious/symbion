@@ -87,7 +87,8 @@ write to it.
    work: `question`, so `summary` lists them at session start (it deals its
    capped head list one kind at a time; `list --kind question --status open`
    is the whole queue) and `resolve <id> --body "decided: …"` (or
-   `declined: …`) closes it with the answer on the resolving row. A
+   `declined: …`) closes it with the answer on the resolving row, which the
+   asker's next summary prints under `closed by`. A
    verification you did not run today: `note` on
    the commit with a pointer to the report, never `check`, because
    provenance is stamped at write time and a retroactive check reads
@@ -116,11 +117,18 @@ write to it.
      neither delete applies. Archive the verbatim copy as above, then replace
      only this project's section in place with a pointer naming each new row
      id, and leave the rest of the file alone.
-   - **The handoff file.** Replace its open-threads section with the one
-     SKILL.md's "Session end" describes, and strike the other items that became rows;
-     its prose stays. Edit it now, by hand: left to a tool that rewrites the
-     file at session end, the migrated threads stayed in it, and the next
-     session was briefed from them (2026-09-23).
+   - **The handoff file.** Retire it. Each item no row, instruction or memory
+     holds becomes a row: a trap is its file's `gotcha`, a practice is a
+     `task` tagged `practice` on the instruction file it belongs in. Copy the
+     file verbatim to `<store>/archive/`, delete it, and end the session with
+     `wrap.md`: from then on the wrap's commit message is the handoff. Do it
+     now, by hand: left to a tool that rewrites the file at session end, the
+     migrated threads stayed in it, and the next session was briefed from them
+     (2026-09-23). From then on, end sessions with continuity's `/wrap -j`,
+     which writes no handoff file; its bare `/wrap` asks first when the cwd has
+     none (0.21.0 and later). With an older continuity, keep the
+     file instead: replace its open-threads section with one naming this store
+     and the commands that read it, and strike the items that became rows.
    - **Claude Code auto-memory, if present** (`~/.claude/projects/<slug>/memory/`).
      Skip this source in projects that do not use it. Copy the migrated
      topic files verbatim to `<store>/archive/claude-memory/`, delete them

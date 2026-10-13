@@ -30,11 +30,13 @@ import pytest
 GUI_DIR = Path(__file__).resolve().parent.parent / "src" / "symbion" / "gui"
 
 ALLOWED_STORE_READS = {
-    "load", "load_malformed", "load_arcs", "heads", "heads_for", "query",
+    "load", "load_malformed", "load_arcs", "heads", "heads_for", "chain_tip", "query",
     "tag_counts", "arc_items", "arc_progress", "read_status", "due_state", "since_cutoff",
     "exists", "newest_first", "written_at", "shown", "appended", "stamp_sha", "unholdable",
-    "notes_path", "arcs_path", "id_tail", "pending_rows", "Note", "Arc", "Target",
+    "notes_path", "arcs_path", "id_tail", "pending_rows", "with_bases", "Note", "Arc", "Target",
     "STATUSES", "BUILTIN_TARGET_TYPES",
+    "UndoRefused", "undo_words",                 # api.undo's refusal, and its words
+    "undoable", "note_from_dict",                # the undo button's read, and its dialog's rows
 }
 
 # `from <anything> import ..., store [as X], ...` -- the module-object import.
@@ -109,9 +111,12 @@ def test_the_audit_skips_comments_but_not_code_after_a_hash_in_a_string():
 CLI_FILE = GUI_DIR.parent / "cli.py"
 CLI_STORE_CALLS = ALLOWED_STORE_READS | {
     "note_from_dict", "read_dict", "reconcile_arc",      # reads
+    "stored_names",                                       # read: list --name's stored form
     "jsonl_lines",                                        # a text helper
-    "citing", "own_draft",                                # reads: why an edit was a new row
+    "_replace_atomically",                                # a file helper: --merge-hook's settings
     "pending_rows", "rows_by_author", "NOTES_FILE",       # reads: what commit would take
+    "session_key",                                        # read: the env's agent session
+    "_now_iso",                                           # read: the store's clock
     "ensure_store", "apply_reconciliation",               # the two writes
 }
 

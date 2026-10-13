@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from datetime import datetime
+from difflib import SequenceMatcher
 from itertools import pairwise, zip_longest
 
 from . import gitref, kinds as K, store as S
@@ -14,6 +15,7 @@ PRIORITY_CAP = 10
 HEAD_CAP = 8
 PREREG_CAP = 10
 PEOPLE_CAP = 3
+CLOSED_CAP = 5
 DUE_CAP = 10
 DUE_DAYS = 7      # how far ahead the due block looks
 HEAD_CHARS = 100
@@ -254,6 +256,8 @@ def empty_summary() -> dict:
         "priority_elided": 0,
         "people": [],
         "people_elided": 0,
+        "closed": [],
+        "closed_elided": 0,
         "heads": [],
         "heads_elided": 0,
         "due": [],
@@ -269,10 +273,31 @@ def empty_summary() -> dict:
         "full": False,
         "rows": 0,
         "gui": None,
+        "wrap": None,
         "skill": None,
-        "leftovers": [],
         "named_store": None,
+        "commit_hint": None,
     }
+
+
+def row_digest(by_id, n, chars, reader, active=frozenset()) -> dict:
+    """One row's fields, the same in every block: a star or a near due
+    date moved a row to a block that dropped its `from` and its
+    registration date (2026-09-29). The labels are the row's. `parked`
+    and `arc` say why a printed row is not in the header's counts: a
+    session summed the rows against them and reported a counting bug
+    (2026-10-12). `active` is the unarchived arc ids."""
+    root = _root(by_id, n)
+    return {"id": n.id, "kind": n.kind,
+            "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
+            "body": clip(n.body, chars),
+            **({"parked": True} if n.spec.parked else {}),
+            **({"arc": n.arc_id} if n.arc_id in active else {}),
+            **who(reader, root.author, n.author),
+            **({"registered": S.shown(root.created_at)[:10]}
+               if n.spec.status and n.spec.verdict else {}),
+            **({"amendments": k} if (k := _amendments(by_id, n)) else {}),
+            **added(by_id, n, reader, chars)}
 
 
 def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
@@ -302,18 +327,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     by_id = {n.id: n for n in loaded}
 
     def digest(n, chars):
-        """One row's fields, the same in every block: a star or a near due
-        date moved a row to a block that dropped its `from` and its
-        registration date (2026-09-29). The labels are the row's."""
-        root = _root(by_id, n)
-        return {"id": n.id, "kind": n.kind,
-                "target": f"{n.target.type}:{clip(n.target.name, NAME_CHARS)}",
-                "body": clip(n.body, chars),
-                **who(reader, root.author, n.author),
-                **({"registered": S.shown(root.created_at)[:10]}
-                   if n.spec.status and n.spec.verdict else {}),
-                **({"amendments": k} if (k := _amendments(by_id, n)) else {}),
-                **added(by_id, n, reader, chars)}
+        return row_digest(by_id, n, chars, reader, active)
 
     prereg = [n for n in heads if n.spec.verdict]
     rest = deal_by_kind([n for n in heads if not n.spec.verdict])
@@ -326,6 +340,32 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         n for n in notes if S.read_status(n) == "open" and n.id not in printed
         and (wrote_it(reader, n.author) or wrote_it(reader, _root(by_id, n).author)))
     o_cap = len(people) if full else PEOPLE_CAP
+    # Resolved rows the reader raised or closed that someone else closed, or
+    # wrote to the body of, since the reader's newest row. Every block above
+    # lists open rows, so an owner's answer by `resolve --body` closed the
+    # agent's question and never reached it (2026-10-11), and an owner's
+    # correction to an agent's resolve read nowhere (2026-10-12). A re-tag is
+    # neither. The reader's newest row stands in for "since you last looked":
+    # symbion keeps no session.
+    # ponytail: parallel sessions share one reader name, so one session's write
+    # hides the block from the next; a session key on each row would fix it.
+    # Ordered as newest_first orders: a stamp is to the second, and the file
+    # order breaks the tie.
+    pos = {n.id: i for i, n in enumerate(loaded)}
+    since = max(((S.written_at(n), pos[n.id]) for n in loaded if n.author == reader),
+                default=None)
+
+    def answered(n) -> bool:
+        if reader not in (_root(by_id, n).author, _closer(by_id, n).author):
+            return False
+        for new, old in pairwise(_chain(by_id, n)):
+            if wrote_it(reader, new.author) and (
+                    new.body != old.body or S.read_status(old) != "resolved"):
+                return (S.written_at(new), pos[new.id]) > since
+        return False
+    closed = S.newest_first(
+        n for n in notes if since and S.read_status(n) == "resolved" and answered(n))
+    c_cap = len(closed) if full else CLOSED_CAP
 
     rows = []
     for a in acts:
@@ -349,6 +389,9 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         # A running `serve`'s URL, so an agent can hand the person a row's
         # page (the owner, 2026-10-01).
         "gui": (r := servers.serving(store_dir)) and r["url"],
+        # The last wrap's commit message is the handoff (2026-10-12): what
+        # the previous session left for this one, read before its rows.
+        "wrap": gitref.last_wrap(store_dir, cfg),
         "open": open_counts,
         "open_in_arcs": sum(r["open"] for r in rows),
         "arcs": rows[:a_cap],
@@ -359,6 +402,9 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         "priority_elided": max(0, len(priority) - p_cap),
         "people": [{**digest(n, HEAD_CHARS), "author": n.author} for n in people[:o_cap]],
         "people_elided": max(0, len(people) - o_cap),
+        "closed": [{**digest(n, HEAD_CHARS), "closed_by": (c := _closer(by_id, n)).author,
+                    "closed_at": c.created_at} for n in closed[:c_cap]],
+        "closed_elided": max(0, len(closed) - c_cap),
         # The people block names an author only for the rows no other block
         # printed, so a person's row that fell INSIDE the head cap lost its
         # attribution; which side of a cap a row falls on is not something a
@@ -394,12 +440,44 @@ def _chain(by_id, n):
         n = by_id.get(n.supersedes)
 
 
+def _closer(by_id, n):
+    """The version that resolved n: the oldest of the resolved versions at the
+    head of its chain, so a later re-tag does not read as the close."""
+    closer = n
+    for m in _chain(by_id, n):
+        if S.read_status(m) != "resolved":
+            break
+        closer = m
+    return closer
+
+
 def _root(by_id, n):
     """The first row of n's supersede chain: a pre-registration's commitment.
     An amendment is a new row, so the head's own date is not the
     registration; 14 of 14 open prediction heads in three adopter stores
     restated it in the body (measured 2026-09-26)."""
     return list(_chain(by_id, n))[-1]
+
+
+_CHANGED = ("kind", "target", "status", "due", "tags", "refs", "checked", "result",
+            "measurements", "arc_id")
+
+
+def written(by_id, n) -> list[str]:
+    """`written <when> by <author>` for the version that wrote n's body and,
+    when a later link kept that body, the fields the newest link changed and
+    who changed them. An edit keeps the id, so the head's author read as the
+    body's: an agent's bug the owner starred read `written … by` the owner
+    (2026-10-12)."""
+    chain = list(_chain(by_id, n))
+    b = next((new for new, old in pairwise(chain) if new.body != old.body), chain[-1])
+    out = [f"written {S.shown(b.created_at)} by {b.author}"]
+    if b is not n:
+        prev = by_id[n.supersedes]
+        what = ", ".join(f for f in _CHANGED if getattr(n, f) != getattr(prev, f)) or "edited"
+        out.append(f"{what}{' changed' if what != 'edited' else ''} "
+                   f"{S.shown(n.created_at)} by {n.author}")
+    return out
 
 
 def _starred_at(by_id, n) -> str:
@@ -417,13 +495,13 @@ def _starred_at(by_id, n) -> str:
 
 
 def _amendments(by_id, n) -> int:
-    """Links of n's chain that added text after a body (`supersede --append`,
-    or a rewrite that kept the old body as its prefix). A digest prints the
-    body's start, so an amendment never reaches it: a prediction's corrected
-    time printed its typo until it resolved (dogfood, 2026-09-30)."""
-    return sum(bool(old.body) and len(new.body) > len(old.body)
-               and new.body.startswith(old.body)
-               for new, old in pairwise(_chain(by_id, n)))
+    """The seams that mark text added below a body, one per link that added
+    it. A digest prints the body's start, so an amendment never reaches it:
+    a prediction's corrected time printed its typo until it resolved
+    (dogfood, 2026-09-30). Read off seams(), not a prefix test of its own: a
+    question the owner trimmed and answered in one save read `+1 amendment`
+    beside the two that `show` marked (2026-10-11)."""
+    return sum(not above for *_, above in seams(by_id, n))
 
 
 def seams(by_id, n) -> list[tuple[int, str, str, bool]]:
@@ -432,15 +510,15 @@ def seams(by_id, n) -> list[tuple[int, str, str, bool]]:
     supersedes are appends, and a diff of one is the whole old body unchanged
     (the owner, 2026-10-08). One link can add both above and below: a
     prepend, then an append that rewrote the uncommitted row in place. A
-    rewrite drops the seams before it, whose offsets no longer hold. An
-    in-place edit of an uncommitted row leaves no link, so no seam."""
+    link that edited the old body reads through _edit_seams. An in-place
+    edit of an uncommitted row leaves no link, so no seam."""
     out = []
     for old, new in pairwise(reversed(list(_chain(by_id, n)))):
         if not old.body or new.body == old.body:
             continue
         i = new.body.find(old.body)
         if i < 0:
-            out = []
+            out = _edit_seams(old.body, new.body, out, new.author, new.created_at)
             continue
         end = i + len(old.body)
         # A side that added only whitespace has no seam: there is no text to mark.
@@ -448,6 +526,114 @@ def seams(by_id, n) -> list[tuple[int, str, str, bool]]:
             + [(at + i, *s) for at, *s in out] \
             + ([(end, new.author, new.created_at, False)] if new.body[end:].strip() else [])
     return out
+
+
+_WORD = re.compile(r"\S+")
+
+
+def _edit_seams(old: str, new: str, out, author: str, created_at: str):
+    """seams() across a link that edited the old body, by a word diff as
+    gui.notes.edited() reads one. A seam stays beside the kept words next to
+    it. Text after the last kept words that starts a paragraph is the link's
+    own: the owner cut a sentence from an agent's question and answered below
+    it in one save, and read as a rewrite the answer joined the question with
+    no seam (2026-10-11). An edit in the last paragraph writes no paragraph,
+    so it gets none."""
+    ow, nw = list(_WORD.finditer(old)), list(_WORD.finditer(new))
+    # A run under 3 words is as likely chance as kept text: a lone `the` carried
+    # a seam into a rewrite of the whole row. Kept runs measured 4 words and up.
+    blocks = [m for m in SequenceMatcher(None, [w[0] for w in ow], [w[0] for w in nw],
+                                         autojunk=False).get_matching_blocks() if m.size >= 3]
+    copy = {i + d: j + d for i, j, size in blocks for d in range(size)}
+    moved = {}                                  # offset -> seam; a later one wins
+    for at, *s in out:
+        k = sum(w.end() <= at for w in ow)      # the first old word that ends below the seam
+        if k < len(ow) and ow[k].start() < at:  # inside it: an append went on with the sentence
+            if k in copy:
+                moved[nw[copy[k]].start() + at - ow[k].start()] = s
+        elif k - 1 in copy:
+            moved[nw[copy[k - 1]].end()] = s
+        elif copy.get(k):
+            moved[nw[copy[k] - 1].end()] = s
+    # ponytail: no seam for a paragraph written above the first kept run (only
+    # a hand-written --body makes one); mirror the tail's check if one turns up.
+    if blocks:
+        _, j, size = blocks[-1]
+        j += size                               # the first new word after the last kept run
+        if j < len(nw) and new.count("\n", nw[j - 1].end(), nw[j].start()) >= 2:
+            moved[nw[j - 1].end()] = [author, created_at, False]
+    out = sorted((at, *s) for at, s in moved.items())
+    # A seam whose side the edit emptied marks no text.
+    cuts = [0, *(at for at, *_ in out), len(new)]
+    return [s for s, a, at, b in zip(out, cuts, cuts[1:], cuts[2:])
+            if (new[a:at] if s[3] else new[at:b]).strip()]
+
+
+def at_seams(body: str, seams) -> list[tuple[str, str | None]]:
+    """`body` cut at each of seams()'s offsets: `(piece, line)` pairs, the
+    line naming who added the text below it (above it, for a prepend) and
+    when; the last piece's is None. A cut's blank lines go: the line
+    stands between the pieces instead."""
+    out, start = [], 0
+    for at, who, when, above in seams:
+        out.append((body[start:at],
+                    f"-- {who} added {'the above' if above else 'below'}, {S.shown(when)} --"))
+        start = at
+    out.append((body[start:], None))
+    return [(p.strip("\n"), line) for p, line in out] if seams else out
+
+
+# A cite: a whole id, the 10-character tail SKILL.md says to cite, or the
+# 17-character one `show` takes too. gui.notes links the same shape.
+_CITE = re.compile(r"(?<![\w-])(\d{8}-\d{6}-\d{6}-[0-9a-f]{3}|(?:\d{6}-)?\d{6}-[0-9a-f]{3})(?![\w-])")
+
+
+def cite_ids(ids) -> dict:
+    """Each id, and each of its 10- and 17-character tails -> the one id it
+    names, or None when several share the tail."""
+    one = {}
+    for i in ids:
+        for t in (i[-10:], i[-17:]):
+            one[t] = None if t in one else i
+    return one | {i: i for i in ids}
+
+
+def links(notes, n) -> list[str]:
+    """A line for each row n's body cites, read through that row's head,
+    then one for each head whose body cites any version of n, newest first.
+    Across many stores, over half the cites between rows named a version
+    since superseded, mostly by a resolve, and only a `show` of each said so
+    (2026-10-11). A cite names one row here: another store's id, or a tail
+    two rows share, names none; a cite of n's own chain is no link."""
+    by_id = {m.id: m for m in notes}
+    one = cite_ids(by_id)
+
+    def cited(m) -> dict:
+        """Each row m's body cites -> the first spelling it is cited by."""
+        out = {}
+        for t in _CITE.findall(m.body or ""):
+            if (i := one.get(t)) and i not in out:
+                out[i] = t
+        return out
+
+    def line(word, h):
+        st = S.read_status(h)
+        # A check with no body, SKILL.md's first example, printed no lead
+        # (2026-10-11): what it found, labelled as `list` labels it.
+        label, text = (("", h.body) if h.body else ("result: ", h.result) if h.result
+                       else ("checked: ", h.checked))
+        lead = text and label + clip(text, HEAD_CHARS)
+        return f"{word} {h.kind}{f' [{st}]' if st else ''}{': ' + lead if lead else ''}"
+
+    mine = {c.id for c in _chain(by_id, S.chain_tip(notes, n.id))}
+    heads = {}
+    for i, t in cited(n).items():
+        h = S.chain_tip(notes, i)
+        if i not in mine and h.id not in heads:
+            heads[h.id] = line(f"cites {t}" + (f" -> {h.id[-10:]}" if h.id != i else ""), h)
+    by = [h for h in S.newest_first(S.heads(notes))
+          if h.id not in mine and mine & cited(h).keys()]
+    return [*heads.values(), *(line(f"cited by {h.id[-10:]}", h) for h in by)]
 
 
 def added(by_id, n, reader, chars) -> dict:
@@ -466,25 +652,48 @@ def added(by_id, n, reader, chars) -> dict:
     lead: the reader's `noted` after an answer changes the body, and counted
     as a revision it made an answer nobody acted on read as handled."""
     rewritten = False
+    lead = clip(n.body, chars)
     for new, old in pairwise(_chain(by_id, n)):
         if wrote_it(reader, new.author):
             was = set(old.body.splitlines())
-            line = next((ln for ln in new.body.splitlines() if ln.strip() and ln not in was),
-                        None)
-            if line:
-                text = clip(line, chars)
-                return ({"added": text, "added_by": new.author, "added_at": new.created_at,
-                         "lead_rewritten_since": rewritten}
-                        if line in n.body and text not in clip(n.body, chars) else {})
+            fresh = [ln for ln in new.body.splitlines() if ln.strip() and ln not in was]
+            if fresh:
+                # The first new line the lead does not show: an owner who
+                # trimmed the lead's last sentence and answered below it
+                # changed the lead first, and the answer never printed
+                # (2026-10-11).
+                line = next((ln for ln in fresh
+                             if ln in n.body and clip(ln, chars) not in lead), None)
+                return ({"added": clip(line, chars), "added_by": new.author,
+                         "added_at": new.created_at, "lead_rewritten_since": rewritten,
+                         "edited": not _seamed(by_id, n, new, line)}
+                        if line else {})
         rewritten |= clip(new.body, chars) != clip(old.body, chars)
     return {}
 
 
+def _seamed(by_id, n, link, line) -> bool:
+    """Does `line` sit in text a seam gives to `link`? An edit that wrote no
+    paragraph of its own has none: an agent's rewrite of a row the owner had
+    amended printed `claude added …` with a reworded sentence of the first
+    version, beside no amendment count (2026-10-12). A body written onto an
+    empty one is all the link's own, and seams() marks no seam there."""
+    if not by_id[link.supersedes].body:
+        return True
+    i, ss = n.body.find(line), seams(by_id, n)
+    cuts = [0, *(at for at, *_ in ss), len(n.body)]
+    return any((who, when) == (link.author, link.created_at)
+               and (cuts[k] <= i < at if above else at <= i < cuts[k + 2])
+               for k, (at, who, when, above) in enumerate(ss))
+
+
 def added_label(a) -> str:
     """`alice added 19h ago, lead rewritten since:`, the words before an
-    `added` line in summary and list."""
+    `added` line in summary and list; `edited` for a line no paragraph of
+    the link's own holds."""
     since = ", lead rewritten since" if a["lead_rewritten_since"] else ""
-    return f"{a['added_by']} added {when_added(a['added_at'])}{since}:"
+    verb = "edited" if a.get("edited") else "added"
+    return f"{a['added_by']} {verb} {when_added(a['added_at'])}{since}:"
 
 
 def json_row(n, by_id, since) -> dict:
@@ -492,8 +701,11 @@ def json_row(n, by_id, since) -> dict:
     `read_dict` plus what they compute. `raised_by` is the author of the
     chain's first row: `author` is the head's, so one `supersede --append` by
     a teammate moved a row out of a consumer's filter on its raiser (an agent
-    harness, 2026-10-07)."""
-    return S.read_dict(n) | {"commits_since": since, "raised_by": _root(by_id, n).author}
+    harness, 2026-10-07). `raised_at` is that row's time, for the same reason:
+    by `created_at`, a row amended today read as filed today (2026-10-12)."""
+    root = _root(by_id, n)
+    return S.read_dict(n) | {"commits_since": since, "raised_by": root.author,
+                             "raised_at": root.created_at}
 
 
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -527,13 +739,16 @@ def _count(n: int, noun: str) -> str:
     return f"{n} {noun}{'' if n == 1 else 's'}"
 
 
-def _labelled(paint, r) -> str:
+def _labelled(paint, r, first=None) -> str:
     """A summary row with its own labels: `from <author>`, on a
     pre-registration its registration date, and its amendment count, in
-    whichever block it prints."""
-    by = ", ".join(f"{label} {r[k]}" for label, k in (("from", "from"), ("last by", "last"))
-                   if r.get(k))
-    reg = f", registered {r['registered']}" if r.get("registered") else ""
+    whichever block it prints. `first` leads the author labels."""
+    by = ", ".join([*([first] if first else []),
+                    *(f"{label} {r[k]}" for label, k in (("from", "from"), ("last by", "last"))
+                      if r.get(k))])
+    reg = (", parked" if r.get("parked") else "") + \
+        (f", arc {r['arc']}" if r.get("arc") else "") + \
+        (f", registered {r['registered']}" if r.get("registered") else "")
     amd = f", +{_count(r['amendments'], 'amendment')}" if r.get("amendments") else ""
     star = f", starred {r['starred_days']}d ago" if r.get("starred_days") else ""
     line = (by and by + " ") + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
@@ -576,6 +791,13 @@ def render_summary(d: dict, paint=plain) -> str:
         out.append(f"  {paint('priority', 'warn')} " + _labelled(paint, p))
     if d["priority_elided"]:
         out.append("  " + paint(f"+{d['priority_elided']} more priority (--full)", "meta"))
+    for c in d.get("closed", ()):
+        # `closed by` names the closer, so a `last by` the same name says it twice.
+        out.append("  " + _labelled(paint, {k: v for k, v in c.items()
+                                            if k != "last" or v != c["closed_by"]},
+                                    first=paint("closed by " + c["closed_by"], "good")))
+    if d.get("closed_elided"):
+        out.append("  " + paint(f"+{d['closed_elided']} more closed (--full)", "meta"))
     for p in d.get("people", ()):
         out.append("  " + _labelled(paint, p))
     if d.get("people_elided"):
@@ -592,11 +814,7 @@ def render_summary(d: dict, paint=plain) -> str:
         if d["registry_modified"]:
             bits.append("arc changes")
         out.append("  " + paint(f"{' and '.join(bits)} not yet in the store's git "
-                                f"(symbion commit)", "warn"))
-    if d.get("leftovers"):
-        # Imported late: cli owns the paths, and imports this module.
-        from .cli import _old_copies_line
-        out.append("  " + paint(_old_copies_line(d["leftovers"]), "warn"))
+                                f"({d.get('commit_hint') or 'symbion commit'})", "warn"))
     if d["unreadable"]:
         out.append("  " + paint(f"{_count(d['unreadable'], 'row')} unreadable, "
                                 f"first: {d['unreadable_first']}", "bad"))
@@ -613,10 +831,16 @@ def render_summary(d: dict, paint=plain) -> str:
                                 f"{d.get('no_status_first')} -- "
                                 f"supersede <id> --status open|resolved", "bad"))
     if d.get("full") and not (d["arcs_elided"] or d["priority_elided"] or d.get("heads_elided")
-                              or d.get("due_elided") or d.get("people_elided")):
+                              or d.get("due_elided") or d.get("people_elided")
+                              or d.get("closed_elided")):
         # A --full that lifted nothing otherwise prints the default text
         # byte for byte, and the flag reads as dropped.
         out.append("  " + paint("(--full: nothing was elided)", "meta"))
+    if w := d.get("wrap"):
+        since = (f", {_count(w['commits_since'], 'commit')} since"
+                 if w["commits_since"] is not None else "")
+        out.append(f"  last wrap by {w['author']}, {when_added(w['at'])}{since}: {w['gist']}")
+        out.extend("    " + paint(ln, "body") for ln in w["body"].splitlines())
     if d.get("gui"):
         out.append(f"  symbion serve: {d['gui']}; when you point the user at a row, "
                    f"link it: {d['gui']}/notes?id=<id>")

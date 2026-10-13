@@ -188,3 +188,16 @@ def test_seed_refuses_an_ineligible_kind_naming_the_bit(tmp_path, label, table, 
     with pytest.raises(ValueError, match=bit):
         store.seed_arc(tmp_path, act.id, "item", ["a"], kind=label)
     assert store.arc_items(store.load(tmp_path), act.id) == []
+
+
+def test_archiving_an_archived_arc_keeps_its_date(tmp_path):
+    """`archived_at` is when the arc left the summary. A second archive
+    re-stamped it, at exit 0 (the 2026-10-09 audit)."""
+    from datetime import datetime, timezone
+    store.ensure_store(tmp_path)
+    a = store.create_arc(tmp_path, "x", "", "item")
+    at = lambda m: lambda: datetime(2026, m, 1, tzinfo=timezone.utc)       # noqa: E731
+    first = store.archive_arc(tmp_path, a.id, _clock=at(1))
+    again = store.archive_arc(tmp_path, a.id, _clock=at(2))
+    assert again == first == store.load_arcs(tmp_path)[0]
+    assert first.archived_at.startswith("2026-01-01"), first

@@ -132,39 +132,107 @@ def test_init_prints_the_hook_block_instead_of_merging_user_settings(repo, tmp_p
     assert settings.read_text() == '{"permissions": {"allow": []}}\n'
     out = capsys.readouterr().out
     assert "SessionStart" in out and "session_start.sh" in out
+    assert "by typing `! symbion init --merge-hook` at the prompt" in out, out
+
+
+OTHER = {"matcher": "startup", "hooks": [{"type": "command", "command": "other-status"}]}
+
+
+@pytest.mark.parametrize("before", [
+    {"theme": "dark", "hooks": {"SessionStart": [OTHER]}, "note": "café"},
+    {"permissions": {"allow": []}},
+    {"hooks": None},
+])
+def test_merge_hook_appends_the_entry_and_keeps_the_rest(repo, tmp_path, capsys, before):
+    """An agent's merge was allowed in one run and denied as self-modification
+    in the next (2026-10-10). The person types --merge-hook instead: it merges
+    without --yes, since the flag asks for that one change."""
+    store_dir = tmp_path / "store"
+    assert run("init", "--yes", store_dir=store_dir) == 0      # everything but the hook
+    settings = _home() / ".claude/settings.json"
+    settings.write_text(json.dumps(before, ensure_ascii=False), encoding="utf-8")
+    settings.chmod(0o600)
+    capsys.readouterr()
+    assert run("init", "--merge-hook", store_dir=store_dir) == 0
+    out = capsys.readouterr().out
+    assert f"merged the symbion SessionStart hook into {settings}" in out
+    assert out.splitlines()[-1] == "nothing else to change", out
+    after = json.loads(settings.read_text(encoding="utf-8"))
+    assert after["hooks"]["SessionStart"][-1] == cli._hook_entry(cli._HOOK_COMMAND)
+    assert {k: v for k, v in after.items() if k != "hooks"} == \
+        {k: v for k, v in before.items() if k != "hooks"}
+    assert after["hooks"]["SessionStart"][:-1] == ((before.get("hooks") or {})
+                                                   .get("SessionStart") or [])
+    if os.name != "nt":
+        assert settings.stat().st_mode & 0o777 == 0o600
+    raw = settings.read_bytes()
+    assert run("init", "--merge-hook", store_dir=store_dir) == 0
+    assert f"kept hook in {settings}" in capsys.readouterr().out
+    assert settings.read_bytes() == raw, "registered already: written again"
+
+
+def test_init_registers_the_gotcha_hook_beside_the_session_hook(repo, tmp_path, capsys):
+    """A trap on a file reaches a session through a hook after each tool call
+    that can name the file (gotchas.sh). A new settings file gets both hooks.
+    One that registers only the session hook, as every install before this
+    one does, hears the gotcha hook is missing, and --merge-hook adds it."""
+    store_dir = tmp_path / "store"
+    assert run("init", "--yes", store_dir=store_dir) == 0
+    settings = _home() / ".claude/settings.json"
+    hooks = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
+    assert hooks["PostToolUse"] == [cli._gotcha_entry()]
+    assert (resources.files("symbion") / "data" / "skill" / "gotchas.sh").is_file()
+    settings.write_text(json.dumps({"theme": "dark"}))
+    capsys.readouterr()
+    assert run("init", "--yes", store_dir=store_dir) == 0
+    out = capsys.readouterr().out
+    assert out.count("does not register") == 2 and out.count("An agent whose edit") == 1, out
+    settings.write_text(json.dumps({"hooks": {"SessionStart": hooks["SessionStart"]}}))
+    assert run("init", "--yes", store_dir=store_dir) == 0
+    out = capsys.readouterr().out
+    assert f"kept hook in {settings}" in out, out
+    assert "does not register the symbion PostToolUse hook" in out, out
+    # Its last line read `nothing to change`, and an upgrade stopped there
+    # with the hook unregistered (2026-10-12).
+    assert run("init", store_dir=store_dir) == 1
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        "the symbion PostToolUse hook is not registered: run `symbion init --merge-hook`")
+    assert run("init", "--merge-hook", store_dir=store_dir) == 0
+    assert f"merged the symbion PostToolUse hook into {settings}" in capsys.readouterr().out
+    assert json.loads(settings.read_text(encoding="utf-8"))["hooks"] == hooks
+    assert run("init", "--merge-hook", store_dir=store_dir) == 0
+    assert f"kept PostToolUse hook in {settings}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("text", ["{ not json", '{"hooks": {"SessionStart": {}}}'])
+def test_merge_hook_refuses_a_file_it_cannot_read_and_leaves_it(repo, tmp_path, capsys, text):
+    settings = _home() / ".claude/settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(text)
+    assert run("init", "--merge-hook", store_dir=tmp_path / "store") == 1
+    err = capsys.readouterr().err
+    assert f"{settings} cannot be read" in err and "left it unchanged" in err, err
+    assert settings.read_text() == text
+
+
+def test_merge_hook_waits_for_the_skill_link_the_hook_runs(repo, tmp_path, capsys):
+    """The hook runs session_start.sh through the skill link: merged before
+    the link exists, it fails at every session start in every project."""
+    settings = _home() / ".claude/settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{}")
+    store_dir = tmp_path / "store"
+    assert run("init", "--merge-hook", store_dir=store_dir) == 1
+    assert "run `symbion init --yes --merge-hook`" in capsys.readouterr().err
+    assert settings.read_text() == "{}"
+    assert run("init", "--yes", "--merge-hook", store_dir=store_dir) == 0
+    assert cli._hook_registered(settings)
 
 
 def test_init_labels_the_pointer_by_what_git_will_take(repo, tmp_path, capsys):
     (repo / ".gitignore").write_text(".claude/\n")
     assert run("init", "--yes", store_dir=repo.parent / "other-notes") == 0
     assert "-> ../other-notes (git: not ignored)" in capsys.readouterr().out
-
-
-def test_init_and_summary_name_per_project_copies_an_older_init_left(repo, tmp_path, capsys):
-    """The migration signal: every adopter holds copies from before the
-    user-level link, and a copy beside the link is a second, staler skill and
-    a second hook. Both directions; a project's own hook is not ours."""
-    store_dir = tmp_path / "store"
-    (repo / "hooks").mkdir()
-    (repo / "hooks/session_start.sh").write_text("echo my own hook\n")
-    run("init", "--yes", store_dir=store_dir)
-    run("add", "note", "--target", "project", store_dir=store_dir)
-    capsys.readouterr()
-    text, d = _summary(tmp_path, capsys)
-    assert d["leftovers"] == [] and "per-project" not in text, text
-
-    (repo / "hooks/session_start.sh").write_text("symbion summary 2>&1 || true\n")
-    (repo / ".claude/skills/symbion").mkdir(parents=True)
-    (repo / ".claude/settings.json").write_text(json.dumps({"hooks": {"SessionStart": [
-        {"hooks": [{"command": "$CLAUDE_PROJECT_DIR/hooks/session_start.sh"}]}]}}))
-    text, d = _summary(tmp_path, capsys)
-    assert d["leftovers"] == [".claude/skills/symbion", "hooks/session_start.sh",
-                              ".claude/settings.json SessionStart entry"], d["leftovers"]
-    assert ("  3 per-project symbion copies from an older init: .claude/skills/symbion, "
-            "hooks/session_start.sh, .claude/settings.json SessionStart entry -- the "
-            "user-level skill replaces them; remove them") in text.splitlines(), text
-    run("init", "--yes", store_dir=store_dir)
-    assert "per-project symbion copies" in capsys.readouterr().out
 
 
 def test_summary_points_at_the_user_skill_before_a_write(repo, tmp_path, capsys):

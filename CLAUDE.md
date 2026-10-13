@@ -13,7 +13,9 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
   that reverses a spec's decision adds a dated note at that decision; renames and
   signatures need none.
 - Before you trust a new or changed test, break the code it guards and watch the test
-  fail.
+  fail. In a checkout that is your installed symbion, break a copy: copy `src`, `tests`
+  and `pyproject.toml` to a scratch dir and patch there. `tests/conftest.py` puts that
+  copy's `src/` first.
 - A `# ponytail: <limit, upgrade path>` comment marks a deliberate simplification.
 - State the mechanism, not where you saw it: no names, paths or data from your other
   projects in code, tests, docs or commit messages.
@@ -40,12 +42,13 @@ Python 3.11 or later:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[test,gui]'
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest -q -n auto
 ```
 
 Run the tests with the venv's Python, not a bare `pytest`: `tests/test_hook.py` runs
 the `symbion` script installed beside the interpreter. With `.[test]` alone, the GUI
-tests skip.
+tests skip. `-n auto` runs the suite on every core (pytest-xdist): each test already
+isolates `HOME`, the cwd and the cache. One test runs faster without it.
 
 To try a change by hand, make a scratch store and name it with `--dir`:
 
@@ -61,6 +64,9 @@ command uses `../<repo>-notes` beside the current repo. Run `.venv/bin/symbion i
 --yes` only when the user asks: it creates that store, it can point the user-wide skill
 and hook at this checkout (`docs/guide.md`, "Adopt in a fresh repo"), and with `--dir`
 it can write a `.symbion` pointer into the checkout. Without `--yes` it only lists them.
+A scratch `init --yes` in a test sets `HOME` (on Windows, `USERPROFILE` too) to a
+scratch dir on the same command line; without it, init acts on your real skill link
+and hook.
 
 ## If this checkout is your installed symbion
 
@@ -69,4 +75,6 @@ When the `symbion` on PATH is this checkout's editable install and
 every Claude Code session on the machine reads its skill and hook from
 `src/symbion/data/skill/`. A broken save then prints a traceback at the start of every
 session, in every project. Keep each save runnable: edit bottom-up (store, api, cli),
-and do not edit `src/` while a `symbion` command runs in another session.
+and do not edit `src/` while a `symbion` command runs in another session. A scripted
+edit to `src/` (sed, a Python rewrite) ends with `python -m py_compile` of each file it
+wrote, in the same command.

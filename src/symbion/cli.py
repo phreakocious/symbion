@@ -21,8 +21,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
+import time
 import tomllib
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 from . import api, catalog, config, gitref, kinds as K, store
@@ -30,13 +33,6 @@ from . import summary as summ
 
 
 # ---- author resolution ----
-def _author_default() -> str:
-    """A thin alias the precedence test in tests/test_cli.py calls, while it
-    patches `cli.subprocess.run` (the same module object api.py's git call
-    goes through). The rule lives in api.author_default()."""
-    return api.author_default()
-
-
 def _resolved_author(args) -> str:
     return args.author if args.author is not None else api.author_default()
 
@@ -74,14 +70,19 @@ def _codex_hook_entry(link: Path) -> dict:
     return entry
 
 
-_HOOK_ENTRY = _hook_entry(_HOOK_COMMAND)
-_HOOK_SETTINGS = {"hooks": {"SessionStart": [_HOOK_ENTRY]}}
 # The script's path, not the command: JSON escapes the command's quotes, and a
 # hand-written entry may spell it `~/...`; either way it runs this file.
 _HOOK_SCRIPT = "skills/symbion/session_start.sh"
 _WINDOWS_HOOK_SCRIPT = "skills/symbion/session_start.ps1"
-# What an older init wrote into each project, and the registration that ran it.
-_OLD_HOOK = "$CLAUDE_PROJECT_DIR/hooks/session_start.sh"
+# The gotcha hook (gotchas.sh), after each tool call that can name a file.
+# Claude Code reads a matcher of plain names as an exact list (its hooks docs).
+_GOTCHA_COMMAND = 'sh "$HOME/.claude/skills/symbion/gotchas.sh"'
+_GOTCHA_SCRIPT = "skills/symbion/gotchas.sh"
+
+
+def _gotcha_entry() -> dict:
+    return {"matcher": "Read|Edit|Write|NotebookEdit|Bash",
+            "hooks": [{"type": "command", "command": _GOTCHA_COMMAND, "timeout": 5}]}
 
 
 def _skill_dir() -> Path:
@@ -90,7 +91,8 @@ def _skill_dir() -> Path:
 
 # Each change init makes, printed in the past tense once made, and as
 # `will <verb>` in the list a run without --yes prints instead.
-_PAST = {"create": "created", "write": "wrote", "link": "linked", "set": "set", "keep": "kept"}
+_PAST = {"create": "created", "write": "wrote", "link": "linked", "set": "set", "keep": "kept",
+         "merge": "merged"}
 
 
 def _act(write: bool, verb: str, what: str) -> bool:
@@ -99,11 +101,16 @@ def _act(write: bool, verb: str, what: str) -> bool:
     return verb != "keep"
 
 
-def _link_user_skill(write: bool = True, agent: str = "claude") -> bool:
+def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = False,
+                     missing: list | None = None) -> bool:
     """Link the skill, and register the hook in the user's settings only when
-    that file is absent: merging someone's JSON is not this tool's business,
-    so an existing file without the hook gets the block printed instead. A
-    skill dir that is not this link is someone's; it is named, never replaced.
+    that file is absent: merging someone's JSON is not this tool's business
+    unless they ask, so an existing file without the hook gets the block
+    printed instead, or merged under `merge` (--merge-hook), with or without
+    `write`: the person typed that flag for that one change. An agent's own
+    merge was allowed in one run and denied as self-modification in the next
+    (2026-10-10), and a command the person types is not the agent's. A skill
+    dir that is not this link is someone's; it is named, never replaced.
     Returns whether it changes anything."""
     codex = agent == "codex"
     link = Path.home() / (_SKILL_LINK if agent == "claude" else _CODEX_SKILL_LINK)
@@ -143,6 +150,8 @@ def _link_user_skill(write: bool = True, agent: str = "claude") -> bool:
         print("note: Hermes runs no symbion hook; for the session-start summary, add this "
               "line to the project's AGENTS.md:\n- At the start of a session, run "
               "`symbion summary` unless a hook already printed it.")
+        if merge:
+            print("note: --merge-hook merges nothing for Hermes, which runs no symbion hook")
         return changed
     settings = ((Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
                  / "hooks.json") if codex else Path.home() / ".claude" / "settings.json")
@@ -156,39 +165,89 @@ def _link_user_skill(write: bool = True, agent: str = "claude") -> bool:
         changed |= _act(write, "keep", f"hook in {inline}")
         print(f"note: {trust}")
         return changed
-    if not settings.exists():
+    # Claude Code also runs the gotcha hook after each call that can name a
+    # file. Codex edits through apply_patch, which this matcher does not name.
+    hooks = [("SessionStart", entry, f"runs {command} in every session",
+              (_HOOK_SCRIPT, _WINDOWS_HOOK_SCRIPT))]
+    if agent == "claude":
+        hooks.append(("PostToolUse", _gotcha_entry(), f"runs {_GOTCHA_COMMAND} after each "
+                      "Read, Edit, Write, NotebookEdit and Bash call", (_GOTCHA_SCRIPT,)))
+    if not settings.exists() and not merge:
         if write:
             settings.parent.mkdir(parents=True, exist_ok=True)
-            settings.write_text(json.dumps({"hooks": {"SessionStart": [entry]}}, indent=2) + "\n",
-                                encoding="utf-8")
-        changed |= _act(write, "write", f"{settings} (a SessionStart hook that runs "
-                                        f"{command} in every session)")
+            settings.write_text(json.dumps({"hooks": {ev: [e] for ev, e, _, _ in hooks}},
+                                           indent=2) + "\n", encoding="utf-8")
+        changed |= _act(write, "write", f"{settings} ("
+                        + "; ".join(f"a {ev} hook that {what}" for ev, _, what, _ in hooks) + ")")
         if write and codex:
             print(f"note: {trust}")
         return changed
-    registered = _hook_registered(settings)
-    # The entry, not a whole settings object: pasted over a file that has
-    # SessionStart hooks already, the object replaced them (adopter report).
-    add = ('append this entry to the "SessionStart" list under "hooks" '
-           f'(create either if missing):\n{json.dumps(entry, indent=2)}'
-           + (f"\n{trust}" if codex else ""))
-    if registered:
-        # Said out loud, as the skill link is: a re-run printed nothing here,
-        # so "hook checked and present" read the same as "hook not checked"
-        # (adopter report, 2026-09-28).
-        changed |= _act(write, "keep", f"hook in {settings}")
-        if codex:
-            print(f"note: {trust}")
-    elif registered is None:
-        print(f"note: {settings} cannot be read as a JSON object, so whether it "
-              f"registers the symbion SessionStart hook is unknown; to register it, {add}")
-    else:
-        print(f"{settings} does not register the symbion SessionStart hook; {add}")
+    advised = False
+    for event, e, _, scripts in hooks:
+        label = "hook" if event == "SessionStart" else f"{event} hook"
+        registered = _hook_registered(settings, event=event, scripts=scripts) \
+            if settings.exists() else False
+        # The entry, not a whole settings object: pasted over a file that has
+        # SessionStart hooks already, the object replaced them (adopter report).
+        add = (f'append this entry to the "{event}" list under "hooks" '
+               f'(create either if missing):\n{json.dumps(e, indent=2)}'
+               + (f"\n{trust}" if codex else ""))
+        if registered:
+            # Said out loud, as the skill link is: a re-run printed nothing here,
+            # so "hook checked and present" read the same as "hook not checked"
+            # (adopter report, 2026-09-28).
+            changed |= _act(write or merge, "keep", f"{label} in {settings}")
+            if codex:
+                print(f"note: {trust}")
+        elif registered is None:
+            if merge:
+                raise SystemExit(f"{settings} cannot be read as a JSON object with a list under "
+                                 f"hooks.{event}, so --merge-hook left it unchanged; fix it, "
+                                 f"or {add}")
+            print(f"note: {settings} cannot be read as a JSON object, so whether it "
+                  f"registers the symbion {event} hook is unknown; to register it, {add}")
+        elif merge:
+            if not (write or os.path.lexists(link)):
+                # The hook runs its script through the link: merged first, it
+                # fails at every session start in every project.
+                raise SystemExit(f"--merge-hook left {settings} unchanged: the hook runs its "
+                                 f"script through {link}, which is not there yet; run "
+                                 f"`symbion init --yes --merge-hook"
+                                 f"{' --agent codex' if codex else ''}` to make both")
+            _merge_hook(settings, e, event=event)
+            _act(True, "merge", f"the symbion {event} hook into {settings}")
+            if codex:
+                print(f"note: {trust}")
+        else:
+            cmd = "symbion init --merge-hook" + (" --agent codex" if codex else "")
+            print(f"{settings} does not register the symbion {event} hook. To register it, "
+                  f"run `{cmd}`, or {add}")
+            if missing is not None:
+                missing.append((event, cmd))
+            if not advised:
+                print(f"An agent whose edit of that file was denied does not run --merge-hook "
+                      f"itself, which would go around the denial: it asks the person to run "
+                      f"it (in Claude Code, by typing `! {cmd}` at the prompt).")
+                advised = True
     return changed
 
 
-def _hook_registered(settings: Path, *, toml: bool = False) -> bool | None:
-    """Does `hooks.SessionStart` run our script? None means the file could not
+def _merge_hook(settings: Path, entry: dict, *, event: str = "SessionStart") -> None:
+    """Append `entry` to hooks[event] and keep the rest of the file.
+    Only after _hook_registered read it as an object whose `hooks` and
+    `SessionStart` are absent or of the right type; an absent file is `{}`.
+    Written through a symlink to its target, as a dotfiles repo links it."""
+    data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
+    hooks = data["hooks"] = data.get("hooks") or {}
+    hooks[event] = [*(hooks.get(event) or []), entry]
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    store._replace_atomically(settings.resolve(),
+                              json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def _hook_registered(settings: Path, *, toml: bool = False, event: str = "SessionStart",
+                     scripts=(_HOOK_SCRIPT, _WINDOWS_HOOK_SCRIPT)) -> bool | None:
+    """Does `hooks[event]` run our script? None means the file could not
     be read as the JSON object it must be, so neither answer is available.
 
     The test used to be a substring match over the whole file, which the
@@ -208,36 +267,14 @@ def _hook_registered(settings: Path, *, toml: bool = False) -> bool | None:
         return False
     if not isinstance(hooks, dict):
         return None
-    entries = hooks.get("SessionStart", [])
+    entries = hooks.get(event, [])
     if not isinstance(entries, list):
         return None
     return any(script in str(h.get(key, "")).replace("\\", "/")
                for e in entries if isinstance(e, dict)
                for h in (e.get("hooks") or []) if isinstance(h, dict)
                for key in ("command", "commandWindows", "command_windows")
-               for script in (_HOOK_SCRIPT, _WINDOWS_HOOK_SCRIPT))
-
-
-def _old_copies(root: Path) -> list[str]:
-    """What an init from before the user-level link left in this project: a
-    second, staler skill beside the linked one, and a second hook. A
-    project's own hooks/session_start.sh is not ours unless it runs symbion."""
-    out = []
-    if (root / _SKILL_LINK).exists():
-        out.append(_SKILL_LINK.as_posix())
-    hook = root / "hooks" / "session_start.sh"
-    if hook.exists() and "symbion summary" in hook.read_text(encoding="utf-8", errors="replace"):
-        out.append("hooks/session_start.sh")
-    settings = root / ".claude" / "settings.json"
-    if settings.exists() and _OLD_HOOK in settings.read_text(encoding="utf-8"):
-        out.append(".claude/settings.json SessionStart entry")
-    return out
-
-
-def _old_copies_line(old: list[str]) -> str:
-    return (f"{len(old)} per-project symbion {'copy' if len(old) == 1 else 'copies'} from an "
-            f"older init: {', '.join(old)} -- the user-level skill replaces "
-            f"{'it' if len(old) == 1 else 'them'}; remove {'it' if len(old) == 1 else 'them'}")
+               for script in scripts)
 
 
 def _git_says(root: Path, path: Path) -> str:
@@ -260,7 +297,7 @@ def _ignored_paths(store_dir, prefix: str) -> list[str]:
 
 
 def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
-          repoint: bool = False, agent: str = "claude") -> int:
+          repoint: bool = False, agent: str = "claude", merge_hook: bool = False) -> int:
     """Without `write`, list each change and make none (the owner's call,
     2026-10-01): installed from pipx, init is run by someone who has not read
     its source, and the skill link and the hook are instruction surfaces
@@ -294,17 +331,15 @@ def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
         if write:
             _write_store_readme(readme, Path(cfg.project_root).name)
         changed |= _act(write, "write", f"{readme}")
+    missing = []
     for selected in (("claude", "codex") if agent == "both" else (agent,)):
-        changed |= _link_user_skill(write, selected)
+        changed |= _link_user_skill(write, selected, merge_hook, missing)
     if changed and agent in ("codex", "both"):
         s = shlex.quote(Path(store_dir).resolve().as_posix())
         print(f"note: Codex's sandbox writes only inside the project, and the store is "
               f"outside it: launch `codex --add-dir {s}`, or add {s} to "
               "sandbox_workspace_write.writable_roots in Codex's config.toml. "
               "`symbion commit` may still ask for approval.")
-    old = _old_copies(Path(cfg.project_root))
-    if old:
-        print("note: " + _old_copies_line(old))
     changed |= _record_pointer(Path(store_dir), Path(cfg.project_root), store_from_env,
                                write, repoint)
     if sys.stdout.isatty():
@@ -316,11 +351,15 @@ def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
                   f"{os.environ.get('TERM', '')}), so symbion prints in plainer ones; "
                   "most terminals do more: set COLORTERM=truecolor, or a TERM ending "
                   "in -256color")
-    if write:
-        return 0
-    print("nothing written: re-run with --yes to make these changes" if changed
-          else "nothing to change")
-    return int(changed)
+    # Last, where the eye stops: `nothing to change` after a missing hook's
+    # paragraph ended an upgrade with the hook unregistered (2026-10-12).
+    rest = "nothing else" if merge_hook else "nothing"
+    if not write and (changed or not missing):
+        print(f"{rest} written: re-run with --yes to make these changes" if changed
+              else f"{rest} to change")
+    for event, cmd in missing:
+        print(f"the symbion {event} hook is not registered: run `{cmd}`")
+    return 0 if write else int(bool(changed or missing))
 
 
 def _record_pointer(store_dir: Path, project_root: Path, store_from_env: bool = False,
@@ -489,6 +528,57 @@ def _hook_json(text: str, line: str) -> str:
     return json.dumps(out)
 
 
+def _hook_session() -> str | None:
+    """The session id in the hook input Claude Code writes on stdin. A
+    terminal, an empty stdin or another shape has none."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return None
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "null")
+    except (ValueError, OSError, AttributeError):
+        return None
+    sid = data.get("session_id") if isinstance(data, dict) else None
+    return sid if isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid) else None
+
+
+def _session_cache() -> Path:
+    """Per-session state: the gotcha lists and what each session has seen.
+    Session start sweeps out what is a week old."""
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "symbion" / "gotchas"
+
+
+def _list_gotchas(ctx, sid: str) -> None:
+    """The list gotchas.sh reads on each tool call: per catalog name a
+    #gotcha row is on or refers to, the row's id and the line the agent gets
+    when a call names it. A trap on a file reached a session only through
+    `context --target`, which four sessions skipped (2026-10-02 to 10-10).
+    Written at session start, so a compacted session gets each line again.
+    # ponytail: a gotcha written mid-session reaches other sessions at their
+    # next start; rebuild in the hook when notes.jsonl is newer if that bites."""
+    d = _session_cache()
+    d.mkdir(parents=True, exist_ok=True)
+    week = time.time() - 7 * 86400
+    for f in d.iterdir():                  # one per session: keep a week's
+        if f.stat().st_mtime < week:
+            f.unlink(missing_ok=True)
+    (d / f"{sid}.seen").unlink(missing_ok=True)
+    lines = []
+    for n in store.heads(store.load(ctx.store_dir)):
+        if "gotcha" not in n.tags or "retired" in n.tags or n.status == "resolved":
+            continue
+        tail = n.id[-10:]
+        show = " ".join(filter(None, ["symbion", _named_store(ctx), "show", tail]))
+        for t in (n.target, *n.refs):
+            if t.type in store.BUILTIN_TARGET_TYPES or not t.name or len(t.name) < 4 \
+                    or re.search(r"[\t\n\r\"\\]", t.name):
+                continue
+            text = (f"symbion row {tail}, tagged gotcha, is on {n.target.type}"
+                    f"{':' + n.target.name if n.target.name else ''}: "
+                    f"{summ.clip(n.body or '', 200)} (`{show}` prints all of it)")
+            lines.append(f"{n.id}\t{t.name}\t{json.dumps(text, ensure_ascii=False)[1:-1]}\n")
+    store._replace_atomically(d / sid, "".join(lines))
+
+
 def _gui(store_dir):
     """The URL of a serve on this store, for the ids a terminal prints; None
     in a pipe, whose line never changes."""
@@ -511,8 +601,11 @@ def _serve_all(*, restart: bool) -> int:
     if not results:
         print("no symbion serve is running")
     for what, r in results:
-        if what in ("restarted", "stopped"):
-            print(f"{what} {r['store']}: {r['url']}")
+        if what == "restarted":
+            print(f"restarted {r['store']}: {r['url']}"
+                  + (f" at {r['build']}" if r.get("build") else ""))
+        elif what == "stopped":
+            print(f"stopped {r['store']}: {r['url']}")
         elif what == "exited":
             print(f"{r['store']}: pid {r['pid']} exited instead of restarting; its terminal "
                   "says why. A serve started before `serve --restart` existed stops on it: "
@@ -520,11 +613,17 @@ def _serve_all(*, restart: bool) -> int:
         else:
             print(f"{r['store']}: pid {r['pid']} did not {'restart' if restart else 'stop'} "
                   "within 30 s")
-    return int(any(what not in ("restarted", "stopped") for what, _ in results))
+    ok = sum(what in ("restarted", "stopped") for what, _ in results)
+    if results:
+        # Last, so output cut by a pipe shows the cut: `| tail -5` hid a
+        # serve, which went unprobed (2026-10-11).
+        print(f"{'restarted' if restart else 'stopped'} {ok} of "
+              f"{summ._count(len(results), 'serve')}")
+    return int(ok < len(results))
 
 
 def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
-                since=None, added=None) -> None:
+                since=None, added=None, seams=(), links=(), written=None) -> None:
     """`state` is api.verdict_state's pair for a verdict row, computed by the
     caller (batched per-listing where it needs a subject lookup); `subject`
     is the commit's subject line for a commit-target note, degrading to the
@@ -533,7 +632,10 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
     print the same fact twice. `head` is the head of a superseded row's
     chain: without it an old row's `[open]` read as live (2026-09-23).
     `since` is gitref.commits_since's count for the row, printed above 0.
-    `added` is summary.added's pair, printed below a clipped body."""
+    `added` is summary.added's pair, printed below a clipped body.
+    `seams` are summary.seams' for a full body: a line at each names who
+    added the text beside it, and when. `links` are summary.links' lines,
+    printed below the body. `written` is summary.written's parts."""
     # A superseded row's own status is history: printed first, `[open]`
     # read as live beside a resolved head (2026-09-28). The head's decides.
     status = store.read_status(head if head is not None else n)
@@ -544,7 +646,8 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
         # session-start hook) never pays the ~50 ms of loading rich.
         from . import term
         term.print_note(n, status=status, state=state, due=due, subject=subject,
-                        head=head, full=full, gui=gui, since=since)
+                        head=head, full=full, gui=gui, since=since, seams=seams,
+                        links=links, written=written)
         return
     tgt = n.target.name or ""          # `project:`, the form --target takes
     if n.target.type == "commit" and subject:
@@ -573,7 +676,7 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
     if full:
         # A row in full says when, by whom, and what it revises: the id is a
         # timestamp no human reads as one (newcomer walk-through, 2026-09-26).
-        print(f"    written {store.shown(n.created_at)} by {n.author}"
+        print("    " + "; ".join(written or [f"written {store.shown(n.created_at)} by {n.author}"])
               + (f"; revises {n.supersedes}" if n.supersedes else ""))
     if n.spec.verdict:
         # Labelled lines, not reprs on the head line; the provenance dict
@@ -592,10 +695,21 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
         print(f"    measured: {m if full else summ.clip(m, summ.LIST_BODY_CHARS)}")
     if n.body and full:
         # A body is markdown by contract: printed as written here, so an
-        # agent reads exactly what was stored. symbion.term renders it.
-        print(f"    {n.body}")
+        # agent reads exactly what was stored, and symbion.term renders it.
+        # Every line takes the row's indent: a second paragraph at column 0
+        # read as outside the row to three fresh agents (2026-10-11).
+        # `--json` is the verbatim form to copy from.
+        # A line at each seam says who added what: an owner's appended reply
+        # read as the agent's own text, which then signed paragraphs by hand
+        # (2026-10-10).
+        for piece, line in summ.at_seams(n.body, seams):
+            print(textwrap.indent(piece, "    "))
+            if line:
+                print(f"    {line}")
     elif n.body:
         print(f"    {summ.clip(n.body, summ.LIST_BODY_CHARS)}")
+    for line in links:
+        print(f"    {line}")
     if added and not full:
         print(f"    {summ.added_label(added)} {added['added']}")
 
@@ -782,13 +896,10 @@ def _extract_dir(argv):
 
 # ---- argparse ----
 def _version(here: Path = Path(__file__).parent) -> str:
-    """pip's `NAME VERSION from PATH`. The metadata version never moves in
-    a checkout, so a checkout adds the commit it runs. It asks whether THIS
-    file is tracked, not whether a repo encloses it: a venv inside a project
-    sits in that project's work tree, and its HEAD is not symbion's."""
+    """pip's `NAME VERSION from PATH`, and in a checkout the commit it runs."""
     line = f"symbion {metadata.version('symbion')} from {here}"
-    if gitref._git(here, "ls-files", "--error-unmatch", "cli.py").returncode == 0:
-        line += f" (git {gitref._git(here, 'describe', '--always', '--dirty').stdout.strip()})"
+    if sha := gitref.own_commit(here):
+        line += f" (git {sha})"
     return line
 
 
@@ -866,6 +977,14 @@ class _Parser(argparse.ArgumentParser):
             legal = action and (action.choices or getattr(action.type, "choices", None))
             if legal:
                 message += f" (choose from {', '.join(legal)})"
+        need = re.fullmatch(r"the following arguments are required: (--[\w-]+)", message)
+        if need and not self._get_positional_actions():
+            # `arc create "Adoption"` said only that --name is required, and
+            # not where its word went (dogfood, 2026-10-09).
+            words = " ".join(x for i, x in enumerate(self._argv) if not x.startswith("-")
+                             and not (i and self._argv[i - 1].startswith("-")))
+            if words:
+                message += f'; {words!r} went unused: it goes in {need[1]} "{words}"'
         super().error(message)
 
     def parse_known_args(self, args=None, namespace=None):
@@ -925,19 +1044,20 @@ _PAIR = re.compile(r"[^\s=-][^\s=]*=")
 # A first-day user's guesses (newcomer walk-through, 2026-09-26), each
 # answered with the command that does it.
 _APPEND_ONLY = ("rows are append-only: `resolve ID` closes a status row, "
-                "`supersede ID --add-tag retired` retires a plain one")
+                "`supersede ID --add-tag retired` retires a plain one, and `undo ID` "
+                "takes back your last write before a commit")
 _VERB_HINTS = {
-    **dict.fromkeys(("delete", "rm", "remove", "undo", "drop"), _APPEND_ONLY),
+    **dict.fromkeys(("delete", "rm", "remove", "drop"), _APPEND_ONLY),
     **dict.fromkeys(("edit", "update", "amend", "correct"),
                     "`supersede ID --body …` records a correction (--append adds to it)"),
     "append": "`supersede ID --append --body …` adds to a row's body",
     **dict.fromkeys(("close", "done", "finish", "complete"), "`resolve ID`"),
     **dict.fromkeys(("search", "find", "grep"), "`list --grep TEXT`"),
-    **dict.fromkeys(("history", "log"), "`show ID` prints a row and names its chain's head"),
+    **dict.fromkeys(("history", "log"), "`show ID --all` prints that version and names its chain's head"),
     **dict.fromkeys(("new", "create", "note"), "`add KIND --target TYPE:NAME --body …`"),
     **dict.fromkeys(("status", "todo", "open"), "`summary`, or `list --status open`"),
     "ls": "`list`",
-    "due": "`list --overdue` (past due), or `summary` (due within 7 days)",
+    "due": "`list --overdue` (past due), `list --due-by DATE`, or `summary` (due within 7 days)",
     "recent": "`list --since 2h`",
 }
 _FLAG_HINTS = {"--open": "--status open", "--closed": "--status resolved",
@@ -1043,6 +1163,14 @@ def _since(v):
         raise argparse.ArgumentTypeError(str(e)) from None
 
 
+def _due_by(v):
+    """(as typed, date) for `list --due-by`."""
+    try:
+        return v, date.fromisoformat(v.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{v!r} is not a date: use YYYY-MM-DD") from None
+
+
 def _kind_choice(kinds, store_dir):
     """A default the table lacks gets the line to paste: a table `init` wrote
     keeps the defaults of its day, so a default added later never reaches it."""
@@ -1086,13 +1214,17 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                  "selected agent's skill and session-start hook outside it: ~/.claude for "
                  "Claude Code, ~/.agents/skills and $CODEX_HOME (default ~/.codex) for "
                  "Codex, ~/.agents/skills and no hook for Hermes. Existing "
-                 "settings are preserved; missing hook entries are printed for you to add. "
+                 "settings are preserved; a missing hook entry is printed for you to add, "
+                 "or merged with --merge-hook. "
                  "Without --yes it lists each change and makes none")
     i = sub.add_parser("init", help=init_says, description=init_says)
     i.add_argument("--agent", choices=("claude", "codex", "hermes", "both"), default="claude",
                    help="agent integration to install; both is claude and codex "
                         "(default: claude)")
     i.add_argument("--yes", action="store_true", help="make the changes it lists")
+    i.add_argument("--merge-hook", action="store_true",
+                   help="add the session-start hook entry to the agent's settings file, "
+                        "keeping the rest of it; works without --yes once the skill is linked")
     i.add_argument("--repoint", action="store_true",
                    help="make this project read the store --dir names, though it reads "
                         "another store that exists (writes .symbion)")
@@ -1153,8 +1285,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     li = sub.add_parser("list", help="list notes, newest first; filter by kind, target, tag, "
                                      "arc or --grep text")
     li.add_argument("--id", dest="note_id", nargs="+", default=None, metavar="ID",
-                    help="rows by id, one or more; implies --all, so a superseded id "
-                         "still resolves. Exits 1 if one matches nothing")
+                    help="rows by id, one or more; a superseded id shows its chain's "
+                         "head, and with --all that version. Exits 1 if one matches nothing")
     li.add_argument("--type", dest="type", default=None, metavar="TYPE",
                     type=_catalog_choice(target_types, "type", store_dir, kinds,
                                          "`list --kind {}`"),
@@ -1178,11 +1310,14 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     li.add_argument("--grep", default=None, metavar="PATTERN",
                     help="regex, case-insensitive, over body, target name, checked, "
                          "result, refs and #tags; ^ and $ anchor a line; an id "
-                         "or its tail also lists that row")
+                         "or its tail, or several joined by |, also lists each row")
     li.add_argument("-F", "--fixed-strings", action="store_true",
                     help="take --grep as a literal string, not a regex")
     li.add_argument("--overdue", action="store_true",
                     help="only open rows past their --due date")
+    li.add_argument("--due-by", default=None, metavar="DATE", type=_due_by,
+                    help="only rows due on or before DATE, past due included; "
+                         "with --status open, what is still owed by then")
     li.add_argument("--since", default=None, metavar="WHEN", type=_since,
                     help="only rows written since WHEN: 30m, 2h, 3d, 1w, a date or an "
                          "ISO datetime, UTC unless TZ is set (a revision counts as "
@@ -1201,10 +1336,12 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
     # Parsed only for -h: main() rewrites `show ID` to `list --id ID` first.
     # Listed so -h and the invalid-choice error name the verb, and with its
     # arguments so `show -h` documents them instead of erroring as `list --id -h`.
-    sh = sub.add_parser("show", help="rows by id; `show ID... [--json]` runs `list --id ID...`",
-                        description="rows by id, superseded or not: `list --id ID...`")
+    sh = sub.add_parser("show", help="rows by id; `show ID... [--json] [--all]` runs `list --id ID...`",
+                        description="rows by id: `list --id ID...`; a superseded id shows "
+                                    "its chain's head, and --all that version")
     sh.add_argument("id", nargs="+")
     sh.add_argument("--json", action="store_true")
+    sh.add_argument("--all", action="store_true", help="a superseded id's own version")
 
     rs = sub.add_parser("resolve", help="mark an open row resolved",
                         description="mark an open row resolved")
@@ -1271,13 +1408,27 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds):
                     help="set the due date: YYYY-MM-DD or an ISO datetime ('' clears it)")
     sp.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
-    cm = sub.add_parser("commit", help="git add -A + commit the store")
-    cm.add_argument("-m", "--message", default="update notes",
+    cm = sub.add_parser("commit", help="commit your pending rows and every changed file")
+    cm.add_argument("-m", "--message", default=None,
                     help="the commit message (default: update notes)")
+    cm.add_argument("--wrap", action="store_true",
+                    help="end a session: -m is the handoff, printed by the next session's "
+                         "summary (one line, then a paragraph)")
     cm.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="list each pending row (its id's tail, author, kind and lead) "
                          "and each other changed file; commit nothing")
+    cm.add_argument("--all", dest="everyone", action="store_true",
+                    help="take every pending row: by default a commit takes the rows this "
+                         "agent session wrote, or with no session, your author's")
     sub.add_parser("push", help="git push the store to its remote; commit first")
+    ud = sub.add_parser("undo", help="take back the store's last write, if it was yours "
+                        "and not yet committed",
+                        description="take back the store's last write, one level: an add, "
+                        "edit, resolve, star or batch, all of it. Refused unless ID is a row "
+                        "or arc that write touched, the write was yours (this agent session's, "
+                        "or with no session your author's), and no commit ran since")
+    ud.add_argument("id", help="a row or arc id (or a row id's tail) the last write touched")
+    ud.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     rn = sub.add_parser("rename",
                         help="re-target all notes for a renamed object and re-point every --ref to it (old -> new name)")
@@ -1561,6 +1712,28 @@ def _name_open_neighbours(store_dir, written) -> None:
                   f"(context --target {where}):{rows}{more}", file=sys.stderr)
 
 
+def _name_unmerged_fixes(cfg, store_dir, written) -> None:
+    """After an add, name a row on its target resolved at a commit HEAD
+    cannot reach. A fix on an unmerged branch read as done, and an agent on
+    main that searched `--status open` filed the bug again (demo run,
+    2026-10-10). It holds the other way too: a branch cut before a fix on
+    main. Narrow on purpose: every resolved row would be noise."""
+    new = {n.id for n in written}
+    heads = store.heads(store.load(store_dir))
+    done = [h for t in dict.fromkeys(n.target for n in written if n.target.type != "project")
+            for h in store.query(heads, target_type=t.type, target_name=t.name,
+                                 status="resolved") if h.id not in new]
+    away = gitref.unmerged(cfg, [r.name for h in done for r in h.refs
+                                 if r.type == "commit" and r.name])
+    for h in done:
+        sha = next((r.name for r in h.refs if r.type == "commit" and r.name in away), None)
+        if sha:
+            print(f"note: {h.id} on {h.target.type}:{h.target.name or ''} was resolved at "
+                  f"{sha[:7]}, which {away[sha]} holds and this branch lacks: if this row is "
+                  f"the same fault, its fix is there\n  {summ.clip(h.body or '', 80)}".rstrip(),
+                  file=sys.stderr)
+
+
 _BOLD_LEAD = re.compile(r"\s*(\*\*|__)(.+?)\1")
 
 
@@ -1612,19 +1785,51 @@ def _name_unknown_ids(store_dir, texts) -> None:
     no id here starts with (or, for a tail, ends with) gets a note; never a
     refusal, since a row may cite another store's."""
     ids = [n.id for n in store.load(store_dir)]
-    for tok in dict.fromkeys(t for text in texts for t in _CITED.findall(text or "")):
-        if re.fullmatch(r"20\d{6}-\d+", tok):
-            continue      # a date-time file stamp, not a cite (dogfood, 2026-10-09)
-        if not any(i.startswith(tok) if tok[8:9] == "-" else i.endswith("-" + tok)
-                   for i in ids):
-            print(f"note: no row in this store matches {tok}, cited in the body",
-                  file=sys.stderr)
+    miss = [tok for tok in dict.fromkeys(t for text in texts for t in _CITED.findall(text or ""))
+            # a date-time file stamp is not a cite (dogfood, 2026-10-09)
+            if not re.fullmatch(r"20\d{6}-\d+", tok)
+            and not any(i.startswith(tok) if tok[8:9] == "-" else i.endswith("-" + tok)
+                        for i in ids)]
+    if miss:      # one line: a retro citing another store's rows printed four (2026-10-11)
+        print(f"note: no row in this store matches {', '.join(miss)} (cited in the body)",
+              file=sys.stderr)
+
+
+def _name_new_items(store_dir, written, before=()) -> None:
+    """After a write, name each `--ref item:NAME` no other row names. A ref
+    meant for an existing followup named nothing and was stored with no
+    word, found only by reading the command back (dogfood, 2026-10-10):
+    `item` has no catalog to miss. A ref may start an item, so a note, never
+    a refusal. A target is not checked: a new item is how a task starts.
+    `before` is the refs the written row inherited, already named once."""
+    new = {n.id for n in written}
+    every = store.load(store_dir)
+    known = {n.target.name for n in every if n.target.type == "item"} \
+        | {r.name for n in every if n.id not in new for r in n.refs if r.type == "item"} \
+        | {r.name for r in before if r.type == "item"}
+    others = [n for n in store.heads(every) if n.id not in new]
+    for name in dict.fromkeys(r.name for n in written for r in n.refs
+                              if r.type == "item" and r.name not in known):
+        near = _containing(others, name)
+        print(f"note: no other row names item:{name}, so this ref starts a new item"
+              + (f"; these contain it: {near}" if near else ""), file=sys.stderr)
+
+
+def _containing(notes, name: str, typ: str | None = None) -> str:
+    """`item:zed two (2 rows), file:zed.py (1 row)`: the targets whose name
+    holds `name`, any case, most rows first, three at most; '' if none."""
+    want = name.lower()
+    near = Counter(f"{n.target.type}:{n.target.name}" for n in notes
+                   if n.target.name and typ in (None, n.target.type)
+                   and want in n.target.name.lower())
+    shown = ", ".join(f"{t} ({summ._count(k, 'row')})" for t, k in near.most_common(3))
+    return shown + (f", +{len(near) - 3} more" if len(near) > 3 else "")
 
 
 def _name_near_tags(store_dir, written) -> None:
     """After a write, name the existing tags a new one nearly is: case, `_`
     or `-`, a trailing s. `list --tag flaky-test` missed every row tagged
-    `flaky-tests` (2026-09-26: 6 such pairs in 2 of 8 adopter stores), and
+    `flaky-tests` (2026-09-26: such pairs in two adopter stores), and
     `tags` lists the vocabulary but nobody runs it before writing. A tag is
     new when no other head carries it."""
     new = {n.id for n in written}
@@ -1640,6 +1845,34 @@ def _name_near_tags(store_dir, written) -> None:
             print(f"note: new tag {tag!r}; this store has {names}: if they mean the "
                   f"same, reuse it", file=sys.stderr)
 
+
+def _name_unchecked(written) -> None:
+    """A verdict row with no `--checked` still reads `current` or `behind
+    N`, as if something ran: a quarter of the verdict heads in two adopter
+    stores had neither field (2026-09-26). Say so at write; the stamp still dates
+    the commit, so it is a note, not a refusal."""
+    miss = [n for n in written if n.spec.verdict and not n.checked]
+    if not miss:
+        return
+    what = (f"this {miss[0].kind} row" if len(miss) == 1 else
+            f"{len(miss)} rows ({', '.join(sorted({n.kind for n in miss}))})")
+    print(f"note: no --checked on {what}: it reads current or behind N with no run "
+          f"recorded; --checked names what ran", file=sys.stderr)
+
+
+def _name_undated(written) -> None:
+    """A parked row prints at session start only when due soon or written by
+    someone other than the reader: most of one store's open ideas were the
+    agent's own and undated, and no session of its saw them again
+    (2026-10-12). Filed as someone else, it reaches the reader's session."""
+    miss = [n for n in written if n.spec.parked and n.spec.status and not n.due
+            and n.author == api.author_default()]
+    if not miss:
+        return
+    what = (f"this {miss[0].kind} row" if len(miss) == 1 else
+            f"{len(miss)} rows ({', '.join(sorted({n.kind for n in miss}))})")
+    print(f"note: no --due on {what}: it is parked, so no session start of yours "
+          f"prints it again; --due DATE sets a revisit", file=sys.stderr)
 
 def _name_dropped(old, note, *, refs: bool, tags: bool) -> None:
     """`supersede --ref` and `--tag` replace, while `resolve --ref` and every
@@ -1675,10 +1908,69 @@ def _echo_clipped_heads(store_dir, written) -> None:
         return
     # "check that", not an order: a row that already leads with its ask read
     # the old wording as a rebuke (cold bootstrap, 2026-09-27).
-    print(f"note: session start shows an open row's first {summ.HEAD_CHARS} chars; "
-          f"check that they carry its claim or ask:", file=sys.stderr)
+    if _first_clip_note():
+        print(f"note: session start shows an open row's first {summ.HEAD_CHARS} chars; "
+              f"check that they carry its claim or ask:", file=sys.stderr)
+    else:
+        cut = [n for n in cut if _dated_opening(summ.clip(n.body, summ.HEAD_CHARS))]
+        if not cut:
+            return
+        print(f"note: session start shows an open row's first {summ.HEAD_CHARS} chars; a lead "
+              f"that opens on a date often holds context, not the claim or ask:", file=sys.stderr)
     for n in cut:
         print(f"  {n.id}  {summ.clip(n.body, summ.HEAD_CHARS)}", file=sys.stderr)
+
+
+def _mark_read(ctx, sid: str, at: str) -> None:
+    """When this session's start summary read the store: `_say_news` takes
+    no row from before it as news."""
+    store._replace_atomically(_session_cache() / f"{sid}.read",
+                              f"{Path(ctx.store_dir).resolve()}\t{at}\n")
+
+
+def _session_read(ctx):
+    """When this agent session's start summary read this store, or None."""
+    key = store.session_key()
+    if not key or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key):
+        return None
+    try:
+        mark = (_session_cache() / f"{key}.read").read_text(encoding="utf-8")
+        where, at = mark.strip().split("\t")
+    except (OSError, ValueError):
+        return None
+    return store.written_at(None, at) if where == str(Path(ctx.store_dir).resolve()) else None
+
+
+def _first_clip_note() -> bool:
+    """False once this agent session has had the clip note. Each `add` is its
+    own process, and one session's batches printed it 23 times, each echoing
+    text just written (2026-10-11). SKILL.md teaches the rule, so a compacted
+    session keeps it. With no session key, every time, as before.
+    # ponytail: a subagent shares its session's key and so its mark; a
+    # machine whose session-start hook never runs keeps every mark."""
+    key = store.session_key()
+    if not key or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key):
+        return True
+    mark = _session_cache() / f"{key}.clip"
+    try:
+        if mark.exists():
+            return False
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        mark.touch()
+    except OSError:                  # a cache it cannot write costs the quiet, not the note
+        pass
+    return True
+
+
+def _dated_opening(lead: str) -> bool:
+    """A short opening clause that holds a date: the lead opens on provenance
+    ("IDEA (owner, 2026-09-26):", "MEASURED 2026-09-07:"), not the claim. Over
+    the clipped open leads of many stores (2026-10-12) this flagged about 2%,
+    nearly all provenance; a lowercase start or a short opening clause alone
+    flagged mostly good leads."""
+    end = re.search(r"[.:;](?:\s|$)|\s[—-]{1,2}\s", lead)
+    opening = lead[:end.start() + 1] if end else lead
+    return len(opening) < 40 and bool(re.search(r"\d{4}-\d{2}-\d{2}", opening))
 
 
 # ---- misses: what failed, the legal values, the command that lists them ----
@@ -1698,7 +1990,7 @@ def _say_tip(store_dir, nid: str, *, resolving: bool):
     (2026-09-26). Say which row the write lands on, and return it: an edit
     in place keeps no other copy of it."""
     try:
-        tip = api._chain_tip(store.load(store_dir), nid)
+        tip = store.chain_tip(store.load(store_dir), nid)
     except KeyError:
         return None                              # the verb's own no-note message
     if tip.id != nid:
@@ -1710,35 +2002,108 @@ def _say_tip(store_dir, nid: str, *, resolving: bool):
 
 
 def _say_rewritten(store_dir, tip, note) -> None:
-    """An edit by a row's own author before `symbion commit` rewrites it
-    (the store's `rewritable`), so the id printed is the one given, not a new one.
-    When a citation alone kept the row, the new id came with no reason and read
-    as the rule failing (2026-10-05): the store's other conditions are checked
-    here as `_supersede_unlocked` checks them, so only that case is named."""
-    if tip is None:
+    """An edit by a row's own author before `symbion commit` rewrites it in
+    place (the store's `rewritable`), and that version is not kept: say
+    so. Any other edit keeps the earlier version under a new id, and the
+    row keeps its own, so there is nothing to explain: the notes that once
+    said why an edit got a new id are gone with the new id.
+
+    A row with an earlier version is only uncommitted in its newest one.
+    Named as the row, it read as if the committed row never was, and an
+    agent spent a `git log` disproving it (2026-10-12): name the version."""
+    if tip is None or note.id != tip.id or note.supersedes != tip.supersedes:
         return
-    if note.id == tip.id:
-        print(f"note: {note.id} was not yet committed, so it was edited in place; "
-              f"no earlier version is kept (`symbion commit` before an edit keeps one, "
-              f"and commits every other writer's pending rows too)", file=sys.stderr)
+    if note.supersedes:
+        what = (f"{note.id}'s newest version, not yet committed, was edited in place; "
+                f"the version before it stays as {note.supersedes}")
+    else:
+        what = f"{note.id} was not yet committed, so it was edited in place; no earlier version is kept"
+    print(f"note: {what} (`symbion commit` before an edit keeps one)", file=sys.stderr)
+
+
+def _others() -> str:
+    """Whose rows a commit leaves: in an agent session it takes that
+    session's, so the rest are other sessions', the same author's included
+    (`it leaves 5 rows of other writers (claude 5)`, read by claude,
+    2026-10-12); with no session, other writers'."""
+    return "other sessions" if store.session_key() else "other writers"
+
+
+def _commit_hint(ctx) -> str:
+    """The command that commits the pending rows. `commit` takes only the
+    caller's, so beside rows that are all someone else's it committed none
+    of them (2026-10-12): name `--all`, and when it is safe."""
+    cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit"]))
+    rows = store.pending_rows(ctx.store_dir)
+    keep = store.with_bases(rows, api.own_rows(ctx))
+    if rows and not any(keep(r) for r in rows):
+        return f"{cmd} --all once their session has ended"
+    return cmd
+
+
+def _say_pending(ctx) -> None:
+    """`add` wrote two rows and said nothing of their being uncommitted: the
+    session found them by `git status` in the store at its end (dogfood,
+    2026-10-11). End a write as `commit` ends, with the command, and say
+    whose rows it takes and whose it leaves."""
+    rows = store.pending_rows(ctx.store_dir)
+    if not rows:
         return
-    dropped = store.unholdable(tip) if note.kind == tip.kind else []
-    if note.status != tip.status or dropped:
-        return                                   # a new row whatever cites it
-    if not store.own_draft(store_dir, tip, note.author):
-        # The new id alone left a session to `show` the old one to learn
-        # which to cite (2026-10-09).
-        why = (f"was written by {tip.author}" if note.author != tip.author else
-               "is a pre-registration" if tip.spec.status and tip.spec.verdict else
-               "is committed")
-        print(f"note: {tip.id} {why}, so it is kept and this edit is a new row; "
-              f"it now lists as superseded -> {note.id}", file=sys.stderr)
+    keep = store.with_bases(rows, api.own_rows(ctx))
+    mine, left = [r for r in rows if keep(r)], [r for r in rows if not keep(r)]
+    cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit"]))
+    if mine:
+        more = (f"; it leaves {summ._count(len(left), 'row')} of {_others()} "
+                f"({store.rows_by_author(left)})" if left else "")
+        print(f"note: {summ._count(len(mine), 'row')} not committed "
+              f"({store.rows_by_author(mine)}): {cmd}{more}", file=sys.stderr)
+    else:
+        print(f"note: {summ._count(len(rows), 'row')} not committed "
+              f"({store.rows_by_author(rows)}), none of them yours: "
+              f"{cmd} --all takes them", file=sys.stderr)
+
+
+def _say_news(ctx, t0) -> None:
+    """Each row someone else wrote or amended since the writer's previous
+    write, as the summary prints it. An owner's reply through the GUI
+    mid-session reached the agent only by `commit`'s per-author count, four
+    times (2026-10-10, 2026-10-11): session start had run before it. Quiet at
+    a terminal, where the reader is the person, and on a first write, which
+    session start covered. The floor is the later of the writer's previous
+    write and this session's start summary: a session's first write repeated
+    what that summary had printed (2026-10-13). A row this write touched is
+    not news. `t0` is when the command began."""
+    if sys.stdout.isatty():
         return
-    by = [i for i in store.citing(store.load(store_dir), tip) if i != note.id]
-    if by:
-        more = f", +{len(by) - _NEIGHBOUR_CAP} more" if len(by) > _NEIGHBOUR_CAP else ""
-        print(f"note: {tip.id} is cited by {', '.join(by[:_NEIGHBOUR_CAP])}{more}, "
-              f"so it is kept and this edit is a new row", file=sys.stderr)
+    reader = api.author_default()
+    loaded = store.load(ctx.store_dir)
+    pos = {n.id: i for i, n in enumerate(loaded)}
+    key = lambda n: (store.written_at(n), pos[n.id])     # noqa: E731
+    mine = [key(n) for n in loaded if n.author == reader and store.written_at(n) < t0]
+    if not mine:
+        return
+    read = _session_read(ctx)          # -1: a row in that second may postdate it
+    since, by_id = max(mine + ([(read, -1)] if read else [])), {n.id: n for n in loaded}
+    news = store.newest_first(
+        h for h in store.heads(loaded) if store.written_at(h) < t0
+        and any(summ.wrote_it(reader, v.author) and key(v) > since
+                for v in summ._chain(by_id, h)))
+    if not news:
+        return
+    print("note: written by someone else since your previous write:", file=sys.stderr)
+    for h in news[:_NEWS_CAP]:
+        r = summ.row_digest(by_id, h, summ.HEAD_CHARS, reader)
+        closer = summ._closer(by_id, h).author if store.read_status(h) == "resolved" else None
+        if closer and r.get("last") == closer:
+            del r["last"]
+        print("  " + summ._labelled(summ.plain, r, first=closer and f"closed by {closer}"),
+              file=sys.stderr)
+    if len(news) > _NEWS_CAP:
+        print(f"  +{len(news) - _NEWS_CAP} more: symbion list --since "
+              f"{since[0].isoformat(timespec='seconds')}", file=sys.stderr)
+
+
+_NEWS_CAP = 5
 
 
 def _say_dropped(tip, note) -> None:
@@ -1750,24 +2115,26 @@ def _say_dropped(tip, note) -> None:
         bits = " or ".join(b for b, keys in (("verdict", {"checked", "result"}),
                                              ("status", {"status", "due"})) if keys & set(gone))
         print(f"note: kind {note.kind!r} has no {bits} bit, so {note.id} drops "
-              f"{', '.join(gone)}; {tip.id} keeps them (show {tip.id} --json). "
+              f"{', '.join(gone)}; its earlier version {note.supersedes} keeps them "
+              f"(show {note.supersedes} --all --json). "
               f"To keep the text on the head, add it to the body", file=sys.stderr)
 
 
 def _name_sweep_drops(store_dir, before: set) -> None:
     """`_say_dropped` for a sweep (rename, reconcile --apply), which printed
     only its counts: every row the sweep wrote since `before` (the ids then)
-    whose old row held a field its kind cannot hold."""
+    whose old row held a field its kind cannot hold. A written row keeps its
+    id, and the version it replaced took a new one."""
     notes = store.load(store_dir)
     by_id = {n.id: n for n in notes}
     old = [by_id[n.supersedes] for n in notes
-           if n.id not in before and n.supersedes in by_id
+           if n.supersedes not in before and n.supersedes in by_id
            and n.kind == by_id[n.supersedes].kind and store.unholdable(by_id[n.supersedes])]
     if old:
         fields = ", ".join(sorted({k for o in old for k in store.unholdable(o)}))
         more = f" (+{len(old) - 1} more)" if len(old) > 1 else ""
         print(f"note: {summ._count(len(old), 'row')} dropped {fields}, a field its kind "
-              f"cannot hold; the old row keeps it: show {old[0].id} --json{more}",
+              f"cannot hold; the old row keeps it: show {old[0].id} --all --json{more}",
               file=sys.stderr)
 
 
@@ -1824,7 +2191,8 @@ def _dispatch(args, ctx) -> int:
     store_dir, cfg, target_types = ctx.store_dir, ctx.cfg, ctx.target_types
     _resolve_body(args)
     if args.cmd == "init":
-        return _init(store_dir, cfg, ctx.store_from_env, args.yes, args.repoint, args.agent)
+        return _init(store_dir, cfg, ctx.store_from_env, args.yes, args.repoint, args.agent,
+                     args.merge_hook)
     if args.cmd == "completion":
         import argcomplete
         print(argcomplete.shellcode(["symbion"], shell=args.shell), end="")
@@ -1862,15 +2230,24 @@ def _dispatch(args, ctx) -> int:
         args.note_id = [_expand_id(store_dir, raw) for raw in args.note_id]
         if None in args.note_id:
             return 1
-    attr = {"resolve": "id", "supersede": "id"}.get(args.cmd)
+    attr = {"resolve": "id", "supersede": "id", "undo": "id"}.get(args.cmd)
     tip = None                                   # the row a resolve or supersede builds on
     if attr and getattr(args, attr):
         full = _expand_id(store_dir, getattr(args, attr))
         if full is None:
             return 1
         setattr(args, attr, full)
-        if args.cmd != "list":
+        if args.cmd in ("resolve", "supersede"):
             tip = _say_tip(store_dir, full, resolving=args.cmd == "resolve")
+
+    if args.cmd == "undo":
+        try:
+            u = api.undo(ctx, args.id, author=_resolved_author(args))
+        except store.UndoRefused as e:
+            print(f"undo: {e}", file=sys.stderr)
+            return 1
+        print(f"undone: {store.undo_words(u)}; the store reads as it did before it")
+        return 0
 
     if args.cmd == "add":
         if args.kind_pos and args.kind:
@@ -1918,7 +2295,11 @@ def _dispatch(args, ctx) -> int:
             print(note.id)
         _name_unknown_ids(store_dir, [n.body for n in written])
         _name_open_neighbours(store_dir, written)
+        _name_unmerged_fixes(ctx.cfg, store_dir, written)
         _name_near_tags(store_dir, written)
+        _name_new_items(store_dir, written)
+        _name_unchecked(written)
+        _name_undated(written)
         if len(written) > 1:
             _name_catalog_misses(ctx.cfg, written)
         _echo_clipped_heads(store_dir, written)
@@ -1941,6 +2322,21 @@ def _dispatch(args, ctx) -> int:
             print(f"list: --grep {args.grep!r} is not a regex: {e}", file=sys.stderr)
             return 2
         every = store.load(store_dir)
+        if args.note_id and not args.all:
+            # A cited id names a thread, not a version: one cited in chat went
+            # stale within hours, and its --json `status` read `open` on a
+            # resolved thread (dogfood, 2026-10-11). resolve, supersede and
+            # --grep already follow it forward; --all reads that version.
+            tips = {}
+            for i in args.note_id:
+                try:
+                    tips[i] = store.chain_tip(every, i).id
+                except KeyError:
+                    continue                           # the miss below names it
+                if tips[i] != i:
+                    print(f"note: {i} was superseded; this is its head, {tips[i]} "
+                          f"(--all shows {i} itself)", file=sys.stderr)
+            args.note_id = list(dict.fromkeys(tips.get(i, i) for i in args.note_id))
         base = every if (args.all or args.note_id) else store.heads(every)
         if args.note_id:
             base = [n for n in base if n.id in args.note_id]
@@ -1957,19 +2353,26 @@ def _dispatch(args, ctx) -> int:
                 print(f"note: read {args.name!r} as --type {t} "
                       f"--name {shlex.quote(n)}", file=sys.stderr)
                 args.type, args.name = t, n
-        filt = dict(target_type=args.type, target_name=api.canon(cfg, args.type, args.name, every),
+        # the stored form, so an abbreviation typed on read matches what a write
+        # stored; a name the rows hold verbatim is itself
+        name = gitref.canon_name(cfg, args.type, args.name, store.stored_names(every, args.type))
+        filt = dict(target_type=args.type, target_name=name,
                     kind=args.kind, tag=args.tag, arc_id=args.arc_id, author=args.author,
                     grep=grep, overdue=args.overdue or None,
-                    since=args.since[1] if args.since else None)
+                    since=args.since[1] if args.since else None,
+                    due_by=args.due_by[1] if args.due_by else None)
         notes = store.query(base, status=args.status, **filt)
         if grep is not None:
             # An id is not text the pattern reads, so a cited tail read `0 of
             # N match` while `show` found its row (2026-10-07). As in the
             # GUI's search: a pasted id or tail joins the hits, and a
-            # superseded one brings its current row.
+            # superseded one brings its current row. Each branch of a `|` is
+            # its own tail: `tailA|tailB` returned only a row citing one
+            # (2026-10-11). -F reads `|` as a character.
             from .gui import filters
-            want = {i for n in every if filters.id_hit(n.id, args.grep)
-                    for i in (n.id, api._chain_tip(every, n.id).id)}
+            branches = [args.grep] if args.fixed_strings else args.grep.split("|")
+            want = {i for n in every if any(filters.id_hit(n.id, b) for b in branches)
+                    for i in (n.id, store.chain_tip(every, n.id).id)}
             got = {n.id for n in notes}
             notes += [n for n in store.query(base, status=args.status, **(filt | {"grep": None}))
                       if n.id in want and n.id not in got]
@@ -1993,14 +2396,10 @@ def _dispatch(args, ctx) -> int:
             # A target with exactly that name was emptied by another filter,
             # which the footer names: `--status open` on a resolved target
             # read `no target is named 'zed'; these contain it: item:zed`.
-            want = args.name.lower()
-            typed = [n for n in base if n.target.name and args.type in (None, n.target.type)]
-            near = Counter(f"{n.target.type}:{n.target.name}" for n in typed
-                           if want in n.target.name.lower())
-            if near and not any(n.target.name == filt["target_name"] for n in typed):
-                shown = ", ".join(f"{t} ({summ._count(k, 'row')})" for t, k in near.most_common(3))
-                more = f", +{len(near) - 3} more" if len(near) > 3 else ""
-                print(f"note: no target is named {args.name!r}; these contain it: {shown}{more} "
+            near = _containing(base, args.name, args.type)
+            if near and not any(n.target.name == filt["target_name"]
+                                and args.type in (None, n.target.type) for n in base):
+                print(f"note: no target is named {args.name!r}; these contain it: {near} "
                       f"(--name matches a whole name)", file=sys.stderr)
         if not total and ops and not args.fixed_strings:
             # Only when -F would find something: a deliberate regex that
@@ -2033,7 +2432,7 @@ def _dispatch(args, ctx) -> int:
         if cap:
             notes = notes[:cap]
         superseded = {n.supersedes for n in every if n.supersedes}
-        heads_of = {n.id: api._chain_tip(every, n.id) for n in notes if n.id in superseded}
+        heads_of = {n.id: store.chain_tip(every, n.id) for n in notes if n.id in superseded}
         given = []
         if not args.note_id:
             given = [f"--{flag} {shlex.quote(str(v))}" for flag, v in (
@@ -2046,6 +2445,8 @@ def _dispatch(args, ctx) -> int:
                 given.append("--overdue")
             if args.since:
                 given.append(f"--since {shlex.quote(args.since[0])}")
+            if args.due_by:
+                given.append(f"--due-by {shlex.quote(args.due_by[0])}")
         # One HEAD for the listing, not a read per check row.
         git_head = gitref.head_sha(cfg) if any(n.spec.verdict for n in notes) else None
         since = gitref.commits_since(cfg, notes)
@@ -2071,7 +2472,7 @@ def _dispatch(args, ctx) -> int:
             hidden = [h for h in (_hidden(every, base, args, filt) if given else ())
                       if h.startswith("+") and not h.endswith("(--all)")]
             if given and not args.all:
-                older = {api._chain_tip(every, n.id).id
+                older = {store.chain_tip(every, n.id).id
                          for n in store.query(every, status=args.status, **filt)
                          if n.id in superseded} - matched
                 if older:
@@ -2083,8 +2484,13 @@ def _dispatch(args, ctx) -> int:
         else:
             paint = _painter(ctx.kinds)
             if not args.note_id:
-                print(paint(_list_header(total, len(notes), _hidden(every, base, args, filt),
-                                         scanned=len(base), filters=given), "meta"))
+                header = _list_header(total, len(notes), _hidden(every, base, args, filt),
+                                      scanned=len(base), filters=given)
+                print(paint(header, "meta"))
+                # `list | grep` deleted the header of a 25-of-38 page, and a miss
+                # read as absence (dogfood, 2026-10-11). A person sees it as is.
+                if len(notes) < total and not sys.stdout.isatty():
+                    print(f"note: {header}", file=sys.stderr)
             # One batched subjects() call for the whole listing rather than
             # one git-log per row -- gitref.subjects's whole reason to exist.
             shas = {n.target.name for n in notes
@@ -2100,7 +2506,10 @@ def _dispatch(args, ctx) -> int:
                 _print_note(n, state=state, subject=subject,
                             full=args.full or bool(args.note_id), head=heads_of.get(n.id),
                             gui=gui, since=since[n.id],
-                            added=summ.added(by_id, n, reader, summ.LIST_BODY_CHARS))
+                            added=summ.added(by_id, n, reader, summ.LIST_BODY_CHARS),
+                            seams=summ.seams(by_id, n) if args.full or args.note_id else (),
+                            links=summ.links(every, n) if args.note_id else (),
+                            written=summ.written(by_id, n) if args.full or args.note_id else None)
             if len(notes) < total:
                 # Where the eye stops: a 10-of-33 page read as the whole answer
                 # (an adopter, 2026-09-26), the header notwithstanding.
@@ -2115,12 +2524,8 @@ def _dispatch(args, ctx) -> int:
         if args.result is not None:
             fields["result"] = args.result
         measures = _measures_from_flags(args.measures)
-        if args.add_tags:
-            try:
-                cur = api._chain_tip(store.load(store_dir), args.id)
-            except KeyError:
-                cur = None            # store.supersede raises it again below
-            fields["tags"] = sorted(set(cur.tags if cur else ()) | set(args.add_tags))
+        if args.add_tags:             # onto the tip; a missing id raises below
+            fields["tags"] = sorted(set(tip.tags if tip else ()) | set(args.add_tags))
         if tip is not None and store.read_status(tip) == "resolved" \
                 and set(fields) == {"status"} and not measures and not args.refs:
             # It printed `already resolved`, then `edited in place` at exit 0,
@@ -2140,6 +2545,7 @@ def _dispatch(args, ctx) -> int:
         _say_dropped(tip, note)
         _name_unknown_ids(store_dir, [args.body])
         _name_near_tags(store_dir, [note])
+        _name_new_items(store_dir, [note], tip.refs if tip else ())
         return 0
 
     if args.cmd == "supersede":
@@ -2182,17 +2588,9 @@ def _dispatch(args, ctx) -> int:
         elif args.add_tags or args.rm_tags:
             # combined with another field: merge inline against the tip, then
             # fall through to the single supersede below, so --add-tag --body
-            # stays ONE row rather than two. A ValueError (cyclic chain)
-            # propagates uncaught to main()'s handler, same as api.retag's
-            # does on the tags-only path above -- both report a cycle
-            # identically. A KeyError (missing id) is swallowed here so the
-            # trailing store.supersede call below still raises it and hits
-            # the existing "no note found" handler.
-            try:
-                cur = api._chain_tip(store.load(store_dir), args.id)
-            except KeyError:
-                cur = None
-            base = set(cur.tags) if cur else set()
+            # stays ONE row rather than two. A missing id leaves tip None,
+            # and the store.supersede below raises it for "no note found".
+            base = set(tip.tags) if tip else set()
             fields["tags"] = sorted((base | set(args.add_tags)) - set(args.rm_tags))
         if args.refs is not None:                      # --ref: replace, like --tag
             try:
@@ -2216,6 +2614,7 @@ def _dispatch(args, ctx) -> int:
         print(note.id)
         _name_unknown_ids(store_dir, [args.body])
         _name_near_tags(store_dir, [note])
+        _name_new_items(store_dir, [note], tip.refs if tip else ())
         _say_rewritten(store_dir, tip, note)
         _say_dropped(tip, note)
         _name_dropped(tip, note, refs=args.refs is not None, tags=args.tags is not None)
@@ -2229,6 +2628,9 @@ def _dispatch(args, ctx) -> int:
         # A careful commit read `git diff` by hand first: `commit` takes every
         # writer's pending rows (dogfood, 2026-10-06).
         rows = store.pending_rows(store_dir)
+        keep = (lambda r: True) if args.everyone else \
+            store.with_bases(rows, api.own_rows(ctx))
+        mine, left = [r for r in rows if keep(r)], [r for r in rows if not keep(r)]
         # Each file, as `commit` names them: status shows an untracked dir as one.
         changed = ["diff", "HEAD", "--name-only", "-z"] if gitref._git(
             store_dir, "rev-parse", "-q", "--verify", "HEAD").returncode == 0 \
@@ -2237,22 +2639,38 @@ def _dispatch(args, ctx) -> int:
                                                 "--exclude-standard"])
                         for f in gitref._git(store_dir, *cmd).stdout.split("\0")
                         if f and f != store.NOTES_FILE})
-        if not rows and not files:
-            print("nothing to commit")
-            return 0
-        said = ([f"rows {store.rows_by_author(rows)}"] if rows else []) + \
+        def listed(rows):
+            for r in rows:
+                print(f"  {(r.get('id') or '?')[-10:]}  {r.get('author') or '?'}  "
+                      f"{r.get('kind') or '?'}  {summ.clip(r.get('body') or '', 60)}".rstrip())
+        said = ([f"rows {store.rows_by_author(mine)}"] if mine else []) + \
             ([f"{summ._count(len(files), 'file')}"] if files else [])
-        print("would commit: " + "; ".join(said))
-        for r in rows:
-            print(f"  {(r.get('id') or '?')[-10:]}  {r.get('author') or '?'}  "
-                  f"{r.get('kind') or '?'}  {summ.clip(r.get('body') or '', 60)}".rstrip())
+        print("would commit: " + "; ".join(said) if said else "nothing to commit")
+        listed(mine)
         for f in files:
             print(f"  {f}")
+        if left:
+            print(f"would leave, {_others()}': rows {store.rows_by_author(left)}")
+            listed(left)
         return 0
 
     if args.cmd == "commit":
-        ok = api.commit(ctx, args.message)
+        if args.wrap and args.message is None:
+            print("error: --wrap needs -m: the message is the handoff the next session "
+                  "reads", file=sys.stderr)
+            return 2
+        ok = api.commit(ctx, args.message or "update notes", everyone=args.everyone,
+                        wrap=args.wrap)
         print(gitref.committed(store_dir) if ok else "nothing to commit")
+        # A row left here may be a live session's, or one a session left
+        # when it ended: the newest's age tells them apart.
+        left = store.pending_rows(store_dir)
+        if left:
+            newest = max(r.get("created_at") or "" for r in left)
+            cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit", "--all"]))
+            print(f"left pending, {_others()}': rows {store.rows_by_author(left)}"
+                  + (f", the newest written {summ.when_added(newest)}" if newest else "")
+                  + f": {cmd} takes them")
         # `git add -A` skips ignored paths silently. A tree copied verbatim
         # under archive/ can carry its own `.gitignore` of `*`, and then the
         # copy is on disk, `diff -r` passes, and the store's git holds none of
@@ -2291,7 +2709,7 @@ def _dispatch(args, ctx) -> int:
             bits.append("arc changes")
         if bits:
             print(f"not pushed: {' and '.join(bits)} not yet in the store's git "
-                  f"(symbion commit)", file=sys.stderr)
+                  f"({_commit_hint(ctx)})", file=sys.stderr)
         return rc
 
     if args.cmd == "rename":
@@ -2352,6 +2770,7 @@ def _dispatch(args, ctx) -> int:
             print(json.dumps(summ.empty_summary()))
             return 0
         at_terminal = sys.stdout.isatty() and not (args.json or args.hook)
+        read_at = store._now_iso() if args.hook else None
         data = summ.summary(store_dir, cfg, full=args.full,
                             reader=None if at_terminal else api.author_default())
         # Both links lead to the same skill directory, so either serves.
@@ -2359,10 +2778,16 @@ def _dispatch(args, ctx) -> int:
                               if (Path.home() / link / "SKILL.md").exists()), None)
         if at_terminal:
             data["skill"] = None      # the line is for an agent; the hook reads a pipe
-        data["leftovers"] = (_old_copies(Path(cfg.project_root))
-                             if cfg.project_root is not None else [])
         data["named_store"] = _named_store(ctx)
+        data["commit_hint"] = _commit_hint(ctx) if data["uncommitted_notes"] else None
         if args.hook:
+            sid = _hook_session()
+            try:
+                if sid:
+                    _list_gotchas(ctx, sid)
+                    _mark_read(ctx, sid, read_at)
+            except OSError:             # a cache it cannot write costs the hint, not the summary
+                pass
             print(_hook_json(summ.render_summary(data), summ.one_line(data)))
         else:
             print(json.dumps(data) if args.json else summ.render_summary(data, _painter(ctx.kinds)))
@@ -2397,15 +2822,19 @@ def _dispatch(args, ctx) -> int:
                 head += f" for commit {args.commit}"
             elif args.branch:
                 head += f" for branch {args.branch}" + (f" since {args.since}" if args.since else "")
-            else:
-                other = len(store.heads(store.load(store_dir))) - len(data["notes"])
+            every = store.load(store_dir)
+            by_id = {n.id: n for n in every}
+            if not (args.target or args.commit or args.branch):
+                other = len(store.heads(every)) - len(data["notes"])
                 if other:
                     head += f"; +{summ._count(other, 'other head')} (list)"
             print(_painter(ctx.kinds)(head, "meta"))
             gui = _gui(store_dir)
             for d in data["notes"]:
                 _print_note(store.note_from_dict(d, kinds=ctx.kinds), gui=gui,
-                            since=d["commits_since"])
+                            since=d["commits_since"],
+                            written=summ.written(by_id, by_id[d["id"]]) if d["id"] in by_id
+                            else None)
         return 0
 
     if args.cmd == "arc":
@@ -2558,6 +2987,7 @@ def _dispatch_arc(args, ctx) -> int:
             _no_arc(store_dir, args.id)
             return 1
         notes = store.load(store_dir)
+        ctx.consulted.add("catalog")
         renames = {}
         for t in cfg.renames:
             renames.update(catalog.rename_map(cfg, t))
@@ -2712,6 +3142,18 @@ def main(argv=None) -> int:
         if sys.stdout is not None:               # None when fd 1 was closed
             sys.stdout.flush()
         return code
+    except FileNotFoundError:
+        # A shell sat in a directory that was then removed, or removed and
+        # made again: git exits 128 there, and os.getcwd() raises this, also
+        # inside the not-a-repo message. It printed as a traceback.
+        try:
+            os.getcwd()
+        except FileNotFoundError:
+            print("error: the current directory no longer exists: it was removed after the "
+                  "shell entered it. If it was made again, `cd .` enters the new one",
+                  file=sys.stderr)
+            return 1
+        raise
     except OSError as e:
         # Windows reports the closed pipe as EINVAL with no file named; a bad
         # path's EINVAL names one.
@@ -2768,20 +3210,27 @@ def _main(argv) -> int:
                    for a in rest[1:] if a != "--"]
             if any(not a.startswith("-") for a in ids):
                 # `show --json ID`, the flag first, read as `list --id --json ID`.
-                flags = [a for a in ids if a == "--json"]
-                rest = ["list", *flags, "--id", *(a for a in ids if a != "--json")]
+                flags = [a for a in ids if a in ("--json", "--all")]
+                rest = ["list", *flags, "--id", *(a for a in ids if a not in flags)]
         args = parser.parse_args(rest)
         args.argv = argv                         # serve --reload re-runs it
-        # On every read it was noise, so a real mismatch was skipped with it
-        # (2026-10-01), and a view is right for its store. A write, and a
-        # catalog run (reconcile, seed), is where whose repo it is matters.
-        if ctx.followed_owner and not (args.cmd in _READS or args.cmd == "arc"
-                                       and args.acmd in {"list", "todo"}):
-            print(f"symbion: {ctx.store_dir} belongs to {ctx.cfg.work_root}; catalogs "
-                  f"and check state resolve there, not in {os.getcwd()}", file=sys.stderr)
         if no_store is not None:
             raise no_store                       # `-h` was a value, not help
-        return _dispatch(args, ctx)
+        t0 = store.written_at(None, store._now_iso())
+        try:
+            rc = _dispatch(args, ctx)
+        finally:
+            # Only where that repo decided something (api.Ctx.consulted): on
+            # every read, then every write, it was noise, so a real mismatch
+            # was skipped with it (2026-10-01, 2026-10-12). Last, so a refusal
+            # it explains prints above it.
+            if ctx.followed_owner and ctx.consulted:
+                print(f"symbion: {ctx.store_dir} belongs to {ctx.cfg.work_root}; catalogs "
+                      f"and check state resolve there, not in {os.getcwd()}", file=sys.stderr)
+        if rc == 0 and args.cmd in ("add", "resolve", "supersede"):
+            _say_pending(ctx)
+            _say_news(ctx, t0)
+        return rc
     except SystemExit as e:
         code = e.code
         if code is None:
