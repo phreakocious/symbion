@@ -406,7 +406,8 @@ def _touch(env, payload):
     if not r.stdout:
         return ""
     out = json.loads(r.stdout)["hookSpecificOutput"]
-    assert out["hookEventName"] == "PostToolUse"
+    sent = payload.get("hook_event_name", "PostToolUse") if isinstance(payload, dict) else None
+    assert out["hookEventName"] == sent, "Claude Code reads it as that event's answer"
     return out["additionalContext"]
 
 
@@ -425,7 +426,7 @@ def test_a_files_gotcha_reaches_a_session_the_first_time_it_touches_the_file(git
                     body="**Start a scratch serve with XDG_CACHE_HOME.** Or a sidebar lists it.")
     via_ref = store.add(s, kind="note", target={"type": "project", "name": None}, author="ann",
                         tags=["gotcha"], refs=[other], body="ref trap")
-    for target, tags, body in ((serve, [], "not a trap"), (serve, ["gotcha", "retired"], "old"),
+    for target, tags, body in ((serve, [], "not a trap"), (serve, ["gotcha", "retired"], "old trap"),
                                ({"type": "item", "name": "windows"}, ["gotcha"], "item trap")):
         store.add(s, kind="note", target=target, author="ann", tags=tags, body=body)
     env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
@@ -442,7 +443,7 @@ def test_a_files_gotcha_reaches_a_session_the_first_time_it_touches_the_file(git
             "tool_response": {"file": {"content": "import other  # src/other.py, windows"}}}
     said = _touch(env, read)
     assert hit.id[-10:] in said and "Start a scratch serve with XDG_CACHE_HOME." in said, said
-    assert not any(t in said for t in ("ref trap", "not a trap", "old", "item trap")), said
+    assert not any(t in said for t in ("ref trap", "not a trap", "old trap", "item trap")), said
     assert _touch(env, read) == "", "once per session"
     windows = {"session_id": "s1", "tool_name": "Edit",
                "tool_input": {"file_path": "C:\\proj\\src\\other.py", "old_string": "a"}}
@@ -454,3 +455,70 @@ def test_a_files_gotcha_reaches_a_session_the_first_time_it_touches_the_file(git
     assert hit.id[-10:] in _touch(env, bash)
     assert _touch(env, {**bash, "session_id": "s2"}) == "", "no session start, no list"
     assert _touch(env, "") == "" and _touch(env, "not json") == ""
+
+
+def test_a_failed_call_gets_its_files_gotcha_too(git_repo, tmp_path):
+    """A Bash call that exited non-zero, when a trap has most likely just
+    bitten, heard nothing: Claude Code sends a failed call to
+    PostToolUseFailure, not PostToolUse (dogfood, 2026-10-13). Its `error`,
+    as a response does, names files the call did not."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    for name, body in (("src/serve.py", "serve trap"), ("src/other.py", "other trap")):
+        store.add(s, kind="note", target={"type": "file", "name": name}, author="ann",
+                  tags=["gotcha"], body=body)
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env,
+                       input=json.dumps({"session_id": "s1", "hook_event_name": "SessionStart"}))
+    assert r.returncode == 0, r
+    said = _touch(env, {"session_id": "s1", "hook_event_name": "PostToolUseFailure",
+                        "tool_name": "Bash", "tool_input": {"command": "pytest src/serve.py"},
+                        "tool_use_id": "toolu_1", "error": "Exit code 1\nin src/other.py",
+                        "is_interrupt": False})
+    assert "serve trap" in said and "other trap" not in said, said
+
+
+def test_a_gotcha_line_says_its_age_its_files_churn_and_how_to_retire_it(git_repo, tmp_path):
+    """A gotcha has no status, so a stale one read as true at every touch
+    (the owner, 2026-10-14). A commit count alone cannot say stale: every
+    file gotcha in one store had changed since, by one commit to hundreds. So the
+    line gives the age and the churn, and how to retire the row: the agent,
+    in the file at that moment, is the one placed to judge it."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    (s / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n')
+
+    def commit(m):
+        _git(git_repo, "add", "-A")
+        _git(git_repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", m)
+
+    for f in ("serve.py", "other.py"):
+        (git_repo / f).write_text("v1\n")
+    commit("files")
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
+    tails = {}
+    for f, more in (("serve.py", ""), ("other.py", " detail" * 40)):
+        r = subprocess.run([str(Path(SYMBION_BIN) / "symbion"), "add", "note", "--target",
+                            f"file:{f}", "--tag", "gotcha", "--body", f"{f} trap{more}"],
+                           cwd=git_repo, capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r
+        tails[f] = r.stdout.strip()[-10:]
+    (git_repo / "serve.py").write_text("v2\n")
+    commit("serve v2")
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env,
+                       input=json.dumps({"session_id": "s1", "hook_event_name": "SessionStart"}))
+    assert r.returncode == 0, r
+
+    def line(f):
+        return _touch(env, {"session_id": "s1", "tool_name": "Read",
+                            "tool_input": {"file_path": f"{git_repo}/{f}"}})
+
+    said = line("serve.py")
+    assert f"is on file:serve.py (written just now; the file has changed in 1 commit since): " \
+           "serve.py trap" in said, said
+    assert said.endswith(f" (if it no longer holds: `symbion supersede {tails['serve.py']} "
+                         "--add-tag retired`)"), "a gotcha that fits has no more to show"
+    said = line("other.py")
+    assert "is on file:other.py (written just now): other.py trap" in said, said
+    assert f"(`symbion show {tails['other.py']}` prints all of it; if it no longer holds: " \
+           f"`symbion supersede {tails['other.py']} --add-tag retired`)" in said, said

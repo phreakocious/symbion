@@ -6,12 +6,15 @@ import re
 import shlex
 import subprocess
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .catalog import NON_CANONICAL_TYPES
+from .catalog import DOC_CATALOG, NON_CANONICAL_TYPES
 
 CONFIG_FILE = "symbion.toml"
+# A repo's catalog under [repos] unless [catalogs] names the repo: every file
+# git lists, committed or not, less what it ignores.
+FILE_CATALOG = "git ls-files --cached --others --exclude-standard"
 
 
 @dataclass(frozen=True)
@@ -46,10 +49,45 @@ class Config:
     # SYMBION_DIR is. None for a hand-built Config (test fixtures), which then
     # leaves the child to resolve the store the normal way.
     store: Path | None = None
+    # [repos]: each listed repo's name -> its main checkout. Each name is also
+    # a catalog type (load puts it in `catalogs`). The roots above stand in
+    # `here`, the listed repo the cwd is in, and in none outside every listed
+    # repo: what is about no row's object runs there, and is refused outside,
+    # as outside a repo today (the repos design, "Where you stand").
+    repos: dict = field(default_factory=dict)
+    here: str | None = None
+    # The cwd's main worktree as resolved, before [repos] cleared the roots:
+    # `init` installs there, and the summary names it when [repos] lacks it.
+    cwd_root: Path | None = None
 
     def __post_init__(self):
         if self.work_root is None:
             object.__setattr__(self, "work_root", self.project_root)
+
+    def repo(self, name) -> "Config":
+        """This config at repo `name`, with no [repos] of its own, so a
+        catalog, a stamp or a git question runs there: in the cwd's worktree
+        when the cwd stands in `name`, else in its main checkout. A name not
+        listed, or a repo this machine lacks, gets no roots: git answers
+        there as it does for a departed sha."""
+        if name is not None and name == self.here:
+            roots = (self.project_root, self.work_root)
+        elif (p := self.repos.get(name)) is not None and p.is_dir():
+            roots = (p, p)
+        else:
+            roots = (None, None)
+        return replace(self, project_root=roots[0], work_root=roots[1], repos={}, here=None)
+
+    def for_type(self, target_type) -> "Config":
+        """`repo(target_type)` for a listed repo's type, else this config."""
+        return self.repo(target_type) if target_type in self.repos else self
+
+    def missing(self, name) -> str | None:
+        """Why repo `name` cannot run here, or None."""
+        p = self.repos.get(name)
+        if p is None or p.is_dir():
+            return None
+        return f"repo {name!r} is listed under [repos] at {p}, which is not on this machine"
 
 
 def project_root(cwd=None) -> Path:
@@ -188,7 +226,42 @@ def orphan_stores(root: Path) -> list[Path]:
     project's store is never offered to the renamed one."""
     from . import store                  # late: config is imported before store
     return sorted(s for s in root.parent.glob("*-notes")
-                  if store.exists(s) and store_owner(s) is None)
+                  if store.exists(s) and not lists_repos(s) and store_owner(s) is None)
+
+
+def lists_repos(store) -> bool:
+    """The store's symbion.toml has a [repos] table. Read raw, before any
+    Config: a store its repos claim has no one owner to follow, and is no
+    orphan."""
+    try:
+        d = tomllib.loads((Path(store) / CONFIG_FILE).read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return bool(d.get("repos"))
+
+
+def _repos(d: dict, store: Path, p: Path) -> dict:
+    """[repos] as name -> the resolved main checkout, each path relative to
+    the store (`~` expands). A name is a target type, so it may not be a
+    built-in's, or `file`, which a store with repos takes as input only.
+    Resolved, so a symlink matches the root git reports; two names on one
+    path would be two spellings of every row's object."""
+    raw = d.get("repos") or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"[repos] in {p} is a table of NAME = \"PATH\", one line per repo")
+    out = {}
+    for name, v in raw.items():
+        if not isinstance(v, str):
+            raise ValueError(f"[repos] in {p} has {name} = {v!r}: a path is a quoted string")
+        if name in NON_CANONICAL_TYPES | {"file"}:
+            raise ValueError(f"[repos] in {p} names {name!r}: a repo's name is its target "
+                             f"type, and {name!r} is taken; name it after the repo")
+        path = (store / Path(v).expanduser()).resolve()
+        if twin := next((k for k, q in out.items() if q == path), None):
+            raise ValueError(f"[repos] in {p} names {path} as {twin!r} and {name!r}: "
+                             f"one repo is one type; keep one name")
+        out[name] = path
+    return out
 
 
 def _claims(cand: Path, store: Path) -> Path | None:
@@ -256,6 +329,14 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
         resolved_work = resolved_root
     catalogs = dict(d.get("catalogs") or {})
     resolvers = dict(d.get("resolvers") or {})
+    repos = _repos(d, Path(store), p)
+    if repos and "file" in catalogs:
+        raise ValueError(f"[catalogs] file in {p} sits beside [repos]: a store with repos has "
+                         f"no file type. Move the command under the repo it lists: "
+                         f"{next(iter(repos))} = {catalogs['file']!r}")
+    for name in repos:
+        catalogs.setdefault(name, FILE_CATALOG)
+    catalogs.setdefault("doc", DOC_CATALOG)
     builtins_named = sorted(set(resolvers) & NON_CANONICAL_TYPES)
     if builtins_named:
         raise ValueError(
@@ -282,6 +363,14 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
         if bad:
             raise ValueError(f"[{table}] in {p} has {', '.join(bad)}: a command is a "
                              f"quoted string")
+    cwd_root, here = resolved_root, None
+    if repos:
+        here = next((n for n, path in repos.items() if path == resolved_root), None)
+        if here is None:
+            # Outside every listed repo the roots stand in none, so what is
+            # about no row's object is refused by name, as outside a repo
+            # today. A repo's type still runs there: Config.repo gives it roots.
+            resolved_root = resolved_work = None
     return Config(
         project_root=resolved_root,
         work_root=resolved_work,
@@ -296,4 +385,7 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
         command_timeout=timeout,
         local_only=local_only,
         store=Path(store).resolve(),
+        repos=repos,
+        here=here,
+        cwd_root=cwd_root,
     )

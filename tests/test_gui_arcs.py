@@ -136,8 +136,8 @@ async def test_a_project_row_on_the_checklist_is_clickable(user: User, seeded):
 
     await user.open("/t")
     hrefs = {e.props.get("href") for e in user.find(marker="note-target").elements}
-    assert f"/notes?id={g.id}" in hrefs, "the project row must link to the note"
-    assert "/object?type=item&name=one" in hrefs, "the item row still links to its object"
+    assert f"/notes?id={g.id}" in hrefs, "the project entry must link to the note"
+    assert "/object?type=item&name=one" in hrefs, "the item entry still links to its object"
 
 
 PREREG = ('[kinds]\nprediction = { status = true, verdict = true }\n'
@@ -196,3 +196,19 @@ async def test_seed_all_is_a_sweep_that_never_runs_the_resolver(user: User, repo
     assert calls(s) == before
     assert sorted(n.target.name for n in store.load(s) if n.arc_id == act.id) \
         == ["40.40", "44.00"]
+
+
+async def test_a_rows_text_links_to_its_note(user: User, seeded):
+    """Only the id linked to the note, and a reader did not find it. A short
+    body links too: the row leaves out the note's tags, refs and edit."""
+    ctx, act = seeded
+    b = api.add(ctx, {"kind": "bug", "target": {"type": "item", "name": "one"},
+                      "body": "broken thing", "arc_id": act.id}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        checklist(ctx, act.id, lambda: None, author="ada")
+
+    await user.open("/t")
+    assert {e.props.get("href") for e in user.find(marker="checklist-body").elements} \
+        == {f"/notes?id={b.id}"}

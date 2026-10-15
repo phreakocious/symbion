@@ -220,7 +220,7 @@ def check_self_ref(target: dict, refs) -> None:
     `file:src/cli.py` are one object once the catalog has run."""
     own = (target["type"], target.get("name"))
     if any((r["type"], r.get("name")) == own for r in refs or ()):
-        raise ValueError(f"a ref to the row's own target ({own[0]}:{own[1] or ''}) "
+        raise ValueError(f"a ref to the entry's own target ({own[0]}:{own[1] or ''}) "
                          f"adds nothing; drop it")
 
 
@@ -268,12 +268,12 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
                              f"omit the flag, or say what it found")
     if d.get("status") is not None and not spec.status:
         raise ValueError(f"status is not valid for kind {kind!r}: it has no status bit, so "
-                         f"there is nothing to open or resolve. A plain row leaves the "
+                         f"there is nothing to open or resolve. A plain entry leaves the "
                          f"default views with `supersede <id> --add-tag retired`; "
                          f"`symbion schema` lists each kind's bits")
     if d.get("status") not in (None, *STATUSES):
         raise ValueError(f"status {d['status']!r} is neither open nor resolved, so no view "
-                         f"would show the row")
+                         f"would show the entry")
     if isinstance(d.get("tags"), str):
         raise ValueError(f"tags must be a list of strings, not the string {d['tags']!r}")
     if not spec.verdict and (d.get("checked") is not None or d.get("result") is not None):
@@ -283,7 +283,7 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
     if (spec.status and spec.verdict and d.get("status") == "resolved"
             and not has_result(d.get("result"))):
         raise ValueError(f"kind {kind!r} cannot be resolved without --result: it is a "
-                         f"pre-registration, and the resolving row carries the verdict: "
+                         f"pre-registration, and the resolving entry carries the verdict: "
                          f"`resolve <id> --result \"what the data said\"`")
     if d.get("due") is not None:
         if not spec.status:
@@ -306,6 +306,19 @@ _VOCAB_HINT = ("the vocabulary changed on 2026-09-08 (followup->task, anomaly->b
 _RETIRED_TYPES = ("global", "activity")
 
 
+def check_types(objs, target_types) -> None:
+    """Each object a write resolved is of a type the store declares. The
+    rule that resolves a name runs in the api, and a name it missed (a
+    `file:` in a store with [repos]) stored a row no read could reach (the
+    repos design). None checks nothing: a reader, or an inherited name."""
+    if target_types is None:
+        return
+    for o in objs:
+        t = o.type if isinstance(o, Target) else o["type"]
+        if t not in target_types:
+            raise ValueError(f"unknown target type: {t!r}")
+
+
 def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
     """`kinds` is the store's table (label -> Kind); None means the defaults.
     An undeclared label is refused with the declared set, and the three
@@ -325,8 +338,9 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
     if retired or target.type in _RETIRED_TYPES:
         raise ValueError(f"retired target type {(retired or [target.type])[0]!r}: "
                          f"{_VOCAB_HINT}; rename it in notes.jsonl")
-    if target_types is not None and target.type not in target_types:
-        raise ValueError(f"unknown target type: {target.type!r}")
+    refs = tuple(r if isinstance(r, Target) else Target(type=r["type"], name=r.get("name"))
+                 for r in (d.get("refs") or ()))
+    check_types((target, *refs), target_types)
     # By name, whatever order they were written in, so every reader lists
     # them alike and two rows' numbers line up (the owner, 2026-10-09).
     m = d.get("measurements")
@@ -337,8 +351,7 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
         checked=d.get("checked"), result=d.get("result"),
         arc_id=d.get("arc_id"), supersedes=d.get("supersedes"), due=d.get("due"),
         tags=tuple(d.get("tags") or ()),
-        refs=tuple(r if isinstance(r, Target) else Target(type=r["type"], name=r.get("name"))
-                   for r in (d.get("refs") or ())),
+        refs=refs,
         provenance=d.get("provenance"),
         measurements=dict(sorted(m.items(), key=lambda kv: kv[0].casefold())) if m else m,
         target_blob=d.get("target_blob"),
@@ -806,7 +819,7 @@ def _parse_jsonl(text: str, parse) -> tuple[list, list]:
             bad.append((i, raw, f"duplicate id {rid}: line {seen[rid]} has it too, so "
                                 f"this line is skipped. A merge kept both sides of two edits: "
                                 f"change the last 3 characters of one line's id to other hex "
-                                f"digits, and both rows read"))
+                                f"digits, and both entries read"))
             continue
         seen[rid] = i
         good.append(row)
@@ -974,7 +987,8 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
 
     Inherits the superseded row's fields (notably `target` — never
     re-resolved, so a departed target stays editable), overridden by
-    **fields, with a fresh id/created_at and supersedes=old_id. The old row
+    **fields, with a fresh id/created_at and supersedes=old_id. A `target`
+    in **fields moves the entry; the caller resolves it. The old row
     stays on disk (the timeline is the history).
 
     `author` is NEVER inherited from the superseded row: a correction is
@@ -1022,7 +1036,7 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         # inherited ones are never re-resolved.
         have = list(base.get("refs") or ())
         base["refs"] = have + [r for r in add_refs if r not in have]
-    if "refs" in fields or add_refs:
+    if "refs" in fields or add_refs or "target" in fields:
         check_self_ref(base["target"], base["refs"])
     if add_measurements:
         # Onto the TIP's too: a name given replaces that name only.
@@ -1033,9 +1047,27 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     if spec is None:
         raise ValueError(f"unknown kind {base['kind']!r}; this store's kinds are "
                          f"{', '.join(kinds)} (declared under [kinds] in symbion.toml)")
-    if prepend_body is not None and spec.status and spec.verdict:
-        raise ValueError(f"{old.id} is a pre-registration: its registered text stays on "
-                         f"top, so nothing goes above it (--append adds after it)")
+    # Parked may change, so a task parks as an idea in place. Across the other
+    # bits a note became a task with no status, and a task a pre-registration
+    # with no registered run and no stamp (2026-10-14).
+    if base["kind"] != old.kind and \
+            (spec.status, spec.verdict) != (old.spec.status, old.spec.verdict):
+        raise ValueError(f"{old.kind} to {base['kind']}: a kind change keeps the status and "
+                         f"verdict bits, and these differ (`symbion schema` lists each kind's "
+                         f"bits); a different thing is a new entry")
+    if spec.status and spec.verdict:
+        if prepend_body is not None:
+            raise ValueError(f"{old.id} is a pre-registration: its registered text stays on "
+                             f"top, so nothing goes above it (--append adds after it)")
+        # A body that keeps the registered text as its prefix is an append
+        # (the GUI's dialog sends one whole); any other one replaced it at
+        # exit 0, under a line still reading `registered at` (2026-10-13).
+        if not (base.get("body") or "").startswith(old.body or ""):
+            raise ValueError(f"{old.id} is a pre-registration: its registered text stays as "
+                             f"written, so a body cannot replace it (--append adds after it)")
+        if base.get("checked") != old.checked:
+            raise ValueError(f"{old.id} is a pre-registration: --checked names its registered "
+                             f"run and stays as written; a different run is a new entry")
     # A legacy row (a hand-written migration, or a kind whose bits changed)
     # can carry a field its kind cannot hold. The reader loads it as written;
     # the WRITER owns the invariants, so an INHERITED illegal field is dropped
@@ -1079,9 +1111,18 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     return note
 
 
+class RefsDropped(ValueError):
+    """A write that would drop refs the entry holds, under `keep_refs`.
+    `dropped` is the tip's Targets the new refs leave out."""
+    def __init__(self, dropped):
+        super().__init__("would drop " + ", ".join(f"{t.type}:{t.name}" for t in dropped))
+        self.dropped = dropped
+
+
 def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
               append_body: str | None = None, add_refs=None,
-              prepend_body: str | None = None, add_measurements=None, **fields) -> Note:
+              prepend_body: str | None = None, add_measurements=None, target_types=None,
+              keep_refs: bool = False, **fields) -> Note:
     """Append a correction superseding old_id -- the single-row public entry
     point. One outer `_lock` spans load -> fast-forward -> mint -> write; see
     `_supersede_unlocked` for what happens inside it.
@@ -1098,8 +1139,12 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
     it never CREATES a new one.
 
     `canonicalize(fields) -> fields` runs inside the lock before the row is
-    built: new refs resolve against the store as it is now; the inherited
-    target is never in `fields` (api.supersede refuses it)."""
+    built: a new target or new refs resolve against the store as it is now;
+    an inherited target or ref is never in `fields`. `target_types`,
+    when given, checks the names this write brings: a new target or ref,
+    never an inherited one. `keep_refs` refuses new refs that leave out one
+    the tip holds (RefsDropped), compared once the names resolve: a writer
+    who meant to add a ref dropped the others (more than once by 2026-10-15)."""
     require_store(store)
     with _lock(store):
         notes = load(store)
@@ -1107,6 +1152,13 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
             fields = canonicalize(fields)
             if add_refs:
                 add_refs = canonicalize({"refs": add_refs})["refs"]
+        check_types([o for o in (fields.get("target"), *(fields.get("refs") or ()),
+                                 *(add_refs or ())) if o], target_types)
+        if keep_refs and fields.get("refs") is not None:
+            now = {(r.type, r.name) if isinstance(r, Target) else (r["type"], r.get("name"))
+                   for r in fields["refs"]}
+            if gone := [r for r in chain_tip(notes, old_id).refs if (r.type, r.name) not in now]:
+                raise RefsDropped(gone)
         return _supersede_unlocked(store, notes, old_id, author=author,
                                    append_body=append_body, add_refs=add_refs,
                                    prepend_body=prepend_body, in_place=lambda tip: rewritable(store, notes, tip, author),
@@ -1218,7 +1270,7 @@ def sessions(store) -> dict:
 
 def own_rows(store, author: str):
     """keep() for `commit`: the caller's own pending rows. In an agent
-    session, the rows it wrote, as whoever (`/symbion KIND` writes as the
+    session, the rows it wrote, as whoever (a row in the user's words is written as the
     person); with no session, the author's rows that no session wrote."""
     known, key = sessions(store), session_key()
     if key:
@@ -1307,7 +1359,9 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
     if id is not None:
         out = [n for n in out if n.id == id]
     if target_type is not None:
-        out = [n for n in out if n.target.type == target_type]
+        # A tuple is several types: `list --type file` in a store with [repos].
+        types = (target_type,) if isinstance(target_type, str) else target_type
+        out = [n for n in out if n.target.type in types]
     if target_name is not None:
         out = [n for n in out if n.target.name == target_name]
     if kind is not None:
@@ -1386,7 +1440,7 @@ def _rename_unlocked(store, notes, kinds, target_type, old, new, author,
 
 
 def rename_target(store, target_type, old, new, author=None,
-                  canonicalize=None, new_type=None) -> tuple[int, int]:
+                  canonicalize=None, new_type=None, target_types=None) -> tuple[int, int]:
     """Re-target every HEAD note for (target_type, old) onto (new_type or
     target_type, new), and re-point every ref to it, via supersede so the old rows remain as
     history. Projects rename catalog objects; notes key on the name string, so a rename orphans them without
@@ -1413,13 +1467,39 @@ def rename_target(store, target_type, old, new, author=None,
     `canonicalize(new) -> new` runs inside the lock, as in `add_many`:
     without it `new` is stored as typed, and a short sha stays short.
     `old` is never resolved: it names a departed object, which a live
-    catalog match would redirect."""
+    catalog match would redirect. `target_types`, when given, checks the
+    type the rows move to."""
+    check_types([{"type": new_type or target_type}], target_types)
     require_store(store)
     with _lock(store):
         if canonicalize is not None:
             new = canonicalize(new)
         return _rename_unlocked(store, load(store), K.read_kinds(store),
                                 target_type, old, new, author, new_type)
+
+
+def retype(store, from_type, to_type, author=None, target_types=None) -> tuple[int, int]:
+    """Move every HEAD's target and refs of `from_type` onto `to_type`, each
+    name as stored, under one lock: how a store's rows leave a type it
+    dropped (the repos design, "Converting a store"). Counts as
+    `rename_target` does. No name is resolved: a per-name rename resolves
+    its new name through the catalog, and moved a departed path onto a live
+    one it is a unique substring of."""
+    check_types([{"type": to_type}], target_types)
+    require_store(store)
+    with _lock(store):
+        notes, kinds = load(store), K.read_kinds(store)
+        names = sorted({o.name for n in heads(notes) for o in (n.target, *n.refs)
+                        if o.type == from_type and o.name is not None})
+        moved = repointed = 0
+        # ponytail: one sweep per name, so a row holding two names of the type
+        # gets two versions; one supersede per row if a converted store's
+        # history reads noisy. Each sweep sees the last: _rename_unlocked
+        # appends what it writes to `notes`.
+        for name in names:
+            m, r = _rename_unlocked(store, notes, kinds, from_type, name, name, author, to_type)
+            moved, repointed = moved + m, repointed + r
+        return moved, repointed
 
 
 def added_rows(diff: str) -> list[dict]:
@@ -1443,9 +1523,28 @@ def _sans_id(row: dict) -> str:
     return json.dumps({k: v for k, v in row.items() if k != "id"}, sort_keys=True)
 
 
+def entries(rows) -> list[dict]:
+    """`rows` less each version another row in it supersedes: an entry
+    edited twice before a commit, its first edit kept because another entry
+    cites it, read as two entries with one lead (2026-10-14)."""
+    later = {r.get("supersedes") for r in rows} - {None}
+    return [r for r in rows if r.get("id") not in later]
+
+
 def rows_by_author(rows) -> str:
-    """`claude 2, codex 4`: the commit's `Rows:` trailer."""
-    by = Counter(r.get("author") or "?" for r in rows)
+    """`claude 2, codex 4`: the commit's `Rows:` trailer, by entry. An entry
+    counts once for each author with a version of it in `rows`: a commit
+    that takes another writer's base must name them (2026-10-02)."""
+    newer = {r.get("supersedes"): r.get("id") for r in rows if r.get("supersedes")}
+
+    def entry(i):
+        seen = set()
+        while i in newer and i not in seen:
+            seen.add(i)
+            i = newer[i]
+        return i
+    by = Counter(a for a, _ in {(r.get("author") or "?", entry(r.get("id")) or id(r))
+                                for r in rows})
     return ", ".join(f"{a} {n}" for a, n in sorted(by.items()))
 
 
@@ -1513,7 +1612,7 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
                     _forget_committed(store)
     if r.returncode:
         said = (r.stderr + r.stdout).strip() or f"exit {r.returncode}, no output"
-        raise RuntimeError(f"git refused the commit; the notes are on disk, "
+        raise RuntimeError(f"git refused the commit; the entries are on disk, "
                            f"not committed. git said:\n{said}")
     return True
 
@@ -1773,10 +1872,10 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
                          f"(declared under [kinds] in symbion.toml); pass --kind")
     if not spec.status:
         raise ValueError(f"kind {kind!r} cannot be seeded: it has no status bit, "
-                         f"and a seeded row is a checklist box")
+                         f"and a seeded entry is a checklist box")
     if spec.parked:
         raise ValueError(f"kind {kind!r} cannot be seeded: it is parked, and a "
-                         f"parked row is never a checklist box")
+                         f"parked entry is never a checklist box")
     if spec.verdict:
         raise ValueError(f"kind {kind!r} cannot be seeded: it has the verdict bit, "
                          f"and seed stamps no provenance and writes no falsifier")

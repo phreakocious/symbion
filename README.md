@@ -3,16 +3,16 @@
 ![symbion: a project's notebook in the browser, and `symbion list` in a terminal over it](https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/banner.png)
 
 A notebook and ticket registry for one project, shared by you and your coding
-agent. Bugs, tasks, decisions and verified results go in as dated notes, so
+agent. Bugs, tasks, decisions and verified results go in as dated entries, so
 what a session learned is still there when the next one starts.
 
-<img src="https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/session.svg" width="100%" alt="A Claude Code session: symbion's hook hands the agent the open rows; asked to work them, it fixes the bug, resolves its row, and hands the question back.">
+<img src="https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/session.svg" width="100%" alt="A Claude Code session: symbion's hook hands the agent the open entries; asked to work them, it fixes the bug, resolves its entry, and hands the question back.">
 
 ## What it does for you
 
 - **Each session starts where the last one stopped.** A session-start hook
-  gives the agent the open bugs, tasks and questions, the rows due soon, and
-  the ones you wrote or answered. `/symbion wrap` ends a session: the rows it
+  gives the agent the open bugs, tasks and questions, the entries due soon, and
+  the ones you wrote or answered. `/symbion wrap` ends a session: the entries it
   owes, then a store commit whose message is the next session's handoff. You
   do not brief it again.
 - **A result knows its age.** A `check` records what ran, what it said, and
@@ -20,17 +20,17 @@ what a session learned is still there when the next one starts.
   "tests pass".
 - **Questions go both ways.** The agent files a `question` for you. Your
   answer, from a terminal or the browser, reaches its next session.
-- **Notes attach to things.** A note sits on a commit, a file, a named item
+- **Entries attach to things.** An entry sits on a commit, a file, a named item
   or the whole project, so `symbion context --target file:src/x.py` finds
-  every note on that file.
+  every entry on that file.
 - **Checklists across a codebase.** An arc is a named line of work with one
   box per item: a file, a test, a host. `symbion arc reconcile` reports the
   boxes whose file was renamed or deleted.
-- **Plain files you own.** The notes are JSONL in a git repo beside the
+- **Plain files you own.** The entries are JSONL in a git repo beside the
   project. There is no server, account or database. Checking out an old
   branch does not change your tickets.
 - **A local web page, if you want one.** `symbion serve` gives boards,
-  search, and a page per note.
+  search, and a page per entry.
 
 symbion works with Claude Code, Codex and Hermes Agent, and the CLI works
 without any of them.
@@ -57,13 +57,13 @@ symbion init --yes    # creates the store, ../<repo>-notes, and links the agent 
 ```
 
 `init --yes` registers its hooks too when `~/.claude/settings.json` does not
-exist: one at session start, and one that gives the agent a file's `gotcha` rows
+exist: one at session start, and one that gives the agent a file's `gotcha` entries
 the first time it touches that file. When the file exists, `init` prints each
 entry to add, or says the hook is already there. `symbion init --merge-hook` adds the entry for you and keeps the
 rest of the file. If your agent's own edit of that file is denied, run it yourself:
 in Claude Code, type `! symbion init --merge-hook` at the prompt.
 
-A new store takes notes on a commit, an item, the project or an arc. For notes
+A new store takes entries on a commit, an item, the project or an arc. For entries
 on files, open `../<repo>-notes/symbion.toml` and uncomment `file =` under
 `[catalogs]` and `file = "git"` under `[renames]`. A file target refused before
 then names both lines.

@@ -24,9 +24,10 @@ from . import catalog, config, gitref, kinds as K, store
 
 @dataclass(frozen=True)
 class Ctx:
-    """Everything a write needs that isn't the row itself. One per process for
-    the CLI; one per request for the GUI, so an edited symbion.toml takes
-    effect without a restart."""
+    """Everything a write needs that isn't the row itself. One per process:
+    a serve holds one for its life, so an edited symbion.toml takes effect
+    at `serve --restart` (measured 2026-10-14: a kind added while it ran left
+    its open rows off the home page until then)."""
     store_dir: Path
     cfg: config.Config
     target_types: frozenset
@@ -53,6 +54,13 @@ class Ctx:
     # otherwise identical, and neither said which project it was about
     # (an adopter driving a satellite repo from a hub, 2026-09-28).
     tree_default: Path | None = None
+
+    @property
+    def input_types(self) -> frozenset:
+        """The types a write or a read takes as input: the stored ones, and
+        `file` in a store with [repos], which finds the repo that holds its
+        name (the repos design)."""
+        return self.target_types | ({"file"} if getattr(self.cfg, "repos", None) else set())
 
 
 def resolve(dir_value=None, follow_owner=True) -> Ctx:
@@ -101,7 +109,9 @@ def resolve(dir_value=None, follow_owner=True) -> Ctx:
     followed = False
     if (follow_owner and (dir_value is not None or from_env or in_store)
             and (root is None or tree_default != store_dir)):
-        owner = config.store_owner(store_dir)
+        # A store with [repos] is claimed by its repos: --dir from one of them
+        # stands in it, and from anywhere else in none (the repos design).
+        owner = None if config.lists_repos(store_dir) else config.store_owner(store_dir)
         if owner is not None:
             root = wroot = owner
             followed = True
@@ -192,8 +202,8 @@ def check_name(typ: str, name) -> None:
     elif typ == "item" and _ROW_ID.fullmatch(name):
         # `--ref item:<row id>` meant "see this row" and minted an item by
         # that name at exit 0, three times in one session (2026-10-02).
-        raise ValueError(f"item:{name} has the shape of a row id: an item names an "
-                         f"object, never a row. Give this row that row's target, and "
+        raise ValueError(f"item:{name} has the shape of an entry id: an item names an "
+                         f"object, never an entry. Give this entry that entry's target, and "
                          f"cite its id in the body")
 
 
@@ -207,8 +217,8 @@ def kind_as_type(typ, kinds, what: str) -> str:
     through the object they share, and an id in the body is the pointer."""
     if typ not in kinds:
         return ""
-    return (f"; {typ!r} is a kind: a {what} names an object, never a row. Give this "
-            f"row that row's target, and cite its id in the body")
+    return (f"; {typ!r} is a kind: a {what} names an object, never an entry. Give this "
+            f"entry that entry's target, and cite its id in the body")
 
 
 def as_object(v):
@@ -218,6 +228,22 @@ def as_object(v):
         return v
     typ, _, name = v.partition(":")
     return {"type": typ, "name": name or None}
+
+
+def check_target(ctx: Ctx, target) -> dict:
+    """Shape, type and name of a target, {type, name} or TYPE:NAME, name
+    NFC'd; as `check_refs`, no catalog runs."""
+    t = as_object(target)
+    if not isinstance(t, dict) or not isinstance(t.get("type"), str):
+        raise ValueError(f"target is {{type, name}} or TYPE:NAME, not {t!r}")
+    if t["type"] not in ctx.input_types:
+        hint = config.uncomment_hint(ctx.store_dir, t["type"])
+        raise ValueError(f"unknown target type {t['type']!r} (choose from "
+                         f"{', '.join(sorted(ctx.input_types))})"
+                         + kind_as_type(t["type"], ctx.kinds, "target")
+                         + (f"; {hint}" if hint else ""))
+    check_name(t["type"], t.get("name"))
+    return {"type": t["type"], "name": catalog.nfc(t.get("name"))}
 
 
 def check_refs(target_types, refs, kinds=()) -> list[dict]:
@@ -245,11 +271,21 @@ def _canonicalizer(ctx: Ctx):
     with the catalog so a repeated query never sees a duplicate candidate."""
     pools: dict[str, list[str]] = {}
     pending: dict[str, list[str]] = {}
+    listed: dict[str, list[str]] = {}          # file_target's: each repo's names, once
 
     def one(t):
         if t is None:
             return None
         typ, name = t["type"], t.get("name")
+        if typ == "file" and (ctx.cfg.repos or gitref.is_path(name)):
+            # The one write-side door for `file:` read from where you stand:
+            # an add's target and refs, --from-json, supersede (the repos
+            # design). A bare name in a store without repos stays the
+            # catalog's, below.
+            ctx.consulted.add("catalog")
+            typ, got = gitref.file_target(ctx.cfg, name, pending, cache=listed)
+            pending.setdefault(typ, []).append(got)
+            return {"type": typ, "name": got}
         if name is not None and (typ == "commit" or typ in ctx.cfg.catalogs):
             ctx.consulted.add("commit" if typ == "commit" else "catalog")
         if name is None or typ in catalog.NON_CANONICAL_TYPES or typ not in ctx.cfg.catalogs:
@@ -263,12 +299,20 @@ def _canonicalizer(ctx: Ctx):
     return one
 
 
+def _entry(i: int, n: int) -> str:
+    """`entry 2: `, the failing row of a batch of n; nothing for one row,
+    where `entry 1:` named a batch that was never typed (2026-10-15)."""
+    return f"entry {i}: " if n > 1 else ""
+
+
 def canonicalize_rows(ctx: Ctx, rows) -> list[dict]:
     """`store.add_many` / `store.supersede` callback: target then refs, row
     by row, so a later row's query sees an earlier row's answer.
 
     A resolution error names its row (1-based): a `--from-json` batch of 45
-    rows says WHICH one was ambiguous rather than leaving the caller to bisect."""
+    rows says WHICH one was ambiguous rather than leaving the caller to bisect.
+    An ambiguous ref says it is a ref: it read as the target's error."""
+    rows = list(rows)
     one = _canonicalizer(ctx)
     out = []
     for i, r in enumerate(rows, 1):
@@ -277,9 +321,13 @@ def canonicalize_rows(ctx: Ctx, rows) -> list[dict]:
             if "target" in r:
                 r["target"] = one(r["target"])
             if r.get("refs"):
-                r["refs"] = [one(x) for x in r["refs"]]
+                try:
+                    r["refs"] = [one(x) for x in r["refs"]]
+                except catalog.AmbiguousName as e:
+                    e.args = (f"ref {e}",) + e.args[1:]
+                    raise
         except (catalog.AmbiguousName, catalog.CatalogError) as e:
-            e.args = (f"row {i}: {e}",) + e.args[1:]
+            e.args = (f"{_entry(i, len(rows))}{e}",) + e.args[1:]
             raise
         out.append(r)
     return out
@@ -303,8 +351,15 @@ def rename_target(ctx: Ctx, target_type: str, old: str, new: str, *,
         return stored[0]
     moved, refs = store.rename_target(ctx.store_dir, target_type, old, new,
                                       author=author, canonicalize=canon,
-                                      new_type=to_type)
+                                      new_type=to_type, target_types=ctx.target_types)
     return moved, refs, stored[0]
+
+
+def retype(ctx: Ctx, from_type: str, to_type: str, *, author: str) -> tuple[int, int]:
+    """`store.retype`: every row and ref of `from_type` onto `to_type`, the
+    names as stored. No catalog runs."""
+    return store.retype(ctx.store_dir, from_type, to_type, author=author,
+                        target_types=ctx.target_types)
 
 
 def canonicalize_names(ctx: Ctx, target_type: str, names) -> list[str]:
@@ -385,7 +440,7 @@ def _harvest(body, rx, name_of):
     return tags, out.strip()
 
 
-def _stamp(ctx: Ctx, kind: str, spec, external: bool = False) -> dict | None:
+def _stamp(ctx: Ctx, kind: str, spec, external: bool = False, target=None) -> dict | None:
     """Provenance for a verdict kind -- or a refusal when there is no tree to
     stamp it from (the store was named from outside any git repository, see
     `resolve`). An unstamped check would read `unverifiable` forever and say
@@ -395,16 +450,46 @@ def _stamp(ctx: Ctx, kind: str, spec, external: bool = False) -> dict | None:
     the tree, so HEAD and a dirty tree say nothing about it: it is stamped
     with when it ran, which `supersede` inherits like a sha, and needs no
     repo. Measured 2026-09-28: in a store whose checks mostly read the world,
-    most verdict rows were this shape, and every one read `behind N` or `unverifiable`."""
+    most verdict rows were this shape, and every one read `behind N` or `unverifiable`.
+
+    In a store with [repos], the stamp is taken in the target's repo, and
+    names it (`_stamp_repo`)."""
     if spec.verdict and external:
         return {"external": True, "at": store._now_iso()}
-    if spec.verdict and ctx.cfg.work_root is None:
+    if not spec.verdict:
+        return None
+    cfg, repo = ctx.cfg, None
+    if cfg.repos:
+        repo = _stamp_repo(ctx, target)
+        if why := cfg.missing(repo):
+            raise ValueError(f"{why}: a check on it is stamped with its HEAD")
+        cfg = cfg.repo(repo)
+    elif cfg.work_root is None:
         raise ValueError(f"kind {kind!r} is stamped with provenance at write, and "
                          f"{os.getcwd()} is in no git repository to stamp it from; "
                          f"run from inside the project")
-    if spec.verdict:
-        ctx.consulted.add("stamp")
-    return gitref.provenance_stamp(ctx.cfg, spec)
+    ctx.consulted.add("stamp")
+    return gitref.provenance_stamp(cfg, spec, repo)
+
+
+def _stamp_repo(ctx: Ctx, target) -> str:
+    """The repo a verdict row is stamped in, in a store with [repos]: its
+    target's (a repo's type, or the repo that holds a commit), else the one
+    the cwd stands in. With neither, refused, as a stamp with no repo is.
+    `target` is resolved: a new row's by the name rule under the lock
+    (`_stamped`), a resolve's by the store."""
+    cfg = ctx.cfg
+    typ, name = (target or {}).get("type"), (target or {}).get("name")
+    repo = typ if typ in cfg.repos else None
+    if typ == "commit" and name:
+        repo = gitref.holder(cfg, gitref.peel(cfg, name))
+    repo = repo or cfg.here
+    if repo is None:
+        raise ValueError(f"a check is stamped with a repo's HEAD, and {os.getcwd()} is in "
+                         f"none of this store's repos ({', '.join(cfg.repos)}), nor is its "
+                         f"target; run it from one of them, or add it with --external if "
+                         f"it read nothing in them")
+    return repo
 
 
 _HINT_CAP = 8
@@ -483,21 +568,12 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
             raise ValueError(f"{key} must be a list, not {row[key]!r}")
     if not all(isinstance(t, str) for t in row.get("tags") or ()):
         raise ValueError(f"tags must be strings, not {row['tags']!r}")
-    refs = check_refs(ctx.target_types, row.get("refs"), ctx.kinds)
+    refs = check_refs(ctx.input_types, row.get("refs"), ctx.kinds)
     spec = ctx.kinds.get(row["kind"])
     if spec is None:
         raise ValueError(f"unknown kind {row['kind']!r} (choose from {', '.join(ctx.kinds)}); "
                          f"kinds are declared in {ctx.store_dir / config.CONFIG_FILE} under [kinds]")
-    t = as_object(row["target"])
-    if not isinstance(t, dict) or not isinstance(t.get("type"), str):
-        raise ValueError(f"target is {{type, name}} or TYPE:NAME, not {t!r}")
-    if t["type"] not in ctx.target_types:
-        hint = config.uncomment_hint(ctx.store_dir, t["type"])
-        raise ValueError(f"unknown target type {t['type']!r} (choose from "
-                         f"{', '.join(sorted(ctx.target_types))})"
-                         + kind_as_type(t["type"], ctx.kinds, "target")
-                         + (f"; {hint}" if hint else ""))
-    check_name(t["type"], t.get("name"))
+    t = check_target(ctx, row["target"])
     store.check_fields(row["kind"], spec, row)
     external = row.get("external", False)
     if not isinstance(external, bool):
@@ -509,9 +585,10 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
     if row.get("measurements") is not None:
         check_measurements(row["measurements"])
     check_arc_targets(ctx, [t, *refs])
+    later = bool(ctx.cfg.repos) and spec.verdict and not external
     return dict(
         kind=row["kind"],
-        target={"type": t["type"], "name": catalog.nfc(t.get("name"))},
+        target=t,
         body=row.get("body") or "", status=row.get("status"),
         checked=row.get("checked"), result=row.get("result"),
         measurements=row.get("measurements"),
@@ -519,7 +596,11 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
         tags=list(row.get("tags") or ()),
         author=row.get("author") or author,
         refs=refs,
-        provenance=_stamp(ctx, row["kind"], spec, external),
+        # In a store with [repos] the stamp names the target's repo, which the
+        # name rule decides under the lock beside this write's other names:
+        # `_stamped` takes it there.
+        **({"_stamp_later": True} if later else
+           {"provenance": _stamp(ctx, row["kind"], spec, external, t)}),
     )
 
 
@@ -620,18 +701,30 @@ def add_fields(ctx: Ctx, fields) -> list:
     stamping, so the per-row guard below is what stands between a forgotten
     author and a plausible-looking row on disk -- `store.add_many` defaults a
     missing one to "unknown" rather than raising."""
-    for i, f in enumerate(fields):
+    for i, f in enumerate(fields, 1):
         if not f.get("author"):
-            raise ValueError(f"row {i}: author is required")
+            raise ValueError(f"{_entry(i, len(fields))}author is required")
     return store.add_many(ctx.store_dir, fields, target_types=ctx.target_types,
                           canonicalize=lambda rows: _stamped(ctx, canonicalize_rows(ctx, rows)))
 
 
 def _stamped(ctx: Ctx, rows) -> list[dict]:
     """Each row with its target file's content as it is now (gitref.target_blob),
-    read after the name resolves: the file is the one the stored name names."""
-    return [r | {"target_blob": gitref.target_blob(ctx.cfg, r["target"]["type"],
-                                                   r["target"]["name"])} for r in rows]
+    read after the name resolves: the file is the one the stored name names.
+    In a store with [repos], a verdict row's stamp is taken here too, in the
+    repo its target resolved to (fields_from_row leaves it for here)."""
+    out = []
+    for i, r in enumerate(rows, 1):
+        r = dict(r)
+        if r.pop("_stamp_later", False):
+            try:
+                r["provenance"] = _stamp(ctx, r["kind"], ctx.kinds[r["kind"]], False,
+                                         r["target"])
+            except ValueError as e:
+                raise ValueError(f"{_entry(i, len(rows))}{e}") from None
+        out.append(r | {"target_blob": gitref.target_blob(ctx.cfg, r["target"]["type"],
+                                                          r["target"]["name"])})
+    return out
 
 
 def add_many(ctx: Ctx, rows, *, author: str) -> list:
@@ -642,19 +735,19 @@ def add_many(ctx: Ctx, rows, *, author: str) -> list:
 
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
               add_refs=None, prepend_body: str | None = None, add_measurements=None,
-              **fields) -> store.Note:
+              keep_refs: bool = False, **fields) -> store.Note:
     """Target, provenance and target_blob are INHERITED from the superseded row
     and never re-resolved (a tag added later is no re-reading of the file), so
-    this needs no canonicalization -- a departed target stays editable.
-    `refs`, if given, is new input: checked here, resolved under the lock by
-    `canonicalize_rows`, which sees only `fields` -- never the inherited
-    target or refs.
+    an edit that names no target needs no canonicalization -- a departed
+    target stays editable. `refs`, if given, is new input: checked here,
+    resolved under the lock by `canonicalize_rows`, which sees only `fields`
+    -- never the inherited target or refs.
 
-    Inheritance is ENFORCED, not merely documented. store.supersede's own
-    `note_from_dict(base)` gets no `target_types=`, so a `target` forwarded
-    through **fields lands on disk uncanonicalized AND unvalidated -- measured:
-    a short sha stayed short and type "bogus" was accepted, both of which
-    add_many rejects. Nothing passes either, and this keeps it that way.
+    A `target` given moves the entry, and is new input as `refs` is. Its
+    `target_blob` is stamped anew under the lock, as `add` stamps one: an
+    entry's commits-since count starts from the file it is on. A misfiled
+    entry had no fix that kept its id (a tester, 2026-10-15). Provenance and
+    target_blob are stamps, never input: neither passes.
 
     ONE exception, and it is this function's, not the caller's: resolving an
     OPEN status+verdict row (a pre-registration) re-stamps provenance, so the
@@ -667,17 +760,23 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
     The tip is read outside the store lock, so two concurrent resolves of the
     same open pre-registration can both read it open and both re-stamp, the
     second landing as a stamped correction to an already-resolved row -- the
-    same race shape as `retag`, and equally no data loss."""
-    for key in ("target", "provenance", "target_blob"):
+    same race shape as `retag`, and equally no data loss.
+
+    `keep_refs` refuses `refs` that drop one the entry holds
+    (store.RefsDropped): the CLI's `--ref`, read as adding one."""
+    for key in ("provenance", "target_blob"):
         if key in fields:
             raise ValueError(
                 f"supersede cannot set {key!r}: it is inherited from the "
-                f"superseded row and never re-resolved (add a new note instead)")
+                f"superseded entry and never re-resolved (add a new entry instead)")
+    if "target" in fields:
+        fields["target"] = check_target(ctx, fields["target"])
     if "refs" in fields:
-        fields["refs"] = check_refs(ctx.target_types, fields["refs"], ctx.kinds)
+        fields["refs"] = check_refs(ctx.input_types, fields["refs"], ctx.kinds)
     if add_refs:
-        add_refs = check_refs(ctx.target_types, add_refs, ctx.kinds)
-    check_arc_targets(ctx, [*(fields.get("refs") or ()), *(add_refs or ())])
+        add_refs = check_refs(ctx.input_types, add_refs, ctx.kinds)
+    check_arc_targets(ctx, [*([fields["target"]] if "target" in fields else ()),
+                            *(fields.get("refs") or ()), *(add_refs or ())])
     check_arc(ctx, fields.get("arc_id"))
     if add_measurements:
         check_measurements(add_measurements)
@@ -685,11 +784,19 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
         tip = store.chain_tip(store.load(ctx.store_dir), note_id)
         if tip.spec.status and tip.spec.verdict and store.read_status(tip) == "open":
             fields["provenance"] = _stamp(ctx, tip.kind, tip.spec,
-                                         bool((tip.provenance or {}).get("external")))
+                                         bool((tip.provenance or {}).get("external")),
+                                         {"type": tip.target.type, "name": tip.target.name})
+
+    def canonicalize(f):
+        f = canonicalize_rows(ctx, [f])[0]
+        if "target" in f:
+            f["target_blob"] = gitref.target_blob(ctx.cfg, f["target"]["type"],
+                                                  f["target"]["name"])
+        return f
     return store.supersede(ctx.store_dir, note_id, author=author, append_body=append_body,
                            add_refs=add_refs, prepend_body=prepend_body,
-                           add_measurements=add_measurements,
-                           canonicalize=lambda f: canonicalize_rows(ctx, [f])[0], **fields)
+                           add_measurements=add_measurements, canonicalize=canonicalize,
+                           target_types=ctx.target_types, keep_refs=keep_refs, **fields)
 
 
 def seed(ctx: Ctx, arc_id: str, target_type: str, names=None, *, author: str,

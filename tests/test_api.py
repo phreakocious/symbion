@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from symbion import api, cli, gitref, store
+from symbion import api, catalog, cli, gitref, store
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
 
@@ -19,12 +19,12 @@ def test_resolve_derives_type_sets_from_catalogs(repo, tmp_path):
     ctx = api.resolve(str(store_dir))
 
     assert ctx.store_dir == store_dir.resolve()
-    assert ctx.cfg.catalogs == {"thing": "echo a"}
+    assert ctx.cfg.catalogs == {"thing": "echo a", "doc": catalog.DOC_CATALOG}   # doc: built in
     # builtins are always legal targets; the catalog extends them
     assert {"thing", "project", "commit", "item", "arc"} <= set(ctx.target_types)
     # scopes differ from target types, and from each other
-    assert set(ctx.arc_scopes) == {"thing", "item", "project", "mixed"}
-    assert set(ctx.seed_scopes) == {"thing", "item"}
+    assert set(ctx.arc_scopes) == {"thing", "doc", "item", "project", "mixed"}
+    assert set(ctx.seed_scopes) == {"thing", "doc", "item"}
 
 
 def test_resolve_without_dir_uses_the_sibling_default(repo, monkeypatch):
@@ -218,7 +218,7 @@ def test_cli_add_tag_with_body_stays_one_row(repo, tmp_path):
                    "--add-tag", "b", "--body", "new"])
 
     assert rc == 0
-    assert len(store.load(tmp_path)) == before + 1, "one row, not two"
+    assert len(store.load(tmp_path)) == before + 1, "one entry, not two"
     head = store.heads(store.load(tmp_path))[0]
     assert set(head.tags) == {"a", "b"} and head.body == "new"
 
@@ -284,6 +284,7 @@ _NON_WRITERS = {
     "canonicalize_names",  # pure: resolves names; seed_arc appends
     "check_arc",           # pure: refuses an arc id that names no arc
     "check_arc_targets",   # pure: the same, for arc: targets and refs
+    "check_target",        # pure: a target's shape, type and name
     "rewritable",          # a read: whether an edit by `author` would rewrite
     "add_fields",   # takes fields, not a row -- no single keyword-only author
                     # for this audit to see; it demands one per row itself
@@ -343,6 +344,7 @@ def test_every_write_requires_author_by_keyword(repo, tmp_path):
         (api.seed,            (ctx, "actid", "item", ["x"])),
         (api.create_arc, (ctx, "n", "d", "item")),
         (api.rename_target,   (ctx, "item", "old", "new")),
+        (api.retype,          (ctx, "file", "item")),
         (api.undo,            (ctx, "someid")),
     ]
     assert sorted(fn.__name__ for fn, _ in cases) == sorted(writers), \
@@ -385,8 +387,10 @@ def test_add_fields_demands_an_author_per_row(repo, tmp_path):
     missing author writes nothing, one carrying it writes."""
     ctx = api.resolve(str(tmp_path))
     row = {"kind": "note", "target": {"type": "project", "name": None}, "body": "b"}
-    with pytest.raises(ValueError, match="author is required"):
+    with pytest.raises(ValueError, match="^author is required"):
         api.add_fields(ctx, [row])
+    with pytest.raises(ValueError, match="^entry 2: author is required"):
+        api.add_fields(ctx, [dict(row, author="ada"), row])     # counted from 1
     assert store.load(tmp_path) == []
 
     made = api.add_fields(ctx, [dict(row, author="ada")])
@@ -441,22 +445,58 @@ def test_commit_raises_when_git_cannot_stage(repo, tmp_path):
         api.commit(ctx, "locked")
 
 
-def test_supersede_refuses_a_target(repo, tmp_path):
-    """store.supersede's internal note_from_dict(base) gets no target_types=,
-    so a target forwarded through **fields lands on disk BOTH uncanonicalized
-    and unvalidated -- measured before the guard: a short sha stayed short and
-    type "bogus" was accepted, neither of which api.add_many allows. Target is
-    inherited by design; the docstring's promise is now enforced."""
+def test_supersede_moves_an_entry_to_another_target(repo, tmp_path):
+    """A misfiled entry had no fix that kept its id: supersede refused a
+    target, and `rename` moves every entry on a name (a tester, 2026-10-15).
+    A target given is new input, checked and resolved as `add` resolves one:
+    a short sha is stored full, and a bad type or a target that is one of
+    the entry's refs writes nothing."""
+    full = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
     ctx = api.resolve(str(tmp_path))
-    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}},
-                author="t")
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "refs": ["item:x"]}, author="t")
+    before = store.load(tmp_path)
 
-    with pytest.raises(ValueError, match="target"):
-        api.supersede(ctx, n.id, author="t",
-                      target={"type": "commit", "name": "0187b02"})
-    with pytest.raises(ValueError, match="target"):
+    with pytest.raises(ValueError, match="unknown target type 'bogus'"):
         api.supersede(ctx, n.id, author="t", target={"type": "bogus", "name": "x"})
-    assert len(store.load(tmp_path)) == 1, "a refused supersede writes nothing"
+    with pytest.raises(ValueError, match="own target"):
+        api.supersede(ctx, n.id, author="t", target="item:x")
+    assert store.load(tmp_path) == before, "a refused supersede writes nothing"
+
+    out = api.supersede(ctx, n.id, author="t", target={"type": "commit", "name": full[:7]})
+    assert (out.target.type, out.target.name) == ("commit", full)
+
+
+def test_a_moved_entry_is_stamped_with_its_new_files_blob(repo, tmp_path):
+    """`target_blob` is what an entry's commits-since count starts from: a
+    moved entry counts from the new file as it is now. An edit that keeps
+    the target keeps the stamp, and an entry moved off a file has none."""
+    (tmp_path / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n')
+    (repo / "g").write_text("y")
+    subprocess.run(["git", "add", "g"], cwd=repo, check=True)
+    blob = lambda p: subprocess.run(["git", "hash-object", p], cwd=repo,   # noqa: E731
+                                    capture_output=True, text=True).stdout.strip()
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": "file:f"}, author="t")
+    assert n.target_blob == blob("f")
+    assert api.supersede(ctx, n.id, author="t", body="edited").target_blob == blob("f")
+    moved = api.supersede(ctx, n.id, author="t", target="file:g")
+    assert (moved.target.name, moved.target_blob) == ("g", blob("g"))
+    assert api.supersede(ctx, n.id, author="t", target="item:x").target_blob is None
+
+
+def test_an_edit_that_names_no_target_never_resolves_it_again(repo, tmp_path):
+    """The departed-target rule (2026-09-04 spec): an entry whose target
+    left the catalog stays editable, and its name is not resolved again. A
+    resolve now would find `alpha2` by substring."""
+    (tmp_path / "symbion.toml").write_text("""[catalogs]\nthing = 'printf "alpha\\n"'\n""")
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": "thing:alpha"}, author="t")
+    (tmp_path / "symbion.toml").write_text("""[catalogs]\nthing = 'printf "alpha2\\n"'\n""")
+    ctx = api.resolve(str(tmp_path))
+    out = api.supersede(ctx, n.id, author="t", body="still here")
+    assert out.target.name == "alpha"
 
 
 def test_supersede_refuses_a_provenance(repo, tmp_path):
@@ -679,7 +719,7 @@ def test_an_external_check_reads_external_whatever_the_tree_does(repo, tmp_path)
     tree = api.add(ctx, row, author="ada")
     assert set(ext.provenance) == {"external", "at"} and ext.provenance["external"] is True
     lag = datetime.fromisoformat(ext.created_at) - datetime.fromisoformat(ext.provenance["at"])
-    assert timedelta(0) <= lag < timedelta(seconds=5), "stamped just before the row is minted"
+    assert timedelta(0) <= lag < timedelta(seconds=5), "stamped just before the entry is minted"
     assert gitref.check_state(ctx.cfg, ext.provenance) == ("external", None)
     assert gitref.check_state(ctx.cfg, tree.provenance) == ("unverifiable", None)
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", "--", "f"], check=True)
@@ -764,7 +804,7 @@ def test_a_batch_resolution_error_names_its_row(repo, tmp_path):
     """`row 2:` prefixes the SAME AmbiguousName raised by the resolver, so a
     `--from-json` batch of many rows says which one failed instead of making
     the caller bisect. Both directions: a two-row batch prefixes row 2 and
-    writes nothing; a one-row add prefixes row 1."""
+    writes nothing; a one-row add names no row, since nothing was numbered."""
     store_dir = reading_store(tmp_path)
     ctx = api.resolve(str(store_dir))
     api.add(ctx, _row("40.00"), author="t")
@@ -772,13 +812,42 @@ def test_a_batch_resolution_error_names_its_row(repo, tmp_path):
     before = {n.target.name for n in store.load(store_dir)}
     with pytest.raises(catalog.AmbiguousName) as e:
         api.add_many(ctx, [_row("44.00"), _row("40.55")], author="t")
-    assert str(e.value).startswith("row 2:")
+    assert str(e.value).startswith("entry 2:")
     assert {n.target.name for n in store.load(store_dir)} == before, \
-        "row 1 resolved cleanly but nothing from this batch should land"
+        "entry 1 resolved cleanly but nothing from this batch should land"
 
     with pytest.raises(catalog.AmbiguousName) as e:
         api.add(ctx, _row("40.55"), author="t")
-    assert str(e.value).startswith("row 1:")
+    assert str(e.value).startswith("'40.55' matches")
+
+
+def test_an_ambiguous_ref_says_it_is_the_ref(repo, tmp_path):
+    """It read as the target's error, so the writer went to fix the target."""
+    ctx = api.resolve(str(reading_store(tmp_path)))
+    api.add(ctx, _row("40.00"), author="t")
+    api.add(ctx, _row("41.25"), author="t")
+    with pytest.raises(catalog.AmbiguousName) as e:
+        api.add(ctx, _row("40.00", refs=[{"type": "reading", "name": "40.55"}]), author="t")
+    assert str(e.value).startswith("ref '40.55' matches")
+
+
+def test_keep_refs_compares_the_refs_once_their_names_resolve(repo, tmp_path):
+    """Another spelling of a ref the entry holds is no drop: the refs are
+    compared after they resolve, under the lock. Both directions, and with
+    keep_refs off (the GUI's edit dialog) a replace still replaces."""
+    ctx = api.resolve(str(reading_store(tmp_path)))
+    api.add(ctx, _row("40.40"), author="t")
+    n = api.add(ctx, _row("x", typ="item", refs=[{"type": "reading", "name": "40.40"}]),
+                author="t")
+    with pytest.raises(store.RefsDropped) as e:
+        api.supersede(ctx, n.id, author="t", keep_refs=True,
+                      refs=[{"type": "item", "name": "z"}])
+    assert [(r.type, r.name) for r in e.value.dropped] == [("reading", "40.40")]
+    got = api.supersede(ctx, n.id, author="t", keep_refs=True,
+                        refs=[{"type": "reading", "name": "40.45"}, {"type": "item", "name": "z"}])
+    assert [(r.type, r.name) for r in got.refs] == [("reading", "40.40"), ("item", "z")]
+    got = api.supersede(ctx, got.id, author="t", refs=[{"type": "item", "name": "w"}])
+    assert [(r.type, r.name) for r in got.refs] == [("item", "w")]
 
 
 def test_sequential_adds_see_the_store(repo, tmp_path):

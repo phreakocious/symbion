@@ -21,10 +21,10 @@ STORE_CATALOG = r'''
 import json, sys
 p = sys.argv[1]
 try:
-    rows = [json.loads(l) for l in open(p) if l.strip()]
+    entries = [json.loads(l) for l in open(p) if l.strip()]
 except FileNotFoundError:
-    rows = []
-for name in sorted({r["target"]["name"] for r in rows
+    entries = []
+for name in sorted({r["target"]["name"] for r in entries
                     if r["target"]["type"] == "reading" and r["target"]["name"]}):
     print(name)
 '''

@@ -270,11 +270,12 @@ def check_tip(cfg, prov, state, distance) -> str:
                 f"branch left it behind. Re-run the check to stamp a live commit")
     if state not in ("behind", "ahead"):
         return at
+    cfg = gitref.stamp_cfg(cfg, prov)            # the commits of the stamp's repo
     lines = gitref.oneline(cfg, f"{sha}..HEAD" if state == "behind" else f"HEAD..{sha}",
                            TIP_COMMITS)
     more = f"\n+{distance - len(lines)} more" if distance > len(lines) else ""
-    since = (f"HEAD is {distance} commits past it" if state == "behind"
-             else f"it is {distance} commits past HEAD")
+    since = (f"HEAD is {summ._count(distance, 'commit')} past it" if state == "behind"
+             else f"it is {summ._count(distance, 'commit')} past HEAD")
     return f"{at}; {since}:\n" + "\n".join(lines) + more
 
 
@@ -325,7 +326,7 @@ def since_tip(cfg, n) -> str:
         return ""
     subj = gitref.subjects(cfg, shas[:TIP_COMMITS])
     more = f"\n+{len(shas) - TIP_COMMITS} more" if len(shas) > TIP_COMMITS else ""
-    return (f"{n.target.name} changed in {summ._count(len(shas), 'commit')} since this row:\n"
+    return (f"{n.target.name} changed in {summ._count(len(shas), 'commit')} since this entry:\n"
             + "\n".join(f"{s[:7]} {subj.get(s, '')}" for s in shas[:TIP_COMMITS]) + more)
 
 
@@ -434,12 +435,14 @@ def _lexer(filename: str):
         return None
 
 
-def view_path(ctx, name):
+def view_path(ctx, name, ttype=None):
     """The checkout's file `name` names, when the viewer shows its kind:
     markdown, or a file pygments names a language for; else None. A target
     name is typed text, so the file must resolve inside the checkout: `..`
-    and a symlink out of it read nothing."""
-    root = ctx.cfg.work_root
+    and a symlink out of it read nothing. `ttype`, a row's target or ref
+    type, picks the repo in a store with [repos]."""
+    root = ctx.store_dir if ttype == "doc" else \
+        ctx.cfg.for_type(ttype).work_root           # a repo's row: its repo's file
     if not root or not name:
         return None
     root = root.resolve()
@@ -453,18 +456,18 @@ def view_path(ctx, name):
 VIEW_CHARS = 500_000
 
 
-def view_button(ctx, name, label: str = ""):
+def view_button(ctx, name, label: str = "", ttype=None):
     """A button that shows the file `name` in a dialog: markdown rendered
     (the owner, 2026-10-02), anything else pygments knows coloured, code
     most of all (the owner, 2026-10-11). None when the viewer cannot show
     it. Read on the click, so the dialog shows the file as it is then."""
-    path = view_path(ctx, name)
+    path = view_path(ctx, name, ttype)
     if path is None:
         return None
     md = path.suffix.lower() == ".md"
 
     def _open():
-        path = view_path(ctx, name)
+        path = view_path(ctx, name, ttype)
         try:
             text = path.read_text(encoding="utf-8", errors="replace") if path else None
         except OSError:
@@ -614,9 +617,10 @@ def _note_content(ctx, n, compact: bool, hit, show_target: bool = False, seams=(
         # Each piece on its own, a rule in the kind's colour between: an
         # append's text after its seam, a prepend's before.
         start = 0
-        for at, who, when, above in seams:
+        for at, who, when, above, rewrote in seams:
             NoteMarkdown(link_ids(n.body[start:at], ctx.store_dir))
-            said = f"{who} added {'the above ' if above else ''}{summ.when_added(when)}"
+            said = (f"{who} {'edited the text above and ' if rewrote else ''}added "
+                    f"{'the above ' if above else ''}{summ.when_added(when)}")
             with ui.element("div").classes("sb-seam"):
                 ui.label(said).tooltip(when).mark("seam")
             start = at
@@ -642,7 +646,7 @@ def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) 
         if show_target:
             if not bare(n):                 # else the headline says it
                 target_link(n)
-            view_button(ctx, n.target.name)
+            view_button(ctx, n.target.name, ttype=n.target.type)
         if since:
             _since_chip(ctx, n, since)
         if n.arc_id and (show_target or not bare(n)):
@@ -652,7 +656,7 @@ def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) 
             ui.link(f"↗ {summ.ref_label(r)}",
                     f"/object?type={quote(r.type)}&name={quote(r.name or '', safe='')}") \
                 .classes("sb-chip sb-ref").mark("note-ref")
-            view_button(ctx, r.name)
+            view_button(ctx, r.name, ttype=r.type)
         for t in n.tags:
             ui.link(f"#{t}", narrow(tag=t)).classes("sb-tag").mark(f"tag-{t}")
         with ui.element("span").classes("sb-note-by"):
@@ -731,7 +735,16 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
         ui.label("resolve — the result is the verdict" if resolving
                  else "edit — this version is not yet committed, so it changes in place"
                  if api.rewritable(ctx, n.id, author=author)
-                 else "supersede — the old row is kept").classes("sb-stat-label")
+                 else "supersede — the old entry is kept").classes("sb-stat-label")
+        # What the entry is on, picked as the new-entry form's header picks
+        # it: the dialog could change neither (a tester, 2026-10-15). An
+        # untouched target is not sent, so a departed one never resolves again.
+        with ui.row().classes("items-center gap-2 w-full"):
+            ui.label("on").classes("sb-stat-label")
+            on_type, on_name = target_picker(ctx, n.target.type, n.target.name,
+                                             marks=("edit-on-type", "edit-on-name"))
+            refs = refs_field(ctx, n.refs).classes("col").style("min-width:160px") \
+                .mark("edit-refs")
         body = ui.textarea("body", value=n.body).props("outlined") \
             .classes("min-w-[420px]").mark("edit-body")
         # Most edits add to a row, and the body's end was a scroll away (the
@@ -741,11 +754,20 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             .classes("w-full").mark("edit-append")
         # The star beside the tags, so an edit and a star are one write, not
         # two (the owner, 2026-10-02). The switch holds `priority`; the field
-        # the rest, and a `priority` typed there still counts.
+        # the rest, and a `priority` typed there still counts. So with
+        # closing: an open status row resolves here, with its message (the
+        # owner, 2026-10-13), and a row with no status retires, which only a
+        # typed tag reached (the owner, 2026-10-14).
+        held = {"priority"} | ({"retired"} if not n.spec.status else set())
         with ui.row(wrap=False).classes("items-center gap-2 w-full"):
-            tags = tags_field(ctx, ", ".join(t for t in n.tags if t != "priority")) \
+            tags = tags_field(ctx, ", ".join(t for t in n.tags if t not in held)) \
                 .classes("col").mark("edit-tags")
             pri = ui.switch("priority", value="priority" in n.tags).mark("edit-priority")
+            close = None
+            if not n.spec.status:
+                close = ui.switch("retired", value="retired" in n.tags).mark("edit-retired")
+            elif S.read_status(n) == "open" and not resolving:
+                close = ui.switch("resolve").mark("edit-resolve")
         # Attaching an EXISTING note to an arc has no other route: seeding
         # mints new tasks, and target/provenance are the only two fields
         # supersede refuses. This is the one.
@@ -772,9 +794,17 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                 .props("dense outlined").classes("w-full").mark("edit-result")
 
         def _save():
-            if resolving and not (res.value or "").strip():
+            resolve = resolving or bool(n.spec.status and close is not None and close.value)
+            if resolve and n.spec.verdict and not (res.value or "").strip():
                 ui.notify("a result is required to resolve this kind", type="warning")
                 return
+            target = picked_target(on_type, on_name)
+            if target is None:
+                return
+            on = {"target": target} if (target["type"], target["name"]) \
+                != (n.target.type, n.target.name) else {}
+            if list(refs.value or ()) != [ref_key(r) for r in n.refs]:
+                on["refs"] = list(refs.value or ())
             harvested, cleaned = api.harvest_hashtags(body.value or "")
             more_tags, added = api.harvest_hashtags(more.value or "")
             if not added.strip():
@@ -788,14 +818,16 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                 text = {"body": S.appended(cleaned, added)}
             verdict = {"checked": checked.value or None,
                        "result": res.value or None} if checked is not None else {}
-            closing = {"status": "resolved"} if resolving else {}
+            closing = {"status": "resolved"} if resolve else {}
+            retired = ["retired"] if not n.spec.status and close.value else []
             dated = {"due": (due.value or "").strip() or None} if due is not None else {}
             try:
                 api.supersede(ctx, n.id, author=author, **text,
                               tags=list(dict.fromkeys(split_tags(tags.value) + harvested
                                                       + more_tags
-                                                      + (["priority"] if pri.value else []))),
-                              arc_id=arc.value or None, **verdict, **closing, **dated)
+                                                      + (["priority"] if pri.value else [])
+                                                      + retired)),
+                              arc_id=arc.value or None, **verdict, **closing, **dated, **on)
             except ValueError as e:
                 ui.notify(str(e), type="negative")
                 return
@@ -891,9 +923,69 @@ def target_names(ctx, typ: str) -> list:
             return catalog.names(ctx.cfg, typ, allow_empty=True)
         except catalog.CatalogError:
             pass
-    used = [o for n in S.newest_first(S.load(ctx.store_dir)) for o in (n.target, *n.refs)
-            if o.type == typ and o.name]
-    return list(dict.fromkeys(o.name for o in used))
+    return [o.name for o in used_objects(ctx) if o.type == typ]
+
+
+def used_objects(ctx) -> list:
+    """The objects this store's entries are on, as target or ref, newest
+    first, once each."""
+    seen: dict = {}
+    for n in S.newest_first(S.load(ctx.store_dir)):
+        for o in (n.target, *n.refs):
+            if o.name:
+                seen.setdefault((o.type, o.name), o)
+    return list(seen.values())
+
+
+def target_picker(ctx, typ: str, name: str | None, marks=("note-on-type", "note-on-name")):
+    """A target's type select and name field, the name hidden on `project`:
+    the new-entry form's header and the edit dialog's. Not an arc: the arc
+    select puts an entry in one, unless the entry is already on one."""
+    types = ["project", *sorted(ctx.target_types - {"project", "arc"})]
+    if typ not in types:
+        types.append(typ)
+    on_type = ui.select(types, value=typ) \
+        .props('dense outlined options-dense aria-label="target type"').mark(marks[0])
+    # The name in its own case: a label's capitals rewrote a path. Any
+    # part of a name matches, and a new one is typed freely.
+    offer = lambda t: target_names(ctx, t) if t != "project" else []   # noqa: E731
+    on_name = Suggest(name or "", offer(typ)) \
+        .props('dense outlined options-dense placeholder=name aria-label="target name"') \
+        .classes("col").style("min-width:160px").mark(marks[1])
+    on_name.bind_visibility_from(on_type, "value", backward=lambda v: v != "project")
+    on_type.on_value_change(lambda e: on_name.set_options(offer(e.value)))
+    return on_type, on_name
+
+
+def picked_target(on_type, on_name) -> dict | None:
+    """The target a picker holds, or None, said, when its name is empty."""
+    if on_type.value == "project":
+        return {"type": "project", "name": None}
+    name = (on_name.value or "").strip()
+    if not name:
+        ui.notify(f"name the {on_type.value} this entry is on", type="warning")
+        return None
+    return {"type": on_type.value, "name": name}
+
+
+def refs_field(ctx, refs=()):
+    """`also on`: the objects an entry is on beside its target, its refs, as
+    chips. It offers the objects this store's entries are on, and takes a
+    new TYPE:NAME typed: the GUI put an entry on one object (a tester,
+    2026-10-15). A value is the name as stored, so a kept ref resolves to
+    itself; the chip shows a commit's short sha."""
+    # ponytail: a changed field sends every ref, as `supersede --ref` does,
+    # so a kept ref whose name left its catalog resolves again; send only
+    # the change if that bites.
+    options = {ref_key(o): summ.ref_label(o) for o in (*refs, *used_objects(ctx))}
+    return ui.select(options, value=[ref_key(r) for r in refs], multiple=True,
+                     new_value_mode="add-unique", label="also on") \
+        .props("dense outlined options-dense use-chips")
+
+
+def ref_key(o) -> str:
+    """An object as `refs_field` holds it: TYPE:NAME, the name as stored."""
+    return f"{o.type}:{o.name or ''}"
 
 
 def add_form(ctx, target_type, target_name, refresh, *, author: str,
@@ -908,31 +1000,22 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
     `start_kind` is the kind it starts as, when this store has it."""
     kinds = ctx.kinds
     labels = list(kinds)
-    types = ["project", *sorted(ctx.target_types - {"project", "arc"})]
-    if target_type not in types:
-        types.append(target_type)
     with ui.row().classes("items-center gap-2 w-full"):
-        ui.label("new note on").classes("sb-stat-label")
-        on_type = ui.select(types, value=target_type) \
-            .props('dense outlined options-dense aria-label="target type"').mark("note-on-type")
-        # The name in its own case: a label's capitals rewrote a path. Any
-        # part of a name matches, and a new one is typed freely.
-        offer = lambda typ: target_names(ctx, typ) if typ != "project" else []   # noqa: E731
-        on_name = Suggest(target_name or "", offer(target_type)) \
-            .props('dense outlined options-dense placeholder=name aria-label="target name"') \
-            .classes("col").style("min-width:160px").mark("note-on-name")
-        on_name.bind_visibility_from(on_type, "value", backward=lambda v: v != "project")
-        on_type.on_value_change(lambda e: on_name.set_options(offer(e.value)))
+        ui.label("new entry on").classes("sb-stat-label")
+        on_type, on_name = target_picker(ctx, target_type, target_name)
+        refs = refs_field(ctx).classes("col").style("min-width:160px").mark("note-refs")
         ui.space()
         ui.label("⌘/Ctrl Enter adds it" + (" · Shift Enter adds another" if another else "")
                  + " · Esc closes").classes("sb-subtitle")
     # The body first, then one toolbar: what the note says is the field a
-    # person came to type in, and the rest are settings on it.
+    # person came to type in, and the rest are settings on it. Outlined like
+    # the fields around it: borderless, one typed space hid the placeholder
+    # and left no edge to the field (a tester, 2026-10-15).
     with ui.element("div").classes("sb-composer"):
-        body = ui.textarea(placeholder="Write a note in markdown — #tag adds a tag, "
+        body = ui.textarea(placeholder="Write an entry in markdown — #tag adds a tag, "
                                        "!task sets the kind") \
-            .props('borderless autogrow autofocus aria-label="body"') \
-            .classes("w-full sb-compose-body").mark("note-body")
+            .props('outlined autogrow autofocus aria-label="body"') \
+            .classes("w-full sb-compose-body mb-2").mark("note-body")
         with ui.row().classes("items-center gap-2 w-full"):
             start = start_kind if start_kind in labels else "note" if "note" in labels \
                 else labels[0]
@@ -981,12 +1064,12 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
             if not cleaned and not kinds[kind.value].verdict:   # `!task` alone says nothing
                 ui.notify("empty note", type="warning")
                 return
-            name = (on_name.value or "").strip() if on_type.value != "project" else None
-            if name == "":
-                ui.notify(f"name the {on_type.value} this note is on", type="warning")
+            target = picked_target(on_type, on_name)
+            if target is None:
                 return
             row = {"kind": kind.value,
-                   "target": {"type": on_type.value, "name": name},
+                   "target": target,
+                   "refs": list(refs.value or ()),
                    "body": cleaned,
                    "arc_id": arc.value or None,
                    "tags": list(dict.fromkeys(split_tags(tags.value) + harvested))}
@@ -1001,6 +1084,7 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
                 ui.notify(str(e), type="negative")
                 return
             body.value = checked.value = result.value = tags.value = due.value = ""
+            refs.value = []
             seen.clear()
             if next_one:
                 ui.notify(f"added {short_id(added.id)}; write the next", type="positive")

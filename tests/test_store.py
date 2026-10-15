@@ -56,7 +56,7 @@ def test_supersede_collapses_to_one_head(tmp_path):
     b = store.supersede(tmp_path, a.id, status="resolved")
     hs = store.heads(store.load(tmp_path))
     assert [h.id for h in hs] == [b.id]
-    assert len(store.load(tmp_path)) == 2, "the superseded row must stay on disk"
+    assert len(store.load(tmp_path)) == 2, "the superseded entry must stay on disk"
 
 
 def test_supersede_inherits_the_stored_target(tmp_path):
@@ -191,7 +191,7 @@ def test_query_status_open_excludes_a_null_status_row(tmp_path):
     _write_raw_legacy_row(tmp_path)
     notes = store.load(tmp_path)
     assert len(store.query(notes, status="open")) == 0
-    assert len(store.query(notes, kind="bug")) == 1, "the row is still IN the store"
+    assert len(store.query(notes, kind="bug")) == 1, "the entry is still IN the store"
 
 
 def test_query_status_open_excludes_an_explicitly_resolved_row(tmp_path):
@@ -243,6 +243,21 @@ def test_supersede_with_a_new_kind_that_can_hold_the_merged_fields_succeeds(tmp_
     b = store.add(tmp_path, kind="bug", target={"type": "project", "name": None})
     t = store.supersede(tmp_path, b.id, kind="task")
     assert (t.kind, t.status) == ("task", "open")
+
+
+def test_a_kind_change_keeps_the_status_and_verdict_bits(tmp_path):
+    """A note moved to task landed with no status, and a task moved to
+    prediction landed with no registered run and no stamp: rows `add` refuses
+    (2026-10-14). The parked bit may change, so a task parks as an idea in
+    place; status and verdict may not."""
+    P = {"type": "project", "name": None}
+    t = store.add(tmp_path, kind="task", target=P)
+    n = store.add(tmp_path, kind="note", target=P)
+    for nid, kind in [(n.id, "task"), (t.id, "prediction"), (t.id, "note")]:
+        with pytest.raises(ValueError, match="status and verdict bits"):
+            store.supersede(tmp_path, nid, kind=kind)
+    assert store.supersede(tmp_path, t.id, kind="idea").kind == "idea"
+    assert store.supersede(tmp_path, n.id, kind="decision").kind == "decision"
 
 
 def test_supersede_to_an_undeclared_kind_names_the_kinds_table(tmp_path):
@@ -549,7 +564,7 @@ def test_a_status_the_kind_no_longer_holds_is_not_read(tmp_path):
 
     _declare(tmp_path, '[kinds]\nmeasurement = { verdict = true }\n')
     n, = store.load(tmp_path)
-    assert n.status == "open", "the reader loads the row as written"
+    assert n.status == "open", "the reader loads the entry as written"
     assert store.read_status(n) is None
     assert store.query([n], status="open") == []
 
@@ -708,9 +723,9 @@ def test_rename_moves_targets_and_repoints_refs_one_case_per_shape(tmp_path):
         "a rename never makes a self-edge"
     assert head[mixed].refs == (T("file", "a.py"), T("item", "new"), T("commit", "abc"))
     assert head[other_type].id == other_type, "a file:old ref moved on an item rename"
-    assert head[stray.id].id == stray.id, "a row the rename does not touch was rewritten"
+    assert head[stray.id].id == stray.id, "an entry the rename does not touch was rewritten"
     assert head[already].refs == (T("item", "new"),), "one object, one entry"
-    assert len(notes) == 8 + 6, "each changed row is superseded exactly once"
+    assert len(notes) == 8 + 6, "each changed entry is superseded exactly once"
     assert {n.id for n in store.heads_for(tmp_path, "item", "new")} == \
         {head[k].id for k in (on, ref_only, both, onto_ref, mixed, already)}
     assert store.heads_for(tmp_path, "item", "old") == []
@@ -811,7 +826,9 @@ def test_an_edit_keeps_the_old_row_where_its_history_matters(tmp_path, case):
     if case == "cited":
         store.add(tmp_path, kind="note", target={"type": "project", "name": None},
                   body=f"see {a.id[-10:]}", author="bob")
-    edit = {"status": "resolved"} if case == "resolve" else {"body": "v2"}
+    # A pre-registration's body may only extend its registered text.
+    edit = ({"status": "resolved"} if case == "resolve"
+            else {"body": "v1\n\nv2" if kind == "prediction" else "v2"})
     b = store.supersede(tmp_path, a.id, author="bob" if case == "other author" else "ann",
                         **edit)
     assert b.id == a.id and b.supersedes not in (None, a.id)
@@ -896,7 +913,7 @@ def test_own_rows_are_the_sessions_and_with_none_the_authors(tmp_path, monkeypat
     """`commit` swept a live session's rows into another's commit four times
     (2026-10-06 to 10-10). Every Claude session writes as `claude`, so the
     session key decides: a row this session wrote is its own, whoever it is
-    written as (`/symbion KIND` writes as the person). With no key, the
+    written as (a row in the user's words is written as the user). With no key, the
     author's rows that no session wrote."""
     from types import SimpleNamespace
     cfg = SimpleNamespace(git_name="t", git_email="t@t")
@@ -1176,7 +1193,7 @@ def test_undo_takes_back_the_last_write_whole(tmp_path, monkeypatch):
     rows = store.add_many(tmp_path, [dict(kind="note", target=project, body=b, author="claude")
                                      for b in ("a", "b")])
     with pytest.raises(KeyError):           # refused under the lock: the level stands
-        store.supersede(tmp_path, "no-such-row", author="claude", body="x")
+        store.supersede(tmp_path, "no-such-entry", author="claude", body="x")
     assert store.undo(tmp_path, rows[1].id, yes)["removed"] == sorted(r.id for r in rows)
     assert files() == was and store.sessions(tmp_path) == known
 
@@ -1232,3 +1249,24 @@ def test_an_undo_preview_changes_nothing_and_names_each_earlier_version(tmp_path
     with open(tmp_path / "notes.jsonl", "a") as f:
         f.write("\n")
     assert not store.undoable(tmp_path), "the files changed outside symbion"
+
+
+def test_a_ref_of_a_type_the_store_lacks_is_refused_on_add(tmp_store):
+    """The repos design: the store's type check covers an add's refs, so a
+    name the api's rule missed fails loud instead of reading as nothing."""
+    with pytest.raises(ValueError, match="unknown target type: 'file'"):
+        store.add_many(tmp_store, [{"kind": "note", "target": {"type": "item", "name": "x"},
+                                    "refs": [{"type": "file", "name": "a"}]}],
+                       target_types={"item"})
+
+
+def test_supersede_and_rename_check_new_names_and_never_inherited_ones(tmp_store):
+    n = store.add_many(tmp_store, [{"kind": "note", "target": {"type": "item", "name": "x"},
+                                    "refs": [{"type": "file", "name": "a"}]}])[0]
+    store.supersede(tmp_store, n.id, author="t", body="edited", target_types={"item"})
+    with pytest.raises(ValueError, match="unknown target type: 'file'"):
+        store.supersede(tmp_store, n.id, author="t", add_refs=[{"type": "file", "name": "b"}],
+                        target_types={"item"})
+    with pytest.raises(ValueError, match="unknown target type: 'file'"):
+        store.rename_target(tmp_store, "item", "x", "y", author="t", new_type="file",
+                            target_types={"item"})

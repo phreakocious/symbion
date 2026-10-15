@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import math
+import posixpath
 import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import catalog, store
+from . import catalog, config, store
 
 
 def _git(cfg_or_path, *args):
@@ -44,15 +45,77 @@ def own_commit(here: Path = Path(__file__).parent) -> str | None:
     return _git(here, "describe", "--always", "--dirty").stdout.strip()
 
 
-def canonical_commit(cfg, ref: str) -> str:
-    """Peel to a COMMIT object and return its full id.
-
+def _peel(cfg, ref) -> str | None:
+    """`ref` peeled to a COMMIT's full id in `cfg`'s repo, or None.
     `^{commit}` is what makes this a commit target rather than an object
-    target: plain --verify accepts HEAD^{tree} and returns a tree id. On a miss
-    (rebased away, shallow clone) fall back to the typed string, like any
-    departed target."""
+    target: plain --verify accepts HEAD^{tree} and returns a tree id."""
     r = _git(cfg, "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
-    return r.stdout.strip() if r.returncode == 0 else ref
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def peel(cfg, ref) -> str | None:
+    """`ref`'s full commit id, or None where git knows no such commit. In a
+    store with [repos], the repo the cwd stands in peels first, so HEAD and
+    a branch name mean its own; else each other listed repo does. A name
+    that peels to different commits in several (a branch typed from outside
+    every repo) is refused, naming them. One sha in several repos (a fork)
+    is one commit."""
+    if not getattr(cfg, "repos", None):
+        return _peel(cfg, ref)
+    if cfg.here and (sha := _peel(cfg.repo(cfg.here), ref)):
+        return sha
+    found = {n: s for n in cfg.repos if n != cfg.here and (s := _peel(cfg.repo(n), ref))}
+    if len(set(found.values())) > 1:
+        raise catalog.CatalogError(
+            f"commit:{ref} names a different commit in each of {', '.join(found)}; "
+            f"write its sha, or run from inside the repo it means")
+    return next(iter(found.values()), None)
+
+
+def canonical_commit(cfg, ref: str) -> str:
+    """Peel to a COMMIT object and return its full id. On a miss (rebased
+    away, shallow clone) fall back to the typed string, like any departed
+    target."""
+    return peel(cfg, ref) or ref
+
+
+# (store, sha) -> the listed repo that holds the commit. A commit's repo does
+# not change, so a process asks once. A miss is not kept: a fetch can bring
+# the object.
+_HOLDERS: dict = {}
+
+
+def holder(cfg, sha) -> str | None:
+    """The listed repo whose history holds commit `sha`, the cwd's first;
+    None when none does, or the store lists no repos."""
+    if not getattr(cfg, "repos", None) or not sha:
+        return None
+    key = (str(cfg.store), sha)
+    if key not in _HOLDERS:
+        order = ([cfg.here] if cfg.here else []) + [n for n in cfg.repos if n != cfg.here]
+        name = next((n for n in order if _peel(cfg.repo(n), sha)), None)
+        if name is None:
+            return None
+        _HOLDERS[key] = name
+    return _HOLDERS[key]
+
+
+def stamp_repo(cfg, prov) -> str | None:
+    """The listed repo a stamp reads in: its `repo` while the store lists
+    it, else the repo that holds its sha. A stamp written before the store
+    had [repos] names none, and in a shared store those came from whichever
+    repo each session stood in, so the sha decides (the repos design)."""
+    name = prov.get("repo") if isinstance(prov, dict) else None
+    return name if name in cfg.repos else holder(cfg, store.stamp_sha(prov))
+
+
+def stamp_cfg(cfg, prov):
+    """The config a stamp's git questions run in: `cfg` itself in a store
+    without [repos], else its repo's, which has no roots when no listed repo
+    holds the stamp, so it reads `unverifiable` as a departed sha does."""
+    if not getattr(cfg, "repos", None):
+        return cfg
+    return cfg.repo(stamp_repo(cfg, prov))
 
 
 def only_on_default_branch(cfg, name) -> str | None:
@@ -118,15 +181,142 @@ def canon_name(cfg, target_type, name, stored=()):
                       f"the catalog resolves it to {got!r}", file=sys.stderr)
         return q
     if target_type == "commit":
-        sha = canonical_commit(cfg, name)
-        if sha == name and _git(cfg, "cat-file", "-e", f"{name}^{{commit}}").returncode:
+        sha = peel(cfg, name)
+        if sha is None:
             # A typo stored silently, where `context --commit` says so (2026-10-09).
-            print(f"note: git does not know commit {name!r} here; taken as typed",
+            where = "in any listed repo" if getattr(cfg, "repos", None) else "here"
+            print(f"note: git does not know commit {name!r} {where}; taken as typed",
                   file=sys.stderr)
+            return name
         return sha
     if target_type in catalog.NON_CANONICAL_TYPES:
         return catalog.nfc(name)
     return catalog.canonical(cfg, target_type, name)
+
+
+# ---- `file:` as input: a path from where you stand ----
+_PATH_LEADS = ("/", "~", "./", "../", ".\\", "..\\")
+
+
+def is_path(name) -> bool:
+    """A `file:` name typed as a path: absolute, under `~`, or from the cwd.
+    symbion never prints a name in this form, so reading it from the cwd
+    changes no pasted name (the repos design, "Paths in a store without
+    repos"). A `.` or `..` segment anywhere makes one too: no catalog lists
+    `sub/../x.py`, which was stored as typed (2026-10-14 review)."""
+    return isinstance(name, str) and (
+        name.startswith(_PATH_LEADS) or Path(name).is_absolute()
+        or not {".", ".."}.isdisjoint(name.replace("\\", "/").split("/")))
+
+
+def _from_path(cfg, q) -> tuple:
+    """(the listed repo, the name from its root, the resolved Path) for a
+    `file:` path read from the cwd. Git says which checkout holds it,
+    so a linked worktree's file names its repo. In a store without [repos]
+    the repo is None, and the path must be in the project."""
+    p = (Path.cwd() / Path(q).expanduser()).resolve()
+    d = p if p.is_dir() else next(a for a in p.parents if a.is_dir())
+    try:
+        main, top = config.project_root(d), config.work_root(d)
+    except (subprocess.CalledProcessError, RuntimeError):
+        main = top = None
+    repos = getattr(cfg, "repos", None) or {}
+    repo = next((n for n, path in repos.items() if main is not None and path == main), None)
+    if repos and repo is None:
+        raise catalog.CatalogError(
+            f"file:{q} is {p}, in none of this store's repos ("
+            + ", ".join(f"{n} {path}" for n, path in repos.items()) + ")")
+    if not repos and (main is None or main != cfg.project_root):
+        raise catalog.CatalogError(f"file:{q} is {p}, outside this project "
+                                   f"({cfg.project_root})")
+    return repo, p.relative_to(top).as_posix(), p
+
+
+def file_target(cfg, name, extra=None, say: bool = True, cache=None,
+                reading: bool = False) -> tuple:
+    """`file:NAME` as typed: (type, name from its repo's root), the rule
+    every write and read of `file:` meets (the repos design, "`file` in a
+    store with repos").
+
+    A path (is_path) resolves from the cwd, in any store. In a store with
+    [repos] a bare name does too, and the first of these that answers wins:
+    the name joined to the cwd's directory in the repo you stand in; that
+    repo's catalog from its root, by the built-in rule; the other repos'
+    catalogs by the same rule at once, where one holder takes it and several
+    refuse; else a new file, at the name joined to the cwd. From outside
+    every repo, only one holder answers.
+
+    A [resolvers] entry is skipped: a resolver may answer a name outside its
+    catalog, so it cannot say whether its repo holds one. `extra` maps a repo
+    to names added to its pool: a write's pending names, a read's stored
+    ones. `say` off keeps the notes, for a caller that needs only the repo.
+    `cache`, a write's dict, keeps each repo's catalog for the write's
+    other names, so a batch runs each catalog once. `reading` words a miss
+    as a read's: `list` said `a new file` of a name it only looked up."""
+    q = catalog.nfc(name)
+
+    def note(s):
+        if say:
+            print(f"note: {s}", file=sys.stderr)
+    if is_path(q):
+        repo, rel, p = _from_path(cfg, q)
+        typ = repo or "file"
+        # A directory took a file's name with no word of it (the repos review).
+        note(f"file:{q} is {typ}:{rel}" + ("" if p.is_file() else ", a directory"
+                                           if p.is_dir() else ", which does not exist"
+                                           + ("" if reading else " yet")))
+        return typ, rel
+    here, extra, cache = cfg.here, extra or {}, {} if cache is None else cache
+
+    def pool(r):
+        if r not in cache:
+            cache[r] = catalog.names(cfg, r, allow_empty=True)
+        return [*cache[r], *extra.get(r, ())]
+    joined = q
+    if here:
+        sub = Path.cwd().resolve().relative_to(cfg.work_root).as_posix()
+        joined = posixpath.normpath(posixpath.join(sub, q))
+        own = pool(here)
+        if sub != "." and joined in own:
+            note(f"file:{q} is {here}:{joined}")
+            return here, joined
+        hits = catalog.across(q, {here: own})
+        if len(hits) > 1:
+            raise catalog.CatalogError(f"file:{q} matches {catalog.listed(hits)}; "
+                                       f"write one of them, or its path")
+        if hits:
+            note(f"file:{q} is {here}:{hits[0][1]}")
+            return hits[0]
+    others = [r for r in cfg.repos if r != here]
+    if gone := [r for r in others if cfg.missing(r)]:
+        note(f"file:{q} skips {', '.join(gone)}: not on this machine")
+    hits = catalog.across(q, {r: pool(r) for r in others if r not in gone})
+    if len(hits) > 1:
+        raise catalog.CatalogError(f"file:{q} matches {catalog.listed(hits)}; "
+                                   f"write one of them, or its path")
+    if hits:
+        note(f"file:{q} is {hits[0][0]}:{hits[0][1]}, the one repo that holds it")
+        return hits[0]
+    if here:
+        note(f"file:{q} matches nothing in any repo; " + (f"read as {here}:{joined}" if reading
+                                                          else f"taken as {here}:{joined}, a new file"))
+        return here, joined
+    raise catalog.CatalogError(f"file:{q} matches nothing in any repo; give its path, "
+                               f"or write REPO:{q} ({', '.join(cfg.repos)})")
+
+
+def read_target(cfg, ttype, name, notes) -> tuple:
+    """A read's (type, name), as `list` and `context --target` match rows:
+    canon_name's stored form, so an abbreviation typed on read finds what a
+    write stored. A `file:` name meets file_target where a write would (a
+    store with [repos], or a path in any store), each repo's stored names in
+    its pool, so a departed file's rows still read. With no name it stays
+    `file`, which `list` reads as every repo's."""
+    repos = getattr(cfg, "repos", None) or {}
+    if ttype == "file" and name is not None and (repos or is_path(name)):
+        return file_target(cfg, name, {r: store.stored_names(notes, r) for r in repos},
+                           reading=True)
+    return ttype, canon_name(cfg, ttype, name, store.stored_names(notes, ttype))
 
 
 def _dirty_paths(cfg) -> list[str]:
@@ -144,12 +334,14 @@ def _dirty_paths(cfg) -> list[str]:
 
 
 
-def provenance_stamp(cfg, spec):
+def provenance_stamp(cfg, spec, repo=None):
     """Verdict kinds only: the bit, not the label, decides. A configured
     override is a configured command like any other — it runs through
     catalog.run_configured, which supplies cwd=work_root,
     stdin=DEVNULL and the command timeout, and turns a hang into
-    CatalogError instead of letting it block forever."""
+    CatalogError instead of letting it block forever. `repo`, when given,
+    is added to the stamp: the listed repo it was taken in (the repos
+    design, "Stamps")."""
     if not spec.verdict:
         return None
     if cfg.provenance_command:
@@ -172,13 +364,13 @@ def provenance_stamp(cfg, spec):
             raise ValueError(f"provenance command {cfg.provenance_command!r} printed "
                              f"{first!r}, not a JSON object; fix [provenance] command "
                              f"in symbion.toml")
-        return prov
+        return prov if repo is None else {**prov, "repo": repo}
     r = _git(cfg, "rev-parse", "--verify", "-q", "HEAD")
     if r.returncode != 0:
         # Plain `rev-parse HEAD` on an unborn branch prints `HEAD` and exits
         # 128; stored as the sha, it read `behind 0` once commits existed.
         branch = _git(cfg, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip() or "HEAD"
-        raise ValueError(f"no commits yet on {branch}: a verdict row is stamped with the "
+        raise ValueError(f"no commits yet on {branch}: a verdict entry is stamped with the "
                          f"commit it ran at. Commit first, or add it with --external if "
                          f"the check read nothing in the tree")
     head = r.stdout.strip()
@@ -186,7 +378,7 @@ def provenance_stamp(cfg, spec):
     # verdict depends on it) should make a stamp dirty cannot be measured
     # from a boolean (2026-09-27: 26% of 536 adopter stamps dirty).
     paths = _dirty_paths(cfg)
-    return {"sha": head, "dirty": bool(paths),
+    return {"sha": head, "dirty": bool(paths), **({"repo": repo} if repo else {}),
             **({"dirty_count": len(paths), "dirty_paths": paths[:20]} if paths else {})}
 
 
@@ -211,6 +403,11 @@ def unmerged(cfg, shas) -> dict:
     or rebase merge leaves the fix's own commit on none once its branch is
     deleted, and it would read "not merged" for good. A name that is no
     commit id, or an object this clone lacks, is skipped."""
+    if getattr(cfg, "repos", None):
+        shas, found = list(shas), {}
+        for name in cfg.repos:                    # each repo's HEAD, its own shas
+            found |= unmerged(cfg.repo(name), shas)
+        return found
     shas = [s for s in dict.fromkeys(shas) if _HEX.fullmatch(s)]
     r = _git(cfg, "rev-list", "--ignore-missing", *shas, "--not", "HEAD", "--") \
         if shas else None
@@ -260,6 +457,15 @@ def check_state(cfg, prov, head: str | None = None):
     stamp = prov["sha"]
     if not _HEX.fullmatch(stamp):
         return ("unverifiable", None)
+    if getattr(cfg, "repos", None):
+        routed = stamp_cfg(cfg, prov)
+        if routed.work_root != cfg.work_root:
+            # The caller's head is its own repo's: another repo's is read
+            # here, once a row.
+            # ponytail: a page of many checks stamped in other repos reads
+            # one HEAD per row; pass a head per repo if the page's time shows it.
+            head = None
+        cfg = routed
     head = head_sha(cfg) if head is None else head
     if not head:
         return ("unverifiable", None)
@@ -306,6 +512,11 @@ def branch_commits(cfg, ref: str, since: str | None = None) -> set:
     --branch no-such-ref`, or a branch in a repo whose default is not the
     configured one, read `0 notes` at exit 0 (2026-09-27)."""
     base = since or cfg.default_branch
+    if getattr(cfg, "work_root", None) is None and getattr(cfg, "repos", None):
+        # git's `not a git repository`, where a check or a catalog names the
+        # repos (the repos review).
+        raise ValueError(f"--branch reads the repo you stand in, and {Path.cwd()} is in none "
+                         f"of this store's repos ({', '.join(cfg.repos)}); run from one of them")
     r = _git(cfg, "rev-list", f"{base}..{ref}")
     if r.returncode != 0:
         why = (r.stderr.strip().splitlines() or ["rev-list failed"])[0]
@@ -330,6 +541,11 @@ def subjects(cfg, shas) -> dict:
     out = {}
     if not shas:
         return out
+    if getattr(cfg, "repos", None):
+        for name in cfg.repos:                    # each repo names its own shas
+            if left := [s for s in shas if s not in out]:
+                out |= subjects(cfg.repo(name), left)
+        return out
     r = _git(cfg, "log", "--no-walk", "--ignore-missing", "--format=%H%x00%s",
              "--end-of-options", *shas)
     if r.returncode != 0:
@@ -353,8 +569,8 @@ def _file(cfg, ttype, name) -> str | None:
     checkout. A catalog lists other things too (URLs, part numbers), so
     the file must be here, and inside the checkout."""
     root = _root(cfg)
-    if root is None or not name or ttype not in cfg.catalogs:
-        return None
+    if root is None or not name or ttype not in cfg.catalogs or ttype == "doc":
+        return None                  # a doc is the store's file, not the checkout's
     root = Path(root).resolve()
     p = (root / name).resolve()
     return name if p.is_file() and p.is_relative_to(root) else None
@@ -371,6 +587,7 @@ def target_blob(cfg, ttype, name) -> str | None:
 def target_blobs(cfg, ttype, names) -> dict:
     """`target_blob` for many names in one `hash-object`: a seed sweep stamps
     a whole catalog. A name that is no file here has no entry."""
+    cfg = cfg.for_type(ttype)
     # ponytail: one argv; a catalog past ~10k paths may need chunks (ARG_MAX).
     paths = {n: p for n in names if (p := _file(cfg, ttype, n))}
     r = _git(cfg, "hash-object", "--", *paths.values()) if paths else None
@@ -446,7 +663,25 @@ def changed_since(cfg, notes, head: str | None = None) -> dict:
     dated after its chain's first row: a revision inherits the stamp, and
     a row with none keeps the time the target was read. `head` is
     head_sha(cfg), passed by a caller that has it; git's answers are kept
-    for it (_HISTORY)."""
+    for it (_HISTORY).
+
+    In a store with [repos], each row's file is asked of its own repo.
+    `head` is the HEAD of the repo `cfg` stands in; another repo's is read
+    once per call."""
+    if not getattr(cfg, "repos", None):
+        return _changed_since(cfg, notes, head)
+    groups = {}
+    for n in notes:
+        groups.setdefault(n.target.type if n.target.type in cfg.repos else None, []).append(n)
+    out = {}
+    for name, rows in groups.items():
+        at = cfg if name is None else cfg.repo(name)
+        out |= _changed_since(at, rows, head if at.work_root == cfg.work_root else None)
+    return out
+
+
+def _changed_since(cfg, notes, head: str | None = None) -> dict:
+    """changed_since in one repo: `cfg`'s roots, no routing."""
     files = {n.id: _file(cfg, n.target.type, n.target.name) for n in notes}
     paths = sorted({p for p in files.values() if p})
     r = _git(cfg, "hash-object", "--", *paths) if paths else None
@@ -488,35 +723,25 @@ def commits_since(cfg, notes, head: str | None = None) -> dict:
             for k, v in changed_since(cfg, notes, head).items()}
 
 
-def uncommitted(store) -> tuple[int, bool]:
-    """(new note rows, registry modified).
+def uncommitted(store_dir) -> tuple[int, bool]:
+    """(entries not committed, registry modified).
 
-    Lines added less lines removed in notes.jsonl are new notes — a count
-    git status cannot give, since 200 appends are one changed path. An edit
-    keeps the row's id and moves the version it replaces to a new line, so
-    it reads +2 -1. arcs.jsonl is rewritten in place, so a line delta there
-    is meaningless; it is a boolean. Computed unconditionally, never only
-    after a write."""
-    store = Path(store)
-    notes, registry = 0, False
+    The entries `commit` would take — a count git status cannot give, since
+    200 appends are one changed path. A line count read an entry edited
+    twice before a commit as two (2026-10-14). arcs.jsonl is rewritten in
+    place, so a line delta there is meaningless; it is a boolean. Computed
+    unconditionally, never only after a write."""
+    # ponytail: an untracked notes.jsonl beside a HEAD (only by hand-run git)
+    # reads 0; pending_rows would need an ls-files to read it whole.
+    store_dir = Path(store_dir)
+    notes, registry = len(store.entries(store.pending_rows(store_dir))), False
     for args in (["diff", "--numstat"], ["diff", "--cached", "--numstat"]):
-        r = _git(store, *args)
-        for line in r.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) != 3:
-                continue
-            added, removed, path = parts
-            if path.endswith("notes.jsonl") and added.isdigit() and removed.isdigit():
-                notes += int(added) - int(removed)
-            elif path.endswith("arcs.jsonl"):
-                registry = True
-    untracked = _git(store, "ls-files", "--others", "--exclude-standard").stdout.split()
+        if any(line.endswith("arcs.jsonl") for line in _git(store_dir, *args).stdout.splitlines()):
+            registry = True
+    untracked = _git(store_dir, "ls-files", "--others", "--exclude-standard").stdout.split()
     for rel in untracked:
-        if rel.endswith("notes.jsonl"):
-            with open(store / rel, encoding="utf-8") as f:
-                notes += sum(1 for _ in f)
-        elif rel.endswith("arcs.jsonl"):
-            registry = registry or bool((store / rel).read_text(encoding="utf-8").strip())
+        if rel.endswith("arcs.jsonl"):
+            registry = registry or bool((store_dir / rel).read_text(encoding="utf-8").strip())
     return notes, registry
 
 
@@ -530,9 +755,9 @@ def committed(store_dir) -> str:
     paths = [p for p in _git(store_dir, "show", "-z", "--name-only", "--format=", "HEAD")
              .stdout.split("\0") if p.strip()]
     if not paths:                                 # a wrap with nothing pending
-        return "committed: the message alone, no rows or files"
+        return "committed: the message alone, no entries or files"
     files = [p for p in paths if p not in (store.NOTES_FILE, store.ARCS_FILE)]
-    said = [f"rows {rows}"] if rows else []
+    said = [f"entries {rows}"] if rows else []
     if files:
         more = f", +{len(files) - 3} more" if len(files) > 3 else ""
         said.append(f"{len(files)} file{'' if len(files) == 1 else 's'}: "
@@ -546,18 +771,29 @@ def last_wrap(store_dir, cfg) -> dict | None:
     wrapped, when, and how many commits the repo's HEAD gained since (None
     outside a repo). None when no commit carries the trailer. `--since` is
     inclusive to the second, so a repo commit in the wrap's own second
-    counts."""
+    counts. In a store with [repos], every repo's commits, and
+    `commits_by_repo` names each repo that has some."""
     out = _git(store_dir, "log", "-1", "--grep=^Wrap: ",
                "--format=%cI%x00%(trailers:key=Wrap,valueonly)%x00%(trailers)%x00%B").stdout
     if "\0" not in out:
         return None
     at, who, trailers, full = out.split("\0", 3)
     gist, _, body = full.strip().removesuffix(trailers.strip()).strip().partition("\n")
-    n = _git(cfg, "rev-list", "--count", "HEAD", f"--since={at}").stdout.strip()
+    def since(c):
+        n = _git(c, "rev-list", "--count", "HEAD", f"--since={at}").stdout.strip()
+        return int(n) if n.isdigit() else None
+    by_repo = None
+    if getattr(cfg, "repos", None):
+        counts = {name: since(cfg.repo(name)) for name in cfg.repos}
+        known = [v for v in counts.values() if v is not None]
+        n = sum(known) if known else None
+        by_repo = {k: v for k, v in counts.items() if v}
+    else:
+        n = since(cfg)
     # %cI is in the committer's offset; rows are stamped in UTC, so this is too.
     at = datetime.fromisoformat(at).astimezone(timezone.utc).isoformat(timespec="seconds")
     return {"gist": gist, "body": body.strip(), "author": who.strip(), "at": at,
-            "commits_since": int(n) if n.isdigit() else None}
+            "commits_since": n, "commits_by_repo": by_repo}
 
 
 def unpushed(store) -> int | None:

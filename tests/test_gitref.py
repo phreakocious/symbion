@@ -541,7 +541,7 @@ def test_a_merged_commit_dated_before_the_row_counts_and_the_merge_does_not(repo
                     "merge", "-q", "--no-ff", "--no-edit", "side"], check=True,
                    capture_output=True, env={**os.environ,
                                              "GIT_COMMITTER_DATE": "2030-01-04T00:00:00+00:00"})
-    assert _since(cfg, row) == 2, "main's commit and side's; by date, side's is before the row"
+    assert _since(cfg, row) == 2, "main's commit and side's; by date, side's is before the entry"
     # git's answers are kept per HEAD (gitref._HISTORY): a new one asks again
     (repo / "f0").write_text("A\nb\nc\nd\nE\nf\n")
     _commit_at(repo, "after the merge", "2030-01-05T00:00:00+00:00")

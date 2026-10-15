@@ -73,9 +73,18 @@ def _recent(ctx, n, since, git_head) -> bool:
     """Written since `since`, or current at HEAD. Only a row stamped at HEAD
     can be current, so the rest cost no git call."""
     sha = S.stamp_sha(n.provenance)
-    return S.written_at(n) >= since or bool(
-        sha and git_head and git_head.startswith(sha)
-        and api.verdict_state(ctx.cfg, n, git_head)[0] == "current")
+    if S.written_at(n) >= since:
+        return True
+    if not sha:
+        return False
+    if ctx.cfg.repos and (n.provenance or {}).get("repo") != ctx.cfg.here:
+        # `git_head` is the serve's repo's, or "" when it stands in none: a
+        # stamp of another repo is read against its own HEAD.
+        # ponytail: one HEAD read per such row; pass a head per repo if
+        # the page's time shows it.
+        return api.verdict_state(ctx.cfg, n, git_head or None)[0] == "current"
+    return bool(git_head and git_head.startswith(sha)
+                and api.verdict_state(ctx.cfg, n, git_head)[0] == "current")
 
 
 def _error_pages(ctx, author: str) -> None:
@@ -137,7 +146,7 @@ def build_page(ctx, *, author: str) -> None:
                                                or S.read_status(n) == "open"
                                                or "priority" in n.tags], git_head)
         with ui.column().classes("sb-main gap-5"):
-            ui.label(f"{summ._count(len(heads), 'note')} · {ctx.store_dir}") \
+            ui.label(f"{summ._count(len(heads), 'entry')} · {ctx.store_dir}") \
                 .classes("sb-subtitle sb-mono")
             bad = S.load_malformed(ctx.store_dir)
             if bad:
@@ -222,19 +231,19 @@ def build_page(ctx, *, author: str) -> None:
               keep=base, here="" if base or old else "/notes", kind=kwargs.get("kind"))
         with ui.column().classes("sb-main gap-4"):
             if len(hits) > 1:
-                ui.label(f"{len(hits)} rows end in -{old}; open the one you mean") \
+                ui.label(f"{len(hits)} entries end in -{old}; open the one you mean") \
                     .classes("text-notable").mark("ambiguous-id")
             shown = rows if params.get("all") else rows[:PAGE_ROWS]
             # The cut is named at the top, not only in the link at the end.
             cut = f"; newest {len(shown)} shown" if len(shown) < len(rows) else ""
             if q:
                 # Name what was read, so a 0 is not taken for "never filed".
-                ui.label(f"{len(rows)} of {summ._count(len(rest), 'note')} match{cut} — "
+                ui.label(f"{len(rows)} of {summ._count(len(rest), 'entry')} match{cut} — "
                          f"searched body, target, checked, result, refs and tags of current "
-                         f"rows, and every version's id").classes("sb-subtitle") \
+                         f"entries, and every version's id").classes("sb-subtitle") \
                     .mark("result-count")
             else:
-                ui.label(summ._count(len(rows), "note") + cut).classes("sb-subtitle") \
+                ui.label(summ._count(len(rows), "entry") + cut).classes("sb-subtitle") \
                     .mark("result-count")
             if kwargs:
                 ui.link("clear filters", "/notes").classes("text-body")
@@ -244,7 +253,7 @@ def build_page(ctx, *, author: str) -> None:
                 # Held to its card: in the page's gap it read as the last one's.
                 with ui.column().classes("w-full gap-1") if n.id in via else nullcontext():
                     for was in via.get(n.id, ()):
-                        ui.label(f"{was} was superseded; this is its current row") \
+                        ui.label(f"{was} was superseded; this is its current entry") \
                             .classes("text-notable").mark("superseded-by")
                     # A row's own page marks where each amendment joined its body.
                     render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
@@ -287,12 +296,12 @@ def build_page(ctx, *, author: str) -> None:
 
         since = gitref.commits_since(ctx.cfg, [n for t in own for n in live[t]], git_head)
         with ui.column().classes("sb-main gap-5"):
-            ui.label(f"{summ._count(len(own), 'target')} with notes on them, open work first") \
+            ui.label(f"{summ._count(len(own), 'target')} with entries on them, open work first") \
                 .classes("sb-subtitle")
             for t in sorted(own, key=lambda t: not live[t]):     # stable: newest within
                 to = target_href(*t)
                 _board(ctx, title(*t), live[t], author,
-                       to=to, aside=f"· {summ._count(len(on[t]), 'note')}", more=to,
+                       to=to, aside=f"· {summ._count(len(on[t]), 'entry')}", more=to,
                        git_head=git_head, show_target=False, since=since)
 
     @ui.page("/tags")
@@ -329,9 +338,9 @@ def build_page(ctx, *, author: str) -> None:
         git_head = gitref.head_sha(ctx.cfg)
         with ui.column().classes("sb-main gap-4"):
             with ui.row().classes("items-center gap-3"):
-                ui.label(f"{summ._count(len(rows), 'note')} on or referencing this object") \
+                ui.label(f"{summ._count(len(rows), 'entry')} on or referencing this object") \
                     .classes("sb-subtitle")
-                view_button(ctx, name, "read the file")
+                view_button(ctx, name, "read the file", ttype=type)
             since = gitref.commits_since(ctx.cfg, rows, git_head)
             for n in rows:
                 # The page names the object: a row only referring to it names its own.
@@ -414,7 +423,7 @@ def build_page(ctx, *, author: str) -> None:
                 # the page showed only the checklist (the gui spec).
                 about = S.heads_for(ctx.store_dir, "arc", id)
                 if about:
-                    ui.label("notes about this arc").classes("sb-board-title")
+                    ui.label("entries about this arc").classes("sb-board-title")
                     git_head = gitref.head_sha(ctx.cfg)
                     since = gitref.commits_since(ctx.cfg, about, git_head)
                     for n in about:

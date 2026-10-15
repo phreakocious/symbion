@@ -83,4 +83,4 @@ def describe(kwargs: dict, q: str = "") -> str:
     parts = [f"search: {' '.join(q.split())}"] if q.strip() else []
     parts += [f"{_KWARG_TO_URL.get(k, k)}={v}" for k, v in sorted(kwargs.items())
               if k != "grep"]
-    return " · ".join(parts) or "All notes"
+    return " · ".join(parts) or "All entries"

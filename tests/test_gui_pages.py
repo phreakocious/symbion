@@ -147,7 +147,7 @@ async def test_the_commit_button_commits_only_its_authors_rows(user: User, ctx_w
     (button,) = user.find(marker="commit-button").elements
     assert "1" in [e.text for e in button.default_slot.children]
     user.find(marker="commit-button").click()
-    await user.should_see("committed: rows ada 1")
+    await user.should_see("committed: entries ada 1")
     assert [r["author"] for r in store.pending_rows(tmp_path)] == ["sam"]
 
 
@@ -167,7 +167,7 @@ async def test_a_search_finds_rows_by_words_in_any_order(user: User, ctx_with_no
     await user.open("/notes?q=BODY%20beta")
     await user.should_see("beta")
     await user.should_not_see("alpha")
-    assert _count(user).startswith("1 of 2 notes match")
+    assert _count(user).startswith("1 of 2 entries match")
 
 
 async def test_a_search_narrows_the_filters_in_view(user: User, ctx_with_notes):
@@ -176,7 +176,7 @@ async def test_a_search_narrows_the_filters_in_view(user: User, ctx_with_notes):
     await user.open("/notes?q=body&tag=blue")
     await user.should_see("beta")          # the hit is marked: "beta <mark>body</mark>"
     await user.should_not_see("alpha")
-    assert _count(user).startswith("1 of 1 note match")
+    assert _count(user).startswith("1 of 1 entry match")
 
 
 async def test_a_pasted_id_tail_finds_its_row(user: User, ctx_with_notes):
@@ -197,11 +197,11 @@ async def test_a_superseded_id_opens_its_current_row(user: User, ctx_with_notes)
     await user.should_see(f"{kept} was superseded")
     await user.open(f"/notes?q={kept.rsplit('-', 1)[1]}")
     await user.should_see("beta revised")
-    assert _count(user).startswith("1 of 2 notes match")
+    assert _count(user).startswith("1 of 2 entries match")
     # and says why it came: the search showed the current row and nothing
     # of the id that brought it (the owner, 2026-10-09)
     (said,) = user.find(marker="superseded-by").elements
-    assert said.text == f"{kept} was superseded; this is its current row"
+    assert said.text == f"{kept} was superseded; this is its current entry"
 
 
 async def test_shift_enter_adds_a_note_and_keeps_the_composer_open(
@@ -231,7 +231,7 @@ async def test_a_cited_tail_opens_its_row(user: User, ctx_with_notes):
     old = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
     await user.open(f"/notes?id={old.split('-', 2)[2]}")
     await user.should_see("beta body")
-    assert _count(user) == "1 note"
+    assert _count(user) == "1 entry"
     kept = api.supersede(ctx_with_notes, old, author="ada", body="beta revised").supersedes
     await user.open(f"/notes?id={old.split('-', 2)[2]}")
     await user.should_see("beta revised")                # an edit keeps the row's id
@@ -251,7 +251,7 @@ async def test_a_tail_several_ids_end_in_lists_each(user: User, repo, tmp_path, 
     await user.open("/notes?id=abc")
     await user.should_see("first body")
     await user.should_see("second body")
-    await user.should_see("2 rows end in -abc")
+    await user.should_see("2 entries end in -abc")
 
 
 async def test_a_notes_own_view_lists_its_earlier_versions(user: User, ctx_with_notes):
@@ -370,7 +370,7 @@ async def test_the_header_search_keeps_the_filters_in_view(user: User, ctx_with_
     await user.open("/notes?kind=bug")
     user.find(marker="search").type("widget").trigger("keydown.enter")
     await user.should_see("search: widget · kind=bug")
-    assert _count(user).startswith("1 of 1 note match")
+    assert _count(user).startswith("1 of 1 entry match")
 
 
 async def test_notes_with_no_filters_shows_everything(user: User, ctx_with_notes):
@@ -382,7 +382,7 @@ async def test_notes_with_no_filters_shows_everything(user: User, ctx_with_notes
 async def test_a_stale_bookmark_renders_rather_than_erroring(user: User, ctx_with_notes):
     await user.open("/notes?tag=nonexistent&utm_source=x")
     await user.should_see(marker="result-count")
-    assert _count(user) == "0 notes"
+    assert _count(user) == "0 entries"
 
 
 async def test_an_unknown_param_does_not_silently_widen_the_result(
@@ -392,7 +392,7 @@ async def test_an_unknown_param_does_not_silently_widen_the_result(
     as success."""
     await user.open("/notes?tag=red&utm_source=x")
     await user.should_see(marker="result-count")
-    assert _count(user) == "1 note"
+    assert _count(user) == "1 entry"
     await user.should_not_see("beta body")
 
 
@@ -768,17 +768,17 @@ async def test_a_long_list_says_what_it_did_not_show(user: User, repo, tmp_path,
     ctx = api.resolve(str(tmp_path))
     for i in range(3):
         api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
-                      "body": f"row {i}", "tags": ["t"]}, author="ada")
+                      "body": f"entry {i}", "tags": ["t"]}, author="ada")
     build_page(ctx, author="ada")
     await user.open("/notes?tag=t")
-    await user.should_see("row 2")
-    await user.should_not_see("row 0")                     # the oldest is the one cut
-    assert _count(user) == "3 notes; newest 2 shown"       # named at the top too
+    await user.should_see("entry 2")
+    await user.should_not_see("entry 0")                     # the oldest is the one cut
+    assert _count(user) == "3 entries; newest 2 shown"       # named at the top too
     (more,) = user.find(marker="show-all").elements
     assert more.text == "+1 older not shown — show all"
     assert more.props["href"] == "/notes?tag=t&all=1"      # the filters survive it
     await user.open(more.props["href"])
-    await user.should_see("row 0")
+    await user.should_see("entry 0")
     await user.should_not_see(marker="show-all")
 
 
@@ -875,7 +875,7 @@ async def test_the_composer_puts_a_note_on_any_target(user: User, repo, tmp_path
     (typ,) = user.find(marker="note-on-type").elements
     assert typ.value == "project"
     await user.should_not_see(marker="note-on-name")                   # a project has no name
-    assert sorted(typ.options) == ["commit", "item", "project", "thing"]   # an arc: its select
+    assert sorted(typ.options) == ["commit", "doc", "item", "project", "thing"]   # an arc: its select
     typ.value = "item"
     (name,) = user.find(marker="note-on-name").elements
     assert name.props["options"] == ["widget"]
@@ -910,12 +910,12 @@ async def test_new_note_from_a_kind_view_starts_as_that_kind(user: User, ctx_wit
     bookmark) leaves the default."""
     await user.open("/notes?kind=task")
     await user.should_see("New task")
-    await user.should_not_see("New note")
+    await user.should_not_see("New entry")
     user.find(marker="new-note").click()
     await user.should_see(marker="note-body")
     assert user.find(marker="note-kind-select").elements.pop().value == "task"
     await user.open("/notes?kind=nosuch")
-    await user.should_see("New note")
+    await user.should_see("New entry")
     user.find(marker="new-note").click()
     await user.should_see(marker="note-body")
     assert user.find(marker="note-kind-select").elements.pop().value == "note"
@@ -926,8 +926,8 @@ async def test_the_keys_list_names_the_shortcuts_and_the_kinds(user: User, ctx_w
     user.find(marker="keys").click()
     await user.should_see(marker="keys-list")
     await user.should_see("!kind")
-    await user.should_see("in a note: sets its kind, one of note, decision, bug, task, "
-                          "question, idea, check, prediction; its first letters do, while one kind "
+    await user.should_see("in an entry: sets its kind, one of note, decision, bug, task, "
+                          "question, idea, check, measurement, prediction; its first letters do, while one kind "
                           "alone starts with them")
 
 
@@ -999,6 +999,19 @@ def test_the_viewer_reads_only_text_it_knows_inside_the_checkout(repo, tmp_path)
     for name in ("../out.md", str(tmp_path / "out.md"), "logo.png",
                  "gone.md", "docs", None):
         assert view_path(ctx, name) is None, name
+
+
+def test_the_viewer_reads_a_doc_from_the_store_not_the_checkout(repo, tmp_path):
+    """A `doc` name is a path from the store's root, and the checkout's file
+    at the same path is another file."""
+    from symbion.gui.notes import view_path
+    ctx = api.resolve(str(tmp_path))
+    for root in (repo, tmp_path):
+        (root / "docs").mkdir()
+        (root / "docs" / "a.md").write_text("# A")
+    assert view_path(ctx, "docs/a.md", "doc") == (tmp_path / "docs" / "a.md").resolve()
+    assert view_path(ctx, "docs/a.md") == (repo / "docs" / "a.md").resolve()
+    assert view_path(ctx, "../p/f", "doc") is None
 
 
 def test_the_viewer_refuses_symlinks_outside_the_checkout(repo, tmp_path, symlink):
@@ -1077,7 +1090,7 @@ async def test_typing_in_the_search_box_does_not_leave_the_page(user: User, ctx_
     await user.should_not_see(marker="result-count")
     user.find(marker="search").trigger("keydown.enter")
     await user.should_see(marker="result-count")
-    assert _count(user).startswith("1 of 2 notes match")
+    assert _count(user).startswith("1 of 2 entries match")
 
 
 async def test_a_filter_that_hides_every_card_searches_the_store(user: User, ctx_with_notes,
@@ -1089,7 +1102,7 @@ async def test_a_filter_that_hides_every_card_searches_the_store(user: User, ctx
     await user.open("/tags")
     user.find(marker="search").trigger("update:value", "beta")
     await user.should_see(marker="result-count")
-    assert _count(user).startswith("1 of 2 notes match")
+    assert _count(user).startswith("1 of 2 entries match")
     went = []
     monkeypatch.setattr(ui.navigate, "to", went.append)
     user.find(marker="search").trigger("update:value", " beta ")
@@ -1183,7 +1196,7 @@ async def test_targets_page_boards_each_target_open_work_first(user: User, repo,
     widget = next(e for e in user.find(marker="board-title").elements if e.text == "item: widget")
     assert widget.props["href"] == "/object?type=item&name=widget"
     asides = {e.props["href"]: e.text for e in user.find(marker="board-aside").elements}
-    assert asides["/object?type=item&name=widget"] == "· 3 notes", asides
+    assert asides["/object?type=item&name=widget"] == "· 3 entries", asides
     # Two cards, each on its own target: the ref's open task is counted on
     # widget's board, not carded there. Cards, not text: the sidebar's closed
     # list shows the resolved row's body too.
@@ -1277,3 +1290,22 @@ async def test_the_undo_button_asks_with_what_it_takes_back(user: User, repo, tm
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
     await user.open("/notes")
     await user.should_not_see(marker="undo-button")
+
+
+async def test_a_store_with_repos_names_the_store_not_the_repo_the_serve_stands_in(
+        user: User, tmp_path, monkeypatch):
+    """The serve is the store's (one per store, on the store's port), so a
+    store over several repos takes the store's name, as the CLI's repos line
+    does, whichever repo the serve started in (the owner, 2026-10-14)."""
+    r = tmp_path / "net"
+    r.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True)
+    (r / ".symbion").write_text("../work-notes\n")
+    store.ensure_store(tmp_path / "work-notes")
+    (tmp_path / "work-notes" / "symbion.toml").write_text('[repos]\nnet = "../net"\n')
+    monkeypatch.chdir(r)
+    build_page(api.resolve(), author="ada")
+    await user.open("/")
+    assert user.client.resolve_title() == "work-notes · symbion"
+    (brand,) = user.find(marker="brand").elements
+    assert brand.text == "work-notes"

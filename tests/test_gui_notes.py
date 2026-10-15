@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("nicegui")
@@ -238,10 +240,20 @@ def test_a_tip_names_the_stamp_or_nothing():
     assert check_tip(None, {"external": True, "at": "x"}, "external", None) == ""
 
 
+def test_a_tip_counts_one_commit_in_the_singular(monkeypatch):
+    """`HEAD is 1 commits past it` (dogfood, 2026-10-14)."""
+    from symbion import gitref
+    from symbion.gui.notes import check_tip
+    monkeypatch.setattr(gitref, "oneline", lambda *a: ["abc1234 later"])
+    prov = {"sha": "0123456789abcdef"}
+    assert check_tip(None, prov, "behind", 1).startswith("stamped at 0123456; HEAD is 1 commit past it:")
+    assert check_tip(None, prov, "ahead", 1).startswith("stamped at 0123456; it is 1 commit past HEAD:")
+
+
 async def test_an_id_cited_in_a_body_links_to_that_note(user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     cited = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
-                          "body": "the cited row"}, author="ada")
+                          "body": "the cited entry"}, author="ada")
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
                       "body": f"settled by {cited.id}; the code `{cited.id}` stays text"},
                 author="ada")
@@ -263,7 +275,7 @@ async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
     other stores' rows too."""
     ctx = api.resolve(str(tmp_path))
     cited = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
-                          "body": "the cited row"}, author="ada")
+                          "body": "the cited entry"}, author="ada")
     tail = cited.id[-10:]
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
                       "body": f"see {tail} and 999999-fff; the code `{tail}` stays text"},
@@ -535,7 +547,7 @@ async def test_a_check_added_in_the_gui_carries_provenance(user: User, repo, tmp
     user.find(marker="note-add").click()
 
     rows = store.load(tmp_path)
-    assert len(rows) == 1, f"expected one row, got {[r.kind for r in rows]}"
+    assert len(rows) == 1, f"expected one entry, got {[r.kind for r in rows]}"
     assert rows[0].kind == "check"
     assert rows[0].provenance and rows[0].provenance.get("sha")
 
@@ -713,7 +725,7 @@ def test_kind_class_is_by_label_as_in_the_terminal():
     from symbion.gui.notes import kind_class
     assert kind_class("bug") == "sb-kind-bug"
     assert kind_class("decision") == "sb-kind-decision"
-    assert kind_class("measurement") == "sb-kind-own sb-kind-measurement"
+    assert kind_class("anomaly") == "sb-kind-own sb-kind-anomaly"
 
 
 async def test_add_form_lists_exactly_the_declared_kinds(user: User, repo, tmp_path):
@@ -850,8 +862,8 @@ async def _append_in_dialog(user: User, ctx, n, text: str, *, body: str | None =
     if body is not None:
         user.find(marker="edit-body").elements.pop().set_value(body)
     user.find(marker="edit-append").type(text)
-    if meanwhile:
-        meanwhile()
+    if meanwhile and asyncio.iscoroutine(r := meanwhile()):
+        await r
     if keys:
         user.find(marker="edit-append").trigger("keydown.meta.enter")
     else:
@@ -892,6 +904,36 @@ async def test_an_edited_body_takes_the_added_text_after_it(user: User, repo, tm
     assert head.body == "first\n\nmore"
 
 
+async def test_the_edit_dialog_moves_an_entry_and_its_refs(user: User, repo, tmp_path):
+    """The dialog could not change what an entry is on (a tester,
+    2026-10-15): its target and `also on` are fields here too."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": "item:a", "body": "first",
+                      "refs": ["item:r1"]}, author="ada")
+
+    def move():
+        refs = user.find(marker="edit-refs").elements.pop()
+        assert refs.value == ["item:r1"]
+        refs.set_value(["item:r2"])
+        assert user.find(marker="edit-on-type").elements.pop().value == "item"
+        user.find(marker="edit-on-name").elements.pop().value = "b"
+
+    head = await _append_in_dialog(user, ctx, n, "more", meanwhile=move)
+    assert (head.target.name, [r.name for r in head.refs]) == ("b", ["r2"])
+
+
+async def test_the_edit_dialog_sends_no_target_it_did_not_change(user: User, repo, tmp_path):
+    """An entry whose target left the catalog stays editable, and its name
+    is not resolved again: a resolve now would find `alpha2` by substring."""
+    (tmp_path / "symbion.toml").write_text("""[catalogs]\nthing = 'printf "alpha\\n"'\n""")
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": "thing:alpha", "body": "first"}, author="ada")
+    (tmp_path / "symbion.toml").write_text("""[catalogs]\nthing = 'printf "alpha2\\n"'\n""")
+    ctx = api.resolve(str(tmp_path))
+    head = await _append_in_dialog(user, ctx, n, "more")
+    assert (head.target.name, head.body) == ("alpha", "first\n\nmore")
+
+
 async def test_the_edit_dialog_stars_a_row_in_the_same_write(user: User, repo, tmp_path):
     """The owner, 2026-10-02: "supersede should include a priority toggle
     for a single op". The switch holds `priority`, the tags field the rest."""
@@ -916,6 +958,74 @@ async def test_the_edit_dialog_unstars_a_row(user: User, repo, tmp_path):
 
     head = await _append_in_dialog(user, ctx, n, "more", meanwhile=flip)
     assert list(head.tags) == ["ux"]
+
+
+async def test_the_edit_dialog_retires_a_plain_row_in_the_same_write(user: User, repo,
+                                                                     tmp_path):
+    """A note could not be retired from the GUI (the owner, 2026-10-14): a
+    row with no status leaves the default views by its `retired` tag, which
+    only a typed tag reached. The switch holds `retired`, as `priority`'s
+    does, on a kind with no status; a status row resolves instead."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "first", "tags": ["gotcha"]}, author="ada")
+    api.commit(ctx, "notes", everyone=True)   # an edit after a commit adds a row
+
+    async def flip():
+        await user.should_not_see(marker="edit-resolve")
+        user.find(marker="edit-retired").click()
+
+    head = await _append_in_dialog(user, ctx, n, "gone since 2b1", meanwhile=flip)
+    assert (head.body, list(head.tags)) == ("first\n\ngone since 2b1", ["gotcha", "retired"])
+    assert len(store.load(tmp_path)) == 2     # one write: the row and its edit
+
+
+async def test_the_edit_dialog_brings_a_retired_row_back(user: User, repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "decision", "target": {"type": "project", "name": None},
+                      "body": "first", "tags": ["retired", "ux"]}, author="ada")
+
+    def flip():
+        assert user.find(marker="edit-tags").elements.pop().value == "ux"
+        user.find(marker="edit-retired").click()
+
+    head = await _append_in_dialog(user, ctx, n, "holds again", meanwhile=flip)
+    assert list(head.tags) == ["ux"]
+
+
+async def test_the_edit_dialog_resolves_an_open_row_in_the_same_write(user: User, repo,
+                                                                     tmp_path):
+    """The owner, 2026-10-13: "the supersede dialog should offer the resolve
+    checkbox so you can do a resolve with a message in one shot"."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "first"}, author="ada")
+    api.commit(ctx, "notes", everyone=True)
+
+    async def flip():
+        await user.should_not_see(marker="edit-retired")
+        user.find(marker="edit-resolve").click()
+
+    head = await _append_in_dialog(user, ctx, n, "done in 2b1", meanwhile=flip)
+    assert (head.body, head.status) == ("first\n\ndone in 2b1", "resolved")
+    assert len(store.load(tmp_path)) == 2
+
+
+async def test_the_resolve_switch_on_a_pre_registration_needs_its_result(user: User, repo,
+                                                                         tmp_path):
+    """The store refuses a bare resolve of a status+verdict row: the switch
+    asks for the result first, as the resolve ring's dialog does."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "prediction", "target": {"type": "project", "name": None},
+                      "body": "p", "checked": "run x"}, author="ada")
+    head = await _append_in_dialog(user, ctx, n, "more",
+                                   meanwhile=lambda: user.find(marker="edit-resolve").click())
+    await user.should_see("a result is required to resolve this kind")
+    assert head.id == n.id and head.status == "open"
+    user.find(marker="edit-result").type("held")
+    user.find(marker="edit-save").click()
+    head = store.heads(store.load(ctx.store_dir))[0]
+    assert (head.status, head.result) == ("resolved", "held")
 
 
 async def test_edit_dialog_sets_and_clears_due(user: User, repo, tmp_path):
@@ -996,6 +1106,29 @@ async def test_add_form_takes_due_on_a_status_kind(user: User, repo, tmp_path):
     assert store.load(tmp_path)[0].due == "2026-10-01"
     sel.set_value("note")
     assert not due.visible
+
+
+async def test_add_form_puts_an_entry_on_more_objects(user: User, repo, tmp_path):
+    """The form took one target (a tester, 2026-10-15). `also on` holds the
+    entry's refs: it offers the objects this store's entries are on, and
+    takes a new one typed."""
+    from symbion.gui.notes import add_form
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": "item:widget", "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    refs = user.find(marker="note-refs").elements.pop()
+    assert "item:widget" in refs.options
+    refs.set_value(["item:widget", "item:gadget"])
+    user.find(marker="note-body").type("on three")
+    user.find(marker="note-add").click()
+    (row,) = [n for n in store.load(tmp_path) if n.body == "on three"]
+    assert [(r.type, r.name) for r in row.refs] == [("item", "widget"), ("item", "gadget")]
+    assert refs.value == [], "the form clears for the next entry"
 
 
 # ---- the card layout (2026-10-01): age, short id ----
@@ -1149,7 +1282,7 @@ async def test_the_edit_dialog_says_whether_the_row_itself_changes(user: User, r
         render_note(ctx, rows[who], lambda: None, author="ada")
 
     for who, words in (("ada", "this version is not yet committed, so it changes in place"),
-                       ("sam", "the old row is kept")):
+                       ("sam", "the old entry is kept")):
         await user.open(f"/t/{who}")
         user.find(marker="note-edit").click()
         await user.should_see(words)
@@ -1172,7 +1305,7 @@ async def test_a_since_chip_lists_the_commits_it_counts(user: User, repo, tmp_pa
                         f"edit {i}"], check=True, cwd=repo)
         shas.append(gitref.head_sha(ctx.cfg))
     assert since_tip(ctx.cfg, n).splitlines() == [
-        "f changed in 2 commits since this row:",
+        "f changed in 2 commits since this entry:",
         f"{shas[1][:7]} edit 1", f"{shas[0][:7]} edit 0"]
 
     @ui.page("/t")

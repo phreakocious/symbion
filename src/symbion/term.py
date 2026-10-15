@@ -27,7 +27,8 @@ from . import summary as summ
 TEXT, BODY, META, FADED = "#cdd6f4", "#a6adc8", "#7f849c", "#6c7086"
 GOOD, WARN, BAD = "#a6e3a1", "#f9e2af", "#f38ba8"
 KIND = {"bug": "#eba0ac", "task": "#89b4fa", "question": "#cba6f7", "idea": "#f5c2e7",
-        "decision": "#fab387", "check": "#94e2d5", "prediction": "#89dceb", "note": "#a6adc8"}
+        "decision": "#fab387", "check": "#94e2d5", "prediction": "#89dceb",
+        "measurement": "#74c7ec", "note": "#a6adc8"}
 OWN_KIND = "#b4befe"        # a kind this store's [kinds] table declares
 
 
@@ -216,7 +217,7 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None) -> tu
         target.append(type_, ink(TEXT))          # `project`
 
     post = Text()
-    if state is not None:
+    if state is not None and head is None:
         word, color = _state(n, state)
         post.append("  " + word, ink(color))
     if since:
@@ -273,14 +274,14 @@ def _details(n, head, state, written=None) -> list[Text]:
     who = Text(f"    {n.id} · " + " · ".join(
         written or [f"written {store.shown(n.created_at)} by {n.author}"]), META)
     if n.supersedes:
-        who.append(f" · revises {n.supersedes}", META)
+        who.append(f" · earlier version saved as {n.supersedes}", META)
     out = [who]
     if n.refs:
         out.append(labelled("refs  ", ", ".join(summ.ref_label(r) for r in n.refs)))
     if n.spec.verdict:
         sha = store.stamp_sha(n.provenance)
         at = f" at {sha[:7]}" if sha else ""
-        if state and state[0] == "pending":
+        if summ.pending(n, state):
             out.append(labelled(f"to check, registered{at}: ", summ.flatten(n.checked)))
         elif n.checked is not None or at:
             out.append(labelled(f"checked{at}: ", summ.flatten(n.checked)))

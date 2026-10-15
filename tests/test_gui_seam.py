@@ -33,9 +33,11 @@ ALLOWED_STORE_READS = {
     "load", "load_malformed", "load_arcs", "heads", "heads_for", "chain_tip", "query",
     "tag_counts", "arc_items", "arc_progress", "read_status", "due_state", "since_cutoff",
     "exists", "newest_first", "written_at", "shown", "appended", "stamp_sha", "unholdable",
-    "notes_path", "arcs_path", "id_tail", "pending_rows", "with_bases", "Note", "Arc", "Target",
+    "notes_path", "arcs_path", "id_tail", "pending_rows", "with_bases", "entries", "Note", "Arc",
+    "Target",
     "STATUSES", "BUILTIN_TARGET_TYPES",
     "UndoRefused", "undo_words",                 # api.undo's refusal, and its words
+    "RefsDropped",                               # api.supersede's refusal under keep_refs
     "undoable", "note_from_dict",                # the undo button's read, and its dialog's rows
 }
 
@@ -95,8 +97,8 @@ def test_the_audit_fires_on_a_planted_violation():
     """The other direction. Without this the audit could pass by matching
     nothing -- a regex typo, a moved directory, an empty glob."""
     assert _violations("x = store.supersede(d, i)") == {"supersede"}
-    assert _violations("store.add_many(d, rows)") == {"add_many"}
-    assert _violations("rows = store.query(notes, tag='x')") == set()
+    assert _violations("store.add_many(d, entries)") == {"add_many"}
+    assert _violations("entries = store.query(notes, tag='x')") == set()
 
 
 def test_the_audit_skips_comments_but_not_code_after_a_hash_in_a_string():
@@ -115,7 +117,8 @@ CLI_STORE_CALLS = ALLOWED_STORE_READS | {
     "jsonl_lines",                                        # a text helper
     "_replace_atomically",                                # a file helper: --merge-hook's settings
     "pending_rows", "rows_by_author", "NOTES_FILE",       # reads: what commit would take
-    "session_key",                                        # read: the env's agent session
+    "session_key", "sessions",                            # reads: the env's agent session,
+                                                          # and the rows each session wrote
     "_now_iso",                                           # read: the store's clock
     "ensure_store", "apply_reconciliation",               # the two writes
 }

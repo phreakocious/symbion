@@ -1,13 +1,15 @@
 """The read side. A store Claude writes to and never reads is a pacifier."""
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from datetime import datetime
 from difflib import SequenceMatcher
 from itertools import pairwise, zip_longest
+from pathlib import Path
 
-from . import gitref, kinds as K, store as S
+from . import catalog, config, gitref, kinds as K, store as S
 from .gui import servers
 
 ARC_CAP = 10
@@ -15,11 +17,13 @@ PRIORITY_CAP = 10
 HEAD_CAP = 8
 PREREG_CAP = 10
 PEOPLE_CAP = 3
+WAITING_CAP = 10
 CLOSED_CAP = 5
 DUE_CAP = 10
 DUE_DAYS = 7      # how far ahead the due block looks
 HEAD_CHARS = 100
 BODY_CHARS = 200
+GOTCHA_CHARS = 200    # what the gotcha hook gives a session of a row
 # A read error is not a note body: the actionable half of the retired-kind hint
 # is the remedy at its END, and BODY_CHARS cut it mid-word. Still capped --
 # the refused `kind` is attacker-controlled text straight off disk.
@@ -190,12 +194,14 @@ def deal_by_kind(rows):
 
 def due_soon(notes, now=None):
     """[(note, due_state)] for open rows past due or due within DUE_DAYS,
-    soonest first. In an arc or not, parked or not: a date is an explicit ask
-    to be reminded, and past due outranks every other block."""
+    soonest first. In an arc or not: a date is an explicit ask to be reminded,
+    and past due outranks every other block. A parked row's date is when to
+    come back to it, so it shows from that day on, not a week before (the
+    owner, 2026-10-14)."""
     out = []
     for n in notes:
         state = S.due_state(n.due, now) if n.due and S.read_status(n) == "open" else None
-        if state and (state[0] or state[1] <= DUE_DAYS):
+        if state and (state[0] or state[1] <= (0 if n.spec.parked else DUE_DAYS)):
             out.append((n, state))
     out.sort(key=lambda p: (p[1][1], not p[1][0], p[0].id))
     return out
@@ -221,6 +227,26 @@ def who(reader, raised, last) -> dict:
     return by
 
 
+def pending(n, state=None) -> bool:
+    """A pre-registration not yet judged. `context` prints with no state, and
+    an open one read `checked at <sha>` there, as if it had run (2026-10-14).
+    One that carries a result has run, whatever its status."""
+    if state is not None:
+        return state[0] == "pending"
+    return bool(n.spec.status and n.spec.verdict and S.read_status(n) == "open"
+                and n.result is None)
+
+
+def waits(reader, n) -> bool:
+    """An open row whose newest word is someone else's waits on the reader:
+    a request, or an answer to the reader's own row. One the reader wrote
+    last is answered, though someone else raised it. A pre-registration asks
+    for nothing until it comes due, when the due block prints it: one in the
+    user's words read `waits on you` for days (2026-10-14)."""
+    return S.read_status(n) == "open" and not (n.spec.status and n.spec.verdict) \
+        and wrote_it(reader, n.author)
+
+
 def starred(notes):
     """#priority notes that have not been explicitly closed.
 
@@ -237,7 +263,7 @@ def starred(notes):
 # The empty state is the onboarding surface:
 # it prints while the store holds zero rows and never again, so it is bounded
 # by store state, not by a session the tool does not keep.
-FIRST_CONTACT = ('no notes yet: symbion add task --target project --body "..."  '
+FIRST_CONTACT = ('no entries yet: symbion add task --target project --body "..."  '
                  '(before a write, an agent loads the symbion skill, SKILL.md)')
 
 
@@ -254,6 +280,8 @@ def empty_summary() -> dict:
         "arcs_elided": 0,
         "priority": [],
         "priority_elided": 0,
+        "waiting": [],
+        "waiting_elided": 0,
         "people": [],
         "people_elided": 0,
         "closed": [],
@@ -274,6 +302,8 @@ def empty_summary() -> dict:
         "rows": 0,
         "gui": None,
         "wrap": None,
+        "repos": [],
+        "unlisted_repo": None,
         "skill": None,
         "named_store": None,
         "commit_hint": None,
@@ -293,11 +323,54 @@ def row_digest(by_id, n, chars, reader, active=frozenset()) -> dict:
             "body": clip(n.body, chars),
             **({"parked": True} if n.spec.parked else {}),
             **({"arc": n.arc_id} if n.arc_id in active else {}),
+            **({"waits": True} if waits(reader, n) else {}),
             **who(reader, root.author, n.author),
             **({"registered": S.shown(root.created_at)[:10]}
                if n.spec.status and n.spec.verdict else {}),
             **({"amendments": k} if (k := _amendments(by_id, n)) else {}),
             **added(by_id, n, reader, chars)}
+
+
+def repo_rows(cfg) -> list[dict]:
+    """`summary --json`'s `repos`: each listed repo, its path from the cwd,
+    and whether the cwd stands in it. The path from the cwd is how an agent
+    opens a row's file (`app:main.tf` is `../terraform-app/main.tf` from
+    here), so it never keeps the map itself."""
+    def from_cwd(p):
+        try:
+            return Path(os.path.relpath(p, Path.cwd())).as_posix()
+        except ValueError:                   # Windows: another drive
+            return p.as_posix()
+    return [{"name": n, "path": str(p), "from_cwd": from_cwd(p), "here": n == cfg.here}
+            for n, p in cfg.repos.items()]
+
+
+def unlisted_repo(store_dir, cfg) -> dict | None:
+    """The cwd's repo when its tree names this store and [repos] does not
+    list it: the line to add, so its rows go on its own type."""
+    root = cfg.cwd_root
+    if not cfg.repos or cfg.here or root is None:
+        return None
+    try:
+        if config.tree_store(root) != Path(store_dir).resolve():
+            return None
+    except config.PointerError:
+        return None
+    return {"name": root.name, "path": Path(os.path.relpath(root, store_dir)).as_posix()}
+
+
+def repos_line(d: dict) -> str:
+    """The store and its repos, the cwd's marked. A `.symbion` pointer makes
+    the header the same in every repo, so this line is where a session sees
+    which store it reads and where it stands, and each other repo's path
+    from the cwd."""
+    names = [r["name"] + (" (here)" if r["here"] else f" {r['from_cwd']}")
+             for r in d["repos"]]
+    line = f"repos in {Path(d['store']).name}: {', '.join(names)}"
+    if u := d.get("unlisted_repo"):
+        return (f"{line}; this repo, {u['name']}, names the store and is not listed: add "
+                f"`{u['name']} = \"{u['path']}\"` under [repos] in symbion.toml")
+    return f"{line}; file:PATH is read from where you stand, REPO:PATH from that repo's root"
 
 
 def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
@@ -312,8 +385,17 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
                    for label, k in kinds.items() if k.status and not k.parked}
     # Each row prints once: in the due block, else the priority block, else
     # the heads. Otherwise priority rows repeat among the heads.
-    due = due_soon(notes, _now)
-    shown_above = {n.id for n, _ in due}
+    # The rows that wait on the reader lead, as their own block under their
+    # count: spread over the blocks below it, after a wrap they sat among the
+    # reader's own rows, and three of four fresh agents read the lines under
+    # the count as those rows (2026-10-14). One that is also due keeps its
+    # phrase there.
+    waiting = S.newest_first(n for n in notes if waits(reader, n))
+    w_cap = len(waiting) if full else WAITING_CAP
+    due_all = due_soon(notes, _now)
+    due_of = {n.id: st for n, st in due_all}
+    due = [(n, st) for n, st in due_all if n.id not in {w.id for w in waiting[:w_cap]}]
+    shown_above = {n.id for n, _ in due} | {n.id for n in waiting[:w_cap]}
     priority = [n for n in starred(notes) if n.id not in shown_above]
     shown_above |= {n.id for n in priority}
     unstated = no_status(notes)
@@ -392,6 +474,8 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         # The last wrap's commit message is the handoff (2026-10-12): what
         # the previous session left for this one, read before its rows.
         "wrap": gitref.last_wrap(store_dir, cfg),
+        "repos": repo_rows(cfg),
+        "unlisted_repo": unlisted_repo(store_dir, cfg),
         "open": open_counts,
         "open_in_arcs": sum(r["open"] for r in rows),
         "arcs": rows[:a_cap],
@@ -400,6 +484,12 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
                       "starred_days": age_days(_starred_at(by_id, n), _now)}
                      for n in priority[:p_cap]],
         "priority_elided": max(0, len(priority) - p_cap),
+        # The rule SKILL.md stated, which loaded after this text was read
+        # and also covered the rows the reader answered last (2026-10-14).
+        "waiting": [{**digest(n, HEAD_CHARS),
+                     **({"due": n.due, "past": st[0], "days": st[1], "phrase": due_phrase(st)}
+                        if (st := due_of.get(n.id)) else {})} for n in waiting[:w_cap]],
+        "waiting_elided": max(0, len(waiting) - w_cap),
         "people": [{**digest(n, HEAD_CHARS), "author": n.author} for n in people[:o_cap]],
         "people_elided": max(0, len(people) - o_cap),
         "closed": [{**digest(n, HEAD_CHARS), "closed_by": (c := _closer(by_id, n)).author,
@@ -468,10 +558,15 @@ def written(by_id, n) -> list[str]:
     when a later link kept that body, the fields the newest link changed and
     who changed them. An edit keeps the id, so the head's author read as the
     body's: an agent's bug the owner starred read `written … by` the owner
-    (2026-10-12)."""
+    (2026-10-12). When someone else raised it, the line names them first: a
+    gotcha the user wrote and the agent amended read `written … by` the
+    agent (2026-10-14)."""
     chain = list(_chain(by_id, n))
     b = next((new for new, old in pairwise(chain) if new.body != old.body), chain[-1])
-    out = [f"written {S.shown(b.created_at)} by {b.author}"]
+    root = chain[-1]
+    out = [f"written {S.shown(b.created_at)} by {b.author}"] if root.author == b.author else [
+        f"written {S.shown(root.created_at)} by {root.author}",
+        f"body changed {S.shown(b.created_at)} by {b.author}"]
     if b is not n:
         prev = by_id[n.supersedes]
         what = ", ".join(f for f in _CHANGED if getattr(n, f) != getattr(prev, f)) or "edited"
@@ -501,12 +596,14 @@ def _amendments(by_id, n) -> int:
     (dogfood, 2026-09-30). Read off seams(), not a prefix test of its own: a
     question the owner trimmed and answered in one save read `+1 amendment`
     beside the two that `show` marked (2026-10-11)."""
-    return sum(not above for *_, above in seams(by_id, n))
+    return sum(not above for _, _, _, above, _ in seams(by_id, n))
 
 
-def seams(by_id, n) -> list[tuple[int, str, str, bool]]:
+def seams(by_id, n) -> list[tuple[int, str, str, bool, bool]]:
     """Where each amendment joins n's body, by offset: `(at, author,
-    created_at, above)`, `above` for a prepend, whose text ends at `at`. Most
+    created_at, above, edited)`, `above` for a prepend, whose text ends at
+    `at`; `edited` when the same link also changed the text it kept, so the
+    line does not pass a rewrite off as the original (2026-10-14). Most
     supersedes are appends, and a diff of one is the whole old body unchanged
     (the owner, 2026-10-08). One link can add both above and below: a
     prepend, then an append that rewrote the uncommitted row in place. A
@@ -522,9 +619,9 @@ def seams(by_id, n) -> list[tuple[int, str, str, bool]]:
             continue
         end = i + len(old.body)
         # A side that added only whitespace has no seam: there is no text to mark.
-        out = ([(i, new.author, new.created_at, True)] if new.body[:i].strip() else []) \
+        out = ([(i, new.author, new.created_at, True, False)] if new.body[:i].strip() else []) \
             + [(at + i, *s) for at, *s in out] \
-            + ([(end, new.author, new.created_at, False)] if new.body[end:].strip() else [])
+            + ([(end, new.author, new.created_at, False, False)] if new.body[end:].strip() else [])
     return out
 
 
@@ -561,7 +658,7 @@ def _edit_seams(old: str, new: str, out, author: str, created_at: str):
         _, j, size = blocks[-1]
         j += size                               # the first new word after the last kept run
         if j < len(nw) and new.count("\n", nw[j - 1].end(), nw[j].start()) >= 2:
-            moved[nw[j - 1].end()] = [author, created_at, False]
+            moved[nw[j - 1].end()] = [author, created_at, False, True]
     out = sorted((at, *s) for at, s in moved.items())
     # A seam whose side the edit emptied marks no text.
     cuts = [0, *(at for at, *_ in out), len(new)]
@@ -575,9 +672,10 @@ def at_seams(body: str, seams) -> list[tuple[str, str | None]]:
     when; the last piece's is None. A cut's blank lines go: the line
     stands between the pieces instead."""
     out, start = [], 0
-    for at, who, when, above in seams:
+    for at, who, when, above, edited in seams:
         out.append((body[start:at],
-                    f"-- {who} added {'the above' if above else 'below'}, {S.shown(when)} --"))
+                    f"-- {who} {'edited the text above and ' if edited else ''}added "
+                    f"{'the above' if above else 'below'}, {S.shown(when)} --"))
         start = at
     out.append((body[start:], None))
     return [(p.strip("\n"), line) for p, line in out] if seams else out
@@ -650,26 +748,38 @@ def added(by_id, n, reader, chars) -> dict:
     the reader had already acted on, under a lead rewritten twice since, was
     briefed as a yes to the new lead's open question (2026-10-07). Only the
     lead: the reader's `noted` after an answer changes the body, and counted
-    as a revision it made an answer nobody acted on read as handled."""
-    rewritten = False
+    as a revision it made an answer nobody acted on read as handled.
+
+    `added_earlier`: the same for each other author before the newest, oldest
+    first. The owner answered `approved.`, a reviewer appended a relay, and
+    the agent's summary printed the relay alone (2026-10-14)."""
+    rewritten, out, seen = False, [], set()
     lead = clip(n.body, chars)
     for new, old in pairwise(_chain(by_id, n)):
-        if wrote_it(reader, new.author):
+        if wrote_it(reader, new.author) and new.author not in seen:
             was = set(old.body.splitlines())
             fresh = [ln for ln in new.body.splitlines() if ln.strip() and ln not in was]
             if fresh:
+                seen.add(new.author)
                 # The first new line the lead does not show: an owner who
                 # trimmed the lead's last sentence and answered below it
                 # changed the lead first, and the answer never printed
                 # (2026-10-11).
                 line = next((ln for ln in fresh
                              if ln in n.body and clip(ln, chars) not in lead), None)
-                return ({"added": clip(line, chars), "added_by": new.author,
-                         "added_at": new.created_at, "lead_rewritten_since": rewritten,
-                         "edited": not _seamed(by_id, n, new, line)}
-                        if line else {})
+                if line:
+                    out.append({"added": clip(line, chars), "added_by": new.author,
+                                "added_at": new.created_at, "lead_rewritten_since": rewritten,
+                                "edited": not _seamed(by_id, n, new, line)})
         rewritten |= clip(new.body, chars) != clip(old.body, chars)
-    return {}
+    if not out:
+        return {}
+    return out[0] | ({"added_earlier": out[:0:-1]} if out[1:] else {})
+
+
+def added_lines(a) -> list[dict]:
+    """Each line added() found, oldest first."""
+    return [*a.get("added_earlier", ()), a] if a.get("added") else []
 
 
 def _seamed(by_id, n, link, line) -> bool:
@@ -684,7 +794,7 @@ def _seamed(by_id, n, link, line) -> bool:
     cuts = [0, *(at for at, *_ in ss), len(n.body)]
     return any((who, when) == (link.author, link.created_at)
                and (cuts[k] <= i < at if above else at <= i < cuts[k + 2])
-               for k, (at, who, when, above) in enumerate(ss))
+               for k, (at, who, when, above, _) in enumerate(ss))
 
 
 def added_label(a) -> str:
@@ -736,14 +846,17 @@ def ref_label(t) -> str:
 
 
 def _count(n: int, noun: str) -> str:
-    return f"{n} {noun}{'' if n == 1 else 's'}"
+    if n == 1:
+        return f"{n} {noun}"
+    return f"{n} {noun[:-1]}ies" if re.search(r"[^aeiou]y$", noun) else f"{n} {noun}s"
 
 
 def _labelled(paint, r, first=None) -> str:
     """A summary row with its own labels: `from <author>`, on a
     pre-registration its registration date, and its amendment count, in
     whichever block it prints. `first` leads the author labels."""
-    by = ", ".join([*([first] if first else []),
+    by = ", ".join([*([first] if first else []), *([paint("waits on you", "warn")]
+                                                   if r.get("waits") else []),
                     *(f"{label} {r[k]}" for label, k in (("from", "from"), ("last by", "last"))
                       if r.get(k))])
     reg = (", parked" if r.get("parked") else "") + \
@@ -753,8 +866,8 @@ def _labelled(paint, r, first=None) -> str:
     star = f", starred {r['starred_days']}d ago" if r.get("starred_days") else ""
     line = (by and by + " ") + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
                                         label=r["kind"] + reg + amd + star)
-    if r.get("added"):
-        line += f"\n    {paint(added_label(r), 'meta')} {paint(r['added'], 'body')}"
+    for a in added_lines(r):
+        line += f"\n    {paint(added_label(a), 'meta')} {paint(a['added'], 'body')}"
     return line
 
 
@@ -765,6 +878,19 @@ def render_summary(d: dict, paint=plain) -> str:
     named = f" {d['named_store']}" if d.get("named_store") else ""
     out = [f"symbion{named}: open outside arcs: "
            f"{counts or 'no status kinds declared'}{in_arcs}"]
+    if d.get("repos"):
+        out.append("  " + repos_line(d))
+    if n := len(d.get("waiting", ())) + d.get("waiting_elided", 0):
+        out.append("  " + paint(f"{_count(n, 'open entry')} {'waits' if n == 1 else 'wait'} on you: "
+                                f"someone else wrote the newest word on "
+                                f"{'it' if n == 1 else 'each'}; act on {'it' if n == 1 else 'them'} "
+                                f"or name {'it' if n == 1 else 'them'} to the user before other work",
+                                "warn"))
+    for r in d.get("waiting", ()):
+        lead = f"{paint(r['phrase'], due_role(r['past'], r['days']))} " if r.get("phrase") else ""
+        out.append("  " + lead + _labelled(paint, {k: v for k, v in r.items() if k != "waits"}))
+    if d.get("waiting_elided"):
+        out.append("  " + paint(f"+{d['waiting_elided']} more waiting (--full)", "meta"))
     for r in d.get("due", ()):
         out.append(f"  {paint(r['phrase'], due_role(r['past'], r['days']))} "
                    + _labelled(paint, r))
@@ -810,13 +936,13 @@ def render_summary(d: dict, paint=plain) -> str:
         # Saved on disk, not yet in git: "2 notes uncommitted" read as unsaved.
         bits = []
         if d["uncommitted_notes"]:
-            bits.append(_count(d["uncommitted_notes"], "note"))
+            bits.append(_count(d["uncommitted_notes"], "entry"))
         if d["registry_modified"]:
             bits.append("arc changes")
         out.append("  " + paint(f"{' and '.join(bits)} not yet in the store's git "
                                 f"({d.get('commit_hint') or 'symbion commit'})", "warn"))
     if d["unreadable"]:
-        out.append("  " + paint(f"{_count(d['unreadable'], 'row')} unreadable, "
+        out.append("  " + paint(f"{_count(d['unreadable'], 'entry')} unreadable, "
                                 f"first: {d['unreadable_first']}", "bad"))
     if d.get("unreadable_arcs"):
         out.append("  " + paint(f"{_count(d['unreadable_arcs'], 'arc line')} unreadable, "
@@ -825,13 +951,13 @@ def render_summary(d: dict, paint=plain) -> str:
         # The first id and the verb, as the unreadable line does: a bare
         # count had no consumer and sat as furniture for a week.
         n = d["no_status"]
-        out.append("  " + paint(f"{_count(n, 'row')} on a status kind "
+        out.append("  " + paint(f"{_count(n, 'entry')} on a status kind "
                                 f"{'carries' if n == 1 else 'carry'} no status (a write that "
                                 f"bypassed symbion): counted neither open nor resolved; first "
                                 f"{d.get('no_status_first')} -- "
                                 f"supersede <id> --status open|resolved", "bad"))
     if d.get("full") and not (d["arcs_elided"] or d["priority_elided"] or d.get("heads_elided")
-                              or d.get("due_elided") or d.get("people_elided")
+                              or d.get("due_elided") or d.get("people_elided") or d.get("waiting_elided")
                               or d.get("closed_elided")):
         # A --full that lifted nothing otherwise prints the default text
         # byte for byte, and the flag reads as dropped.
@@ -839,10 +965,12 @@ def render_summary(d: dict, paint=plain) -> str:
     if w := d.get("wrap"):
         since = (f", {_count(w['commits_since'], 'commit')} since"
                  if w["commits_since"] is not None else "")
+        if w.get("commits_by_repo"):
+            since += f" ({', '.join(f'{k} {v}' for k, v in w['commits_by_repo'].items())})"
         out.append(f"  last wrap by {w['author']}, {when_added(w['at'])}{since}: {w['gist']}")
         out.extend("    " + paint(ln, "body") for ln in w["body"].splitlines())
     if d.get("gui"):
-        out.append(f"  symbion serve: {d['gui']}; when you point the user at a row, "
+        out.append(f"  symbion serve: {d['gui']}; when you point the user at an entry, "
                    f"link it: {d['gui']}/notes?id=<id>")
     if d.get("store") and d.get("rows") == 0:
         out.append("  " + FIRST_CONTACT)
@@ -861,9 +989,9 @@ def one_line(d: dict) -> str:
     line = render_summary(d).split("\n", 1)[0]
     n = len(d["due"]) + d["due_elided"]
     if n == 1:
-        line += f"; 1 row {d['due'][0]['phrase']}"
+        line += f"; 1 entry {d['due'][0]['phrase']}"
     elif n:
-        line += f"; {n} rows due, the first {d['due'][0]['phrase']}"
+        line += f"; {n} entries due, the first {d['due'][0]['phrase']}"
     if d.get("gui"):
         line += f" · {d['gui']}"
     return line
@@ -881,7 +1009,7 @@ def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -
     loaded = S.load(store_dir)
     if target:
         ttype, _, tname = target.partition(":")
-        tname = gitref.canon_name(cfg, ttype, tname or None, S.stored_names(loaded, ttype))
+        ttype, tname = gitref.read_target(cfg, ttype, tname or None, loaded)
         rows = S.heads_for(store_dir, ttype, tname, loaded=loaded)
     else:
         notes = S.heads(loaded)
@@ -925,7 +1053,8 @@ def schema(store_dir, cfg, kinds=None) -> dict:
                    "verdict": k.verdict, "when": k.when, "rows": counts.get(label, 0)}
                   for label, k in kinds.items()],
         "targets": ([{"type": t, "catalog": None, "resolver": None} for t in TARGET_ORDER]
-                    + [{"type": t, "catalog": cmd, "resolver": cfg.resolvers.get(t)}
+                    + [{"type": t, "catalog": cmd, "resolver": cfg.resolvers.get(t),
+                        **({"repo": str(cfg.repos[t])} if t in cfg.repos else {})}
                        for t, cmd in sorted(cfg.catalogs.items())]),
     }
 
@@ -936,7 +1065,7 @@ def _bits(k: dict) -> str:
 
 def render_schema(d: dict, paint=plain) -> str:
     src = "symbion.toml [kinds]" if d["declared"] else "symbion.toml [kinds]; absent = these defaults"
-    out = [f"kinds  ({src})   rows"]
+    out = [f"kinds  ({src})   entries"]
     w = max((len(k["label"]) for k in d["kinds"]), default=4)
     for k in d["kinds"]:
         out.append(f"  {paint(k['label'].ljust(w), 'kind:' + k['label'])}  "
@@ -947,10 +1076,14 @@ def render_schema(d: dict, paint=plain) -> str:
     out.append(f"  {builtin:<{w + 22}}  {paint('built in', 'meta')}")
     for t in d["targets"]:
         if t["catalog"] is not None:
-            line = (f"  {t['type']:<{w + 22}}  {paint('catalog: ', 'meta')}"
+            own = "built in catalog: " if t["catalog"] == catalog.DOC_CATALOG else "catalog: "
+            line = (f"  {t['type']:<{w + 22}}  {paint(own, 'meta')}"
                     f"{paint(flatten(t['catalog']), 'body')}")
             if t.get("resolver"):
                 line += (f"\n  {'':<{w + 22}}  {paint('resolver: ', 'meta')}"
                          f"{paint(flatten(t['resolver']), 'body')}")
+            if t.get("repo"):
+                line += (f"\n  {'':<{w + 22}}  {paint('repo: ', 'meta')}"
+                         f"{paint(t['repo'], 'body')}")
             out.append(line)
     return "\n".join(out)

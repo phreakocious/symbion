@@ -10,6 +10,7 @@ from nicegui import ui
 from .. import api
 from .. import store as S
 from .. import summary as summ
+from .filters import href
 from .notes import ago, bare, edit_dialog, id_link, kind_class, target_headline, target_link
 
 
@@ -71,8 +72,13 @@ def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
                 .mark("checklist-toggle", f"toggle-{fu.id}")   # per-row: find() returns a SET
             with ui.element("div").classes("sb-note-main"):
                 if not bare(fu):
-                    ui.label(summ.clip(fu.body, summ.HEAD_CHARS)).classes("sb-note-text") \
-                        .mark("checklist-body")
+                    # The text is the link to the whole note, as a clipped
+                    # card's is: only the id linked, and a reader did not
+                    # find it (GitHub issue 1). Always, clipped or not: the
+                    # row leaves out the note's tags, refs and edit button.
+                    with ui.link(target=href(id=fu.id)).classes("sb-note-open") \
+                            .mark("checklist-body"):
+                        ui.label(summ.clip(fu.body, summ.HEAD_CHARS)).classes("sb-note-text")
                 with ui.element("div").classes("sb-note-foot"):
                     if bare(fu):
                         target_headline(fu)

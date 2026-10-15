@@ -42,6 +42,12 @@ def posix_sh() -> str | None:
     return str(sh) if sh and sh.exists() else None
 
 
+# The store's own docs/, built in so `--ref doc:NAME` holds in every store: a
+# row's long detail lives in a file there (the owner, 2026-10-14). A name is
+# its path from the store's root. A [catalogs] `doc` entry replaces it.
+DOC_CATALOG = 'git -C "${SYMBION_DIR:?}" ls-files --cached --others --exclude-standard docs'
+
+
 def run_configured(cfg, cmd: str, input: str | None = None):
     """Run one configured shell command in the CURRENT worktree, bounded.
 
@@ -64,6 +70,11 @@ def run_configured(cfg, cmd: str, input: str | None = None):
     `--dir` resolved the default store instead and answered confidently from
     the wrong names."""
     if getattr(cfg, "work_root", None) is None:
+        if getattr(cfg, "repos", None):
+            raise CatalogError(
+                f"{os.getcwd()} is in none of this store's repos ({', '.join(cfg.repos)}): "
+                f"a configured command that is no repo's runs in the repo you stand in; "
+                f"run from one of them: {cmd}")
         raise CatalogError(
             f"no git repository at {os.getcwd()}: a configured command runs in the "
             f"project's worktree, and this store was named from outside one: {cmd}")
@@ -135,7 +146,10 @@ def names(cfg, target_type: str, *, allow_empty: bool = False) -> list[str]:
     cmd = cfg.catalogs.get(target_type)
     if cmd is None:
         raise CatalogError(f"no catalog command for type {target_type!r}: add one under [catalogs] in symbion.toml")
-    r = run_configured(cfg, cmd)
+    if why := cfg.missing(target_type):
+        raise CatalogError(f"{why}; its entries still read, and a write on {target_type!r} "
+                           f"waits for the repo")
+    r = run_configured(cfg.for_type(target_type), cmd)
     if r.returncode != 0:
         raise CatalogError(f"catalog {target_type!r} exited {r.returncode}: {cmd}\n"
                            f"{r.stderr.strip()[:400]}")
@@ -180,10 +194,14 @@ def pool(cfg, target_type: str) -> list[str]:
     out = names(cfg, target_type, allow_empty=True)
     if out or target_type in cfg.resolvers:
         return out
+    if target_type == "doc" and cfg.catalogs.get("doc") == DOC_CATALOG:
+        raise CatalogError(f"the store has no file under docs/ yet: write "
+                           f"{Path(cfg.store or '.', 'docs', 'NAME').as_posix()} first, "
+                           f"then name it with doc:NAME")
     raise CatalogError(
         f"catalog {target_type!r} produced no names and no [resolvers] entry "
         f"is declared for it, so a first name cannot be minted: {cfg.catalogs.get(target_type)}\n"
-        f"A store-derived catalog is empty until its first {target_type!r} row exists. "
+        f"A store-derived catalog is empty until its first {target_type!r} entry exists. "
         f"Declare a resolver for {target_type!r} in symbion.toml to mint one.")
 
 
@@ -199,7 +217,7 @@ def resolve_with(cfg, target_type: str, query: str, candidates) -> str:
     q = nfc(query)
     if "\n" in q or "\r" in q:
         raise CatalogError(f"resolver {target_type!r} cannot resolve a name containing a newline: {q!r}")
-    r = run_configured(cfg, cmd, input="\n".join([q, *candidates]) + "\n")
+    r = run_configured(cfg.for_type(target_type), cmd, input="\n".join([q, *candidates]) + "\n")
     lines = _lines(r.stdout)
     if r.returncode == 2 and lines:
         raise AmbiguousName(q, lines)
@@ -228,6 +246,7 @@ def match(cfg, target_type: str, query: str, candidates) -> str:
     writes both, and it does not know the verb, so a `list --name` miss used
     to promise a write the read never made (adopter report, 2026-09-28). A
     batch write, which does know, still says "stored" (cli's from-json note)."""
+    cfg = cfg.for_type(target_type)       # its notes ask the repo the name is in
     if target_type in cfg.resolvers:
         return resolve_with(cfg, target_type, query, candidates)
     got = resolve(query, candidates)
@@ -268,6 +287,28 @@ def canonical(cfg, target_type: str, name, pending=(), candidates=None):
     base = pool(cfg, target_type) if candidates is None else candidates
     cands = list(dict.fromkeys([*base, *pending]))
     return match(cfg, target_type, name, cands)
+
+
+def across(query, pools) -> list[tuple[str, str]]:
+    """The built-in rule over several catalogs at once, each name kept with
+    its catalog: the hits of the first step that has any (exact, else
+    substring, else equal but for case). Every hit is returned, never
+    raised, so a caller can name each in its refusal."""
+    q = nfc(query)
+    every = [(t, n) for t, ns in pools.items() for n in dict.fromkeys(ns)]
+    for test in (lambda n: n == q, lambda n: q in n,
+                 lambda n: n.casefold() == q.casefold()):
+        if hits := [(t, n) for t, n in every if test(n)]:
+            return hits
+    return []
+
+
+def listed(hits, cap: int = 8) -> str:
+    """`a:x, b:y and c:z` for a refusal; past `cap`, `+N more`."""
+    shown = [f"{t}:{n}" for t, n in hits[:cap]]
+    if len(hits) > cap:
+        return f"{', '.join(shown)}, +{len(hits) - cap} more"
+    return shown[0] if len(shown) == 1 else f"{', '.join(shown[:-1])} and {shown[-1]}"
 
 
 # ---- rename providers ----
@@ -333,6 +374,7 @@ def rename_map(cfg, target_type: str) -> dict:
     spec = cfg.renames.get(target_type)
     if not spec:
         return {}
+    cfg = cfg.for_type(target_type)
     if spec == "git":
         return _resolve_chains(_git_rename_pairs(cfg))
     r = run_configured(cfg, spec)

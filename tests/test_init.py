@@ -173,35 +173,38 @@ def test_merge_hook_appends_the_entry_and_keeps_the_rest(repo, tmp_path, capsys,
 
 def test_init_registers_the_gotcha_hook_beside_the_session_hook(repo, tmp_path, capsys):
     """A trap on a file reaches a session through a hook after each tool call
-    that can name the file (gotchas.sh). A new settings file gets both hooks.
-    One that registers only the session hook, as every install before this
-    one does, hears the gotcha hook is missing, and --merge-hook adds it."""
+    that can name the file (gotchas.sh), and after each that fails, which
+    PostToolUse never sees (2026-10-13). A new settings file gets all three
+    hooks. One that lacks a gotcha hook, as every install before it does,
+    hears which is missing, and --merge-hook adds it."""
     store_dir = tmp_path / "store"
     assert run("init", "--yes", store_dir=store_dir) == 0
     settings = _home() / ".claude/settings.json"
     hooks = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
-    assert hooks["PostToolUse"] == [cli._gotcha_entry()]
+    assert hooks["PostToolUse"] == hooks["PostToolUseFailure"] == [cli._gotcha_entry()]
     assert (resources.files("symbion") / "data" / "skill" / "gotchas.sh").is_file()
     settings.write_text(json.dumps({"theme": "dark"}))
     capsys.readouterr()
     assert run("init", "--yes", store_dir=store_dir) == 0
     out = capsys.readouterr().out
-    assert out.count("does not register") == 2 and out.count("An agent whose edit") == 1, out
-    settings.write_text(json.dumps({"hooks": {"SessionStart": hooks["SessionStart"]}}))
+    assert out.count("does not register") == 3 and out.count("An agent whose edit") == 1, out
+    settings.write_text(json.dumps({"hooks": {k: hooks[k] for k in ("SessionStart",
+                                                                    "PostToolUse")}}))
     assert run("init", "--yes", store_dir=store_dir) == 0
     out = capsys.readouterr().out
-    assert f"kept hook in {settings}" in out, out
-    assert "does not register the symbion PostToolUse hook" in out, out
+    assert f"kept hook in {settings}" in out and f"kept PostToolUse hook in {settings}" in out
+    assert out.count("does not register") == 1, out
+    assert "does not register the symbion PostToolUseFailure hook" in out, out
     # Its last line read `nothing to change`, and an upgrade stopped there
     # with the hook unregistered (2026-10-12).
     assert run("init", store_dir=store_dir) == 1
     assert capsys.readouterr().out.splitlines()[-1] == (
-        "the symbion PostToolUse hook is not registered: run `symbion init --merge-hook`")
+        "the symbion PostToolUseFailure hook is not registered: run `symbion init --merge-hook`")
     assert run("init", "--merge-hook", store_dir=store_dir) == 0
-    assert f"merged the symbion PostToolUse hook into {settings}" in capsys.readouterr().out
+    assert f"merged the symbion PostToolUseFailure hook into {settings}" in capsys.readouterr().out
     assert json.loads(settings.read_text(encoding="utf-8"))["hooks"] == hooks
     assert run("init", "--merge-hook", store_dir=store_dir) == 0
-    assert f"kept PostToolUse hook in {settings}" in capsys.readouterr().out
+    assert f"kept PostToolUseFailure hook in {settings}" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("text", ["{ not json", '{"hooks": {"SessionStart": {}}}'])
@@ -277,7 +280,7 @@ def test_init_starter_toml_carries_a_resolvers_block_that_parses(repo, tmp_path)
     store = tmp_path / "store"
     assert run("init", "--yes", store_dir=store) == 0
     text = (store / "symbion.toml").read_text()
-    assert "[resolvers]" in text and "pipefail" in text and "fragment" in text
+    assert "[resolvers]" in text and "out=$(" in text and "fragment" in text
     assert tomllib.loads(text).get("resolvers", {}) == {}
 
 

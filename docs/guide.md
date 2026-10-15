@@ -20,7 +20,7 @@ pipx install 'symbion[gui]'     # or: uv tool install 'symbion[gui]'
 
 The core's four dependencies serve a person at a terminal: `rich` and
 `rich-argparse` colour and align the output (a pipe gets plain text),
-`markdown-it-py` reads note bodies, and `argcomplete` does TAB completion.
+`markdown-it-py` reads entry bodies, and `argcomplete` does TAB completion.
 
 Run `command -v symbion` from another directory to check that it is on PATH.
 The SessionStart hook finds `symbion` through PATH. Without it, the hook
@@ -41,7 +41,7 @@ file and loads on the first TAB, not at every shell start. Regenerate it after
 an argcomplete upgrade.
 
 TAB completes verbs, flags and the store's values: kinds, target types, the
-`TYPE:NAME` targets its rows use, row ids (only open ones for `resolve`), arc
+`TYPE:NAME` targets its entries use, entry ids (only open ones for `resolve`), arc
 ids and tags. zsh and fish describe each value. A `--dir` on the line picks
 the store.
 
@@ -61,27 +61,31 @@ That sets up Claude Code; `--agent codex` sets up Codex instead,
 
 This creates `../<repo>-notes`, a git repo with no remote, holding a commented
 `symbion.toml` whose every value has a default and a README.md that says what
-the store is. Out of the box a note goes on a commit, an item, the project or
-an arc. For notes on files, uncomment `file =` under `[catalogs]` and `file =
+the store is. Out of the box an entry goes on a commit, an item, the project or
+an arc. For entries on files, uncomment `file =` under `[catalogs]` and `file =
 "git"` under `[renames]`; a file target refused before then names both lines,
 by number. For Claude Code, the first
 `init` on a machine also links `~/.claude/skills/symbion` to the skill directory in the installed
 package (SKILL.md, adoption.md, catalogs.md and the hook scripts), so an upgrade
-reaches every project. It registers two hooks in `~/.claude/settings.json` when
-that file does not exist: the session-start hook, and the gotcha hook below.
-When it does, `init` says each hook is already there, or prints the entry to
-append to `hooks.SessionStart` or `hooks.PostToolUse`, or says the file is not
-valid JSON. `init --merge-hook` appends each missing entry and keeps the rest of
-the file.
+reaches every project. It registers its hooks in `~/.claude/settings.json` when
+that file does not exist: the session-start hook, and the gotcha hook below on
+two events. When it does, `init` says each hook is already there, or prints the
+entry to append to `hooks.SessionStart`, `hooks.PostToolUse` or
+`hooks.PostToolUseFailure`, or says the file is not valid JSON.
+`init --merge-hook` appends each missing entry and keeps the rest of the file.
 It refuses a file that is not valid JSON. Without `--yes` it merges only once the
 skill link is in place, since the hook runs its script through that link. If your
 agent's own edit of the file is denied, as Claude Code's auto mode may deny it, run
 the flag yourself: type `! symbion init --merge-hook` at the agent's prompt. At each
 session start the hook gives the agent `symbion summary` and shows you one line of it: the open counts, the soonest due
-row and, while `symbion serve` runs, its address. The gotcha hook runs
-`gotchas.sh` after each Read, Edit, Write, NotebookEdit and Bash call: the first
-time a session's call names a file that a row tagged `gotcha` is on, the agent
-gets that row's lead. It reads a list the session-start hook writes under
+entry and, while `symbion serve` runs, its address. The gotcha hook runs
+`gotchas.sh` after each Read, Edit, Write, NotebookEdit and Bash call, failed
+calls included (a Bash command that exits non-zero is one): the first time a
+session's call names a file that an entry tagged `gotcha` is on, the agent
+gets that entry's lead, its age, how many commits have changed the file since,
+and the command that retires it: a gotcha has no status, and the agent in
+the file is the one placed to judge whether it still holds. It reads a list
+the session-start hook writes under
 `~/.cache/symbion/gotchas/`, so it costs a few milliseconds and never runs
 `symbion`. A `~/.claude/skills/symbion` that is not the
 link is left alone and named. On Windows the link is a directory junction
@@ -106,19 +110,14 @@ in Codex's `config.toml`; `init` prints the path. A `.symbion` pointer grants
 no access, and `symbion commit` may still ask for approval. A linked worktree
 uses the main checkout's store, so grant that one.
 
-For Hermes Agent, `init --agent hermes` makes the same
-`~/.agents/skills/symbion` link and registers no hook: no Hermes hook puts
-text in front of the model once, at session start. Hermes reads the link once
-`$HERMES_HOME/config.yaml` (default `~/.hermes/config.yaml`) lists the
-directory. `init` does not edit that file, so add it yourself:
-
-```yaml
-skills:
-  external_dirs:
-    - ~/.agents/skills
-```
-
-The summary then comes from a line in the project's `AGENTS.md` (step 3).
+For Hermes Agent, `init --agent hermes` links `$HERMES_HOME/skills/symbion`
+(default `~/.hermes/skills/symbion`), where Hermes finds it with no change to
+its config, and registers no hook: no Hermes hook puts text in front of the
+model once, at session start. A named profile has its own `HERMES_HOME`: run
+`init --agent hermes` again with it set. An install before this one linked
+`~/.agents/skills` and listed it under `skills.external_dirs`; that still
+works beside the new link. The summary comes from a line in the project's
+`AGENTS.md` (step 3).
 Hermes's default local terminal writes to the store beside the project with
 no further setup.
 
@@ -150,10 +149,10 @@ print as plain text, and the PowerShell hook prints all of it that way.
 
 | output | meaning |
 |---|---|
-| `symbion: open outside arcs: bug 0, task 0, question 0, prediction 0` (`; N open in arcs` when arcs hold any), then a line per arc and the open rows | working |
+| `symbion: open outside arcs: bug 0, task 0, question 0, prediction 0` (`; N open in arcs` when arcs hold any), then a line per arc and the open entries | working |
 | `symbion --dir ../other-notes: open outside arcs: …` | working, on a store this repo's tree does not name (`--dir`, `SYMBION_DIR`, or a cwd inside a store); the header names it, so two summaries in one session can be told apart |
-| either, then `  N notes not yet in the store's git (symbion commit)` | working; `/symbion wrap` at session end commits them |
-| either, then `… (symbion commit --all once their session has ended)` | the rows are another session's, and `symbion commit` takes only yours: `--all` takes them once that session has ended |
+| either, then `  N entries not yet in the store's git (symbion commit)` | working; `/symbion wrap` at session end commits them |
+| either, then `… (symbion commit --all once their session has ended)` | the entries are another session's, and `symbion commit` takes only yours: `--all` takes them once that session has ended |
 | `symbion: cannot read store at … because 'symbion' is not on PATH` | see [Install](#install) |
 | `symbion: no store at …; run \`symbion init\`` | no store yet, or `.symbion`/`SYMBION_DIR` names a missing path |
 | `error: …/.symbion is a link to …` or `error: cannot read …/.symbion` | `.symbion` is there but is not a file symbion can read; the message gives the fix |
@@ -177,14 +176,19 @@ finds in the project, so put the line in that file:
 If that instruction file is gitignored or its owner reviews every change to it,
 propose the line to the owner instead of writing it.
 
+**Several repos that change together.** Make one store, list the repos under
+`[repos]` in its `symbion.toml`, and run `symbion --dir ../<store> init --yes`
+in each repo, which writes its `.symbion`. `catalogs.md`, "Repos", has the
+table and how to convert a store that already exists.
+
 ## First session
 
 A repo with history (known issues, TODOs, docs, a handoff file) starts with
 `adoption.md`, installed beside `SKILL.md`. It says which catalogs to turn on
-and what to bring in; its rows go in as one `symbion add --from-json -`,
+and what to bring in; its entries go in as one `symbion add --from-json -`,
 validated together before any is written. Either way:
 
-**The first note is a check, written now:** the state the store began at,
+**The first entry is a check, written now:** the state the store began at,
 which no commit message records. It pays first: dated, re-checkable, and
 visibly stale once HEAD moves. A check stamps HEAD and whether the tree is
 dirty, untracked files included. Until step 3's line is committed, the tree is
@@ -204,7 +208,7 @@ body. `seed` mints one bodiless task per name and is for fanning out over a
 
 ```bash
 aid=$(symbion arc create --name "Adoption" --scope item --desc "Usable by someone who was not in the room.")
-symbion add task --target "item:write the README" --arc-id "$aid" --body "Done: a stranger can install and record a note."
+symbion add task --target "item:write the README" --arc-id "$aid" --body "Done: a stranger can install and record an entry."
 symbion arc todo "$aid" --json      # open items
 symbion resolve <id>                # tick one: <id> reads resolved, its open version kept under a new id
 symbion arc list                    # done/total per arc
@@ -212,9 +216,10 @@ symbion list --arc "$aid" --json    # every item, resolved included
 ```
 
 **End a session with `/symbion wrap`.** Writes never commit, so a git failure
-never blocks a note; `symbion summary` shows the uncommitted count until a
-commit. The wrap (`wrap.md` in the skill) writes rows for what the session
-learned, changed and finished, then commits the store with the day as its
+never blocks an entry; `symbion summary` shows the uncommitted count until a
+commit. The wrap (`wrap.md` in the skill) files an open `question` for each ask
+the user left unanswered, writes entries for what the session learned, changed
+and finished, then commits the store with the day as its
 message:
 
 ```bash
@@ -236,9 +241,9 @@ With nothing to commit, `commit` exits 1, as git does, so a script's `symbion co
 then, so a session that changed only the repo still leaves its handoff. The first `commit` also takes the files
 `init` wrote (`.gitignore`, `README.md`, `symbion.toml`): `init` commits nothing.
 
-`commit` takes your rows: in a Claude Code or Codex session, the ones that session
+`commit` takes your entries: in a Claude Code or Codex session, the ones that session
 wrote; at a plain terminal, your author's. Two sessions on one store each commit
-their own. It names the rows it left and the newest one's age, and `commit --all`
+their own. It names the entries it left and the newest one's age, and `commit --all`
 takes them too, for a session that ended without committing.
 
 ## Browse it (optional)
@@ -247,26 +252,26 @@ takes them too, for a session that ended without committing.
 symbion serve        # the one command that needs the gui extra
 ```
 
-![The notebook page of symbion serve: a sidebar of places and open counts by kind, and boards of note cards](images/gui.png)
+![The notebook page of symbion serve: a sidebar of places and open counts by kind, and boards of entry cards](images/gui.png)
 
 A local page on a port of the store's own, the same at every restart, so a link
-to a row stays good (`serve` prints it, and `--port` picks another). It has:
+to an entry stays good (`serve` prints it, and `--port` picks another). It has:
 
 - boards: by kind on the notebook, by target on the targets page;
-- a note list where every tag, kind, author and target is a filter link;
+- an entry list where every tag, kind, author and target is a filter link;
 - a search box (`/`): its text filters the page as you type, and Enter
   searches the whole store (every word, literally, in any case, a phrase in
-  double quotes as one word, or a pasted note id), as a pause in the typing
+  double quotes as one word, or a pasted entry id), as a pause in the typing
   does once nothing on the page matches;
-- a new note from any page (`n`), on that page's object or any other: `#tag`
+- a new entry from any page (`n`), on that page's object or any other: `#tag`
   and `!kind` in its body set its tags and kind, and Shift Enter adds it and
   starts the next;
 - a page per note: a rule in its body marks where each amendment joined it,
   with who added it and when, and its earlier versions show an edit as a
   diff; a tag index, and arc checklists you tick;
 - commit and push buttons, shown while there is something to commit or push.
-  The commit button takes only the rows written as you, so an agent's
-  pending rows stay for it to commit.
+  The commit button takes only the entries written as you, so an agent's
+  pending entries stay for it to commit.
 
 `?` lists the keys. It writes as **you**: `SYMBION_AUTHOR`, else git
 `user.name`, shown at the foot of the sidebar, or in the top bar on a window
@@ -286,12 +291,13 @@ the other stores a `serve` is running on, on this machine. Each running
 `serve` keeps a small record in `~/.cache/symbion/serve/` (or under
 `$XDG_CACHE_HOME`). A second `serve` on one store warns: the sidebars link the
 first until it stops, then the second. While a `serve` runs on a store, each id
-that `list`, `show` and `context` print at a terminal links to its row's page
+that `list`, `show` and `context` print at a terminal links to its entry's page
 (cmd-click in iTerm2), and `summary` names the URL.
 
-A running `serve` keeps the symbion it started with. After an upgrade,
-`symbion serve --restart`, run from anywhere, restarts every one in place: in
-its own terminal, on its own port, and its open tabs reload. It prints the
-version each now runs, or in a checkout the commit, and ends with a count
-(`restarted 3 of 3 serves`). `--stop` stops them all.
+A running `serve` keeps the symbion it started with, and the `symbion.toml`
+it read: a new kind or catalog type shows after a restart. After an upgrade or
+a `symbion.toml` edit, `symbion serve --restart`, run from anywhere, restarts
+every one in place: in its own terminal, on its own port, and its open tabs
+reload. It prints the version each now runs, or in a checkout the commit, and
+ends with a count (`restarted 3 of 3 serves`). `--stop` stops them all.
 Neither works on Windows: there, Ctrl-C each one and start it again.

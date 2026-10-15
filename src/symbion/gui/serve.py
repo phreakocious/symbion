@@ -34,7 +34,7 @@ from nicegui.helpers import format_url
 from .. import gitref
 from . import servers
 from .pages import build_page
-from .theme import FAVICON_SVG
+from .theme import FAVICON
 
 
 class AllowOnly:
@@ -247,7 +247,7 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
             host=host, port=port, show=show, reload=reload,
             uvicorn_reload_dirs=str(Path(__file__).resolve().parent),
             uvicorn_reload_includes="*.py",
-            title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON_SVG,
+            title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON,
             reconnect_timeout=30.0,
         )
     except KeyboardInterrupt:

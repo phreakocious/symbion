@@ -55,10 +55,10 @@ function sbFilter(text, expand) {
 
 # What `?` lists. The kinds are the store's, read at render.
 _KEYS = (("/", "filter this page"), ("Enter", "in the filter: search the whole store"),
-         ("n", "new note"), ("?", "this list"), ("Esc", "close a dialog"),
-         ("⌘/Ctrl Enter", "add the note being written, or save an edit"),
+         ("n", "new entry"), ("?", "this list"), ("Esc", "close a dialog"),
+         ("⌘/Ctrl Enter", "add the entry being written, or save an edit"),
          ("Shift Enter", "add it and write another"),
-         ("#tag", "in a note: adds the tag"))
+         ("#tag", "in an entry: adds the tag"))
 
 
 def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
@@ -74,7 +74,9 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     `kind` the kind it starts as."""
     ui.dark_mode().enable()
     root = ctx.cfg.project_root
-    name = root.name if root else ctx.store_dir.name   # named from outside any repo: no project
+    # Named from outside any repo, or a store over several repos (the serve
+    # is the store's, whichever repo it started in): the store's name.
+    name = root.name if root and not ctx.cfg.repos else ctx.store_dir.name
     ui.page_title(f"{name} · symbion")                 # the tab names the project
     ui.colors(**quasar_colors())
     ui.add_head_html(root_vars_css())          # no border flash on first paint
@@ -110,7 +112,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                     last = ui.link(label, to) if to else ui.label(label)
                 last.classes("sb-here").mark("page-title")
             ui.space()
-            # Left of New note, so that button stays put as these come and go
+            # Left of New entry, so that button stays put as these come and go
             # (the owner, 2026-10-02).
             _git_buttons(ctx, author)
             _new_note_button(ctx, author, *new, kind=kind)
@@ -143,7 +145,7 @@ def _new_note_button(ctx, author: str, target_type, target_name, arc_id,
     where a page has none. It sat on two pages, as the page's top. From a
     kind= view it starts as that kind and says so (the owner, 2026-10-11)."""
     kind = kind if kind in ctx.kinds else None
-    word = kind or "note"
+    word = kind or "entry"
     def build():
         added = []                  # by Shift Enter: the page shows them on close
         with ui.dialog() as dialog, ui.card().classes("bg-panel sb-new-card"):
@@ -163,7 +165,7 @@ def _keys_dialog(ctx):
     with ui.dialog() as dialog, ui.card().classes("bg-panel"):
         ui.label("keyboard").classes("sb-stat-label")
         with ui.element("div").classes("sb-keys-list").mark("keys-list"):
-            for key, what in _KEYS + (("!kind", "in a note: sets its kind, one of "
+            for key, what in _KEYS + (("!kind", "in an entry: sets its kind, one of "
                                        + ", ".join(ctx.kinds)
                                        + "; its first letters do, while one kind "
                                          "alone starts with them"),):
@@ -175,7 +177,7 @@ def _keys_dialog(ctx):
 SOURCE = "https://github.com/phreakocious/symbion"
 
 # The sidebar's places: (label, path, Material icon).
-_PLACES = (("Notebook", "/", "menu_book"), ("All notes", "/notes", "notes"),
+_PLACES = (("Notebook", "/", "menu_book"), ("All entries", "/notes", "notes"),
            ("Targets", "/targets", "my_location"), ("Tags", "/tags", "tag"),
            ("Arcs", "/arcs", "linear_scale"))
 
@@ -190,7 +192,7 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
             ui.html(LOGO_SVG, sanitize=False)
             with ui.column().classes("gap-0"):
                 ui.label(name).classes("sb-brand-name").mark("brand")
-                ui.label(f"symbion · {summ._count(len(heads), 'note')}").classes("sb-brand-sub")
+                ui.label(f"symbion · {summ._count(len(heads), 'entry')}").classes("sb-brand-sub")
         # Only the groups scroll: the badge sat below them, cut off in an
         # 800px window once the RECORDS group came (2026-10-06).
         with ui.element("div").classes("sb-scroll"):
@@ -247,7 +249,7 @@ def _closed(heads, n: int = 5) -> None:
         return
     with ui.element("div").classes("sb-nav"):
         ui.link("recently closed", href(status="resolved")).classes("sb-nav-head") \
-            .mark("closed-all").tooltip("every resolved row")
+            .mark("closed-all").tooltip("every resolved entry")
         for r in rows:
             text = r.body or (f"{r.target.type}: {r.target.name}"
                               if r.target.name else r.target.type)
@@ -305,7 +307,7 @@ def _search_box(q: str, keep: dict) -> None:
     box.tooltip("typing filters this page, and searches the store when nothing here "
                 "matches; Enter searches the store: every word, in any case, in body, "
                 'target, checked, result, refs or tags; a "quoted phrase" as one word; '
-                "or a note id")
+                "or an entry id")
 
 
 # Seconds between reads of the store's git state for the two buttons.
@@ -322,8 +324,9 @@ def _git_buttons(ctx, author: str) -> None:
     def read():
         rows = S.pending_rows(ctx.store_dir)
         keep = S.with_bases(rows, lambda r: r.get("author") == author)
-        mine = sum(keep(r) for r in rows)
-        return (mine, len(rows) - mine, gitref.uncommitted(ctx.store_dir)[1],
+        mine = len(S.entries([r for r in rows if keep(r)]))
+        return (mine, len(S.entries([r for r in rows if not keep(r)])),
+                gitref.uncommitted(ctx.store_dir)[1],
                 gitref.unpushed(ctx.store_dir), S.undoable(ctx.store_dir))
 
     @ui.refreshable
@@ -355,7 +358,7 @@ def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> Non
 
     def _do():
         try:
-            ok = api.commit(ctx, "notes: via symbion serve", author=author)
+            ok = api.commit(ctx, "entries: via symbion serve", author=author)
         except RuntimeError as e:     # a hook refused: no reload, so it stays read
             ui.notify(str(e), type="negative", multi_line=True,
                       close_button="dismiss", timeout=0)
@@ -366,8 +369,8 @@ def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> Non
     # On a phone the word goes and the count stays: the icon says commit.
     with ui.button(icon="save", on_click=_do).props("outline dense no-caps color=notable") \
             .classes("px-2 sb-commit").mark("commit-button") \
-            .tooltip(f"git commit {author}'s rows" + (
-                f"; {summ._count(others, 'row')} by other writers stay pending for them"
+            .tooltip(f"git commit {author}'s entries" + (
+                f"; {summ._count(others, 'entry')} by other writers stay pending for them"
                 if others else "")):
         ui.label("commit").classes("sb-btn-word")
         ui.label(str(n) if n else "registry")
@@ -392,6 +395,6 @@ def _push_button(ctx, n: int | None) -> None:
 
     with ui.button(icon="cloud_upload", on_click=_do).props("flat dense no-caps color=muted") \
             .classes("px-2 sb-push").mark("push-button") \
-            .tooltip(f"git push the note store: {summ._count(n, 'commit')} not on its remote"):
+            .tooltip(f"git push the store: {summ._count(n, 'commit')} not on its remote"):
         ui.label("push").classes("sb-btn-word")
         ui.label(str(n))

@@ -19,6 +19,7 @@ import pytest
 pytest.importorskip("nicegui")
 
 from symbion import gitref, store     # noqa: E402
+from symbion.gui.theme import FAVICON  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +98,9 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
         status, page = _get_page(p, port)
         # one record, the parent's: the reload worker serves, but never records
         running = [json.loads(f.read_text()) for f in records.glob("*.json")]
+        if status == 200:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=2) as r:
+                icon = r.headers["content-type"], r.read()
     finally:
         if os.name == "nt":
             p.send_signal(STOP)
@@ -115,8 +119,10 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     assert os.name == "nt" or running[0]["pid"] == p.pid, running
     assert not list(records.glob("*.json")), "a serve that stopped leaves its record"
     # ui.run's favicon, which only a served page carries: NiceGUI's own icon
-    # is a static .ico, ours an inline SVG.
-    assert 'href="data:image/svg+xml' in page and "favicon.ico" not in page, page[:2000]
+    # is under /_nicegui/. Not an inline data: URL, which Obsidian's web viewer
+    # cannot fetch.
+    assert 'href="/favicon.ico"' in page, page[:2000]
+    assert icon == ("image/svg+xml", FAVICON.read_bytes()), icon
     # What tells Dark Reader the page is already dark: ui.run(dark=True) writes
     # the color-scheme meta its detector reads first; shell() adds its lock.
     assert re.search(r'name="color-scheme"\s+content="dark"', page), page[:2000]

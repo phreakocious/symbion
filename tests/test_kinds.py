@@ -5,9 +5,10 @@ import pytest
 from symbion import kinds as K
 
 
-def test_defaults_are_the_eight_in_order():
+def test_defaults_are_the_nine_in_order():
     assert list(K.DEFAULT_KINDS) == ["note", "decision", "bug", "task",
-                                     "question", "idea", "check", "prediction"]
+                                     "question", "idea", "check", "measurement",
+                                     "prediction"]
     assert K.DEFAULT_KINDS["idea"] == K.Kind(status=True, parked=True,
                                              when=K.DEFAULT_KINDS["idea"].when)
     assert K.DEFAULT_KINDS["check"].verdict and not K.DEFAULT_KINDS["check"].status

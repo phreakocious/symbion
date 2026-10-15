@@ -1,163 +1,210 @@
 # Adopting symbion in an existing project
 
-Read this in full before a bootstrap writes its first row. `SKILL.md`
-beside it covers everything after; nothing here is needed again once the
-sources are retired.
+A bootstrap reads this in full before it writes its first entry. `SKILL.md` covers
+everything after; nothing here is needed again once the sources are retired.
 
-The store starts empty and the project does not. Populate it with a
-**working set**, not a ledger: what a future session needs in order to not
-redo or misread work. Measured twice on 2026-09-04: several hundred lines of
-gitignored scratch and a few hundred commits became two or three dozen rows
-each, and some scratch items were already closed by later commits.
+The store starts empty and the project does not. A bootstrap fills it with a
+working set, not a ledger: what a later session needs to not redo or misread
+the work. Several hundred lines of scratch and a few hundred commits make two
+or three dozen entries, and some scratch items turn out to be closed already.
 
-**One store per repo, even when you only ever sit in one of them.** A hub the
-operator works from, with satellites whose files the work is really about,
-still gets a store each: a `check` row stamps the HEAD of the repo its session
-runs in, and a `commit` target must exist there, so a satellite's rows in the
-hub's store carry the wrong provenance and can name none of its commits. The
-hub's own store keeps only what is about the hub. To see both at session start,
-give the hub a project `SessionStart` hook that runs `symbion --dir
-../<sat>-notes summary`: the store belongs to the satellite, so its catalogs
-and check state still resolve there, and the header names the store it read
-(`symbion --dir ../<sat>-notes: open outside arcs: …`), which is also how to
-write to it.
+**One store per repo, unless the repos change together.** A `check` stamps one
+repo's HEAD, and a `commit` target lives in one repo. The hub the user works
+from, and each satellite the work is about, get a store each when the work
+stays in one repo at a time; the hub's store keeps only what is about the hub.
+A project `SessionStart` hook in the hub running `symbion --dir ../<sat>-notes
+summary` shows the satellite's store there, and the same `--dir` writes to it.
+Repos whose changes go together (one change starts in one repo and ends in
+another) share one store that lists them under `[repos]` (`catalogs.md`).
 
-1. **Enable a `file` catalog first** (`git ls-files --cached --others
-   --exclude-standard`, with a glob when notes will only attach to code;
-   dry-run the seed) so notes can attach to files, including one not yet
-   committed. Without it every row is `item` or `project`.
-2. **Sources, in order.** Gitignored scratch (`TODO.md`, `IDEAS.md`,
-   `NEXT_SESSION.md`, `.superpowers/`) first: it is the only copy and it is
-   about to go away. Tracked docs (`AGENTS.md`, `CLAUDE.md`, `NOTES.md`, `docs/audits/`)
-   get a pointer, never a copy. Claude Code memory, when present, only when no tracked file
-   already says it. Other stores on the machine (`../*-notes`, and any a
-   `.symbion` file names): before this project had a store, a session
-   elsewhere wrote its findings about it into the store at hand. Sweep them
-   in one pass, for the project's name and the names it goes by (a host, a
-   domain) -- the glob enumerates the stores that EXIST, so a name you
-   mistyped cannot read as a zero, and the printed path is each zero's
-   denominator:
+1. **A `file` catalog first.** A bootstrap enables one, so entries can attach to
+   files, one not yet committed included: under `[catalogs]` in the store's
+   `symbion.toml`,
+   `file = "git ls-files --cached --others --exclude-standard"`, with a
+   pathspec when entries will attach only to code. `symbion arc seed --scope file
+   --dry-run` lists its names. Without it, every entry is `item` or `project`. A
+   store with `[repos]` has a type per repo instead. Other types come at step
+   5, once the candidates show them.
+
+2. **Sources.** A project's open threads and lessons sit wherever its
+   sessions left them, and each project leaves them somewhere new. A
+   bootstrap sweeps for all of them. Places they have been:
+   - gitignored scratch (`TODO.md`, `IDEAS.md`, `NEXT_SESSION.md`,
+     `.superpowers/`), often the only copy;
+   - tracked docs (`AGENTS.md`, `CLAUDE.md`, `NOTES.md`, `docs/audits/`);
+   - Claude Code memory;
+   - retros and handoffs;
+   - another store on the machine, where a session elsewhere wrote about this
+     project before it had a store of its own;
+   - a folder beside the repo that belongs to the project but sits outside
+     it, which a tracked file comes from with nothing in the repo saying so.
+
+   What a source is decides what it gives. The only copy migrates, and step 7
+   retires it. A tracked file gets a pointer, never a copy. Memory gives what
+   no tracked file says. A retro or a handoff gives its open items, and any
+   lesson that names a file and that no tracked file states. An agent
+   instruction file that is gitignored, or whose every change the user
+   reviews (a hook gates it, or the user said so), is the user's: its
+   candidate rules go in as one arc, one `question` per rule.
+
+   Two sweeps found sources nothing else did. The first covers the stores on
+   the machine (`../*-notes`, and any a `.symbion` file names), for the
+   project's name and the names it goes by (a host, a domain). Each line names
+   what it counted; a zero means only that the pattern matched nothing.
 
    ```bash
-   for s in ../*-notes; do printf '%s: ' "$s"
-     symbion --dir "$s" list --all --grep '<name>|<host>' --json 2>/dev/null | jq length
+   for s in ../*-notes; do
+     [ -f "$s/notes.jsonl" ] || { printf '%s: not a store\n' "$s"; continue; }
+     n=$(symbion --dir "$s" list --all --grep '<name>|<host>' --json | jq length)
+     printf '%s: %s\n' "$s" "${n:-failed, see above}"
    done
    ```
 
-   Then re-read the stores that answered non-zero, without `--json`. A row
-   there that belongs here is a candidate, with that row as its source.
-   Measured 2026-09-28: a sibling store held the handoff's oldest open
-   thread, so skipping it would have minted that thread twice.
-
-   Folders beside the repo that are part of the project but not in it (no
-   git, or no store) come next: a tracked file may be generated from one,
-   and nothing in the repo says so. List the sibling paths that tracked
-   files name, and the siblings that share the repo's name:
+   The bootstrap reads each store that answers non-zero without `--json`: a
+   entry there that belongs here comes over with that entry as its source. The
+   second lists the sibling paths tracked files name, absolute and relative,
+   and the siblings that share the repo's name. A `../` path is relative to
+   its file.
 
    ```bash
    r=$(git rev-parse --show-toplevel)
-   git grep -h -o -I -E "$(dirname "$r")/[^/\"' )\`]+" -- :/ | grep -v -x -F "$r" | sort | uniq -c
+   d=$(dirname "$r" | sed 's/[][\.*^$(){}?+|]/\\&/g')
+   git grep -h -o -I -E "$d/[^/\"' )\`]+" -- :/ | grep -v -x -F "$r" | sort | uniq -c
+   git grep -n -I -F '../' -- :/
    ls -d "$r"*
    ```
 
-   A scratch file there is a source like the ones above. A tracked file
-   generated from there gets a `note` naming its source and the command that
-   regenerates it, so no session edits the copy by hand; if you regenerate
-   it today, the diff is a `check --external` on that file. Measured
-   2026-09-28: a tracked export named its source in a sibling folder with no
-   git and no store, every sweep above missed it, and the copy lagged its
-   source.
+   A tracked file generated from a folder there gets a `note` naming its
+   source and the command that regenerates it.
 
-   An agent instruction file (`AGENTS.md` or `CLAUDE.md`) that is gitignored, or whose owner reviews
-   every change to it, is the owner's: propose, do not write. Several candidate rules go in as one
-   arc, one `question` per rule, so each is accepted or
-   declined on its own. Retros and handoffs: their
-   open items, plus any lesson that names a file and that no tracked file
-   already states; the narrative and the generic lessons stay where they are.
-3. **Git log since the last handoff is for striking, not minting.** Read the
-   commit subjects and bodies (some repos put everything in the subject) and
-   verify every open scratch item against HEAD (grep the
-   function, run the `jq`) before writing it. A closed item gets no row
-   unless its body carries a lesson the commit does not. A commit body can
-   also carry an open item nothing else does (an assertion added and never
-   run): mint that one.
-4. **Kind mapping.** Decided, declined, rejected, accepted: `decision`.
-   Known broken: `bug`. A concrete next action: `task`. A priced
-   idea: `idea`. Something that needs the owner's call rather than
-   work: `question`, so `summary` lists them at session start (it deals its
-   capped head list one kind at a time; `list --kind question --status open`
-   is the whole queue) and `resolve <id> --body "decided: …"` (or
-   `declined: …`) closes it with the answer on the resolving row, which the
-   asker's next summary prints under `closed by`. A
-   verification you did not run today: `note` on
-   the commit with a pointer to the report, never `check`, because
-   provenance is stamped at write time and a retroactive check reads
-   `current` against today's HEAD. A `task` minted from scratch is read
-   against the rest of its file first: a prior ruling in the file's preamble goes
-   into the ticket body as the counter-position, or the ticket is not minted.
-   Measured: a ticket to add a file to a never-ship list, when the deleted
-   file's own header had ruled that unnecessary.
-5. **Present the candidate table and wait for the owner's go:** kind,
-   target, one line, source. An autonomous run with no owner to ask writes,
-   and puts the table in its final report. Then write it as one `add --from-json -`, not one `add` per row
-   (one bootstrap ran a shell command per row, each with a quoted markdown
-   body). Rows are append-only; a bad one is superseded, not gone.
-6. **After: retire every source that migrated,** in this session, so no
-   list survives in two places. Per source:
-   - **Scratch.** Untracked: `git add -f` a verbatim copy under
-     `<store>/archive/` (it was never tracked, so this is the only way the
-     compression stays auditable), then delete it. `-f` because a scratch
-     DIRECTORY can carry its own `.gitignore` of `*`, which the copy brings
-     along: `git add -A` then stages none of it, at exit 0. Tracked: delete
-     it; git keeps it. Either way, first grep the tree for inbound references and
-     fix them, and carry the file's preamble, which has no kind and says
-     what the file was FOR, into the project `decision` that records the
-     migration. **Shared with other projects** (one scratch file, outside any
-     repo, that several projects append to): it is still live for them, so
-     neither delete applies. Archive the verbatim copy as above, then replace
-     only this project's section in place with a pointer naming each new row
-     id, and leave the rest of the file alone.
-   - **The handoff file.** Retire it. Each item no row, instruction or memory
-     holds becomes a row: a trap is its file's `gotcha`, a practice is a
-     `task` tagged `practice` on the instruction file it belongs in. Copy the
-     file verbatim to `<store>/archive/`, delete it, and end the session with
-     `wrap.md`: from then on the wrap's commit message is the handoff. Do it
-     now, by hand: left to a tool that rewrites the file at session end, the
-     migrated threads stayed in it, and the next session was briefed from them
-     (2026-09-23). From then on, end sessions with continuity's `/wrap -j`,
-     which writes no handoff file; its bare `/wrap` asks first when the cwd has
-     none (0.21.0 and later). With an older continuity, keep the
-     file instead: replace its open-threads section with one naming this store
-     and the commands that read it, and strike the items that became rows.
-   - **Claude Code auto-memory, if present** (`~/.claude/projects/<slug>/memory/`).
-     Skip this source in projects that do not use it. Copy the migrated
-     topic files verbatim to `<store>/archive/claude-memory/`, delete them
-     and their `MEMORY.md` lines, and make `MEMORY.md` state the split: memory
-     keeps how to work with the owner and context that attaches to no object;
-     the rest is a row. Leave auto-memory on. A memory dir that was COPIED
-     when this repo was carved out of another holds the same topic files as
-     the other project's, one of which may have drifted: `cmp` each pair,
-     archive the superset, and put only the copies that are a subset on the
-     owner's delete list -- a drifted copy is a second source, not a
-     duplicate.
-   - **Rows in another store.** Run `symbion --dir <store> resolve <id>` on
-     each row that moved (a plain row: `supersede <id> --add-tag retired`),
-     with a body naming its new id here, then `symbion --dir <store> commit`.
-     When both projects touch the object (a shared host, a service), the
-     migration's project `decision` says which store owns it, so later
-     sessions in either project write to one place.
+3. **The git log since the last handoff strikes; it does not mint.** A
+   bootstrap checks each open scratch item against HEAD (greps the function,
+   runs the command it names) before it becomes an entry. A closed item gets no
+   entry unless its body carries a lesson the commit does not. A commit body can
+   carry an open item nothing else does (an assertion added and never run):
+   the bootstrap mints that one.
 
-   **The deletes are the owner's to run.** An agent's own `rm` over migrated
-   sources can be refused as irreversible destruction — including an `echo rm
-   -- …` dry run — and one such refusal forbids the delete by every other
-   route, leaving the sources in two places. So end the step by printing the
-   list and handing over the single line to run: `rm -- <paths>`. Verify each
-   copy first and say in the same breath that the copies are archived and
-   committed -- two checks, because they answer different questions: `cmp`
-   against its archived twin says the COPY is faithful, and
-   `git -C <store> ls-files archive/<src> | wc -l` against
-   `find <src> -type f | wc -l` says git HOLDS it. `cmp` reads the working
-   copy, so it passes on a copy git ignored and never committed.
+4. **Kinds.** The schema table's descriptions map most items. Three do not map
+   by their look:
+   - A verification not run today is a `note` on its commit, pointing at the
+     report. symbion stamps a `check` when it is written, so a late one reads
+     `current` against today's HEAD.
+   - What needs the user's call, not work, is a `question`; `resolve <id>
+     --body "decided: …"` closes it with the answer.
+   - A bootstrap reads a `task` from a scratch file against the rest of that
+     file: a ruling in its preamble goes into the task as the
+     counter-position, or the bootstrap does not mint the task.
 
-   Then `symbion commit`, and end with at least one `check` row, dirty tree
-   or not.
+   The defaults fit most projects. A project mints a kind of its own when a
+   class of entries recurs that no default's description fits. Stores in use added
+   `anomaly` (a reading nobody can explain yet, resolved by the explanation;
+   `status`); `measurement` began the same way, in several stores, before it
+   became a default. A kind adds only a name and its description: the bits are
+   all symbion acts on. The name pays when someone filters by it (`list
+   --kind`), or when it gives a class its own place at session start, which
+   deals one open entry of each kind in turn. A topic is a tag, not a kind.
+   `[kinds]` replaces the defaults, so a new kind goes in beside the defaults
+   the project keeps, with a `when` line: `symbion schema` prints it to every
+   writer choosing a kind. A label renamed once entries use it needs the one-time
+   `sed` the starter `symbion.toml` gives.
+
+5. **Target types.** `item:` takes any name, and a near spelling of one is a
+   second item. When several candidates are members of one kind of object (a
+   host, a test, a metric, a board), that kind earns a catalog type of its
+   own. Its names then match one list, a misspelling gets a `did you mean`,
+   `arc seed` makes one task per member, and `arc reconcile` notices a member
+   that left the list.
+
+   The list usually exists already, somewhere the project keeps it. Catalogs
+   in use print:
+   - the hosts in an inventory file (`grep -E '^[a-z]' inventory.txt`);
+   - the keys of a JSON file the project generates (`jq -r '.runs | keys[]'
+     out/runs.json`);
+   - a registry in the project's code (`python3 -c 'import m;
+     print(*m.REGISTRY, sep="\n")'`);
+   - the directories that hold a marker file (`git ls-files '*/agent.yaml' |
+     sed 's#/agent.yaml##'`);
+   - test ids (`catalogs.md`, "Seed");
+   - a fixed list typed in place, for hardware serials (`printf '%s\n' A1 B2`);
+   - a narrower or wider `file`: code only (`… '*.py' '*.sh'`), or a
+     gitignored file entries attach to (`… --others --ignored --exclude-standard
+     -- CLAUDE.md`).
+
+   A resolver comes with a catalog whose names the built-in match gets wrong:
+   - numbers, where a near value becomes a second target (`3.1416` is not a
+     substring of `3.14159`);
+   - names with aliases or formats (a domain with and without `www.`, a
+     version as `v1.2` or `1.2.0`), which the resolver reduces to one form;
+   - a set no list holds yet (people, places): a catalog over the names entries
+     already use, whose resolver mints the canonical form at the first
+     sighting.
+
+   When the list's names change by plan (a migration renames every metric),
+   `[renames] TYPE` maps old to new, and reconcile follows them.
+
+   A kind with a handful of members and no list stays `item`, and so does one
+   whose list no command can print yet. A bootstrap runs `arc seed --scope TYPE
+   --dry-run` on a new type before its first entry: the names it prints are the
+   names entries will match. A long command lives in the store's `tools/`, run as
+   `"$SYMBION_DIR"/tools/x.sh`. A pipe checks its producer with `out=$(…) &&`:
+   `sh` is dash on Debian and Ubuntu, which refuses `set -o pipefail`.
+   `catalogs.md` has the rules for catalogs, resolvers and renames.
+
+6. **The candidate table.** A bootstrap shows the user a table of the
+   candidates (kind, target, one line, source) and waits for their go. An
+   autonomous run with no user to ask writes, and puts the table in its final
+   report. The bootstrap writes the entries as one `add --from-json -` (`add -h`
+   lists the keys), and symbion writes none unless every line passes. Once
+   committed, entries are append-only.
+
+7. **Retiring the sources.** A bootstrap retires every source that migrated,
+   in the same session, so no list survives in two places. A file to delete
+   goes on a list the user runs at the end of this step. An edit in place (a
+   `MEMORY.md` line, a shared file's section) the bootstrap makes itself.
+   - **Scratch.** Untracked: a verbatim copy goes under `<store>/archive/`
+     with `git add -f` (a scratch directory can carry its own `.gitignore` of
+     `*`), and the file goes on the delete list. Tracked: the delete list;
+     git keeps it. First, the bootstrap fixes the tree's references to it,
+     and carries its preamble (what the file was for) into the project
+     `decision` that records the migration. A scratch file shared with other
+     projects is still theirs: after the archive copy, the bootstrap replaces
+     only this project's section, with a pointer naming each new entry.
+   - **The handoff file.** Each item no entry, instruction or memory holds
+     becomes an entry: a trap is its file's `gotcha`, and a practice that names
+     the failure behind it is a `task` tagged `practice` on the instruction
+     file it belongs in. The bootstrap copies the file to `<store>/archive/`
+     and puts it on the delete list now, by hand: a tool that rewrites it at
+     session end keeps the migrated threads in it. From then on the wrap's
+     commit message is the handoff (`wrap.md`). With continuity 0.21.0 or
+     later, sessions end with `/wrap -j`, which writes no handoff file. With an
+     older continuity the file stays, its open-threads section replaced by one
+     naming this store and the commands that read it.
+   - **Claude Code auto-memory** (`~/.claude/projects/<slug>/memory/`), where
+     the project uses it. The bootstrap copies migrated topic files to
+     `<store>/archive/claude-memory/`, puts them on the delete list, and
+     removes their `MEMORY.md` lines. `MEMORY.md` then states the split: memory
+     keeps how to work with the user and context no object holds; the rest is a
+     entry. Auto-memory stays on. A memory dir copied when this repo was carved
+     from another holds that project's files too, and a pair may have drifted:
+     the bootstrap compares each pair with `cmp`, archives the superset, and
+     lists only the subset copies for deletion.
+   - **Entries in another store.** Each entry that moved gets `symbion --dir <store>
+     resolve <id> --body "moved: <new id>"`, then `symbion --dir <store>
+     commit`. A plain entry has no status: it takes `supersede <id> --add-tag
+     retired --append --body …`. When both projects touch the object (a shared
+     host), the migration's `decision` names the store that owns it.
+
+   **The deletes are the user's to run.** An agent's own `rm` over migrated
+   sources can be refused as irreversible, an `echo rm` dry run included, and
+   one refusal forbids the delete by every other route. So the bootstrap runs
+   `symbion commit` first: it names any path under `archive/` that git ignored,
+   and the `git add -f` that takes it. Then it makes two checks for each copy:
+   `cmp` against its archived twin says the copy is faithful, and `git -C
+   <store> ls-tree -r --name-only HEAD archive/<src> | wc -l` against `find
+   <src> -type f | wc -l` says the commit holds it. `cmp` alone passes on a
+   copy git ignored, and `git ls-files` on one staged and never committed. The
+   bootstrap ends the step on the list and one line to run, `rm -r -- <paths>`,
+   with the word that the copies are archived and committed.
+
+   Last, it writes at least one `check --external` on the migration: what the
+   check covers is the store, not the repo.

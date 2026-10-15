@@ -54,7 +54,7 @@ def test_counts_stay_exact_when_the_listing_is_capped(tmp_path):
         store.add(tmp_path, kind="bug", target={"type": "item", "name": f"a{i}"},
                   tags=["priority"])
     data = summary.summary(tmp_path, cfg)
-    assert data["open"]["bug"] == 25, "the cap must hide rows, never change a count"
+    assert data["open"]["bug"] == 25, "the cap must hide entries, never change a count"
     assert len(data["priority"]) == 10
     assert data["priority_elided"] == 15
 
@@ -335,7 +335,7 @@ def test_summary_reports_unreadable_rows_with_the_first_error(tmp_path):
     d = summary.summary(tmp_path, cfg)
     assert d["unreadable"] == 1
     assert d["unreadable_first"].startswith("line 2: ")
-    assert "1 row unreadable, first: line 2: " in summary.render_summary(d)
+    assert "1 entry unreadable, first: line 2: " in summary.render_summary(d)
 
 
 def test_summary_is_silent_about_unreadable_rows_when_there_are_none(tmp_path):
@@ -809,11 +809,28 @@ def test_the_due_block_lists_past_due_and_due_soon_open_rows_once(tmp_path):
         (parked, "overdue today"), (soon, "due in 3d")]
     assert data["due_elided"] == 0
     listed = {p["id"] for p in data["priority"]} | {h["id"] for h in data["heads"]}
-    assert not listed & {d["id"] for d in data["due"]}, "a due row prints once"
+    assert not listed & {d["id"] for d in data["due"]}, "a due entry prints once"
     assert far in {h["id"] for h in data["heads"]}
     text = summary.render_summary(data)
     assert text.splitlines()[1].startswith("  overdue 2d [task, arc a] item:in-arc"), \
         "the due block leads, right under the header"
+
+
+def test_a_parked_row_reaches_the_due_block_on_its_date_not_a_week_before(tmp_path):
+    """A parked entry's date is when to come back to it. "Park it, come back
+    next week" with a date 5 days out put it in the summary that day, for 5 of
+    5 fresh agents (2026-10-14). From its date on it shows until it is
+    resolved or re-dated; a status entry keeps its week's notice."""
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    t = {"type": "item", "name": None}
+    add = lambda name, **kw: store.add(tmp_path, target=t | {"name": name}, **kw).id
+    add("later", kind="idea", due="2026-09-27")
+    today = add("today", kind="idea", due="2026-09-24")
+    past = add("past", kind="idea", due="2026-09-20")
+    task = add("task", kind="task", due="2026-09-27")
+    due = summary.due_soon(store.heads(store.load(tmp_path)), now)
+    assert [n.id for n, _ in due] == [past, today, task]
 
 
 def test_the_persons_line_is_the_header_the_soonest_due_row_and_the_gui(tmp_path):
@@ -823,15 +840,15 @@ def test_the_persons_line_is_the_header_the_soonest_due_row_and_the_gui(tmp_path
     store.add(tmp_path, kind="task", target=t, body="late\nsecond line")
     data = summary.summary(tmp_path, cfg)
     header = summary.render_summary(data).splitlines()[0]
-    assert summary.one_line(data) == header, "no due row, no serve: the header alone"
+    assert summary.one_line(data) == header, "no due entry, no serve: the header alone"
     store.add(tmp_path, kind="task", target=t, due="2000-01-01")
     data = summary.summary(tmp_path, cfg)
     assert summary.one_line(data) == (summary.render_summary(data).splitlines()[0]
-                                      + f"; 1 row {data['due'][0]['phrase']}")
+                                      + f"; 1 entry {data['due'][0]['phrase']}")
     store.add(tmp_path, kind="task", target=t, due="2001-01-01")
     data = summary.summary(tmp_path, cfg) | {"gui": "http://127.0.0.1:1"}
     assert summary.one_line(data).endswith(
-        f"; 2 rows due, the first {data['due'][0]['phrase']} · http://127.0.0.1:1")
+        f"; 2 entries due, the first {data['due'][0]['phrase']} · http://127.0.0.1:1")
 
 
 def test_the_due_block_is_capped_and_says_how_many_it_hid(tmp_path):
@@ -858,8 +875,8 @@ def test_seams_mark_where_each_append_and_prepend_joins_the_heads_body():
     by_id, head = _versions(("ada", "lead"), ("sam", "lead\n\nmore"),
                             ("kim", "top\n\nlead\n\nmore"))
     got = summary.seams(by_id, head)
-    assert got == [(5, "kim", "2026-10-03T00:00:00+00:00", True),
-                   (9, "sam", "2026-10-02T00:00:00+00:00", False)]
+    assert got == [(5, "kim", "2026-10-03T00:00:00+00:00", True, False),
+                   (9, "sam", "2026-10-02T00:00:00+00:00", False, False)]
     assert [head.body[a:b] for a, b in pairwise([0, 5, 9, None])] == \
         ["top\n\n", "lead", "\n\nmore"]
 
@@ -867,14 +884,14 @@ def test_seams_mark_where_each_append_and_prepend_joins_the_heads_body():
 def test_a_rewrite_drops_the_seams_whose_words_it_cut_and_an_unchanged_body_keeps_them():
     t2 = "2026-10-02T00:00:00+00:00"
     kept = _versions(("ada", "a"), ("sam", "a\n\nb"), ("kim", "a\n\nb"))
-    assert summary.seams(*kept) == [(1, "sam", t2, False)]
+    assert summary.seams(*kept) == [(1, "sam", t2, False, False)]
     # A seam stays beside the kept words on either side of it.
     above = _versions(("ada", "one two three"), ("sam", "one two three\n\nfour five six seven"),
                       ("kim", "one two three\n\nFour five six seven"))
-    assert summary.seams(*above) == [(13, "sam", t2, False)]
+    assert summary.seams(*above) == [(13, "sam", t2, False, False)]
     below = _versions(("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
                       ("kim", "one two THREE\n\nfour five six"))
-    assert summary.seams(*below) == [(13, "sam", t2, False)]
+    assert summary.seams(*below) == [(13, "sam", t2, False, False)]
     rewritten = _versions(("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
                           ("kim", "One Two three\n\nFour Five six"))
     assert summary.seams(*rewritten) == []
@@ -885,14 +902,14 @@ def test_a_rewrite_drops_the_seams_whose_words_it_cut_and_an_unchanged_body_keep
     # An append that went on with the sentence put its seam inside a word.
     inside = _versions(("ada", "filter as you type"), ("sam", "filter as you type, then search"),
                        ("kim", "Filter as you type, then search\n\nok"))
-    assert summary.seams(*inside) == [(18, "sam", t2, False),
-                                      (31, "kim", "2026-10-03T00:00:00+00:00", False)]
+    assert summary.seams(*inside) == [(18, "sam", t2, False, False),
+                                      (31, "kim", "2026-10-03T00:00:00+00:00", False, True)]
     # The edit took back what the seam marked.
     taken = _versions(("ada", "one two three"), ("sam", "one two three #gui\n"),
                       ("kim", "one two three"))
     assert summary.seams(*taken) == []
     after = _versions(("ada", "a"), ("sam", "x"), ("kim", "x\n\nc"))
-    assert summary.seams(*after) == [(1, "kim", "2026-10-03T00:00:00+00:00", False)]
+    assert summary.seams(*after) == [(1, "kim", "2026-10-03T00:00:00+00:00", False, False)]
     # A body written into an empty row is its first text, not an amendment.
     assert summary.seams(*_versions(("ada", ""), ("sam", "b"))) == []
 
@@ -903,11 +920,11 @@ def test_an_edit_that_also_writes_a_paragraph_below_gets_a_seam_before_it():
     t2, t3 = "2026-10-02T00:00:00+00:00", "2026-10-03T00:00:00+00:00"
     by_id, head = _versions(("ada", "Pick a or b. Answer with resolve.\n"),
                             ("sam", "Pick a or b.\n\nb, since a misleads."))
-    assert summary.seams(by_id, head) == [(12, "sam", t2, False)]
+    assert summary.seams(by_id, head) == [(12, "sam", t2, False, True)]
     # An edit in the middle, then a paragraph below.
     by_id, head = _versions(("ada", "teh first part\n\nsome more text"),
                             ("sam", "the first part\n\nsome more text\n\nan answer"))
-    assert summary.seams(by_id, head) == [(30, "sam", t2, False)]
+    assert summary.seams(by_id, head) == [(30, "sam", t2, False, True)]
     # A fix inside the last paragraph writes no paragraph of its own.
     assert summary.seams(*_versions(("ada", "one two three\n\nteh end of it"),
                                     ("sam", "one two three\n\nthe end of it"))) == []
@@ -916,7 +933,7 @@ def test_an_edit_that_also_writes_a_paragraph_below_gets_a_seam_before_it():
     # The text below an earlier seam rewritten: the new seam takes its place.
     by_id, head = _versions(("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
                             ("kim", "one two three\n\nseven eight nine"))
-    assert summary.seams(by_id, head) == [(13, "kim", t3, False)]
+    assert summary.seams(by_id, head) == [(13, "kim", t3, False, True)]
 
 
 def test_the_amendment_count_is_the_seams_below_the_body():
@@ -935,12 +952,12 @@ def test_one_link_that_adds_above_and_below_gets_a_seam_at_each_end():
     both seams."""
     by_id, head = _versions(("ada", "lead"), ("sam", "x"), ("kim", "top\n\nx\n\nend"))
     t = "2026-10-03T00:00:00+00:00"
-    assert summary.seams(by_id, head) == [(5, "kim", t, True), (6, "kim", t, False)]
+    assert summary.seams(by_id, head) == [(5, "kim", t, True, False), (6, "kim", t, False, False)]
     # A newline is not an amendment: a seam marks text on its side.
     by_id, head = _versions(("ada", "x"), ("sam", "top\n\nx\n"))
-    assert summary.seams(by_id, head) == [(5, "sam", "2026-10-02T00:00:00+00:00", True)]
+    assert summary.seams(by_id, head) == [(5, "sam", "2026-10-02T00:00:00+00:00", True, False)]
     by_id, head = _versions(("ada", "x"), ("sam", "\n\nx\n\nend"))
-    assert summary.seams(by_id, head) == [(3, "sam", "2026-10-02T00:00:00+00:00", False)]
+    assert summary.seams(by_id, head) == [(3, "sam", "2026-10-02T00:00:00+00:00", False, False)]
 
 
 def test_summary_names_the_last_wrap_and_the_repo_commits_since(tmp_path):
@@ -973,7 +990,7 @@ def test_summary_names_the_last_wrap_and_the_repo_commits_since(tmp_path):
     w = d["wrap"]
     assert w["gist"] == "the gist" and w["body"] == "the day, in a paragraph"
     assert w["author"] == "ada" and w["commits_since"] == 1
-    assert w["at"].endswith("+00:00"), "a stamp in the row's zone, not the committer's"
+    assert w["at"].endswith("+00:00"), "a stamp in the entry's zone, not the committer's"
     text = summary.render_summary(d)
     assert "  last wrap by ada, just now, 1 commit since: the gist\n    the day, in a paragraph" in text
     assert "Rows:" not in text and "Wrap:" not in text

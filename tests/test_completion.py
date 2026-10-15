@@ -55,7 +55,7 @@ def test_completion_prints_shell_code_outside_a_repo(tmp_path, monkeypatch, caps
 
 
 def test_verbs_complete_outside_a_repo(tmp_path):
-    assert tab("symbion ar", tmp_path) == {"arc": "campaigns: a checklist of rows across objects"}
+    assert tab("symbion ar", tmp_path) == {"arc": "campaigns: a checklist of entries across objects"}
 
 
 def test_kinds_are_the_store_s_own_with_their_when(tmp_path):
@@ -91,7 +91,7 @@ def test_tags_complete_with_their_counts(tmp_path):
     for tags in (["ux"], ["ux", "cli"]):
         _main(d, "add", "note", "--target", "item:x", "--body", "n",
               *(a for t in tags for a in ("--tag", t)))
-    assert tab(f"symbion --dir {d.as_posix()} list --tag ", tmp_path) == {"ux": "2 rows", "cli": "1 row"}
+    assert tab(f"symbion --dir {d.as_posix()} list --tag ", tmp_path) == {"ux": "2 entries", "cli": "1 entry"}
 
 
 def test_dir_on_the_line_names_the_store_for_arcs(tmp_path):

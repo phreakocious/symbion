@@ -51,7 +51,7 @@ def test_every_filter_key_is_a_real_store_query_kwarg():
 
 def test_describe_names_filters_in_url_words_not_kwarg_words():
     """The heading has to match the URL the reader is looking at."""
-    assert filters.describe({}) == "All notes"
+    assert filters.describe({}) == "All entries"
     assert filters.describe({"target_type": "file"}) == "type=file"
     assert filters.describe({"kind": "check", "tag": "ci"}) == "kind=check · tag=ci"
 

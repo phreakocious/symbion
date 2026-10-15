@@ -2,7 +2,7 @@ import os
 import subprocess
 from pathlib import Path
 import pytest
-from symbion import config
+from symbion import catalog, config
 
 
 def _git(cwd, *args):
@@ -55,7 +55,7 @@ def test_load_with_no_config_file_returns_defaults(repo, tmp_path):
     store = tmp_path / "myproj-notes"
     store.mkdir()
     cfg = config.load(store, project_root=repo)
-    assert cfg.catalogs == {}
+    assert cfg.catalogs == {"doc": catalog.DOC_CATALOG}   # built in
     assert cfg.default_branch == "main"
     assert cfg.provenance_command is None
     assert cfg.command_timeout == 30
@@ -70,7 +70,7 @@ def test_load_reads_catalogs_and_renames(repo, tmp_path):
     (store / "symbion.toml").write_text(
         '[catalogs]\nfile = "git ls-files"\n\n[renames]\nfile = "git"\n')
     cfg = config.load(store, project_root=repo)
-    assert cfg.catalogs == {"file": "git ls-files"}
+    assert cfg.catalogs == {"file": "git ls-files", "doc": catalog.DOC_CATALOG}
     assert cfg.renames == {"file": "git"}
 
 
