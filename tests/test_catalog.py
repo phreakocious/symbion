@@ -345,3 +345,17 @@ def test_match_announces_a_substring_pick_but_not_an_exact_one(tmp_path, capsys)
         "note: 'SRC/CLI.PY' resolved to 'src/cli.py' (same name but for case in the t catalog)\n"
     catalog.match(c, "t", "nothing", ["src/parser.py"])
     assert "matches nothing in the t catalog; taken as typed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("git_dir", ["cmd", "mingw64/bin", "ucrt64/bin"])
+def test_posix_sh_finds_git_for_windows_sh_from_any_of_its_gits(tmp_path, monkeypatch, git_dir):
+    """Git Bash puts Git/mingw64/bin, or Git/ucrt64/bin from Git 2.5x, ahead of
+    Git/cmd: a git from there, with no sh on PATH, found no sh beside it, and
+    every configured command refused (windows-latest, 2026-10-15)."""
+    git = tmp_path / "Git" / git_dir / "git.exe"
+    sh = tmp_path / "Git" / "bin" / "sh.exe"
+    for f in (git, sh):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("")
+    monkeypatch.setattr(catalog.shutil, "which", {"git": str(git)}.get)
+    assert catalog.posix_sh() == str(sh.resolve())

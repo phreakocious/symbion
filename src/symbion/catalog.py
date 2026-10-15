@@ -32,14 +32,17 @@ def nfc(s):
 
 def posix_sh() -> str | None:
     """The sh a configured command runs in on Windows: one on PATH, else the
-    one Git for Windows installs beside its git (Git/cmd/git.exe beside
-    Git/bin/sh.exe). Its installer puts only Git/cmd on PATH."""
+    one Git for Windows installs beside its git: Git/bin/sh.exe, from
+    Git/cmd/git.exe (its installer puts only Git/cmd on PATH) or from
+    Git/mingw64/bin or Git/ucrt64/bin (Git Bash puts those first)."""
     found = shutil.which("sh")
     if found:
         return found
     git = shutil.which("git")
-    sh = Path(git).resolve().parents[1] / "bin" / "sh.exe" if git else None
-    return str(sh) if sh and sh.exists() else None
+    for d in Path(git).resolve().parents[1:3] if git else ():
+        if (d / "bin" / "sh.exe").exists():
+            return str(d / "bin" / "sh.exe")
+    return None
 
 
 # The store's own docs/, built in so `--ref doc:NAME` holds in every store: a
