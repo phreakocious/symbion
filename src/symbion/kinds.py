@@ -32,7 +32,7 @@ DEFAULT_KINDS: dict[str, Kind] = {
     "decision": Kind(when="an ADR: a judgment call not obvious from the diff"),
     "bug": Kind(status=True, when="a known-broken thing to return to; resolve when fixed"),
     "task": Kind(status=True, when="a concrete next action; with --arc-id, a checklist box in that arc"),
-    "question": Kind(status=True, when="needs the user's answer before work can proceed; resolve --body adds the answer below it"),
+    "question": Kind(status=True, when="needs the user's answer before work can proceed; --option gives each answer, the default first; resolve --body adds the answer below it"),
     "idea": Kind(status=True, parked=True, when="a parked thought; resolve --add-tag adopted or retired, --body says why"),
     "check": Kind(verdict=True, when="a dated verification: --checked what ran, --result what it said"),
     "measurement": Kind(verdict=True, when="a number and what produced it, compared over time: --measure KEY=VALUE for each count; a pending half is its own task or prediction"),

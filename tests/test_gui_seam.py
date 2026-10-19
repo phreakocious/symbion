@@ -38,6 +38,7 @@ ALLOWED_STORE_READS = {
     "STATUSES", "BUILTIN_TARGET_TYPES",
     "UndoRefused", "undo_words",                 # api.undo's refusal, and its words
     "RefsDropped",                               # api.supersede's refusal under keep_refs
+    "Twin",                                      # api.add's refusal of an uncommitted twin
     "undoable", "note_from_dict",                # the undo button's read, and its dialog's rows
 }
 

@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 471" width="960" height="471" xml:space="preserve" role="img" aria-labelledby="title">
-<title id="title">symbion at session start: the hook hands Claude Code the open rows; asked to work them, it fixes the bug, resolves its row, and hands the question back.</title>
+<title id="title">symbion at session start: the hook hands Claude Code the open entries; asked to work them, it fixes the bug, resolves its entry, and hands the question back.</title>
 <!-- Geist Mono: Copyright (c) 2023 Vercel, in collaboration with basement.studio.
      Embedded unmodified under the SIL Open Font License 1.1 (https://openfontlicense.org). -->
 <style>
@@ -148,7 +148,7 @@ text{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospa
 <path d="M0.5 34V12.5A12 12 0 0 1 12.5 0.5H947.5A12 12 0 0 1 959.5 12.5V34Z" fill="#1e1e2e"/>
 <path d="M0.5 34.5H959.5" stroke="#313244"/>
 <text x="20" y="22" fill="#a6adc8" style="font-size:12px">claude · ~/myapp</text>
-<g class="a hk"><path d="M44.0 52V61h7" fill="none" stroke="#6c7086" stroke-width="1.4"/><text x="69.0" y="65"><tspan fill="#7f849c">SessionStart:startup says: </tspan><tspan fill="#a6adc8">symbion: open outside arcs: bug 1, task 1, question 1;</tspan></text><text x="69.0" y="90"><tspan fill="#a6adc8">1 row due in 2d · http://127.0.0.1:29213</tspan></text></g>
+<g class="a hk"><path d="M44.0 52V61h7" fill="none" stroke="#6c7086" stroke-width="1.4"/><text x="69.0" y="65"><tspan fill="#7f849c">SessionStart:startup says: </tspan><tspan fill="#a6adc8">symbion: open outside arcs: bug 1, task 1, question 1, prediction 0;</tspan></text><text x="69.0" y="90"><tspan fill="#a6adc8">1 entry due in 2d · http://127.0.0.1:26186</tspan></text></g>
 <g class="a box"><rect x="24" y="104" width="285.0" height="30" rx="4" fill="#1e1e2e"/><text x="36" y="124"><tspan fill="#a6adc8">&gt; </tspan></text></g>
 <text x="54.0" y="124" fill="#cdd6f4"><tspan class="t c0">w</tspan><tspan class="t c1">o</tspan><tspan class="t c2">r</tspan><tspan class="t c3">k</tspan><tspan class="t c4"> </tspan><tspan class="t c5">w</tspan><tspan class="t c6">h</tspan><tspan class="t c7">a</tspan><tspan class="t c8">t</tspan><tspan class="t c9">&#x27;</tspan><tspan class="t c10">s</tspan><tspan class="t c11"> </tspan><tspan class="t c12">o</tspan><tspan class="t c13">p</tspan><tspan class="t c14">e</tspan><tspan class="t c15">n</tspan><tspan class="t c16"> </tspan><tspan class="t c17">i</tspan><tspan class="t c18">n</tspan><tspan class="t c19"> </tspan><tspan class="t c20">s</tspan><tspan class="t c21">y</tspan><tspan class="t c22">m</tspan><tspan class="t c23">b</tspan><tspan class="t c24">i</tspan><tspan class="t c25">o</tspan><tspan class="t c26">n</tspan></text>
 <rect class="cur k0" x="55.0" y="111" width="8.0" height="17" fill="#cdd6f4"/>
@@ -179,7 +179,7 @@ text{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospa
 <rect class="cur k25" x="280.0" y="111" width="8.0" height="17" fill="#cdd6f4"/>
 <rect class="cur k26" x="289.0" y="111" width="8.0" height="17" fill="#cdd6f4"/>
 <rect class="cur k27" x="298.0" y="111" width="8.0" height="17" fill="#cdd6f4"/>
-<g class="a a1"><circle cx="28.5" cy="153" r="4" fill="#cdd6f4"/><text x="42.0" y="158"><tspan fill="#cdd6f4">Three rows are open: a bug, a task and a question. The bug first.</tspan></text></g>
+<g class="a a1"><circle cx="28.5" cy="153" r="4" fill="#cdd6f4"/><text x="42.0" y="158"><tspan fill="#cdd6f4">Three entries are open: a bug, a task and a question. The bug first.</tspan></text></g>
 <g class="a a2"><circle cx="28.5" cy="186" r="4" fill="#a6e3a1"/><text x="42.0" y="191"><tspan fill="#cdd6f4" font-weight="600">Bash</tspan><tspan fill="#a6adc8">(symbion show 478284-d21)</tspan></text></g>
 <g class="a a2r"><path d="M44.0 203V212h7" fill="none" stroke="#6c7086" stroke-width="1.4"/><text x="69.0" y="216"><tspan fill="#a6adc8">bug      item:sync [open]  20261008-192327-478284-d21</tspan></text></g>
 <g class="a a3"><circle cx="28.5" cy="236" r="4" fill="#a6e3a1"/><text x="42.0" y="241"><tspan fill="#cdd6f4" font-weight="600">Update</tspan><tspan fill="#a6adc8">(src/sync.py)</tspan></text></g>
@@ -188,6 +188,6 @@ text{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospa
 <g class="a a4r"><path d="M44.0 303V312h7" fill="none" stroke="#6c7086" stroke-width="1.4"/><text x="69.0" y="316"><tspan fill="#a6adc8">213 passed</tspan></text></g>
 <g class="a a5"><circle cx="28.5" cy="336" r="4" fill="#a6e3a1"/><text x="42.0" y="341"><tspan fill="#cdd6f4" font-weight="600">Bash</tspan><tspan fill="#a6adc8">(git commit -am &quot;sync: time out the ssh step&quot;)</tspan></text></g>
 <g class="a a6"><circle cx="28.5" cy="361" r="4" fill="#a6e3a1"/><text x="42.0" y="366"><tspan fill="#cdd6f4" font-weight="600">Bash</tspan><tspan fill="#a6adc8">(symbion resolve 478284-d21 --ref commit:HEAD)</tspan></text></g>
-<g class="a a6r"><path d="M44.0 378V387h7" fill="none" stroke="#6c7086" stroke-width="1.4"/><text x="69.0" y="391"><tspan fill="#a6adc8">20261010-094137-753816-061</tspan></text></g>
+<g class="a a6r"><path d="M44.0 378V387h7" fill="none" stroke="#6c7086" stroke-width="1.4"/><text x="69.0" y="391"><tspan fill="#a6adc8">20261008-192327-478284-d21</tspan></text></g>
 <g class="a a7"><circle cx="28.5" cy="419" r="4" fill="#cdd6f4"/><text x="42.0" y="424"><tspan fill="#cdd6f4">Fixed and resolved. </tspan><tspan fill="#cba6f7">The question is yours:</tspan><tspan fill="#cdd6f4"> ship the web UI in the default install,</tspan></text><text x="42.0" y="449"><tspan fill="#cdd6f4">or keep it behind [gui]?</tspan></text></g>
 </svg>

@@ -81,7 +81,7 @@ def test_the_installed_codex_hook_reads_its_session_cwd_as_codex(tmp_path, monke
     subprocess.run([sys.executable, "-c",
                     'from symbion.cli import main; main(["init", "--agent", "codex", "--yes"])'],
                    cwd=project, check=True, capture_output=True)
-    for author, body in (("codex", "my parked idea"), ("human", "owner parked idea")):
+    for author, body in (("codex", "my parked idea"), ("human", "user parked idea")):
         store.add(notes, kind="idea", target={"type": "project", "name": None},
                   author=author, body=body, status="open")
     handler = json.loads((Path.home() / ".codex/hooks.json").read_text()
@@ -99,7 +99,7 @@ def test_the_installed_codex_hook_reads_its_session_cwd_as_codex(tmp_path, monke
                             input=json.dumps({"cwd": str(project), "source": "startup"}),
                             capture_output=True)
     assert result.returncode == 0 and result.stderr == ""
-    assert "owner parked idea" in result.stdout
+    assert "user parked idea" in result.stdout
     assert "my parked idea" not in result.stdout
     # Only the Codex link exists here, and the summary names it.
     assert "~/.agents/skills/symbion/SKILL.md" in result.stdout

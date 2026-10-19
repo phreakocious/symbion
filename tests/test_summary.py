@@ -349,7 +349,7 @@ def test_summary_is_silent_about_unreadable_rows_when_there_are_none(tmp_path):
 
 
 def test_summary_counts_open_questions_and_renders_zero(tmp_path):
-    """Questions are the owner's queue (spec: ad-hoc tags reinvented this
+    """Questions are the user's queue (spec: ad-hoc tags reinvented this
     twice). The zero case is asserted because it is the
     normally-true one: a stuck 0 would read as broken."""
     cfg = Config(project_root=tmp_path)
@@ -412,7 +412,8 @@ def test_summary_counts_every_non_parked_status_kind_under_its_label(tmp_path):
     d = summary.summary(tmp_path, cfg)
     assert d["open"] == {"anomaly": 1}
     assert "open_bugs" not in d
-    assert summary.render_summary(d).splitlines()[0] == "symbion: open outside arcs: anomaly 1"
+    assert summary.render_summary(d).splitlines()[0] == \
+        "symbion: open outside arcs: anomaly 1; 1 parked", "a parked kind is counted apart"
 
 
 def test_summary_open_counts_rows_outside_arcs_only(tmp_path):
@@ -522,6 +523,10 @@ def test_schema_lists_a_resolver_beside_its_catalog(tmp_path):
     assert all("resolver" in t for t in d["targets"])
     text = summary.render_schema(d)
     assert "catalog: cat names" in text and "resolver: bin/resolve" in text
+    cfg = Config(project_root=tmp_path, catalogs={"num": "cat names"}, resolvers={"num": "closed"})
+    text = summary.render_schema(summary.schema(tmp_path, cfg))
+    assert "closed: a name the catalog does not list is refused" in text and "resolver:" not in text, \
+        "`closed` is a keyword, not a command named closed"
 
 
 def test_render_schema_says_the_defaults_are_defaults(tmp_path):
@@ -614,7 +619,7 @@ def test_a_printed_row_the_header_leaves_out_says_why(tmp_path):
     for name, kind, arc in (("idea", "idea", None), ("boxed", "task", aid),
                             ("loose", "task", None)):
         store.add(tmp_path, kind=kind, target={"type": "item", "name": name},
-                  author="owner", arc_id=arc)
+                  author="human", arc_id=arc)
     data = summary.summary(tmp_path, cfg, reader="claude")
     assert data["open"]["task"] == 1
     lines = summary.render_summary(data).splitlines()
@@ -640,6 +645,25 @@ def test_a_star_says_how_long_it_has_been_on(tmp_path, monkeypatch):
     assert "[decision, starred 12d ago]" in summary.render_summary(data)
     data = summary.summary(tmp_path, cfg, _now=t0 + timedelta(hours=1))
     assert "starred" not in summary.render_summary(data)
+
+
+def test_a_star_prints_in_whichever_block_takes_the_row(tmp_path):
+    """Each row prints once, in the waiting block, else the due block, else
+    the priority block, and the first two dropped the star: a box another
+    author starred read `due in 3d from <author> [bug, arc …]` (2026-10-15)."""
+    cfg = Config(project_root=tmp_path)
+    soon = (datetime.now(timezone.utc).date() + timedelta(days=3)).isoformat()
+    for name, author in (("asked", "lead"), ("mine", "claude")):
+        store.add(tmp_path, kind="bug", target={"type": "item", "name": name},
+                  author=author, tags=["priority"], due=soon)
+    data = summary.summary(tmp_path, cfg, reader="claude")
+    assert [r["target"] for r in data["waiting"] + data["due"]] == ["item:asked", "item:mine"]
+    assert data["priority"] == [] and all(
+        r["starred_days"] == 0 for r in data["waiting"] + data["due"])
+    lines = summary.render_summary(data).splitlines()
+    assert any(ln.startswith("  due in 3d priority from lead [bug] item:asked ")
+               for ln in lines), lines
+    assert any(ln.startswith("  due in 3d priority [bug] item:mine ") for ln in lines), lines
 
 
 def test_arc_rows_carry_an_age(tmp_path):
@@ -761,7 +785,7 @@ def test_a_kind_the_header_counts_cannot_be_missing_from_the_heads(tmp_path):
     cap over all of them, so a whole kind could be counted and unlisted:
     measured 2026-09-28 on an adopter store where a bootstrap wrote its two
     `question` rows first and both landed in `+6 more open`, though the kind
-    exists for the owner to see at session start. The heads are dealt one kind
+    exists for the user to see at session start. The heads are dealt one kind
     at a time now. Both directions: every counted kind appears, and the cap
     still holds."""
     cfg = Config(project_root=tmp_path)
@@ -915,7 +939,7 @@ def test_a_rewrite_drops_the_seams_whose_words_it_cut_and_an_unchanged_body_keep
 
 
 def test_an_edit_that_also_writes_a_paragraph_below_gets_a_seam_before_it():
-    """The owner cut a sentence from an agent's question and answered below
+    """The user cut a sentence from an agent's question and answered below
     it in one save: read as a rewrite, the answer joined the question."""
     t2, t3 = "2026-10-02T00:00:00+00:00", "2026-10-03T00:00:00+00:00"
     by_id, head = _versions(("ada", "Pick a or b. Answer with resolve.\n"),
@@ -937,7 +961,7 @@ def test_an_edit_that_also_writes_a_paragraph_below_gets_a_seam_before_it():
 
 
 def test_the_amendment_count_is_the_seams_below_the_body():
-    """A question the owner trimmed and answered in one save read `+1
+    """A question the user trimmed and answered in one save read `+1
     amendment` beside the two seams `show` marked (2026-10-11)."""
     assert summary._amendments(*_versions(
         ("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
@@ -995,3 +1019,50 @@ def test_summary_names_the_last_wrap_and_the_repo_commits_since(tmp_path):
     assert "  last wrap by ada, just now, 1 commit since: the gist\n    the day, in a paragraph" in text
     assert "Rows:" not in text and "Wrap:" not in text
     assert summary.empty_summary()["wrap"] is None
+    assert w["changed"] == []
+
+
+def test_the_wrap_marks_each_entry_it_cites_that_changed_after_it(tmp_path, monkeypatch):
+    """A handoff named a question to pick up first after the user had
+    resolved it, and only a block above it said so (2026-10-16). Each entry
+    the handoff cites that changed after the wrap gets a mark under it: what
+    changed, by whom. An unchanged cite, another store's id and a second cite
+    of one entry add nothing."""
+    r = tmp_path / "p"
+    r.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True)
+    cfg = Config(project_root=r)
+    s = tmp_path / "store"
+    store.ensure_store(s)
+
+    def add(kind, body):
+        return store.add(s, kind=kind, target={"type": "project", "name": None},
+                         body=body, author="agent").id
+    q, t, n = add("question", "ship it?"), add("task", "do it"), add("note", "a fact")
+    assert store.commit(s, f"Next: the answer to {q[-10:]}\n\nRead first: {t[-10:]}, "
+                           f"{n[-10:]}, {q[-10:]}, 999999-abc", cfg, wrap="agent")
+    clock = (f"2099-01-01T00:00:{i:02d}+00:00" for i in range(60))
+    monkeypatch.setattr(store, "_now_iso", lambda: next(clock))
+    store.supersede(s, q, author="human", status="resolved")
+    store.supersede(s, q, author="agent", tags=["later"])       # not the close
+    store.supersede(s, t, author="human", append_body="and this")
+    d = summary.summary(s, cfg)
+    assert [(c["id"], c["what"], c["by"]) for c in d["wrap"]["changed"]] == \
+        [(q[-10:], "resolved", "human"), (t[-10:], "added to", "human")]
+    assert f"    since the wrap: {q[-10:]} resolved by human" in summary.render_summary(d)
+
+
+def test_a_question_prints_its_options_under_its_row(tmp_path):
+    """A question's answers are data (the user, 2026-10-16), so the body no
+    longer names its default in its first 100 characters: the row prints
+    the options under it, in every block, whole, where the body clips."""
+    cfg = Config(project_root=tmp_path)
+    body = "Should the fix ship as checked in one browser alone, or wait for a run in a second one before the cut?"
+    store.add(tmp_path, kind="question", target={"type": "project", "name": None},
+              body=body, author="human", options=["ship as checked", "wait for a second run"])
+    data = summary.summary(tmp_path, cfg, reader="claude")
+    (row,) = data["waiting"]
+    assert row["options"] == ["ship as checked", "wait for a second run"]
+    text = summary.render_summary(data)
+    assert len(body) > summary.HEAD_CHARS and body not in text
+    assert "\n    options: ship as checked | wait for a second run\n" in text + "\n", text

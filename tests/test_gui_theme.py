@@ -71,7 +71,7 @@ def test_text_that_sets_no_colour_takes_the_text_colour():
 
 def test_a_verdict_reads_as_bright_as_a_body():
     """A check with no body showed only its `checked → result` line, as dim
-    11px metadata, beside rows whose body was Text (owner, 2026-10-01: "the
+    11px metadata, beside rows whose body was Text (user, 2026-10-01: "the
     brighter is more correct")."""
     from symbion.gui.theme import DARK_CSS
     assert re.search(r"\.sb-verdict\s*\{[^}]*color:\s*var\(--q-emph\)", DARK_CSS)
@@ -88,6 +88,8 @@ def test_quasars_own_whites_are_themed():
     from symbion.gui.theme import DARK_CSS
     assert re.search(r"\.q-field--dark \.q-field__native[\s,{]", DARK_CSS)
     assert re.search(r"\.q-item--dark\s*\{\s*color:\s*var\(--q-emph\);", DARK_CSS)  # /arcs' archived
+    # an arc's progress track: white at .6 under opacity .4 (2026-10-16)
+    assert re.search(r"\.q-linear-progress__track--dark\s*\{\s*background:\s*var\(--q-", DARK_CSS)
     # A notice with no type carries `.text-white` too: dark text on the dark
     # panel, until its own rule moved into the layer as well.
     layer = re.search(r"@layer overrides\s*\{(.*?)\}\s*\}", DARK_CSS, re.S)
@@ -159,7 +161,7 @@ def test_only_link_chips_light_up_on_hover():
 
 def test_a_row_marks_its_kind_on_one_corner_not_its_whole_left_edge():
     """A full-height left border in the kind's colour read as every other
-    dashboard's (owner, 2026-10-01). The mark is a bend at the top-left
+    dashboard's (user, 2026-10-01). The mark is a bend at the top-left
     corner and a run along the top that trails off in dashes."""
     from symbion.gui.theme import DARK_CSS
     css = re.sub(r"/\*.*?\*/", "", DARK_CSS, flags=re.S)
@@ -174,7 +176,7 @@ def test_a_row_marks_its_kind_on_one_corner_not_its_whole_left_edge():
 def test_the_browsers_own_widgets_are_dark():
     """The browser draws a datalist's dropdown (the composer's names), the
     scrollbars and autofill itself, outside any CSS but `color-scheme`; with
-    none declared they came out light on the dark page (the owner,
+    none declared they came out light on the dark page (the user,
     2026-10-01). Declared in the first-paint style, so no light frame."""
     from symbion.gui.theme import root_vars_css
     assert re.search(r":root\{[^}]*color-scheme:dark", root_vars_css())
@@ -190,12 +192,75 @@ def _ratio(a: str, b: str) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
-def _bodies(selector: str) -> list[str]:
-    """The bodies of every DARK_CSS rule whose selector list holds `selector`."""
+def _rules() -> list[tuple[list[str], str]]:
+    """Each DARK_CSS rule as (its selectors, its body), comments dropped."""
     from symbion.gui.theme import DARK_CSS
     css = re.sub(r"/\*.*?\*/", "", DARK_CSS, flags=re.S)
-    return [body for sels, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
-            if selector in (" ".join(s.split()) for s in sels.split(","))]
+    return [([" ".join(s.split()) for s in sels.split(",")], body)
+            for sels, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)]
+
+
+def _bodies(selector: str) -> list[str]:
+    """The bodies of every DARK_CSS rule whose selector list holds `selector`."""
+    return [body for sels, body in _rules() if selector in sels]
+
+
+def _ground(body: str, q: dict) -> str:
+    """The ground a rule's words sit on: its own wash over a card, its own
+    background, else a card's."""
+    from symbion.gui.theme import PALETTE
+    if w := re.search(r"background(?:-color)?:\s*color-mix\(in srgb, var\(--q-([a-z-]+)\) (\d+)%",
+                      body):
+        wash, t = q[w[1]], int(w[2]) / 100
+        return "#" + "".join(f"{round(int(wash[i:i + 2], 16) * t + int(PALETTE.bg_panel[i:i + 2], 16) * (1 - t)):02x}"
+                             for i in (1, 3, 5))
+    if s := re.search(r"background(?:-color)?:\s*var\(--q-([a-z-]+)\)", body):
+        return q[s[1]]
+    return PALETTE.bg_panel
+
+
+# Not words on a card: a mark, whose floor is 3:1 (WCAG 2, 1.4.11), or dark
+# text on a filled control, whose ground is the control's own colour.
+_NOT_WORDS = (".sb-sep", ".text-dim", ".sb-docs > .q-icon", ".q-btn.text-white")
+
+
+def test_every_rule_that_sets_a_colour_reads_at_4_5_to_1():
+    """An amendment's who-and-when was `dim` on the card, 3.6:1, and a
+    deleted block's words `muted` on a red wash, 4.3:1 (measured 2026-10-16):
+    text needs 4.5:1 (WCAG 2, 1.4.3). Three selectors named by hand missed
+    every rule added after them, so each rule that sets a palette colour is
+    read on its own ground, else a card's."""
+    from symbion.gui.theme import quasar_colors
+    q = {k.replace("_", "-"): v for k, v in quasar_colors().items()}
+    read, low = 0, []
+    for sels, body in _rules():
+        m = re.search(r"(?<![-\w])color:\s*var\(--q-([a-z-]+)\)", body)
+        if not m or m[1] not in q or any(s in sels for s in _NOT_WORDS):
+            continue
+        read += 1
+        if (r := _ratio(q[m[1]], ground := _ground(body, q))) < 4.5:
+            low.append((sels, m[1], ground, round(r, 2)))
+    assert read > 100 and not low, (read, low)
+
+
+def test_a_wash_over_a_whole_card_steps_its_small_words_up():
+    """The peek's pick washed its card in the accent, and the card's small
+    words, `muted`, read 4.21:1 on the wash (2026-10-16). The words are other
+    rules', so the rule that washes a card re-maps `--q-muted` to a step up."""
+    from symbion.gui.theme import quasar_colors
+    q = {k.replace("_", "-"): v for k, v in quasar_colors().items()}
+    card = re.compile(r"(\.[\w-]+ )*\.sb-note(\.[\w-]+|:[\w-]+)*")
+    washes = [(sels, body) for sels, body in _rules()
+              if any(card.fullmatch(s) for s in sels) and "color-mix" in _background(body)]
+    assert washes, "the pick's wash is one"
+    for sels, body in washes:
+        if _ratio(q["muted"], _ground(body, q)) < 4.5:
+            assert re.search(r"--q-muted:\s*var\(--q-(body|emph)\)", body), sels
+
+
+def _background(body: str) -> str:
+    m = re.search(r"background(?:-color)?:\s*([^;]+)", body)
+    return m[1] if m else ""
 
 
 def test_the_contrast_ratio_is_wcags():
@@ -205,6 +270,30 @@ def test_the_contrast_ratio_is_wcags():
     assert round(_ratio("#ffffff", "#000000"), 2) == 21
     assert round(_ratio(PALETTE.text_muted, PALETTE.bg_panel), 2) == 4.75
     assert _ratio(PALETTE.border_hi, PALETTE.bg_panel) < 3
+
+
+def test_code_takes_the_palette_and_reads_on_its_ground():
+    """Fenced code took the github-dark NiceGUI serves (the user, 2026-10-16:
+    "palette code"). Each token's colour is a Mocha hue or a text step and
+    reads 4.5:1 on a block's ground; no github-dark token rule is left
+    standing, and a diff's lines take the palette's washes."""
+    from pygments.formatters import HtmlFormatter
+
+    from symbion import kinds, term
+    from symbion.gui.theme import DARK_CSS, PALETTE
+    rules = re.findall(r"body\.body--dark \.codehilite \.(\w+) \{([^}]*)\}", DARK_CSS)
+    theirs = re.findall(r"\.body--dark \.codehilite \.(\w+) \{", HtmlFormatter(
+        style="github-dark").get_style_defs(".body--dark .codehilite"))
+    assert set(theirs) - {cls for cls, _ in rules} == {"hll"}   # a line pick: never drawn
+    def six(h):                       # pygments writes #ff0000 as #F00
+        return "#" + (h if len(h) == 6 else "".join(c * 2 for c in h)).lower()
+    inks = {six(h) for _, body in rules
+            for h in re.findall(r"(?<![-\w])color:\s*#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{3})\b", body)}
+    assert inks and inks <= set(kinds.COLORS.values()) | {term.TEXT, term.BODY}, inks
+    assert min(_ratio(c, PALETTE.bg_raise) for c in inks) >= 4.5, \
+        sorted((round(_ratio(c, PALETTE.bg_raise), 2), c) for c in inks)[:3]
+    assert {cls for cls, body in rules
+            if re.search(r"(?<![-\w])background:\s*color-mix", body)} == {"gd", "gi"}
 
 
 def test_the_empty_resolve_ring_is_a_control_a_reader_can_see():
@@ -274,3 +363,11 @@ def test_a_link_inside_prose_is_underlined():
     assert _ratio(PALETTE.accent, PALETTE.text_emph) < 3
     for sel in (".sb-note .nicegui-markdown a", ".sb-md-card .nicegui-markdown a"):
         assert any(re.search(r"text-decoration:\s*underline", b) for b in _bodies(sel)), sel
+
+
+def test_every_page_keeps_room_for_the_scrollbar():
+    """The column and the top bar moved 7px, half a scrollbar, between a page
+    that scrolls and one that does not, wherever a scrollbar takes room
+    (measured in headless Chrome at 1440px, 2026-10-16)."""
+    from symbion.gui.theme import DARK_CSS
+    assert re.search(r"html\s*\{\s*scrollbar-gutter:\s*stable;", DARK_CSS)

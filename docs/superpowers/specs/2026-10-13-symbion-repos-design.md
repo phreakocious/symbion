@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-13
 **Status:** Approved 2026-10-13. Revised three times that day: twice after
-the owner's reviews (`file:` finds its repo, then `file:` is read from where
+the user's reviews (`file:` finds its repo, then `file:` is read from where
 you stand), then after a second look by a fresh reviewer (the conversion is
 one bulk rename; outside every repo, a write refuses as today). 2026-10-14:
 the second look's smaller findings (a shared store's owner, a fork's
@@ -154,12 +154,12 @@ silent 0. An arc's `--scope` and `rename --to-type` take a repo's name, and
 `[repos]` does not load, and the message says to move that command under the
 repo's name.
 
-*2026-10-13, the owner's review:* the first draft refused every `file:`,
+*2026-10-13, the user's review:* the first draft refused every `file:`,
 because each input that takes a type would need its own translation, and one
 missed would store a wrong row. The write inputs meet in one call, and the
 read forms are three.
 
-*2026-10-13, the owner's second review:* `file:` is read from where you
+*2026-10-13, the user's second review:* `file:` is read from where you
 stand, which reverses "the repo you stand in breaks no tie" (see "Not
 chosen"). Finding the repo is deterministic work, and it belongs to symbion,
 not the agent: an agent gives the path it already holds. The case that rule
@@ -203,8 +203,12 @@ repo when the cwd was in none, and listed the provenance command and the
 wrap count here, against "Stamps" and "Session start". A fallback keyed on
 the order of `[repos]` prints nothing when that order changes, and a
 non-repo catalog that reads the repo would list a different set from each
-one, the same-name defect this design opens with. The owner chose the
+one, the same-name defect this design opens with. The user chose the
 refusal.
+
+*2026-10-15:* `doc`, built in since 2026-10-14, is not refused. Its names are
+paths in the store's own `docs/`, so every cwd lists the same set, and the
+reason above does not hold. Its commands run at the store's root.
 
 ### The repo of an object
 
@@ -367,7 +371,7 @@ Merging several stores into one is not in this design.
   design is for sessions that read across repos. A session in `net` that writes
   about `../terraform-app/main.tf` would store a row on `net:main.tf`, with no
   word. A refusal names both targets.
-  *Reversed 2026-10-13 by the owner:* `file:` is read from where you stand
+  *Reversed 2026-10-13 by the user:* `file:` is read from where you stand
   (see "`file` in a store with repos"). The session above stores net's, with
   a note naming it, and the path it read names app's.
 - **`file:` read from the cwd in a store without repos.** There `file:NAME`

@@ -23,7 +23,7 @@ import secrets
 import shutil
 import subprocess
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields as dc_fields, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
@@ -65,7 +65,9 @@ class Note:
     refs: tuple = ()           # secondary (Target) objects this note also implicates
     provenance: dict | None = None  # domain stamp: what this note was measured against
     measurements: dict | None = None  # flat: finite float/int/str values only
+    options: tuple | None = None      # question: its answers, the default first (check_fields)
     target_blob: str | None = None    # the target file's blob id when written (gitref.target_blob)
+    extra: dict | None = None         # a newer symbion's fields, written back as read (_ROW_KEYS)
     spec: K.Kind = K.Kind()           # the kind's bits, set at read time; NEVER serialized
     # Its chain's first created_at, set at read time on a revision; NEVER
     # serialized. A revision is no re-reading of the target (see target_blob).
@@ -83,6 +85,16 @@ class Arc:
     author: str
     archived: bool = False
     archived_at: str | None = None
+    extra: dict | None = None          # a newer symbion's fields, written back as read
+
+
+# The keys a row's line holds that this symbion writes. Any other is a newer
+# symbion's field, kept through an edit, or the row loses it at an older
+# install's edit (the user, 2026-10-19). A key this symbion took out
+# is not carried: every row written before 2026-10-09 holds `"evidence": []`.
+_ROW_KEYS = frozenset(f.name for f in dc_fields(Note)) - {"spec", "first_written", "extra"}
+_RETIRED_KEYS = frozenset({"evidence"})
+_ARC_KEYS = frozenset(f.name for f in dc_fields(Arc)) - {"extra"}
 
 
 # ---- status and verdict invariants ----
@@ -260,6 +272,14 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
        word passed rule 3 as a verdict (measured 2026-09-26).
     6. `status` is open or resolved, and `tags` is not one string: a script
        stored `wontfix`, a row in no view, and "abc" as three tags (2026-10-09).
+    7. `options` only on a question. By the kind's NAME, not a bit: a
+       supersede inherits the tip's fields and `--kind` moves a question to
+       a task (they share bits), so the rule judges the row as written and
+       refuses the move, as the kind-change rule refuses a shed field. A row
+       that carries them under a renamed kind (the reference's sed) is a
+       legacy row: `unholdable` drops them on its next write.
+       ponytail: `summary.asks` names the kind the same way; a bit in
+       [kinds] lifts both when a store renames it.
 
     The reader never calls this: a row already on disk loads as written."""
     for key in ("checked", "result"):
@@ -291,6 +311,8 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
                              f"so it is never open and can never be past due "
                              f"(`symbion schema` lists the status kinds)")
         canon_due(d["due"])
+    if d.get("options") is not None and kind != "question":
+        raise ValueError(f"options on kind {kind!r}: only a question takes answers")
 
 
 # ---- serialization ----
@@ -342,7 +364,7 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
                  for r in (d.get("refs") or ()))
     check_types((target, *refs), target_types)
     # By name, whatever order they were written in, so every reader lists
-    # them alike and two rows' numbers line up (the owner, 2026-10-09).
+    # them alike and two rows' numbers line up (the user, 2026-10-09).
     m = d.get("measurements")
     return Note(
         id=d["id"], kind=d["kind"], target=target,
@@ -354,7 +376,10 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
         refs=refs,
         provenance=d.get("provenance"),
         measurements=dict(sorted(m.items(), key=lambda kv: kv[0].casefold())) if m else m,
+        # In the order given: the first is the default (the user, 2026-10-16).
+        options=tuple(o) if (o := d.get("options")) else None,
         target_blob=d.get("target_blob"),
+        extra={k: v for k, v in d.items() if k not in _ROW_KEYS | _RETIRED_KEYS} or None,
         spec=kinds[d["kind"]],
     )
 
@@ -378,7 +403,9 @@ def note_to_dict(note: Note) -> dict:
         "refs": [{"type": r.type, "name": r.name} for r in note.refs],
         "provenance": note.provenance,
         "measurements": note.measurements,
+        "options": list(note.options) if note.options is not None else None,
         "target_blob": note.target_blob,
+        **(note.extra or {}),
     }
 
 
@@ -503,7 +530,7 @@ def _kept_id(created_at: str) -> str:
 def id_tail(raw: str) -> str:
     """An id or tail as people cite one, bare: `…a1b`, `...a1b` and `-a1b`
     are `a1b`. symbion itself prints "rows end in -a1b", and a search for
-    `-a1b` found nothing (the owner, 2026-10-09)."""
+    `-a1b` found nothing (the user, 2026-10-09)."""
     return raw.strip().removeprefix("…").removeprefix("...").lstrip("-")
 
 
@@ -695,7 +722,7 @@ def undoable(store) -> bool:
 def undo(store, note_id: str | None, mine, apply: bool = True) -> dict:
     """Put the store back as it was before its last write, one level. The
     misclick case (a resolve, a star, an edit) and an in-place edit, whose
-    earlier text is on no disk, are why (the owner, 2026-10-01). A batch
+    earlier text is on no disk, are why (the user, 2026-10-01). A batch
     (`add --from-json`, `arc seed`, `rename`) is one write. Refused, naming
     why, unless `note_id` is a row or arc that write touched (None: the
     caller was shown the write, as the GUI's dialog shows it), `mine(last,
@@ -763,9 +790,11 @@ def undo_words(u: dict) -> str:
 
 
 def ensure_store(store) -> bool:
-    """Create the store dir + both empty files + `git init` if absent.
+    """Create the store dir + both empty files + docs/ + `git init` if absent.
     Idempotent. Returns True iff it had to bootstrap anything. `init` is the
-    one caller that may create; writes go through require_store."""
+    one caller that may create; writes go through require_store. docs/ holds
+    the files `doc:NAME` names (the user, 2026-10-15: part of every store);
+    git keeps no empty dir, so a clone has it from its first doc."""
     store = Path(store)
     created = not store.exists()
     store.mkdir(parents=True, exist_ok=True)
@@ -773,6 +802,9 @@ def ensure_store(store) -> bool:
         if not f.exists():
             f.touch()
             created = True
+    if not (store / "docs").exists():
+        (store / "docs").mkdir()
+        created = True
     if not (store / ".git").exists():
         r = subprocess.run(["git", "init", "-q", str(store)], capture_output=True, text=True,
                            encoding="utf-8")
@@ -793,7 +825,7 @@ def ensure_store(store) -> bool:
 # ---- notes I/O ----
 # file -> (text, kinds, notes, malformed), its last parse. A serve page parsed
 # the store two or three times and `summary` twice, at 40 ms a parse on a large
-# one (the owner, 2026-10-09). The file is read every time and its parse kept only for an
+# one (the user, 2026-10-09). The file is read every time and its parse kept only for an
 # equal text, so no write, git checkout or hand edit can leave it stale.
 # ponytail: one entry per store path a process reads, each a copy of the file.
 _PARSED: dict = {}
@@ -880,7 +912,7 @@ def _append_note_unlocked(store, note: Note) -> None:
     _record_session(store, note.id)
 
 
-def add_many(store, rows, target_types=None, canonicalize=None) -> list:
+def add_many(store, rows, target_types=None, canonicalize=None, refuse_twins=False) -> list:
     """Append several notes as one write. Mints id/created_at/author/body/
     status defaults per row. Every row is built and validated before any is
     appended, so a bad row 30 of 45 leaves nothing behind to supersede.
@@ -894,7 +926,9 @@ def add_many(store, rows, target_types=None, canonicalize=None) -> list:
     `canonicalize(rows) -> rows`, when given, runs INSIDE the lock over every
     row before any is appended: the name rule sees the store as it is at
     write time, and a raise there (an ambiguous name) leaves nothing behind.
-    The api owns that callback; the store only guarantees where it runs."""
+    The api owns that callback; the store only guarantees where it runs.
+    `refuse_twins` raises `Twin`, under the same lock, for a row identical to
+    an uncommitted head: the api's policy for a writer, as the callback is."""
     kinds = K.read_kinds(store)
     for fields in rows:
         spec = kinds.get(fields.get("kind"))
@@ -911,7 +945,8 @@ def add_many(store, rows, target_types=None, canonicalize=None) -> list:
             rows = canonicalize(rows)
         for fields in rows:
             check_self_ref(fields["target"], fields.get("refs"))
-        used = {n.id for n in load(store)}
+        existing = load(store)
+        used = {n.id for n in existing}
         notes = []
         for fields in rows:
             fields = dict(fields)
@@ -924,9 +959,38 @@ def add_many(store, rows, target_types=None, canonicalize=None) -> list:
             if "status" not in fields or fields["status"] is None:
                 fields["status"] = default_status_for(kinds[fields["kind"]])
             notes.append(note_from_dict(fields, target_types=target_types, kinds=kinds))
+        if refuse_twins:
+            stored = {_as_written(n): n.id for n in heads(existing)}
+            twins = [(i, stored[k]) for i, n in enumerate(notes)
+                     if (k := _as_written(n)) in stored]
+            if twins:                       # git only when a twin is possible
+                pending = {r.get("id") for r in pending_rows(store)}
+                if twins := [(i, nid) for i, nid in twins if nid in pending]:
+                    raise Twin(twins)
         for note in notes:
             _append_note_unlocked(store, note)
     return notes
+
+
+class Twin(ValueError):
+    """An add whose every field equals an uncommitted head's. A command
+    retried after its add ran stored the entry twice (2026-10-15), and
+    `undo` reaches only the last write. A committed twin is a new run (the
+    same check at a later date). `pairs` is (row index, stored id)."""
+    def __init__(self, pairs):
+        self.pairs = pairs
+        super().__init__(f"identical to stored entry {pairs[0][1]}; nothing was written")
+
+
+def _as_written(note) -> str:
+    """A row's fields as its writer gave them: no id, no times. An external
+    stamp's time is when it was written, not what was run."""
+    d = note_to_dict(note)
+    for k in ("id", "created_at", "supersedes"):
+        del d[k]
+    if d["provenance"]:
+        d["provenance"] = {k: v for k, v in d["provenance"].items() if k != "at"}
+    return json.dumps(d, sort_keys=True)
 
 
 def add(store, target_types=None, **fields) -> Note:
@@ -951,7 +1015,8 @@ def unholdable(note: Note) -> list[str]:
     row's (a migration, or a kind whose bits changed). The next supersede drops
     them from the new row."""
     return [k for k, bit in (("checked", note.spec.verdict), ("result", note.spec.verdict),
-                             ("status", note.spec.status), ("due", note.spec.status))
+                             ("status", note.spec.status), ("due", note.spec.status),
+                             ("options", note.kind == "question"))
             if not bit and getattr(note, k) is not None]
 
 
@@ -1062,9 +1127,13 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         # A body that keeps the registered text as its prefix is an append
         # (the GUI's dialog sends one whole); any other one replaced it at
         # exit 0, under a line still reading `registered at` (2026-10-13).
-        if not (base.get("body") or "").startswith(old.body or ""):
-            raise ValueError(f"{old.id} is a pre-registration: its registered text stays as "
-                             f"written, so a body cannot replace it (--append adds after it)")
+        body = base.get("body") or ""
+        if not body.startswith(old.body or "") and \
+                not body.startswith(_committed_floor(store, notes, old)):
+            raise ValueError(f"{old.id} is a pre-registration: its registered text and each "
+                             f"committed amendment stay as written, so a body may change only "
+                             f"text added since the last `symbion commit` (--append adds "
+                             f"after it)")
         if base.get("checked") != old.checked:
             raise ValueError(f"{old.id} is a pre-registration: --checked names its registered "
                              f"run and stays as written; a different run is a new entry")
@@ -1092,7 +1161,7 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         _rewrite_note_unlocked(store, note)
         return note
     # The head keeps the id, and the version it replaces moves to a new one
-    # (the owner, 2026-10-11): a row went through three ids in one session,
+    # (the user, 2026-10-11): a row went through three ids in one session,
     # and the cites, commit messages and chat that named it went stale.
     # Across many stores, over half the cites named a version since
     # replaced, and a sample of them meant the row, not the version. The
@@ -1193,6 +1262,27 @@ def own_draft(store, tip: Note, author: str | None) -> bool:
     lines = jsonl_lines(notes_path(store).read_text(encoding="utf-8"))
     return not any(tip.id in raw and raw in committed and _line_id(raw) == tip.id
                    for raw in lines)
+
+
+def _committed_floor(store, notes, tip: Note) -> str:
+    """What an edit of pre-registration `tip` keeps as its body's prefix:
+    the body git last committed under its id (the head keeps the id through
+    every edit), else the registered text, its chain's first body. An
+    amendment git has not seen is a draft: a placeholder left in one took a
+    second append to patch (2026-10-15). The tip's whole body when git
+    cannot say."""
+    committed = _committed_lines(store)
+    if committed is None:
+        return tip.body or ""
+    for raw in committed:
+        if tip.id in raw and _line_id(raw) == tip.id:
+            return json.loads(raw).get("body") or ""
+    by_id, root = {n.id: n for n in notes}, tip
+    for _ in notes:                     # a cycle ends the walk
+        if root.supersedes not in by_id:
+            break
+        root = by_id[root.supersedes]
+    return root.body or ""
 
 
 def citing(notes, tip: Note) -> list[str]:
@@ -1346,11 +1436,13 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
     when they want current state (see data-flow in the spec).
 
     `grep` is a compiled pattern searched over body, target name, checked,
-    result, each ref as `type:name` and each tag as `#tag` -- the text a
-    reader would otherwise pipe a paged list to grep for, losing the page's
-    header and reading the silence as absence. Refs are in because SKILL.md
-    tells writers to put a second object there instead of in prose. Tags
-    are in because a writer tags a subject the text never names.
+    result, each ref as `type:name`, each tag as `#tag`, each measurement
+    as `name=value` and each option -- the text a reader would otherwise pipe a paged list to
+    grep for, losing the page's header and reading the silence as absence.
+    Refs are in because SKILL.md tells writers to put a second object there
+    instead of in prose. Tags are in because a writer tags a subject the text
+    never names. Measurements are in because a wrong value read 0 entries
+    and was found only by accident (2026-10-14).
 
     `id` is an exact match on the row, not a walk of its supersede chain: it
     filters whatever set it is handed, so pass raw notes to reach a superseded
@@ -1377,7 +1469,9 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
     if grep is not None:
         out = [n for n in out if grep.search("\n".join(
             [f for f in (n.body, n.target.name, n.checked, n.result) if f]
-            + [f"{r.type}:{r.name or ''}" for r in n.refs] + [f"#{t}" for t in n.tags]))]
+            + [f"{r.type}:{r.name or ''}" for r in n.refs] + [f"#{t}" for t in n.tags]
+            + [f"{k}={v}" for k, v in (n.measurements or {}).items()]
+            + list(n.options or ())))]
     if overdue:
         out = [n for n in out if is_overdue(n)]
     if since is not None:
@@ -1466,16 +1560,36 @@ def rename_target(store, target_type, old, new, author=None,
 
     `canonicalize(new) -> new` runs inside the lock, as in `add_many`:
     without it `new` is stored as typed, and a short sha stays short.
-    `old` is never resolved: it names a departed object, which a live
-    catalog match would redirect. `target_types`, when given, checks the
-    type the rows move to."""
+    `old` never goes through a catalog: it names a departed object, which a
+    live catalog match would redirect. A short commit `old` resolves against
+    the stored shas (`_stored_commit`). `target_types`, when given, checks
+    the type the rows move to."""
     check_types([{"type": new_type or target_type}], target_types)
     require_store(store)
     with _lock(store):
         if canonicalize is not None:
             new = canonicalize(new)
-        return _rename_unlocked(store, load(store), K.read_kinds(store),
+        notes = load(store)
+        if target_type == "commit":
+            old = _stored_commit(notes, old)
+        return _rename_unlocked(store, notes, K.read_kinds(store),
                                 target_type, old, new, author, new_type)
+
+
+def _stored_commit(notes, old):
+    """`old` as the one stored commit it begins: rows key on the full sha,
+    and a short OLD re-targeted nothing after a history rewrite (2026-10-15).
+    Stored names only, never git: the rewrite took the old commit away. A
+    name stored as typed wins, as `rename SHORT SHORT` needs."""
+    names = {o.name for n in heads(notes) for o in (n.target, *n.refs)
+             if o.type == "commit" and o.name}
+    if old in names or not re.fullmatch(r"[0-9a-fA-F]{4,39}", old):
+        return old
+    hits = sorted(x for x in names if x.lower().startswith(old.lower()))
+    if len(hits) > 1:
+        raise ValueError(f"commit:{old} begins {len(hits)} stored commits: "
+                         f"{', '.join(hits[:5])}; give more of the sha")
+    return hits[0] if hits else old
 
 
 def retype(store, from_type, to_type, author=None, target_types=None) -> tuple[int, int]:
@@ -1550,19 +1664,22 @@ def rows_by_author(rows) -> str:
 
 def pending_rows(store) -> list[dict]:
     """What `commit` would take from notes.jsonl: the rows added or
-    rewritten since HEAD, or every row before the first commit."""
+    rewritten since HEAD, or every row before the first commit. Plumbing:
+    a porcelain `git diff` rewrites the index under index.lock when a file's
+    stat data is stale, and a `symbion commit`'s `git add` beside it refused
+    while the GUI polled this (2026-10-16)."""
     git = ["git", "-C", str(store)]
     if subprocess.run([*git, "rev-parse", "-q", "--verify", "HEAD"],
                       capture_output=True).returncode:
         f = Path(store) / NOTES_FILE
         text = f.read_text(encoding="utf-8") if f.exists() else ""
         return added_rows("".join(f"+{ln}\n" for ln in jsonl_lines(text)))
-    return added_rows(subprocess.run([*git, "diff", "HEAD", "-U0", "--", NOTES_FILE],
+    return added_rows(subprocess.run([*git, "diff-index", "-p", "-U0", "HEAD", "--", NOTES_FILE],
                                      capture_output=True, text=True, encoding="utf-8").stdout)
 
 
 def commit(store, message: str, cfg, keep=None, files: bool = False,
-           wrap: str | None = None) -> bool:
+           wrap: str | None = None, paths=()) -> bool:
     """git add -A + commit the store. Hermetic identity so it works in CI/tmp.
     The lock is here because `add -A` would otherwise stage whatever another
     writer has half-written. Returns True on a commit, False when nothing
@@ -1572,7 +1689,9 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
 
     `keep(row) -> bool`, when given, takes only the pending rows it accepts,
     and the registry; every other row stays pending (_stage_kept), and so
-    does every other file unless `files`. `wrap` names who ends a session
+    does every other file unless `files`. `paths`, store-relative, are
+    the docs a GUI commit's rows name: those no commit has taken and git
+    does not ignore are staged too. `wrap` names who ends a session
     with this commit: a `Wrap:` line in the one trailer block (a second
     `-m` would put `Rows:` outside it), and summary reads the newest. A
     wrap commits even with nothing staged."""
@@ -1586,6 +1705,17 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
         if r.returncode == 0 and keep is not None and files:
             r = subprocess.run([*git, "add", "-A", "--", ".", f":(exclude){NOTES_FILE}"],
                                capture_output=True, text=True, encoding="utf-8")
+        if r.returncode == 0 and paths:
+            # Only a doc no commit has taken: an edit to a tracked one is its
+            # writer's, and an ignored one makes `git add` refuse. Literal:
+            # a name is typed text, and `[ab].md` is a glob.
+            r = subprocess.run([*git, "--literal-pathspecs", "ls-files", "-z", "--others",
+                                "--exclude-standard", "--", *paths],
+                               capture_output=True, text=True, encoding="utf-8")
+            new = [p for p in r.stdout.split("\0") if p]
+            if r.returncode == 0 and new:
+                r = subprocess.run([*git, "--literal-pathspecs", "add", "--", *new],
+                                   capture_output=True, text=True, encoding="utf-8")
         if r.returncode == 0:
             r = subprocess.run([*git, "diff", "--cached", "--quiet"],
                                capture_output=True, text=True, encoding="utf-8")
@@ -1711,6 +1841,7 @@ def arc_from_dict(d: dict, legal_scopes=None) -> Arc:
         author=d.get("author", "unknown"),
         archived=bool(d.get("archived", False)),
         archived_at=d.get("archived_at"),
+        extra={k: v for k, v in d.items() if k not in _ARC_KEYS} or None,
     )
 
 
@@ -1719,7 +1850,7 @@ def arc_to_dict(act: Arc) -> dict:
         "id": act.id, "name": act.name, "description": act.description,
         "target_scope": act.target_scope, "created_at": act.created_at,
         "author": act.author, "archived": act.archived,
-        "archived_at": act.archived_at,
+        "archived_at": act.archived_at, **(act.extra or {}),
     }
 
 
@@ -1914,7 +2045,9 @@ def reconcile_arc(notes, arc_id, live_for, rename_map, catalog_types):
 
     `live_for(target_type) -> set[str]` and `catalog_types` are injected —
     this module never imports config or a catalog constant. `rename_map`
-    maps an old target name to its current one (see catalog.rename_map).
+    is {target type: {old name: current name}} (see catalog.rename_map):
+    one map for every type moved a repo's task on another repo's rename
+    (2026-10-15).
 
     Returns rows [{id, target_type, target_name, status, suggestion}] where
     status is 'live' (target still exists), 'renamed' (old name -> a live
@@ -1933,11 +2066,11 @@ def reconcile_arc(notes, arc_id, live_for, rename_map, catalog_types):
         if n.target.type not in catalog_types:
             status, sugg = "uncheckable", None
         else:
-            live = live_for(n.target.type)
+            live, new = live_for(n.target.type), rename_map.get(n.target.type, {}).get(name)
             if name in live:
                 status, sugg = "live", None
-            elif rename_map.get(name) in live:
-                status, sugg = "renamed", rename_map[name]
+            elif new in live:
+                status, sugg = "renamed", new
             else:
                 status, sugg = "stale", None
         rows.append({"id": n.id, "target_type": n.target.type,

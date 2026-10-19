@@ -9,9 +9,11 @@ commit, a file, a free-form item, an arc, or the whole project. Nine kinds by
 default: `check` (a dated verification), `measurement` (a number and what
 produced it, compared over time), `prediction` (a pre-registration,
 written before the data), `decision` (an ADR), `bug`, `task`,
-`question` (needs the user's answer), `idea` (parked) and `note`. A kind is a label on
+`question` (needs the user's answer; `--option` offers up to three, the default
+first), `idea` (parked) and `note`. A kind is a label on
 three bits (`status`, `parked`, `verdict`); declare your own under `[kinds]` in
-`symbion.toml`, and `symbion schema` prints the table. An **arc** is a named
+`symbion.toml`, each with a `when` that says what it is for, and `symbion schema`
+prints the table; the web page shows each `when` beside its kind. An **arc** is a named
 line of work (an epic), shown as a checklist of entries across objects. The store is
 a separate git repo of JSONL beside the project, so checking out an old branch
 never time-travels your tickets.
@@ -34,10 +36,16 @@ Each key becomes a target type (`--target file:src/x.py`). An arc seeded over
 it gets one task per member, and `arc reconcile` reports which are live,
 renamed or stale as the tree changes.
 
+A line may add a tab and a description: `web1<TAB>the frontend box`. The GUI's
+pickers show it under the name, and typing there matches it. Nothing else reads
+it: a name resolves on the name, and the CLI prints no description. `commit`,
+which has no catalog, shows each commit's subject.
+
 One catalog type is built in: `doc`, the files under the store's own `docs/`,
-each named by its path from the store's root (`--ref doc:docs/recipe.md`, or
-a unique part of it). An entry's long detail goes in such a file, and the entry
-names it. A `doc` key under `[catalogs]` replaces it.
+each named by its path within it (`--ref doc:recipe.md`, or a unique part of
+it; `doc:docs/recipe.md` finds it too). An entry's long detail goes in such a file, and the entry
+names it. Its catalog runs at the store's root, so a `doc` name resolves from
+any directory. A `doc` key under `[catalogs]` replaces it.
 
 Several repos that change together share one store: `[repos]` lists them,
 and each repo's name becomes a target type whose catalog runs in that repo
@@ -52,7 +60,7 @@ warning is the only thing that catches a typo. A gitignored file (a local
 worktree`.
 
 **Dry-run the first seed of every catalog type**
-([catalogs.md](../src/symbion/data/skill/catalogs.md#seed-add-unless-there-is-a-catalog) says why):
+([catalogs.md](../src/symbion/data/skill/catalogs.md#seed) says why):
 
 ```bash
 symbion arc seed --scope file --dry-run     # no arc needed; writes nothing
@@ -62,11 +70,15 @@ Names resolve exact, then unique substring, then the one name equal but for
 case, else as typed. `parser.py` matches both `src/parser.py` and
 `tests/test_parser.py`, so it is refused: use the full path. A read first takes
 a name the store already holds as itself, so a deleted file's entries stay
-readable by its old name.
+readable by its old name. A closed catalog (`[resolvers] TYPE = "closed"`)
+refuses the last step: a name it does not list is never stored
+([catalogs.md](../src/symbion/data/skill/catalogs.md#resolvers)). Nor is a
+name with a `.` or `..` segment that the catalog does not list: a `doc:` name
+is its path within `docs/`, and a `file:` one is read as a path.
 
 A catalog of **measured** names (a reading, a serial) needs a resolver, and
 so does every **store-derived** one (`symbion list … --type X | jq …`).
-[catalogs.md](../src/symbion/data/skill/catalogs.md#resolvers-when-substring-is-the-wrong-match) says why, and
+[catalogs.md](../src/symbion/data/skill/catalogs.md#resolvers) says why, and
 gives the protocol.
 
 Within one write (`add --from-json`, `arc seed --name …`), names resolved by
@@ -145,6 +157,8 @@ where two separate adds would store both.
   `symbion.toml`, and the
   `README.md` and `.gitignore` that `init` writes. `archive/` holds files
   copied in to keep (`adoption.md`); `commit` names any path there git ignores.
+  An edit keeps a field this symbion does not know, such as a newer release's,
+  on the entry or arc as written.
 - **Settings:** besides the tables above, `symbion.toml` takes
   `default_branch`, `local_only = true` (no remote on purpose: `commit` stops
   saying "no remote"), `command_timeout` (the seconds a configured command

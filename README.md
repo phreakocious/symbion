@@ -29,8 +29,11 @@ what a session learned is still there when the next one starts.
 - **Plain files you own.** The entries are JSONL in a git repo beside the
   project. There is no server, account or database. Checking out an old
   branch does not change your tickets.
-- **A local web page, if you want one.** `symbion serve` gives boards,
-  search, and a page per entry.
+- **A local web page, if you want one.** `symbion serve` opens on what waits
+  on you, with one-click answers to the agent's questions; then boards, a
+  peek at any entry beside the page (`j`/`k`), and search across every store
+  you serve (`⌘K`). It installs as an app. [How symbion works](https://github.com/phreakocious/symbion/blob/main/src/symbion/data/help.md),
+  its help page, explains the model for a person rather than an agent.
 
 symbion works with Claude Code, Codex and Hermes Agent, and the CLI works
 without any of them.

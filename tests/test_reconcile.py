@@ -16,7 +16,7 @@ def test_reconcile_reports_all_four_states(tmp_path):
     rows = store.reconcile_arc(
         store.load(tmp_path), act.id,
         live_for=lambda t: {"here.py", "renamed.py"},
-        rename_map={"moved.py": "renamed.py"},
+        rename_map={"file": {"moved.py": "renamed.py"}},
         catalog_types={"file"},
     )
     by_name = {r["target_name"]: r["status"] for r in rows}
@@ -32,7 +32,7 @@ def test_apply_retargets_renamed_and_leaves_stale_open(tmp_path):
     rows = store.reconcile_arc(
         store.load(tmp_path), act.id,
         live_for=lambda t: {"renamed.py"},
-        rename_map={"moved.py": "renamed.py"}, catalog_types={"file"})
+        rename_map={"file": {"moved.py": "renamed.py"}}, catalog_types={"file"})
     retargeted, _, resolved = store.apply_reconciliation(tmp_path, rows)
     assert (retargeted, resolved) == (1, 0)
     items = {n.target.name: store.read_status(n)
@@ -143,7 +143,7 @@ def test_apply_retargets_a_renamed_prediction(tmp_path):
               arc_id=act.id)
     rows = store.reconcile_arc(store.load(tmp_path), act.id,
                                live_for=lambda t: {"renamed.py"},
-                               rename_map={"moved.py": "renamed.py"}, catalog_types={"file"})
+                               rename_map={"file": {"moved.py": "renamed.py"}}, catalog_types={"file"})
     assert store.apply_reconciliation(tmp_path, rows) == (1, 0, 0)
     (item,) = store.arc_items(store.load(tmp_path), act.id)
     assert (item.target.name, store.read_status(item)) == ("renamed.py", "open")
@@ -161,7 +161,7 @@ def test_apply_moves_every_row_on_a_renamed_name_not_only_the_arc_item(tmp_path)
                          refs=[{"type": "file", "name": "moved.py"}])
     rows = store.reconcile_arc(store.load(tmp_path), act.id,
                                live_for=lambda t: {"renamed.py"},
-                               rename_map={"moved.py": "renamed.py"}, catalog_types={"file"})
+                               rename_map={"file": {"moved.py": "renamed.py"}}, catalog_types={"file"})
     assert store.apply_reconciliation(tmp_path, rows) == (2, 1, 0)
     hs = {n.id: n for n in store.heads(store.load(tmp_path))}
     assert hs[outside.id].target.name == "renamed.py"

@@ -1,5 +1,6 @@
 import os
 import shlex
+import subprocess
 import sys
 import time
 
@@ -15,6 +16,16 @@ def cfg(tmp_path, **catalogs):
 def test_names_splits_stdout_lines_and_strips_blanks(tmp_path):
     c = cfg(tmp_path, thing="printf 'a\\n\\nb\\n'")
     assert catalog.names(c, "thing") == ["a", "b"]
+
+
+def test_a_git_catalog_lists_a_non_ascii_path_as_it_is(tmp_path):
+    """git C-quotes a path with a byte over 0x7f while core.quotePath is on,
+    its default: the catalog listed `"caf\\303\\251.md"`, and no typed name
+    matched it."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "café.md").write_text("x")
+    c = cfg(tmp_path, file="git ls-files --cached --others --exclude-standard")
+    assert catalog.names(c, "file") == ["café.md"]
 
 
 def test_commands_run_in_the_project_root(tmp_path):
@@ -137,6 +148,43 @@ def test_names_keeps_a_name_verbatim_including_its_trailing_space(tmp_path):
     the catalog again on any later reconcile."""
     c = cfg(tmp_path, thing="printf 'a .py\\n b.py\\n   \\nc.py\\n'")
     assert catalog.names(c, "thing") == ["a .py", " b.py", "c.py"]
+
+
+def test_a_tab_ends_the_name_and_starts_its_description(tmp_path):
+    """A picker's names need a second datum (the user, 2026-10-15): a
+    catalog line may carry one after a tab. Only the GUI's pickers read it;
+    the name before the tab stays verbatim."""
+    c = cfg(tmp_path, thing="printf 'a\\tthe first\\nb\\nc \\t  spaced  \\n'")
+    assert catalog.names(c, "thing") == ["a", "b", "c "]
+    assert catalog.described(c, "thing") == {"a": "the first", "b": "", "c ": "spaced"}
+
+
+def test_a_line_with_no_name_before_its_tab_is_skipped(tmp_path):
+    c = cfg(tmp_path, thing="printf '\\tno name\\n  \\tnone\\na\\n'")
+    assert catalog.names(c, "thing") == ["a"]
+    c = cfg(tmp_path, thing="printf '\\tno name\\n'")
+    with pytest.raises(catalog.CatalogError, match="produced no names"):
+        catalog.names(c, "thing")
+
+
+def test_a_repeated_name_keeps_its_first_description(tmp_path):
+    c = cfg(tmp_path, thing="printf 'a\\tfirst\\na\\tsecond\\n'")
+    assert catalog.described(c, "thing") == {"a": "first"}
+
+
+def test_a_name_resolves_on_the_name_never_its_description(tmp_path):
+    """The user, 2026-10-15: names still resolve on the name."""
+    c = cfg(tmp_path, thing="printf 'web1\\tthe frontend box\\n'")
+    assert catalog.canonical(c, "thing", "web") == "web1"
+    assert catalog.canonical(c, "thing", "frontend") == "frontend"   # a miss: taken as typed
+
+
+def test_a_resolver_reads_names_without_their_descriptions(tmp_path):
+    c = rcfg(tmp_path, "printf 'web1\\tthe frontend\\nweb2\\tthe backend\\n'",
+             "tail -n +2; exit 2")
+    with pytest.raises(catalog.AmbiguousName) as e:
+        catalog.canonical(c, "t", "web")
+    assert e.value.candidates == ["web1", "web2"]
 
 
 def test_a_missing_catalog_says_where_catalogs_are_configured(tmp_path):
@@ -343,6 +391,19 @@ def test_match_announces_a_substring_pick_but_not_an_exact_one(tmp_path, capsys)
     assert catalog.match(c, "t", "SRC/CLI.PY", ["src/parser.py", "src/cli.py"]) == "src/cli.py"
     assert capsys.readouterr().err == \
         "note: 'SRC/CLI.PY' resolved to 'src/cli.py' (same name but for case in the t catalog)\n"
+
+
+def test_a_pick_from_an_earlier_entry_of_the_write_does_not_claim_the_catalog(tmp_path, capsys):
+    """Within one write, `alpha` matched `alpha-long`, a name an earlier
+    entry took as typed, and the note said it was in the catalog
+    (a clean-room review, 2026-10-13)."""
+    c = Config(project_root=tmp_path, catalogs={"t": "echo a"})
+    got = catalog.canonical(c, "t", "alpha", pending=["alpha-long"], candidates=["beta"])
+    assert got == "alpha-long"
+    assert capsys.readouterr().err == ("note: 'alpha' resolved to 'alpha-long' "
+                                       "(unique substring, from an earlier entry of this write)\n")
+    catalog.canonical(c, "t", "bet", pending=["alpha-long"], candidates=["beta"])
+    assert "(unique substring in the t catalog)" in capsys.readouterr().err
     catalog.match(c, "t", "nothing", ["src/parser.py"])
     assert "matches nothing in the t catalog; taken as typed" in capsys.readouterr().err
 

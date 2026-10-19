@@ -197,7 +197,7 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
         # allowed client's browser can still rebind; a Host list flag
         # closes that if a wide serve ever faces untrusted browsing.
         app.add_middleware(HostIsAddress)
-    # The store's own port, so a link to it outlives a restart (the owner,
+    # The store's own port, so a link to it outlives a restart (the user,
     # 2026-10-02). `--port` overrides it and is never warned about.
     want = servers.port(ctx.store_dir) if port is None else None
     try:

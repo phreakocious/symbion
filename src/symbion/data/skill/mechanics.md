@@ -27,8 +27,8 @@ A `resolve` always keeps one. To keep your draft's earlier version, commit
 first.
 
 In `notes.jsonl` an edit appends the new version under the entry's id, and the
-version it replaces stays on its own line under its new id. A committed line
-is never edited.
+version it replaces stays on its own line under its new id. Of a committed
+line, only that id ever changes.
 
 `undo ID` puts back the whole of the store's last write, a batch too: each
 write first copies `notes.jsonl`, `arcs.jsonl` and the sessions file into the
@@ -39,6 +39,12 @@ changed the files. One level: an undo leaves nothing more to undo. In
 `symbion serve`, an undo icon sits in the top bar while the store's last write
 is yours and uncommitted; it shows each entry the undo removes or puts back,
 and asks first.
+
+An `add` whose every field equals an uncommitted entry's writes nothing: it
+prints that entry's id and says so, so a retried command stores one entry.
+The time of an `--external` stamp is not compared. A `--from-json` batch
+holding such a row writes nothing and names the line. After a commit, the
+same add is a new entry.
 
 Two copies of one store, written to between pulls, conflict in `notes.jsonl`,
 since each appends at its end. Keep both sides. If both copies edited one
@@ -52,9 +58,10 @@ entries.
 The hook prints `symbion summary`, in this order:
 
 1. `open outside arcs:` the open count of each status kind that is not
-   parked, then `; N open in arcs` when arcs hold any. A parked entry and an
-   entry in an arc count in neither, so each says so in its brackets
-   (`[idea, parked]`, `[task, arc release]`).
+   parked, then `; N open in arcs` when arcs hold any, and `; N parked` when
+   any open entry is parked. A parked entry and an entry in an arc are not
+   in the per-kind counts, so each says so in its brackets (`[idea,
+   parked]`, `[task, arc release]`).
 2. `repos in <store>:`, in a store over several repos: where you stand, and
    each other repo's path from here.
 3. `N open entries wait on you`, and below it each of them: the open entries
@@ -65,8 +72,8 @@ The hook prints `symbion summary`, in this order:
 4. The due block: each open entry past due or due within 7 days, and each
    parked one from its due date on (`overdue 2d`, `due in 3d`).
 5. A line per arc: its id, done/total, age and name.
-6. `priority`: each unresolved entry tagged `priority`, with `starred Nd ago`
-   from a day on.
+6. `priority`: each unresolved entry tagged `priority` that no block above
+   printed, with `starred Nd ago` from a day on.
 7. `closed by <author>`: an entry you raised or closed that someone else then
    resolved, or wrote to the body of, since your newest write.
 8. Open entries someone else raised and you answered last, that no block
@@ -78,14 +85,19 @@ The hook prints `symbion summary`, in this order:
     that fixes each.
 11. `last wrap by <author>, <age>, N commits since: <first line>`, and the
     rest of that wrap's commit message below it: the previous session's
-    handoff.
+    handoff. `since the wrap:` under it names each entry the handoff cites
+    that changed after the wrap, with what changed and who changed it.
 12. While `symbion serve` runs, its URL and the link form for one entry,
     `<url>/notes?id=<id>`.
 
 Each elided list ends with the flag that shows it: `+N more open (--full)`.
+The hook's copy stays under Claude Code's 10,000-character limit for hook
+text: past it, it drops rows, the open list first and the waiting rows last,
+and a line says how many; `symbion summary` prints them.
 
 An entry's line reads `[labels] [kind, …] TYPE:NAME  lead  id`:
 
+- `priority`: the entry is starred, in whichever block prints it.
 - `from <author>`: someone else raised it. `last by <author>`: someone else
   wrote its newest version. Both print when both hold.
 - In the brackets: `parked`, `arc <id>`, a pre-registration's `registered
@@ -121,8 +133,11 @@ the session-start summary if that came later.
 `add` also prints a `note:` line on stderr for the open entries already on its
 target, an id in the body that matches no entry, a catalog name stored as
 typed, a verdict entry with no `--checked` or stamped on a dirty tree, and a
-parked entry of yours with no `--due`. Each write ends with the count of
-entries not yet committed.
+parked entry of yours with no `--due`. In an agent session, it lists a
+target's open entries at your first add there and gives only their count after
+that, until the next session start. `add`, `resolve` and `supersede` say when
+the text they write runs past 500 characters. Each write ends with the count
+of entries not yet committed.
 
 ## What a terminal and a pipe get
 

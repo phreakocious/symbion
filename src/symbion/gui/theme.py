@@ -19,7 +19,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from pygments.formatters import HtmlFormatter
+from pygments.style import Style
+from pygments.token import (Comment, Error, Generic, Keyword, Name, Number, Operator,
+                            Punctuation, String, Token)
+
+from .. import kinds as K
 from .. import term as T
+
+_M = K.COLORS                  # Mocha's hues by name
 
 
 @dataclass(frozen=True)
@@ -71,8 +79,9 @@ FONTS_HTML = "<style>" + "".join(
 # the hidden sidebar would show
 NARROW = 900
 
-# Two overlapping rings, one per partner, in place of NiceGUI's own icon, in
-# PALETTE's accent and rare. A file, not a string: NiceGUI links a string as a
+# Two linked rings, one per partner, in place of NiceGUI's own icon, in
+# PALETTE's accent and rare: accent passes over at the top crossing, rare at
+# the bottom. A file, not a string: NiceGUI links a string as a
 # data: URL, and Obsidian's web viewer fetches a tab icon over http(s) only
 # (Electron's net.request), so it drew a globe.
 FAVICON = Path(__file__).resolve().parents[1] / "data" / "favicon.svg"
@@ -138,6 +147,9 @@ DARK_CSS = """
 /* Quasar's dark body is #fff: text that sets no colour (a note's markdown
    body) rendered white beside the rest (measured 2026-10-01) */
 body.body--dark { color: var(--q-emph) !important; font-size: 14px; }
+/* a page that does not scroll keeps the scrollbar's room: the column and the
+   top bar moved half a scrollbar between pages, wherever one takes room */
+html { scrollbar-gutter: stable; }
 .q-page { padding: 0 !important; }
 /* Links set no underline of their own; a row of them read as a ransom note. */
 a { text-decoration: none; }
@@ -145,7 +157,7 @@ a { text-decoration: none; }
 /* the sidebar: places, open counts, recently closed, who is writing */
 .q-drawer { background: var(--q-panel) !important; border-right: 1px solid var(--q-border); }
 /* NiceGUI pads its drawer 16px too: under .sb-side-inner's own, a place's
-   icon sat 40px in (measured 2026-10-01, the owner's "a lot of border space").
+   icon sat 40px in (measured 2026-10-01, the user's "a lot of border space").
    The 11px top centres the 35px brand on the 56px top bar's line. */
 .sb-side { padding: 0; }
 /* The drawer aligns its content flex-start, so the inner box took its
@@ -154,7 +166,8 @@ a { text-decoration: none; }
                  height: 100%; width: 100%; box-sizing: border-box; }
 /* the groups between the brand and the badge: they scroll, the badge stays */
 .sb-scroll { display: flex; flex-direction: column; gap: 24px; flex: 1; min-height: 0;
-             overflow-y: auto; margin: 0 -14px; padding: 0 14px; }
+             overflow-y: auto; margin: 0 -14px; padding: 0 14px;
+             scrollbar-width: thin; scrollbar-color: var(--q-border-hi) transparent; }
 .sb-brand  { display: flex; align-items: center; gap: 10px; padding: 0 8px; color: var(--q-emph); }
 .sb-brand-name { font-weight: 600; font-size: 15px; line-height: 1.2; color: var(--q-emph);
                  overflow-wrap: anywhere; }
@@ -182,10 +195,14 @@ a { text-decoration: none; }
              color: var(--q-accent); display: grid; place-items: center; flex: none;
              font-family: var(--mono); font-size: 12px; }
 .sb-badge  { font-size: 12px; color: var(--q-body); overflow-wrap: anywhere; }
-.sb-who .sb-keys { margin-left: auto; }
+.sb-who-icons { margin-left: auto; display: flex; flex-direction: column; }
 .sb-source { margin-top: -14px; padding: 0 10px; font-family: var(--mono); font-size: 11px;
               color: var(--q-muted); }
 .sb-source:hover { color: var(--q-emph); }
+.sb-tabhint { display: none; padding: 4px 10px 0; font-family: var(--mono); font-size: 11px;
+              color: var(--q-notable); overflow-wrap: anywhere; }
+html.sb-untabbed .sb-tabhint { display: block; }
+.sb-tabhint code { user-select: all; font-family: inherit; }
 /* who is writing, in the top bar while the sidebar is hidden: the badge
    shows before a write, and a narrow window still writes */
 .sb-who-top { display: flex; align-items: center; gap: 8px; flex: none; max-width: 160px; }
@@ -194,7 +211,10 @@ a { text-decoration: none; }
 
 /* the top bar: where you are, ending in the page's title, and the search */
 /* NiceGUI pads its header 16px a side: with the 56px bar in it, an 89px band
-   (measured 2026-10-01, the owner's "large gap") */
+   (measured 2026-10-01, the user's "large gap"). On the page's colour, as
+   the installed app's active tab is: on the panel, under a page-coloured
+   strip, Chrome still drew the tab in the page's colour and no tab read as
+   current (2026-10-16). */
 .sb-header { background: var(--q-dark-page) !important; border-bottom: 1px solid var(--q-panel);
              box-shadow: none !important; min-height: 56px; padding: 0; }
 /* the bar's row lines up with the cards: the main column's width, plus the
@@ -221,9 +241,25 @@ a { text-decoration: none; }
 /* the composer's dialog, and the list `?` opens */
 .sb-new-card { width: min(680px, 94vw); max-width: none !important; }
 .sb-new-card .sb-composer { border: 0; padding: 0; }
+/* A file dragged over a page: what a drop does (chrome._DROP_JS). */
+body[data-sb-drop]::after { content: attr(data-sb-drop); position: fixed; inset: 12px;
+  z-index: 9000; pointer-events: none; display: flex; align-items: center;
+  justify-content: center; border: 2px dashed var(--q-primary); border-radius: 12px;
+  font: 600 18px var(--sans); color: var(--q-emph);
+  background: color-mix(in srgb, var(--q-dark-page) 75%, transparent); }
+/* the address of the link under the pointer, in the installed app
+   (chrome._APP_JS); above a dialog's 6000 */
+.sb-linktip { position: fixed; left: 0; bottom: 0; z-index: 7000; pointer-events: none;
+  max-width: 60vw; padding: 3px 8px; overflow: hidden; white-space: nowrap;
+  text-overflow: ellipsis; font: 12px var(--sans); color: var(--q-body);
+  background: var(--q-panel); border: solid var(--q-border); border-width: 1px 1px 0 0;
+  border-top-right-radius: 6px; }
 /* a markdown file read in a dialog: a document, so its headings stand, at
    sizes that fit a dialog (NiceGUI's h1 is 3rem) */
 .sb-md-card { width: min(860px, 94vw); max-width: none !important; }
+/* it takes the focus so the page keys scroll it (notes.viewer): no ring round
+   the whole dialog, as Quasar's own node, focused before, had none */
+.sb-md-card:focus { outline: none; }
 /* the card's width, not its widest code line's: a long line scrolls in its block */
 .sb-md-card .nicegui-markdown { color: var(--q-emph); font-size: 14.5px; line-height: 1.6;
                                 width: 100%; min-width: 0; overflow-wrap: anywhere; }
@@ -255,9 +291,20 @@ a { text-decoration: none; }
 .sb-board-title { font-size: 18px; font-weight: 600; color: var(--q-emph); }
 .sb-board-title::first-letter { text-transform: uppercase; }
 .sb-count  { font-family: var(--mono); font-size: 13px; color: var(--q-muted); }
-a.sb-board-aside { font-size: 12px; color: var(--q-muted); }
+.sb-board-aside { font-size: 12px; color: var(--q-muted); }
 a.sb-board-aside:hover { color: var(--q-primary); }
 .sb-board-empty .sb-board-title { color: var(--q-muted); font-weight: 500; font-size: 15px; }
+/* the Docs page: a markdown file a row, its entries, its read button */
+.sb-docs { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto 32px;
+           align-items: center; column-gap: 12px; row-gap: 2px; font-size: 13px; }
+.sb-docs > .q-icon { font-size: 18px; color: var(--q-dim); }
+a.sb-docs-name { font-family: var(--mono); color: var(--q-emph); text-decoration: none;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+a.sb-docs-name:hover { color: var(--q-primary); }
+.sb-docs-n { display: flex; gap: 4px; justify-self: end; font-family: var(--mono);
+             font-size: 12px; color: var(--q-muted); }
+a.sb-docs-more { grid-column: 2 / -1; font-family: var(--mono); font-size: 12px;
+                 color: var(--q-body); text-decoration: none; }
 /* an arc on the index: its name as the person wrote it (no capital forced) */
 .sb-arc    { display: flex; flex-direction: column; gap: 10px; }
 a.sb-arc-name { font-size: 16px; font-weight: 600; color: var(--q-emph); }
@@ -272,6 +319,11 @@ a.sb-arc-name:hover { color: var(--q-primary); }
 .sb-composer .sb-compose-body .q-field__native { font-size: 15px; line-height: 1.5;
                                                  min-height: 48px; }
 .sb-composer .sb-compose-tags input { font-family: var(--mono); font-size: 12px; }
+/* A picker's menu: a long description is cut with an ellipsis, in a menu no
+   wider than its items. The cap is on the items: Quasar fits the menu to the
+   window with an inline max-width, and a cap on the menu itself, made
+   !important, overrode that and ran 22px past a phone's edge. */
+.sb-pick-menu .q-item { max-width: 36rem; }
 
 /* badges */
 .sb-chip { display: inline-flex; align-items: center; font-family: var(--mono);
@@ -303,8 +355,22 @@ a.sb-tag:hover { color: var(--q-primary); }
 .sb-note { position: relative; display: flex; align-items: flex-start; gap: 14px;
            background: var(--q-panel); border: 1px solid var(--q-border);
            border-radius: 12px; padding: 14px 16px 12px; box-sizing: border-box;
-           transition: border-color .15s; }
+           transition: border-color .15s, background-color .15s; }
 .sb-note:hover, .sb-note:focus-within { border-color: var(--q-border-hi); }
+/* the entry the peek shows, picked by a click on its text or by j/k, lit
+   while the peek is open (chrome.shell's sb-peeking). A selected row, as the
+   sidebar's: an accent wash, and its small words a step up, since muted read
+   4.2:1 on the wash. A 1px accent border read as a focused field (the user,
+   2026-10-16: "could be more aesthetically pleasing"). */
+.sb-peeking .sb-note.sb-picked, .sb-peeking .sb-note.sb-picked:hover {
+    border-color: color-mix(in srgb, var(--q-primary) 45%, var(--q-border));
+    background: color-mix(in srgb, var(--q-primary) 7%, var(--q-panel));
+    --q-muted: var(--q-body); }
+/* the peek, an entry beside the page: the sidebar's ground, its rule on
+   the side that faces the page */
+.sb-peek { padding: 0; border-right: 0 !important; border-left: 1px solid var(--q-border); }
+.sb-peek-inner { display: flex; flex-direction: column; gap: 12px; padding: 8px 20px 32px;
+                 width: 100%; box-sizing: border-box; }
 .sb-note-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 /* the body's first line clears the toolbar over the card's top-right
    corner, and the lines under it run the card's width: a padding cleared
@@ -334,25 +400,42 @@ a.sb-tag:hover { color: var(--q-primary); }
    the second */
 .sb-note-by { display: flex; align-items: center; gap: 10px; margin-left: auto;
               white-space: nowrap; }
+/* a chip and the button that reads its file: one unit at a wrap. Apart, the
+   button began the next line, beside the chip after it (2026-10-16) */
+.sb-pair { display: flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; }
+.sb-pair:empty { display: none; }
 .sb-note-meta { color: var(--q-muted); font-family: var(--mono); font-size: 12px; }
 /* a check's `checked → result` is its content: as bright as a body, mono at
    the size of a body's inline code (dim metadata before, 2026-10-01) */
 .sb-verdict { color: var(--q-emph); font-family: var(--mono); font-size: 12px; }
+/* a question's one-click answers, under its body and parted from it */
+.sb-answer { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+             margin-top: 2px; padding-top: 10px; border-top: 1px solid var(--q-border); }
+.sb-answer-field { flex: 1 1 220px; min-width: 0; }
+/* its buttons as quiet as the field beside them: Quasar draws an outline in
+   the text's colour, and emph and notable drew both at full strength (the
+   user, 2026-10-16: "quite a bit brighter than the rest of the page") */
+.sb-answer .q-btn { color: var(--q-body); }
+.sb-answer .q-btn--outline::before { border-color: var(--q-dim); }
+.sb-answer .q-btn:hover { color: var(--q-primary); }
+.sb-answer .q-btn--outline:hover::before { border-color: currentColor; }
 /* where an amendment joined the body: a thin rule in the kind's colour,
-   who added it and when at its end, quieter than the text around it */
-.sb-seam { display: flex; align-items: center; gap: 10px; color: var(--q-dim);
+   who added it and when at its end, quieter than the text around it. Its
+   words are `muted`: `dim` read 3.6:1, under text's 4.5:1 (2026-10-16) */
+.sb-seam { display: flex; align-items: center; gap: 10px; color: var(--q-muted);
            font-family: var(--mono); font-size: 11px; }
 .sb-seam::before { content: ""; flex: 1;
                    border-top: 1px solid color-mix(in srgb, var(--kind) 55%, transparent); }
-/* an earlier version against the next: a block gone, a block that came */
+/* an earlier version against the next: a block gone, a block that came.
+   A gone block's words are `body`: `muted` on the red wash read 4.3:1 */
 .sb-diff-del, .sb-diff-ins { padding-left: 10px; border-left: 2px solid; }
-.sb-diff-del { border-color: var(--q-bad); color: var(--q-muted);
+.sb-diff-del { border-color: var(--q-bad); color: var(--q-body);
                background: color-mix(in srgb, var(--q-bad) 7%, transparent); }
 .sb-diff-ins { border-color: var(--q-good);
                background: color-mix(in srgb, var(--q-good) 7%, transparent); }
 /* the same inside a checked or result, word by word; struck and underlined
    as well as tinted, so the colour is not the only sign */
-.sb-verdict del { color: var(--q-muted);
+.sb-verdict del { color: var(--q-body);
                   background: color-mix(in srgb, var(--q-bad) 14%, transparent); }
 .sb-verdict ins { background: color-mix(in srgb, var(--q-good) 14%, transparent); }
 a.sb-id { color: var(--q-muted); }
@@ -437,8 +520,8 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   .q-btn.sb-resolve:hover, .q-btn.sb-resolve:focus-visible { color: var(--q-good) !important; }
   .q-btn.sb-resolve.sb-resolved { color: var(--q-good) !important; }
   /* an unlayered muted rule read text-primary's blue (2026-10-01) */
-  .q-btn.sb-keys { color: var(--q-muted) !important; }
-  .q-btn.sb-keys:hover { color: var(--q-emph) !important; }
+  .q-btn.sb-keys, .q-btn.sb-help { color: var(--q-muted) !important; }
+  .q-btn.sb-keys:hover, .q-btn.sb-help:hover { color: var(--q-emph) !important; }
   /* Quasar's `no-outline` is `outline: 0 !important` on every button, so
      keyboard focus showed only Quasar's faint tint (2026-10-02). accent is
      5.9:1 or more on every ground, a selected sidebar row's included. */
@@ -463,6 +546,9 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 .q-btn { text-transform: none; font-weight: 500; letter-spacing: 0; border-radius: 7px; }
 /* not !important: Quasar's is a plain layered rule, and `.q-menu .q-item` must still win */
 .q-item--dark { color: var(--q-emph); }
+/* an arc's progress track: Quasar's white at .6 under opacity .4 read about
+   #4f4f59 on a card; border_hi is the palette's nearest (2026-10-16) */
+.q-linear-progress__track--dark { background: var(--q-border-hi); opacity: 1; }
 /* Quasar sets max-width inline to the space left, so a closed row's 200 chars
    ran 1216px across a 1280px page (2026-10-06). 80ch holds a sha and a
    72-char commit subject on one line; a long path or URL breaks inside it. */
@@ -470,14 +556,65 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
              border: 1px solid var(--q-border); font-family: var(--mono); font-size: 11px;
              white-space: pre-line; overflow-wrap: anywhere;
              max-width: min(80ch, calc(100vw - 32px)) !important; }
+/* a sidebar kind's: its name and properties over what it is for (chrome._kind_item) */
+.q-tooltip.sb-kindtip { max-width: 320px !important; padding: 10px 12px; border-radius: 6px;
+                        border-color: var(--q-border-hi); color: var(--q-body) !important;
+                        font-size: 12px; line-height: 1.5; white-space: normal; }
+.sb-kindtip-head { color: var(--q-emph); margin-bottom: 4px; }
 
 /* the header's search box, and the words a search found in a result */
 /* the title takes the bar first and the search what is left: shrinking
    alike, "Arcs" got 30px at 901 with the sidebar open (2026-10-01) */
 .sb-search { flex: 10 1 0; min-width: 120px; max-width: 340px; }
 .sb-search .q-field__control { background: var(--q-panel); }
-.sb-snippet mark { background: transparent; color: var(--q-notable);
-                   box-shadow: inset 0 -1px var(--q-notable); }
+.sb-snippet mark, .sb-palette mark { background: transparent; color: var(--q-notable);
+                                     box-shadow: inset 0 -1px var(--q-notable); }
+
+/* the palette (chrome._PALETTE_JS): a native <dialog>, so the browser holds
+   the focus in it, Esc closes it, and the page under it takes no clicks */
+.sb-palette { width: min(640px, calc(100vw - 32px)); max-width: none;
+              max-height: calc(100vh - 128px); margin: 64px auto auto; padding: 0;
+              overflow: hidden; color: var(--q-emph); background: var(--q-panel);
+              border: 1px solid var(--q-border-hi); border-radius: 12px; }
+.sb-palette[open] { display: flex; flex-direction: column; }
+.sb-palette::backdrop { background: var(--q-dark-page); opacity: .72; }
+.sb-pal-box { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+              border-bottom: 1px solid var(--q-border); }
+.sb-pal-box .q-icon { font-size: 20px; color: var(--q-body); }
+.sb-pal-box input { flex: 1 1 auto; min-width: 0; background: transparent; border: 0;
+                    outline: 0; color: var(--q-emph); font: 16px var(--sans); }
+.sb-pal-box input::placeholder { color: var(--q-emph); opacity: .7; }
+.sb-pal-list { overflow-y: auto; padding: 4px 8px 8px; }
+.sb-pal-head { display: flex; align-items: baseline; gap: 8px; padding: 14px 10px 4px; }
+.sb-pal-head:first-child { padding-top: 10px; }
+.sb-pal-head .sb-nav-head { padding: 0; }
+.sb-pal-aside, .sb-pal-none { font-family: var(--mono); font-size: 11px; color: var(--q-muted); }
+.sb-pal-none { padding: 12px 10px; font-size: 12px; }
+.sb-pal-row { display: flex; align-items: center; gap: 12px; width: 100%; height: 36px;
+              padding: 0 10px; border: 0; border-radius: 7px; background: none;
+              color: var(--q-emph); font: inherit; text-align: left; cursor: pointer; }
+.sb-pal-row > .q-icon { font-size: 18px; color: var(--q-muted); }
+.sb-pal-row .sb-dot { margin: 0 5px; }
+.sb-pal-text { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden;
+               text-overflow: ellipsis; }
+.sb-pal-text.sb-mono { font-size: 13px; }
+.sb-pal-entry .sb-pal-text { color: var(--q-body); }
+.sb-pal-done .sb-pal-text { color: var(--q-muted); }
+.sb-pal-meta, .sb-pal-kind, .sb-pal-id, .sb-pal-store {
+  flex: none; white-space: nowrap; font-family: var(--mono); font-size: 12px; color: var(--q-muted); }
+.sb-pal-store { display: inline-flex; align-items: center; gap: 4px; }
+.sb-pal-store .q-icon { font-size: 15px; }
+.sb-pal-kind { color: var(--kind); }
+.sb-pal-notable { color: var(--q-notable); }
+.sb-pal-good { color: var(--q-good); }
+.sb-pal-on { background: var(--q-border); }
+.sb-pal-on > .q-icon { color: var(--q-primary); }
+/* muted reads 3.4:1 on the pick's fill, body 5.65: its small words step up */
+.sb-pal-on .sb-pal-meta:not(.sb-pal-notable), .sb-pal-on .sb-pal-id, .sb-pal-on .sb-pal-store,
+.sb-pal-on.sb-pal-done .sb-pal-text { color: var(--q-body); }
+.sb-pal-foot { display: flex; flex-wrap: wrap; gap: 16px; padding: 10px 18px;
+               border-top: 1px solid var(--q-border); font-family: var(--mono); font-size: 12px;
+               color: var(--q-muted); white-space: nowrap; }
 
 /* NiceGUI's "connection lost" popup (shown while `serve` restarts): black,
    sans-serif and an emoji; the panel, the mono stack and a notable line here */
@@ -516,14 +653,16 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   .sb-btn-word, .sb-crumbs > :not(.sb-here) { display: none; }
   .sb-topbar { column-gap: 8px; }
 }
-.sb-commit .q-btn__content, .sb-push .q-btn__content, .sb-new .q-btn__content {
-  flex-wrap: nowrap; white-space: nowrap; gap: 6px; }
+.sb-commit .q-btn__content, .sb-push .q-btn__content, .sb-new .q-btn__content,
+.sb-stale .q-btn__content { flex-wrap: nowrap; white-space: nowrap; gap: 6px; }
 /* A Material glyph draws inside its 24px box: `add` 5px in from the left,
    `save`, `archive` and `article` 3px, `code` and `playlist_add` 2px.
    Beside a label, a button read 2 to 4px heavier on the left (measured
    2026-10-13). `on-left` is the icon of a button given a label. New's word
    goes on a narrow screen, and its icon alone is centred already. */
 .sb-commit .q-icon, .q-btn .q-icon.on-left { margin-left: -2px; }
+.sb-stale .q-icon { margin-left: -3px; }   /* `refresh`, beside a count: 9px a side */
+.sb-undo-gone { opacity: .45; }
 @media (min-width: @WIDE@px) { .sb-new .q-icon { margin-left: -4px; } }
 @media (max-width: 600px) {
   /* a phone's top bar: the title alone says where you are, and there is
@@ -539,8 +678,10 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   .sb-topbar > .sb-who-top { order: 2; }
   .sb-topbar::after { content: ""; order: 3; flex-basis: 100%; margin-top: 8px; }
   .sb-topbar > .sb-new { order: 4; }
-  .sb-topbar > .sb-undo, .sb-topbar > .sb-commit, .sb-topbar > .sb-push { order: 5; }
+  .sb-topbar > .sb-stale, .sb-topbar > .sb-undo, .sb-topbar > .sb-commit,
+  .sb-topbar > .sb-push { order: 5; }
   .sb-topbar > .sb-search { order: 6; flex: 1; min-width: 0; max-width: none; }
+  .sb-palette { margin-top: 8px; max-height: calc(100vh - 16px); }
 }
 """.replace("@WIDE@", str(NARROW + 1)).replace("@NARROW@", str(NARROW)).replace("@TRAILW@", str(_TRAIL_W)) \
    .replace("@TRAIL@", _TRAIL).replace("@RUN@", str(_RUN))
@@ -549,6 +690,42 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 DARK_CSS += "".join(f".sb-kind-{k} {{ --kind: {c}; }}\n"
                     for k, c in {**T.KIND, "own": T.OWN_KIND}.items())
 DARK_CSS += '.sb-chip[class*="sb-kind-"] { color: var(--kind); }\n'
+
+
+class _Code(Style):
+    """Fenced code, in an entry or a file read in the viewer, in Mocha's
+    hues, where NiceGUI served pygments' github-dark (the user, 2026-10-16:
+    "palette code"). Comments and punctuation take `body`: `muted` reads
+    4.44:1 on a block's ground and `dim` 3.36:1."""
+    styles = {
+        # The root: every token gets a rule, or github-dark's stood for those
+        # unnamed here (a name, a literal, a prompt).
+        Token: T.TEXT,
+        Comment: f"italic {T.BODY}", Punctuation: T.BODY, Generic.Output: T.BODY,
+        Keyword: _M["mauve"], Keyword.Constant: _M["peach"], Keyword.Type: _M["yellow"],
+        Operator: _M["sky"], Operator.Word: _M["mauve"],
+        Name.Builtin: _M["red"], Name.Function: _M["blue"], Name.Class: _M["yellow"],
+        Name.Decorator: _M["sky"], Name.Exception: _M["maroon"], Name.Namespace: _M["yellow"],
+        Name.Constant: _M["peach"], Name.Attribute: _M["blue"], Name.Tag: _M["mauve"],
+        Name.Variable: _M["flamingo"], Name.Label: _M["sapphire"],
+        String: _M["green"], String.Escape: _M["pink"], String.Regex: _M["pink"],
+        String.Interpol: _M["pink"], Number: _M["peach"],
+        Generic.Heading: f"bold {_M['blue']}", Generic.Subheading: _M["blue"],
+        Generic.Deleted: _M["red"], Generic.Inserted: _M["green"], Generic.Error: _M["red"],
+        Generic.Emph: "italic", Generic.Strong: "bold", Error: _M["red"],
+    }
+
+
+# `body.`: NiceGUI's own `.body--dark .codehilite` sheet loads after this
+# one, so an equal selector lost to it.
+DARK_CSS += "\n".join(HtmlFormatter(style=_Code)
+                      .get_token_style_defs("body.body--dark .codehilite")) + "\n"
+# A diff's lines take the washes an earlier version's blocks do, in place of
+# github-dark's dark red and green.
+DARK_CSS += """
+body.body--dark .codehilite .gd { background: color-mix(in srgb, var(--q-bad) 7%, transparent); }
+body.body--dark .codehilite .gi { background: color-mix(in srgb, var(--q-good) 7%, transparent); }
+"""
 
 
 def kind_css(kinds) -> str:

@@ -289,6 +289,8 @@ def _details(n, head, state, written=None) -> list[Text]:
             out.append(labelled("result: ", summ.flatten(n.result)))
     if n.measurements:
         out.append(labelled("measured: ", summ.measured(n.measurements)))
+    if n.options:
+        out.append(labelled("options: ", summ.options_line(n.options)))
     return out
 
 

@@ -2,21 +2,25 @@
 snapshot, so a page is stale only in the browser and any navigation fixes it."""
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Request
 from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse, RedirectResponse
 from nicegui import Client, app, ui
 from starlette.exceptions import HTTPException
 
 from .. import api, gitref
 from .. import store as S
 from .. import summary as summ
-from . import arcs, filters
-from .chrome import shell
-from .notes import render_note, target_href, view_button
-from .theme import FONTS_DIR, FONTS_URL
+from . import arcs, filters, palette, servers
+from .chrome import shell, store_name
+from .notes import (NoteMarkdown, ago, file_buttons, history, link_ids, render_note,
+                    target_href, view_button)
+from .theme import FAVICON, FONTS_DIR, FONTS_URL, PALETTE
 
 # /notes renders this many rows before "show all": every row is a few dozen
 # elements and a check a few git calls, and all 312 of one store's rows took
@@ -25,12 +29,12 @@ PAGE_ROWS = 100
 
 # A "recent <kind>" board holds verdict rows this young, and older ones still
 # current at HEAD. It held the 25 newest of any age: suite runs from weeks
-# back, nearly all `behind`, filled it (the owner, 2026-10-02).
+# back, nearly all `behind`, filled it (the user, 2026-10-02).
 RECENT_DAYS = 14
 
 # A board on `/` or `/targets` shows this many of its newest rows, and every
 # row due soon or past due: `/` drew every open row, a second's render on a
-# busy store and as much again in the browser (the owner, 2026-10-09). The
+# busy store and as much again in the browser (the user, 2026-10-09). The
 # rest are a count in the heading, linked to the view that lists them all.
 BOARD_ROWS = 10
 
@@ -67,6 +71,66 @@ def _board(ctx, title, rows, author, *, aside: str = "", more: str = "", tip: st
             render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
                         show_target=show_target, compact=True, git_head=git_head,
                         since=since.get(n.id))
+
+
+def _naming(notes) -> dict[tuple, list]:
+    """Each (type, name) with every row on or citing it, in the rows' order,
+    as /object counts a target's rows."""
+    on: dict[tuple, list] = {}
+    for n in notes:
+        for t in dict.fromkeys([(n.target.type, n.target.name),
+                                *((r.type, r.name) for r in n.refs)]):
+            on.setdefault(t, []).append(n)
+    return on
+
+
+def _docs_board(ctx, title: str, docs, on, mark: str, all: str, aside: str = "") -> None:
+    """A board of the Docs page: a row a file, with its entries and the open
+    ones among them, and a read button where the viewer can show it. Past
+    BOARD_ROWS, a link shows them all."""
+    docs = sorted(docs, key=lambda t: (-len(on[t]), t[1]))
+    shown = docs if all else docs[:BOARD_ROWS]
+    with ui.element("section").classes("sb-board" + ("" if docs else " sb-board-empty")) \
+            .mark(mark):
+        with ui.element("div").classes("sb-board-head"):
+            ui.label(title).classes("sb-board-title")
+            ui.label(str(len(docs))).classes("sb-count")
+            if aside:
+                ui.label(aside).classes("sb-board-aside")
+        with ui.element("div").classes("sb-docs"):
+            for typ, name in shown:
+                rows = on[(typ, name)]
+                n_open = sum(S.read_status(n) == "open" and not n.spec.parked for n in rows)
+                ui.icon("article")
+                ui.link(name if typ in ("file", "doc") else f"{typ}: {name}",
+                        target_href(typ, name)).classes("sb-docs-name").mark("doc-link")
+                with ui.element("span").classes("sb-docs-n").mark("doc-count"):
+                    ui.label(f"{len(rows)} ·" if n_open else summ._count(len(rows), "entry"))
+                    if n_open:
+                        ui.label(f"{n_open} open").classes("text-notable")
+                view_button(ctx, name, ttype=typ) or ui.element("span")
+            if len(shown) < len(docs):
+                ui.link(f"+{len(docs) - len(shown)} more", "/docs?all=1") \
+                    .classes("sb-docs-more").mark("docs-more")
+
+
+def _wrap_board(ctx, wrap: dict) -> None:
+    """The last wrap's commit message, the handoff `summary` prints an agent
+    before any row: what the last session did, and what it left next."""
+    with ui.element("section").classes("sb-board").mark("board"):
+        with ui.element("div").classes("sb-board-head"):
+            ui.label("last wrap").classes("sb-board-title").mark("board-title")
+            ui.label(ago(wrap["at"])).classes("sb-count").tooltip(S.shown(wrap["at"]))
+            if wrap["commits_since"] is not None:
+                ui.label(f"· {summ._count(wrap['commits_since'], 'commit')} since") \
+                    .classes("sb-board-aside")
+        with ui.element("div").classes("sb-note").mark("wrap"):
+            with ui.element("div").classes("sb-note-main"):
+                NoteMarkdown(link_ids("\n\n".join(filter(None, (wrap["gist"], wrap["body"]))),
+                                      ctx.store_dir))
+                with ui.element("div").classes("sb-note-foot"):
+                    with ui.element("span").classes("sb-note-by"):
+                        ui.label(wrap["author"]).classes("sb-note-meta")
 
 
 def _recent(ctx, n, since, git_head) -> bool:
@@ -111,36 +175,91 @@ def _error_pages(ctx, author: str) -> None:
         return client.build_response(request, 404)
 
 
-def _history(ctx, every, head, author: str, git_head=None) -> None:
-    """The rows `head` superseded, newest first: the store keeps every
-    version, and the GUI showed only the last. Read-only: an edit made from
-    an old version lands on the current row."""
-    by_id = {n.id: n for n in every}
-    chain, cur = [], head
-    while cur.supersedes in by_id and by_id[cur.supersedes] not in chain:
-        cur = by_id[cur.supersedes]
-        chain.append(cur)
-    if not chain:
-        return
-    with ui.expansion(f"earlier versions ({len(chain)})").classes("w-full sb-card") \
-            .mark("history"):
-        for old, new in zip(chain, [head, *chain]):
-            # with its target: a rename is a version that changed nothing else
-            render_note(ctx, old, lambda: None, author=author, actions=False,
-                        git_head=git_head, show_target=True, diff_to=new)
-
-
 def build_page(ctx, *, author: str) -> None:
     _error_pages(ctx, author)
     app.add_static_files(FONTS_URL, FONTS_DIR)
 
+    # Makes the GUI an installable app. "tabbed" opens its pages as tabs in
+    # one app window; a Chrome without tabbed mode (on desktop, behind
+    # chrome://flags/#enable-desktop-pwas-tab-strip) falls back to standalone.
+    # PNG icons, rendered from favicon.svg: Chrome on macOS installed the app
+    # with a blank icon from the SVG alone (the user, 2026-10-15). They are
+    # the page background, opaque (the user, same day), with the rings inside
+    # the 40% circle a maskable icon keeps. To redraw: favicon.svg with a
+    # viewBox of -4 -4 40 40 over a page-colour rect, screenshot by Chrome,
+    # the SVG at the icon's pixel size: under Chrome's minimum window width,
+    # one that fills the viewport renders larger and is cropped.
+    icons = [{"src": app.add_static_file(local_file=FAVICON.parent / f"icon-{s}.png",
+                                         url_path=f"/icon-{s}.png"),
+              "sizes": f"{s}x{s}", "type": "image/png", "purpose": "any maskable"}
+             for s in (192, 512)]
+
+    @app.get("/manifest.webmanifest")
+    def manifest():
+        return JSONResponse({
+            "name": f"{store_name(ctx)} · symbion", "short_name": store_name(ctx),
+            "id": "/", "start_url": "/", "scope": "/",
+            "display": "standalone", "display_override": ["tabbed"],
+            # Chrome paints a tabbed app's frame and inactive tabs in
+            # theme_color. Its active tab was bg_page with background_color
+            # bg_page and with bg_panel, the app relaunched (2026-10-16): it
+            # follows the page's background, or a value stored at install. So the strip is the sidebar's colour, the
+            # one that differs from the tab, or no tab reads as current.
+            "theme_color": PALETTE.bg_panel, "background_color": PALETTE.bg_page,
+            # A link Chrome sends to the app opens in a new tab of its window:
+            # one reused would leave its page, a draft and all. A link another
+            # program opens (a terminal's) stays in the browser; one option its
+            # team weighed, 2026-09-08, captures those for a site that names a
+            # client_mode (Chromium issue 330282442).
+            "launch_handler": {"client_mode": "navigate-new"},
+            # A link from another program reaches the app through its shim
+            # only as a scheme registered here: the shim drops an http link
+            # and launches the app on its start page (2026-10-17). A router
+            # rewrites the store's link to web+symbion:, and /go sends it on.
+            "protocol_handlers": [{"protocol": "web+symbion", "url": "/go?to=%s"}],
+            "icons": icons,
+        }, media_type="application/manifest+json")
+
+    @app.get("/go")
+    def go(request: Request, to: str = ""):
+        """A web+symbion: link, as the manifest's protocol handler hands it
+        here, sent on to its page. Only this serve's address and the other
+        running serves' are followed: any page can make the app open a
+        web+symbion: link, and this must not send it anywhere."""
+        url = urlsplit(to)
+        own = {request.url.netloc, *(urlsplit(r["url"]).netloc for r in servers.running())}
+        if url.scheme != "web+symbion" or url.netloc not in own:
+            raise HTTPException(404, f"not a web+symbion: link to a running serve: {to}")
+        return RedirectResponse(urlunsplit(("http", url.netloc, url.path, url.query, url.fragment)),
+                                status_code=302)
+
+    # The ⌘K palette's rows for what is typed (palette.py). A plain def:
+    # FastAPI runs it on a thread, off the loop every page's socket shares.
+    @app.get("/palette")
+    def palette_rows(q: str = ""):
+        return JSONResponse(palette.rows(ctx, author, q))
+
     @ui.page("/")
+    @gitref.heads_once()           # each repo's HEAD once a page
     def home():
-        shell(ctx, author, [("Notebook", None)], here="/")
+        shell(ctx, author, [("Summary", None)], here="/")
         # One HEAD for the page: each check badge read it again (2026-10-01).
         git_head = gitref.head_sha(ctx.cfg)
-        heads = S.heads(S.load(ctx.store_dir))
+        loaded = S.load(ctx.store_dir)
+        heads = S.heads(loaded)
         newest = S.newest_first(heads)
+        # What `summary` puts first for an agent, for the person: what waits
+        # on them, the last session's handoff, what is due. Each row shows
+        # once, as there: the boards below leave these out and count them.
+        by_id = {n.id: n for n in loaded}
+        waiting = [n for n in newest if summ.asks(author, by_id, n)]
+        due = [n for n, _ in summ.due_soon(newest) if n.id not in {w.id for w in waiting}]
+        above = {n.id for n in waiting + due}
+
+        def below(rows, aside=""):
+            kept = [n for n in rows if n.id not in above]
+            up = len(rows) - len(kept)
+            return kept, " ".join(filter(None, (f"· {up} above" if up else "", aside)))
         # The boards' pool, counted once: all heads cost twice as much.
         since = gitref.commits_since(ctx.cfg, [n for n in newest if n.spec.verdict
                                                or S.read_status(n) == "open"
@@ -152,16 +271,23 @@ def build_page(ctx, *, author: str) -> None:
             if bad:
                 ui.label(f"⚠ {len(bad)} malformed line(s) skipped — "
                          f"first at line {bad[0][0]}").classes("text-notable")
+            if waiting:
+                _board(ctx, "waiting on you", waiting, author, git_head=git_head, since=since)
+            if wrap := gitref.last_wrap(ctx.store_dir, ctx.cfg):
+                _wrap_board(ctx, wrap)
+            if due:
+                _board(ctx, "due soon", due, author, git_head=git_head, since=since)
             active = {a.id for a in S.load_arcs(ctx.store_dir) if not a.archived}
             for label, k in ctx.kinds.items():
                 if k.status and not k.parked:
-                    rows = summ.open_outside_arcs(newest, label, active)
-                    in_arcs = len(summ.open_notes(newest, label)) - len(rows)
-                    _board(ctx, f"open {label}", rows, author,
-                           aside=f"· {in_arcs} in arcs" if in_arcs else "",
+                    every = summ.open_outside_arcs(newest, label, active)
+                    in_arcs = len(summ.open_notes(newest, label)) - len(every)
+                    rows, aside = below(every, f"· {in_arcs} in arcs" if in_arcs else "")
+                    _board(ctx, f"open {label}", rows, author, aside=aside,
                            more=filters.href(kind=label, status="open"), git_head=git_head,
                            since=since)
-            _board(ctx, "priority", summ.starred(newest), author,
+            rows, aside = below(summ.starred(newest))
+            _board(ctx, "priority", rows, author, aside=aside,
                    more=filters.href(tag="priority"), git_head=git_head, since=since)
             young = datetime.now().astimezone() - timedelta(days=RECENT_DAYS)
             for label, k in ctx.kinds.items():
@@ -177,6 +303,7 @@ def build_page(ctx, *, author: str) -> None:
                            since=since)
 
     @ui.page("/notes")
+    @gitref.heads_once()           # each repo's HEAD once a page
     def notes_page(request: Request):
         # The annotation is load-bearing: unannotated, FastAPI reads
         # `request` as a required QUERY parameter and every /notes URL
@@ -186,14 +313,14 @@ def build_page(ctx, *, author: str) -> None:
         q = (params.get("q") or "").strip()
         # What a chip or a search adds to. Not the id: one row has nothing
         # to narrow, and its kind chip opened that row again under
-        # `id=… · kind=bug` (the owner, 2026-10-06).
+        # `id=… · kind=bug` (the user, 2026-10-06).
         base = {k: v for k, v in params.items()
                 if k in filters.FILTER_KEYS and k != "id" and v}
         every = S.load(ctx.store_dir)
         heads = S.heads(every)
         # The superseded ids that brought each current row: its card says
         # so, as a search for one showed the row and nothing of why (the
-        # owner, 2026-10-09).
+        # user, 2026-10-09).
         via: dict[str, list[str]] = {}
 
         def tip(i: str) -> str:
@@ -264,20 +391,16 @@ def build_page(ctx, *, author: str) -> None:
                 ui.link(f"+{len(rows) - len(shown)} older not shown — show all",
                         filters.href(**base, all="1")).classes("text-body").mark("show-all")
             if "id" in kwargs and len(rows) == 1:
-                _history(ctx, every, rows[0], author, git_head)
+                history(ctx, every, rows[0], author, git_head)
 
     @ui.page("/targets")
+    @gitref.heads_once()           # each repo's HEAD once a page
     def targets_page():
         shell(ctx, author, [("Targets", None)], here="/targets")
         git_head = gitref.head_sha(ctx.cfg)
         newest = S.newest_first(S.heads(S.load(ctx.store_dir)))
-        # Each target with every row on or referencing it, as /object counts
-        # them; first seen is newest, so the dict is in order of activity.
-        on: dict[tuple, list] = {}
-        for n in newest:
-            for t in dict.fromkeys([(n.target.type, n.target.name),
-                                    *((r.type, r.name) for r in n.refs)]):
-                on.setdefault(t, []).append(n)
+        # first seen is newest, so the dict is in order of activity
+        on = _naming(newest)
         # The cards are open rows on the target itself: a ref's row is
         # counted, and is a card on its own target's board.
         live = {t: [n for n in rows if (n.target.type, n.target.name) == t
@@ -321,7 +444,28 @@ def build_page(ctx, *, author: str) -> None:
                 for tag, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
                     ui.link(f"#{tag} {n}", filters.href(tag=tag)).classes("sb-chip")
 
+    @ui.page("/docs")
+    def docs_page(all: str = ""):
+        """The user, 2026-10-16: "add Docs below Arcs in the sidebar and show
+        all the documents we know about". Every markdown file a row is on or
+        cites, the repo's, then the store's docs/, the most named first."""
+        shell(ctx, author, [("Docs", None)], here="/docs")
+        on = {t: rows for t, rows in _naming(S.heads(S.load(ctx.store_dir))).items()
+              if t[1] and t[1].lower().endswith(".md")}
+        docs, root = ctx.store_dir / "docs", ctx.cfg.project_root
+        try:
+            where = os.path.relpath(docs, root) if root else str(docs)
+        except ValueError:           # Windows: no relative path to another drive
+            where = str(docs)
+        with ui.column().classes("sb-main gap-5"):
+            ui.label(f"{summ._count(len(on), 'markdown file')} that entries name, "
+                     "the most named first").classes("sb-subtitle")
+            _docs_board(ctx, "in the repo", [t for t in on if t[0] != "doc"], on, "docs-repo", all)
+            _docs_board(ctx, "in the store", [t for t in on if t[0] == "doc"], on, "docs-store",
+                        all, aside=f"· {where}")
+
     @ui.page("/object")
+    @gitref.heads_once()           # each repo's HEAD once a page
     def object_page(type: str = "", name: str = ""):
         # Guard BEFORE the shell: rendering a header for ": " and then
         # navigating away paints a frame of a page that does not exist.
@@ -341,6 +485,8 @@ def build_page(ctx, *, author: str) -> None:
                 ui.label(f"{summ._count(len(rows), 'entry')} on or referencing this object") \
                     .classes("sb-subtitle")
                 view_button(ctx, name, "read the file", ttype=type)
+                if (path := api.object_path(ctx, type, name)) and path.is_file():
+                    file_buttons(path)
             since = gitref.commits_since(ctx.cfg, rows, git_head)
             for n in rows:
                 # The page names the object: a row only referring to it names its own.
@@ -356,6 +502,7 @@ def build_page(ctx, *, author: str) -> None:
             arcs.index(ctx, author=author)
 
     @ui.page("/arc")
+    @gitref.heads_once()           # each repo's HEAD once a page
     def arc_page(id: str = ""):
         if not id:
             ui.navigate.to("/arcs")

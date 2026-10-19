@@ -80,14 +80,14 @@ def test_search_takes_regex_characters_literally():
 
 def test_double_quotes_make_a_phrase():
     """`"read only"` matched a literal `"read` and `only"`, so no row held it
-    (the owner, 2026-10-12). An unclosed quote runs to the end, as the filter
+    (the user, 2026-10-12). An unclosed quote runs to the end, as the filter
     reads it while the closing one is still to be typed."""
     p = filters.search_pattern('"read only" store')
     assert p.search("a read\nonly store")          # any whitespace between
     assert not p.search("only read store")        # in order, adjacent
     assert filters.search_pattern('"read on').search("read only")
     assert filters.search_pattern('"') is None
-    assert filters.search_pattern("owner's").search("the owner's call")
+    assert filters.search_pattern("user's").search("the user's call")
 
 
 def test_a_blank_search_is_no_filter():
@@ -98,7 +98,7 @@ def test_a_blank_search_is_no_filter():
 
 def test_an_id_or_its_printed_tail_is_a_hit():
     """`-a1b` too: symbion prints "rows end in -a1b", and a search for one
-    found nothing (the owner, 2026-10-09)."""
+    found nothing (the user, 2026-10-09)."""
     nid = "20260101-120000-123456-a1b"
     for q in (nid, "a1b", "…a1b", "...a1b", "123456-a1b", "-a1b", "-123456-a1b"):
         assert filters.id_hit(nid, q), q

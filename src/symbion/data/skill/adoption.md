@@ -105,7 +105,8 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
    deals one open entry of each kind in turn. A topic is a tag, not a kind.
    `[kinds]` replaces the defaults, so a new kind goes in beside the defaults
    the project keeps, with a `when` line: `symbion schema` prints it to every
-   writer choosing a kind. A label renamed once entries use it needs the one-time
+   writer choosing a kind, and the web page shows it beside the kind, in the
+   sidebar and the help. A label renamed once entries use it needs the one-time
    `sed` the starter `symbion.toml` gives.
 
 5. **Target types.** `item:` takes any name, and a near spelling of one is a
@@ -138,6 +139,11 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
    - a set no list holds yet (people, places): a catalog over the names entries
      already use, whose resolver mints the canonical form at the first
      sighting.
+
+   When the list holds every legal name (an inventory's hosts, a fixed set of
+   services), `[resolvers] TYPE = "closed"` refuses a name it does not list,
+   so a typo never becomes a second target. Leave `file` open: a closed `file`
+   refuses an entry on a file not yet made.
 
    When the list's names change by plan (a migration renames every metric),
    `[renames] TYPE` maps old to new, and reconcile follows them.

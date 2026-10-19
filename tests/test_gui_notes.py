@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
@@ -10,7 +11,7 @@ from nicegui import ui                      # noqa: E402
 from nicegui.testing import User            # noqa: E402
 
 from symbion import api, store              # noqa: E402
-from symbion.gui.notes import diff_blocks, edited, render_note   # noqa: E402
+from symbion.gui.notes import changes, diff_blocks, edited, render_note   # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
 
@@ -128,7 +129,7 @@ async def test_an_external_check_badge_reads_external(user: User, repo, tmp_path
     await user.open("/t")
     await user.should_see("external — <1d ago")
     await user.should_not_see("current")
-    # "external — 1d ago" was vague with no tooltip (the owner, 2026-10-07).
+    # "external — 1d ago" was vague with no tooltip (the user, 2026-10-07).
     await user.should_see(f"ran {store.shown(n.provenance['at'])}, against something outside "
                           f"the repo: no commit makes it stale, only time")
 
@@ -201,7 +202,7 @@ async def test_an_open_pre_registration_badge_reads_pending(user: User, repo, tm
 
 
 async def test_a_behind_badge_lists_the_commits_since_its_stamp(user: User, repo, tmp_path):
-    """The badge lit up on hover and a click did nothing (the owner's bug).
+    """The badge lit up on hover and a click did nothing (the user's bug).
     Its tooltip now names the stamp and the commits `behind N` counts."""
     import subprocess
     ctx = api.resolve(str(tmp_path))
@@ -270,7 +271,7 @@ async def test_an_id_cited_in_a_body_links_to_that_note(user: User, repo, tmp_pa
 
 
 async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
-    """The owner, 2026-10-01: rows cite the 10-character tail, and only a
+    """The user, 2026-10-01: rows cite the 10-character tail, and only a
     full id linked. A tail links only to a row this store has: rows cite
     other stores' rows too."""
     ctx = api.resolve(str(tmp_path))
@@ -309,6 +310,36 @@ async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
     assert f'href="/notes?id={later.id}"' in md.props["innerHTML"], md.props["innerHTML"]
 
 
+async def test_a_cited_entry_that_is_resolved_reads_struck(user: User, repo, tmp_path):
+    """The user, 2026-10-16: a link to a resolved entry is struck through,
+    as a done item is. Its title says the word, so the strike is not the only
+    sign. An open entry's link stays plain; a cite of an earlier version
+    reads as its entry does now."""
+    ctx = api.resolve(str(tmp_path))
+
+    def task(body):
+        return api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                             "body": body}, author="ada").id
+    done, still, moved = task("done one"), task("still open"), task("edited, then done")
+    api.supersede(ctx, done, author="sam", status="resolved")
+    earlier = api.supersede(ctx, moved, author="sam", body="edited").supersedes
+    api.supersede(ctx, moved, author="sam", status="resolved")
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": f"see {done[-10:]}, {still[-10:]} and {earlier}"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    html = md.props["innerHTML"]
+    anchors = dict(re.findall(r'<a href="/notes\?id=([^"]+)"([^>]*>.*?)</a>', html))
+    assert anchors[done] == f' title="resolved"><s>{done[-10:]}</s>', html
+    assert anchors[earlier] == f' title="resolved"><s>{earlier}</s>', html
+    assert anchors[still] == f">{still[-10:]}", html
+
+
 async def test_a_tag_in_a_body_prints_as_text(user: User, repo, tmp_path):
     """A body is read at a terminal too, where `<pre>` is five characters.
     markdown2 passes raw tags through and DOMPurify keeps the legal ones: a
@@ -332,6 +363,31 @@ async def test_a_tag_in_a_body_prints_as_text(user: User, repo, tmp_path):
     assert "<pre" not in html and "<td" not in html, html
     assert "<code>&lt;pre&gt;</code>" in html, html          # escaped once, not twice
     assert '<a href="https://example.org">' in html, html
+
+
+async def test_a_bare_url_in_a_body_is_a_link(user: User, repo, tmp_path):
+    """The user, 2026-10-16: "external URLs in bodies should become
+    clickable". A sentence's period and a bracket around the URL stay
+    outside the link, its own balanced parentheses inside; a URL in code, or
+    in a link already made, stays as it is."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "see https://example.org/a_b. (and https://example.org/x_(y)) "
+                              "`https://in.code` [named](https://example.org/named) "
+                              "<https://example.org/auto>"},
+                author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    html = md.props["innerHTML"]
+    assert '<a href="https://example.org/a_b">https://example.org/a_b</a>.' in html, html
+    assert '<a href="https://example.org/x_(y)">https://example.org/x_(y)</a>)' in html, html
+    assert "<code>https://in.code</code>" in html, html
+    assert html.count("<a ") == 4, html
 
 
 async def test_a_body_reads_as_it_does_at_a_terminal(user: User, repo, tmp_path):
@@ -378,7 +434,7 @@ async def test_a_compact_row_clips_a_long_verdict_and_a_full_one_does_not(
     assert "END" not in short and "…" in short
     assert full == f"checked: {long}   →   result: ok"
     # A check's verdict is its content, not metadata: one with no body
-    # showed only this line, dim, beside bodies in Text (owner, 2026-10-01).
+    # showed only this line, dim, beside bodies in Text (user, 2026-10-01).
     assert all("sb-verdict" in e.classes for e in user.find(marker="note-verdict").elements)
 
 
@@ -871,9 +927,52 @@ async def _append_in_dialog(user: User, ctx, n, text: str, *, body: str | None =
     return store.heads(store.load(ctx.store_dir))[0]
 
 
+async def test_an_edit_keeps_what_others_wrote_while_the_dialog_was_open(user: User, repo,
+                                                                        tmp_path):
+    """The dialog wrote its own copies of the body, tags, arc and due, read
+    when it opened, so a star given in it took back an agent's addition and
+    tag made meanwhile (a review, 2026-10-16). It sends what the person
+    changed, onto the entry as it is at the save; a body both changed is
+    refused, and the dialog stays open with the person's text."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "first", "tags": ["a"]}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    async def open_dialog():
+        await user.open("/t")
+        user.find(marker="note-edit").click()
+        await user.should_see(marker="edit-priority")
+    arc = store.create_arc(tmp_path, "rig", "", "mixed").id
+    await open_dialog()
+    api.supersede(ctx, n.id, author="claude", append_body="the agent's addition",
+                  arc_id=arc, due="2026-11-01", add_refs=["item:theirs"])
+    api.retag(ctx, n.id, add=["agent-tag"], author="claude")
+    user.find(marker="edit-priority").elements.pop().value = True
+    user.find(marker="edit-refs").elements.pop().set_value(["item:mine"])
+    user.find(marker="edit-save").click()
+    head = store.chain_tip(store.load(tmp_path), n.id)
+    assert head.body == "first\n\nthe agent's addition", head.body
+    assert set(head.tags) == {"a", "agent-tag", "priority"}, head.tags
+    assert (head.arc_id, head.due) == (arc, "2026-11-01")
+    assert [f"{r.type}:{r.name}" for r in head.refs] == ["item:theirs", "item:mine"]
+
+    await open_dialog()
+    api.supersede(ctx, n.id, author="claude", append_body="a second addition")
+    user.find(marker="edit-body").elements.pop().set_value("rewritten by ada")
+    user.find(marker="edit-save").click()
+    assert user.notify.contains("changed since this dialog opened"), user.notify.messages
+    head = store.chain_tip(store.load(tmp_path), n.id)
+    assert head.body.endswith("a second addition"), "nothing written over it"
+    assert user.find(marker="edit-body").elements.pop().value == "rewritten by ada"
+
+
 async def test_the_edit_dialog_adds_text_after_the_body(user: User, repo, tmp_path):
     """Most edits add to a row, and the body's end was a scroll away (the
-    owner, 2026-10-01). A #tag in the added text is a tag, as in the body.
+    user, 2026-10-01). A #tag in the added text is a tag, as in the body.
     ⌘ Enter saves, as it adds a note in the composer."""
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
@@ -935,7 +1034,7 @@ async def test_the_edit_dialog_sends_no_target_it_did_not_change(user: User, rep
 
 
 async def test_the_edit_dialog_stars_a_row_in_the_same_write(user: User, repo, tmp_path):
-    """The owner, 2026-10-02: "supersede should include a priority toggle
+    """The user, 2026-10-02: "supersede should include a priority toggle
     for a single op". The switch holds `priority`, the tags field the rest."""
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
@@ -962,7 +1061,7 @@ async def test_the_edit_dialog_unstars_a_row(user: User, repo, tmp_path):
 
 async def test_the_edit_dialog_retires_a_plain_row_in_the_same_write(user: User, repo,
                                                                      tmp_path):
-    """A note could not be retired from the GUI (the owner, 2026-10-14): a
+    """A note could not be retired from the GUI (the user, 2026-10-14): a
     row with no status leaves the default views by its `retired` tag, which
     only a typed tag reached. The switch holds `retired`, as `priority`'s
     does, on a kind with no status; a status row resolves instead."""
@@ -995,7 +1094,7 @@ async def test_the_edit_dialog_brings_a_retired_row_back(user: User, repo, tmp_p
 
 async def test_the_edit_dialog_resolves_an_open_row_in_the_same_write(user: User, repo,
                                                                      tmp_path):
-    """The owner, 2026-10-13: "the supersede dialog should offer the resolve
+    """The user, 2026-10-13: "the supersede dialog should offer the resolve
     checkbox so you can do a resolve with a message in one shot"."""
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
@@ -1047,7 +1146,7 @@ async def test_edit_dialog_sets_and_clears_due(user: User, repo, tmp_path):
 
 
 async def test_a_picked_date_fills_the_due_field(user: User, repo, tmp_path):
-    """Both due fields carry a calendar (the owner, 2026-10-12): a date
+    """Both due fields carry a calendar (the user, 2026-10-12): a date
     picked there is the row's due, in the add form and in the edit dialog."""
     from symbion.gui.notes import add_form
     ctx = api.resolve(str(tmp_path))
@@ -1131,6 +1230,186 @@ async def test_add_form_puts_an_entry_on_more_objects(user: User, repo, tmp_path
     assert refs.value == [], "the form clears for the next entry"
 
 
+async def test_a_catalog_refusal_shows_in_the_form(user: User, repo, tmp_path):
+    """A closed catalog refuses a name it does not list, and the refusal is a
+    CatalogError, which the form's `except ValueError` let through: save did
+    nothing, and the traceback went to the serve's log."""
+    from symbion.gui.notes import add_form
+    (tmp_path / "symbion.toml").write_text(
+        "[catalogs]\nhost = \"printf 'web1\\\\n'\"\n[resolvers]\nhost = \"closed\"\n")
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    user.find(marker="note-refs").elements.pop().set_value(["host:db9"])
+    user.find(marker="note-body").type("on a host the catalog lacks")
+    user.find(marker="note-add").click()
+    assert user.notify.contains("which is closed"), user.notify.messages
+    assert store.load(tmp_path) == []
+
+    n = api.add(ctx, {"kind": "note", "target": "host:web1", "body": "b"}, author="ada")
+
+    @ui.page("/e")
+    def edit_page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/e")
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-refs")
+    user.find(marker="edit-refs").elements.pop().set_value(["host:db8"])
+    user.notify.messages.clear()
+    user.find(marker="edit-save").click()
+    assert user.notify.contains("which is closed"), user.notify.messages
+    assert [x.id for x in store.load(tmp_path)] == [n.id], "the edit wrote nothing"
+
+
+async def test_the_name_field_shows_each_name_with_its_description(user: User, repo, tmp_path):
+    """A catalog line's description, after a tab, shows under its name."""
+    from symbion.gui.notes import add_form
+    (repo / "hosts.tsv").write_text("web1\tthe frontend\nweb2\n")
+    (tmp_path / "symbion.toml").write_text('[catalogs]\nhost = "cat hosts.tsv"\n')
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "host", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    name = user.find(marker="note-on-name").elements.pop()
+    assert name._props["options"] == ["web1", "web2"]
+    assert name._props["captions"] == {"web1": "the frontend"}
+
+
+async def test_the_commit_picker_offers_the_newest_commits_with_their_subjects(
+        user: User, repo, tmp_path, monkeypatch):
+    """It listed bare shas (the user, 2026-10-15): now the newest commits on
+    HEAD, then those rows name, each a short sha with its subject. A name git
+    does not know shows as stored."""
+    import subprocess
+    from symbion.gui import notes
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(repo), *a], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    c0 = git("rev-parse", "HEAD")
+    git("commit", "-q", "--allow-empty", "-m", "c1")
+    c1 = git("rev-parse", "HEAD")
+    git("commit", "-q", "--allow-empty", "-m", "c2")
+    c2 = git("rev-parse", "HEAD")
+    monkeypatch.setattr(notes, "RECENT_COMMITS", 2)
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": f"commit:{c0}", "body": "b"}, author="ada")
+    api.add(ctx, {"kind": "note", "target": "commit:not-a-sha", "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        notes.add_form(ctx, "commit", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    name = user.find(marker="note-on-name").elements.pop()
+    assert name._props["options"] == [c2[:7], c1[:7], "not-a-sha", c0[:7]]
+    assert name._props["captions"] == {c2[:7]: "c2", c1[:7]: "c1", c0[:7]: "c0"}
+
+
+async def test_a_commit_form_reads_the_commits_once_and_stores_a_picked_sha_whole(
+        user: User, repo, tmp_path, monkeypatch):
+    """From the review of the commit picker (2026-10-16): a commit with an
+    empty message showed its full sha, for the cut keyed on having a
+    subject; a commit-typed form read the commits once per picker, 70 ms
+    each; and no test saw a picked short sha stored as the full one."""
+    import subprocess
+    from symbion import gitref
+    from symbion.gui import notes
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty",
+                    "--allow-empty-message", "-m", ""], check=True)
+    bare = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    ctx = api.resolve(str(tmp_path))
+    reads, real = [], gitref.recent
+    monkeypatch.setattr(gitref, "recent", lambda *a: reads.append(a) or real(*a))
+
+    @ui.page("/t")
+    def page():
+        notes.add_form(ctx, "commit", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    assert len(reads) == 1, "the name field and also on share one read"
+    name = user.find(marker="note-on-name").elements.pop()
+    assert bare[:7] in name._props["options"] and bare not in name._props["options"]
+    name.value = bare[:7]
+    user.find(marker="note-body").type("on the bare commit")
+    user.find(marker="note-add").click()
+    (n,) = store.load(tmp_path)
+    assert n.target.name == bare
+
+    @ui.page("/e")
+    def edit_page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/e")
+    reads.clear()
+    user.find(marker="note-edit").click()
+    await user.should_see(marker="edit-refs")
+    assert len(reads) == 1, "the edit dialog's pickers share one read too"
+
+
+def test_the_name_menu_reads_a_caption_only_from_its_own_keys():
+    """An option named like a member of every JS object (`item:constructor`)
+    read `captions[o]` as an inherited function: the filter threw, and the
+    menu showed `function Object() { [native code] }` as a caption. The
+    `user` fixture runs no JS, so node runs suggest.js's own filter."""
+    import base64
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+    from symbion.gui import notes
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("no node to run suggest.js")
+    src = base64.b64encode(Path(notes.__file__).with_name("suggest.js").read_bytes()).decode()
+    script = """
+    import("data:text/javascript;base64,%s").then(({default: c}) => {
+      const ctx = {options: ["constructor", "toString", "__proto__", "web1"], needle: "web",
+                   captions: {web1: "the frontend"}, tokens: false, text: ""};
+      for (const [k, f] of Object.entries(c.methods)) ctx[k] = f.bind(ctx);
+      const out = {web: c.computed.shown.call(ctx)};
+      ctx.needle = "front";
+      out.front = c.computed.shown.call(ctx);
+      out.caps = ctx.options.map((o) => ctx.cap(o));
+      console.log(JSON.stringify(out));
+    });""" % src
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout, [ln for ln in r.stderr.splitlines() if "Error" in ln]
+    assert json.loads(r.stdout) == {"web": ["web1"], "front": ["web1"],
+                                    "caps": ["", "", "", "the frontend"]}
+
+
+async def test_also_on_offers_the_newest_commits_with_their_subjects(user: User, repo, tmp_path):
+    """The label carries the subject after a newline: the menu shows it under
+    the ref and typing matches it (NiceGUI filters on the label); a chip shows
+    the first line (option-label)."""
+    import subprocess
+    from symbion.gui.notes import add_form
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    ctx = api.resolve(str(tmp_path))
+
+    @ui.page("/t")
+    def page():
+        add_form(ctx, "project", None, lambda: None, author="ada")
+
+    await user.open("/t")
+    refs = user.find(marker="note-refs").elements.pop()
+    assert refs.options[f"commit:{head}"] == f"commit:{head[:7]}\nc0"
+    assert "split('\\n')[0]" in refs._props[":option-label"]
+    # a paragraph-long subject stretched the menu to the window's edge
+    assert refs._props["popup-content-class"] == "sb-pick-menu"
+
+
 # ---- the card layout (2026-10-01): age, short id ----
 
 def test_a_rows_age_is_one_unit():
@@ -1156,7 +1435,7 @@ def test_a_rows_id_shows_its_last_two_parts():
     assert short_id("20260102-030405-735180-a9c") == "735180-a9c"
 
 
-# ---- the owner's GUI rows of 2026-10-01 ----
+# ---- the user's GUI rows of 2026-10-01 ----
 
 async def test_the_resolve_box_comes_after_the_text(user: User, repo, tmp_path):
     """On the left it pushed an open row's text in past a closed row's."""
@@ -1212,7 +1491,7 @@ async def test_a_tags_field_drops_its_hashes_when_left(user: User, repo, tmp_pat
 
 async def test_the_tags_fields_offer_the_stores_tags_most_used_first(user: User, repo,
                                                                      tmp_path):
-    """Tags should offer the ones in use as you type (the owner, 2026-10-01).
+    """Tags should offer the ones in use as you type (the user, 2026-10-01).
     `tokens`: the menu completes the field's last word, not the whole text."""
     from symbion.gui.notes import add_form
     ctx = api.resolve(str(tmp_path))
@@ -1248,7 +1527,7 @@ async def test_a_bang_in_the_body_picks_the_kind_and_leaves_the_body(user: User,
     user.find(marker="note-body").type("!task fix the header #gui")
     assert user.find(marker="note-kind-select").elements.pop().value == "task"   # as typed
     # The button names the kind, so a request is not filed as a note unseen
-    # (the owner's row, 2026-10-02): a `note` reaches no open view.
+    # (the user's row, 2026-10-02): a `note` reaches no open view.
     assert add.text == "Add task"
     user.find(marker="note-add").click()
     (row,) = store.heads(store.load(tmp_path))
@@ -1266,7 +1545,7 @@ async def test_a_bang_alone_is_an_empty_note(user: User, repo, tmp_path):
     await user.open("/t")
     user.find(marker="note-body").type("!task")
     user.find(marker="note-add").click()
-    await user.should_see("empty note")
+    await user.should_see("empty entry")
     assert not store.heads(store.load(tmp_path))
 
 
@@ -1340,3 +1619,15 @@ def test_a_rewrite_that_shares_letters_but_not_words_is_a_replacement():
     assert edited(old, "the upload test fails about once in fifty runs on CI")
     # The old body whole inside the new one: seams mark both ends, not a diff.
     assert not edited(old, f"a new lead\n\n{old}\n\nand a new end")
+
+
+def test_changes_names_an_options_change(tmp_path):
+    """The peek lists what each version changed; untaught, a corrected
+    option list read as no change."""
+    store.ensure_store(tmp_path)
+    q = store.add(tmp_path, kind="question", target={"type": "project", "name": None},
+                  body="?", author="sam", options=["a", "b"])
+    same = store.supersede(tmp_path, q.id, author="ada", tags=["t"])
+    assert "options" not in changes(q, same)
+    new = store.supersede(tmp_path, same.id, author="ada", options=["a", "c"])
+    assert "options" in changes(same, new)

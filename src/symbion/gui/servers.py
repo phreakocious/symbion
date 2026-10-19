@@ -1,5 +1,5 @@
 """Which `symbion serve` processes run here, and on which store. The sidebar
-links the other stores' (the owner, 2026-10-01: switch stores in the GUI).
+links the other stores' (the user, 2026-10-01: switch stores in the GUI).
 One serve per store keeps each store's author and repo; a store in every
 URL of one process would not.
 
@@ -32,7 +32,7 @@ def name(store) -> str:
 
 def port(store) -> int:
     """The store's own port: the same at every restart, from every session,
-    and on every machine where its directory has the same name (the owner,
+    and on every machine where its directory has the same name (the user,
     2026-10-02: a row link must not go stale). Below the ports either OS
     gives outgoing connections (macOS from 49152, Linux from 32768)."""
     return 20000 + zlib.crc32(name(store).encode()) % 10000
@@ -54,7 +54,7 @@ def record(url: str, store, build: str = "") -> Path | None:
     `build` is the commit or version it runs, which `serve --restart`
     prints: a re-exec keeps the pid, so only this tells new code from old.
     None for a scratch store when the cache is not scratch too: a scratch
-    serve started without XDG_CACHE_HOME was listed in the owner's sidebar
+    serve started without XDG_CACHE_HOME was listed in the user's sidebar
     (2026-10-05). A test's cache is under a temp root, so it still records."""
     d = _dir()
     if _scratch(store) and not _scratch(d):

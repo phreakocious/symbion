@@ -97,6 +97,8 @@ def test_a_linked_worktree_stands_in_its_repo(ws, monkeypatch):
     ('repos = "../tf-net"\n', "a table of NAME"),
     ('[repos]\nnet = "../tf-net"\n[catalogs]\nfile = "git ls-files"\n',
      "Move the command under the repo"),
+    ('[repos]\nnet = "../tf-net"\n[renames]\nfile = "git"\n',
+     "write it under each repo whose renames it follows: net = 'git'"),
 ])
 def test_a_repos_table_that_cannot_work_does_not_load(ws, toml, says):
     s = ws / "work-notes"
@@ -185,6 +187,27 @@ def test_renames_for_a_repo_type_reads_that_repos_history(ws, monkeypatch):
     assert catalog.rename_map(api.resolve().cfg, "net") == {"main.tf": "network.tf"}
 
 
+def test_reconcile_reads_each_repos_renames_alone(ws, sym):
+    """Reconcile merged every `[renames]` type into one map, so tf-net's
+    rename of main.tf moved an app task on main.tf once tf-app held a
+    network.tf of its own (2026-10-15). Each type reads its own evidence."""
+    assert sym("arc", "create", "--name", "x", "--scope", "net")[0] == 0
+    aid = store.load_arcs(ws / "work-notes")[0].id
+    for t in ("net", "app"):
+        assert sym("add", "task", "--target", f"{t}:main.tf", "--arc-id", aid)[0] == 0
+    _git(ws / "tf-net", "mv", "main.tf", "network.tf")
+    _commit(ws / "tf-net", "rename")
+    _git(ws / "tf-app", "rm", "-q", "main.tf")
+    _commit(ws / "tf-app", "drop")
+    (ws / "tf-app" / "network.tf").write_text("a different file\n")
+    _commit(ws / "tf-app", "add")
+    (ws / "work-notes" / "symbion.toml").write_text(TOML + '[renames]\nnet = "git"\napp = "git"\n')
+    rc, out, err = sym("arc", "reconcile", aid, "--json")
+    assert rc == 0, err
+    assert {r["target_type"]: r["status"] for r in json.loads(out)} == \
+        {"net": "renamed", "app": "stale"}
+
+
 def test_a_listed_repo_this_machine_lacks_refuses_writes_and_reads(ws, sym):
     """A write on its type is refused, naming the path; its rows still read."""
     (ws / "work-notes" / "symbion.toml").write_text(TOML + 'dns = "../tf-dns"\n')
@@ -266,6 +289,21 @@ def test_each_step_of_the_file_rule_from_a_subdirectory(ws, sym):
     rc, out, err = sym("add", "note", "--target", "file:../../../work-notes/x",
                        "--body", "x", at=X)
     assert rc == 1 and "in none of this store's repos" in err, err
+
+
+def test_a_doc_resolves_from_outside_every_repo(ws, monkeypatch, capsys):
+    """A `doc:` name is a path in the store's own docs/, so it needs no repo
+    to stand in. From the store's dir, a [repos] store refused it as in none
+    of its repos (the user, 2026-10-15)."""
+    s = ws / "work-notes"
+    (s / "docs").mkdir(exist_ok=True)
+    (s / "docs" / "plan.md").write_text("# plan\n")
+    for cwd in (ws, s):                   # in no git repo; in the store's own
+        monkeypatch.chdir(cwd)
+        rc = cli.main(["--dir", str(s), "add", "note", "--target", "item:x",
+                       "--ref", "doc:plan", "--body", str(cwd)])
+        assert rc == 0, capsys.readouterr().err
+    assert [n.refs[0].name for n in _heads(ws)] == ["plan.md"] * 2
 
 
 def test_a_path_into_a_linked_worktree_names_its_repo(ws, sym):
@@ -424,6 +462,17 @@ def test_a_commit_peels_in_the_repo_that_holds_it(ws, sym):
     assert "tf-app c0" in out
     rc, out, err = sym("add", "note", "--target", "commit:main", "--body", "x", at=None)
     assert rc == 1 and "names a different commit in each of ansible, net, app" in err, err
+
+
+def test_recent_takes_the_newest_commits_of_every_repo_by_time(ws, monkeypatch):
+    """The commit picker offers the newest commits first (the user,
+    2026-10-16). In a store over several repos, a commit may be any repo's."""
+    for day, name in enumerate(("ansible", "tf-net", "tf-app"), start=1):
+        monkeypatch.setenv("GIT_COMMITTER_DATE", f"2030-01-0{day}T00:00:00Z")
+        _commit(ws / name, f"{name} late")
+    monkeypatch.chdir(ws / "tf-net")
+    got = gitref.recent(api.resolve().cfg, 2)
+    assert list(got.values()) == ["tf-app late", "tf-net late"]
 
 
 def test_unmerged_asks_each_repo_for_its_own_shas(ws, monkeypatch):
@@ -606,8 +655,28 @@ def test_the_viewer_reads_a_repo_rows_file_in_its_repo(ws, monkeypatch):
     from symbion.gui.notes import view_path
     monkeypatch.chdir(ws / "tf-app")
     ctx = api.resolve()
-    assert view_path(ctx, "site.yml", "ansible") == (ws / "ansible" / "site.yml").resolve()
+    assert view_path(ctx, "site.yml", "ansible") == ((ws / "ansible" / "site.yml").resolve(), None)
     assert view_path(ctx, "site.yml") is None
+
+
+def test_the_viewer_reads_a_file_only_its_repos_default_branch_holds(ws, monkeypatch):
+    """A ref to a .tf file had no view button in a store over several repos:
+    the file was on main, and that repo had another branch checked out (the
+    user, 2026-10-15). The repo's default branch holds the copy shown."""
+    pytest.importorskip("nicegui")
+    from symbion.gui.notes import view_path
+    net = ws / "tf-net"
+    base = _git(net, "rev-parse", "HEAD")
+    (net / "modules" / "dns").mkdir(parents=True)
+    (net / "modules" / "dns" / "main.tf").write_text('resource "dns_zone" "z" {}\n')
+    _commit(net, "dns")
+    _git(net, "checkout", "-q", "-b", "wip", base)
+    monkeypatch.chdir(ws / "tf-app")
+    ctx = api.resolve()
+    assert view_path(ctx, "modules/dns/main.tf", "net") == (None, "main")
+    assert "dns_zone" in gitref.blob_text(ctx.cfg.for_type("net"), "main", "modules/dns/main.tf")
+    assert view_path(ctx, "modules/dns/main.tf", "app") is None, "another repo's main lacks it"
+    assert view_path(ctx, "modules/nowhere.tf", "net") is None
 
 
 def test_a_check_tip_lists_the_commits_of_its_repo(ws, sym, monkeypatch):
@@ -620,6 +689,26 @@ def test_a_check_tip_lists_the_commits_of_its_repo(ws, sym, monkeypatch):
     state, distance = gitref.check_state(ctx.cfg, n.provenance)
     assert (state, distance) == ("behind", 1)
     assert "net moves" in check_tip(ctx.cfg, n.provenance, state, distance)
+
+
+def test_a_scope_reads_each_repos_head_once(ws, sym, monkeypatch):
+    """A page of checks stamped in a repo the serve does not stand in read
+    that repo's HEAD once a row: a home page of 200 took 2.07 s against
+    0.16 s (2026-10-14). Inside `heads_once` each repo's HEAD is read
+    once; outside one every read is fresh, so a commit between reads shows."""
+    for _ in range(3):
+        _check(sym, "app:main.tf", at="tf-net")
+    monkeypatch.chdir(ws / "tf-net")
+    ctx, rows = api.resolve(), _heads(ws)
+    head, real, reads = gitref.head_sha(ctx.cfg), gitref.head_sha, []
+    monkeypatch.setattr(gitref, "head_sha", lambda cfg: reads.append(1) or real(cfg))
+    with gitref.heads_once():
+        assert {api.verdict_state(ctx.cfg, n, head)[0] for n in rows} == {"current"}
+    assert len(reads) == 1, "app's HEAD, once for three rows"
+    _commit(ws / "tf-app", "app moves")
+    assert {api.verdict_state(ctx.cfg, n, head)[0] for n in rows} == {"behind"}
+    with gitref.heads_once():
+        assert {api.verdict_state(ctx.cfg, n, head)[0] for n in rows} == {"behind"}
 
 
 def test_the_recent_board_holds_a_check_current_in_another_repo(ws, sym, monkeypatch):
@@ -662,8 +751,8 @@ def test_a_larger_batch_of_file_rows_runs_no_more_catalogs(ws, sym, monkeypatch)
     for n in (2, 5):
         ran.clear()
         p = ws / "entries.jsonl"
-        p.write_text("".join(json.dumps({"kind": "note", "target": "file:site.yml"}) + "\n"
-                             for _ in range(n)))
+        p.write_text("".join(json.dumps({"kind": "note", "target": "file:site.yml",
+                                         "body": f"{n}.{i}"}) + "\n" for i in range(n)))
         rc, out, err = sym("add", "--from-json", str(p))
         assert rc == 0, err
         counts.append(len(ran))
@@ -716,6 +805,20 @@ def test_a_read_of_a_missing_file_is_worded_as_a_read(ws, sym):
                  ("context", "--target", "file:nosuch.tf")):
         rc, out, err = sym(*args)
         assert "read as net:nosuch.tf" in err and "a new file" not in err, (args, err)
+
+
+def test_a_closed_repo_takes_no_new_file(ws, sym):
+    """`[resolvers] net = "closed"`: a name no repo holds was taken as a new
+    file in the repo you stand in, past the closed catalog. A read of it is
+    still a read."""
+    (ws / "work-notes" / "symbion.toml").write_text(TOML + '[resolvers]\nnet = "closed"\n')
+    rc, out, err = sym("add", "note", "--target", "file:nosuch.tf", "--body", "x")
+    assert rc == 1 and "file:nosuch.tf matches nothing in any repo, and the net catalog is " \
+        "closed" in err, err
+    rc, out, err = sym("list", "--target", "file:nosuch.tf")
+    assert rc == 0 and "read as net:nosuch.tf" in err, err
+    rc, out, err = sym("add", "note", "--target", "file:nosuch.tf", "--body", "x", at="tf-app")
+    assert rc == 0 and "taken as app:nosuch.tf, a new file" in err, "app is open"
 
 
 def test_branch_outside_every_repo_names_the_repos(ws, sym):

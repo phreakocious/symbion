@@ -36,7 +36,7 @@ def test_native_hook_adoption_and_errors(repo, tmp_path, mode):
     if mode not in {"absent", "blank-alone", "missing", "directory"}:
         store.ensure_store(notes)
         store.add(notes, kind="task", target={"type": "project", "name": None},
-                  author="human", body="owner request: → λ", status="open")
+                  author="human", body="user request: → λ", status="open")
     pointer = repo / ".symbion"
     if mode in {"relative", "missing", "broken-config"}:
         pointer.write_bytes(b" \r\n../notes with spaces\r\n")
@@ -61,7 +61,7 @@ def test_native_hook_adoption_and_errors(repo, tmp_path, mode):
     elif mode == "broken-config":
         assert "could not parse" in result.stdout
     else:
-        assert "owner request: → λ" in result.stdout
+        assert "user request: → λ" in result.stdout
 
 
 def test_native_hook_names_missing_executable_only_in_adopted_projects(repo):

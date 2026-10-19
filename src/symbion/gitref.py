@@ -3,29 +3,36 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import posixpath
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import catalog, config, store
 
 
-def _git(cfg_or_path, *args):
+def _git(cfg_or_path, *args, input: str | None = None):
     """HEAD, branches and dirtiness are per-worktree, so this must run
     against `work_root` (the CURRENT checkout), never `project_root` (which
     is deliberately the MAIN checkout -- see config.project_root). A bare
     path (as `uncommitted(store)` passes) has neither attribute and is used
-    as-is."""
+    as-is.
+
+    A list that grows with the store goes on `input`, never argv: a Windows
+    command line holds at most 32,767 characters, and past it the call
+    raises WinError 206 (a store's paths ran well past it, 2026-10-16)."""
     root = _root(cfg_or_path)
     if root is None:
         # A store named from outside any repository (api.resolve): every git
         # question answers as it does for a departed sha -- a failed run --
         # so a check reads `unverifiable`, a subject falls back to its sha.
         return subprocess.CompletedProcess(["git", *args], 128, "", "not a git repository")
-    return subprocess.run(["git", "-C", str(root), *args],
+    return subprocess.run(["git", "-C", str(root), *args], input=input,
                           capture_output=True, text=True, encoding="utf-8")
 
 
@@ -135,6 +142,37 @@ def only_on_default_branch(cfg, name) -> str | None:
     return b if _git(cfg, "cat-file", "-e", f"{b}:{name}").returncode == 0 else None
 
 
+def other_worktree(cfg, name) -> str | None:
+    """`<path from the cwd> (<branch>)` of another worktree of this repo
+    that holds `name`, when this one does not. A catalog lists the checkout
+    you stand in, so a file only a linked worktree held read as a typo
+    (2026-10-13)."""
+    root = getattr(cfg, "work_root", None)
+    if not root or not name or Path(root, name).exists():
+        return None
+    for rec in _git(cfg, "worktree", "list", "--porcelain").stdout.split("\n\n"):
+        f = dict(ln.partition(" ")[::2] for ln in rec.splitlines())
+        wt = f.get("worktree")
+        if wt and Path(wt).resolve() != Path(root).resolve() and Path(wt, name).exists():
+            try:
+                wt = Path(os.path.relpath(wt)).as_posix()
+            except ValueError:                   # Windows: another drive
+                pass
+            return f"{wt} ({f.get('branch', '').removeprefix('refs/heads/') or 'detached'})"
+    return None
+
+
+def blob_text(cfg, rev, name) -> str | None:
+    """`name` as `rev` holds it, when it is a file there that reads as
+    UTF-8; else None. The viewer's copy of a file only the default branch
+    holds (only_on_default_branch)."""
+    try:
+        r = _git(cfg, "cat-file", "blob", f"{rev}:{name}")
+    except UnicodeDecodeError:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
 def ignored_here(cfg, name) -> bool:
     """`name` is a file in this worktree that git ignores. The default file
     catalog (`--exclude-standard`) drops it, so a task on a gitignored
@@ -173,7 +211,7 @@ def canon_name(cfg, target_type, name, stored=()):
             try:
                 pool = catalog.pool(cfg, target_type)
                 got = catalog.resolve_with(cfg, target_type, q, pool) \
-                    if target_type in cfg.resolvers else catalog.resolve(q, pool)
+                    if catalog.resolver(cfg, target_type) else catalog.resolve(q, pool)
             except (catalog.CatalogError, catalog.AmbiguousName):
                 got = q
             if got != q:
@@ -258,20 +296,27 @@ def file_target(cfg, name, extra=None, say: bool = True, cache=None,
     def note(s):
         if say:
             print(f"note: {s}", file=sys.stderr)
-    if is_path(q):
-        repo, rel, p = _from_path(cfg, q)
-        typ = repo or "file"
-        # A directory took a file's name with no word of it (the repos review).
-        note(f"file:{q} is {typ}:{rel}" + ("" if p.is_file() else ", a directory"
-                                           if p.is_dir() else ", which does not exist"
-                                           + ("" if reading else " yet")))
-        return typ, rel
     here, extra, cache = cfg.here, extra or {}, {} if cache is None else cache
 
     def pool(r):
         if r not in cache:
             cache[r] = catalog.names(cfg, r, allow_empty=True)
         return [*cache[r], *extra.get(r, ())]
+
+    def closed(typ, got, what):          # a write's new name, where only listed ones go
+        if not reading and cfg.resolvers.get(typ) == catalog.CLOSED and got not in pool(typ):
+            raise catalog.CatalogError(f"file:{q} {what}, and the {typ} catalog is closed: it "
+                                       f"takes only the names it lists ([resolvers] {typ} = "
+                                       f"\"closed\" in symbion.toml)")
+    if is_path(q):
+        repo, rel, p = _from_path(cfg, q)
+        typ = repo or "file"
+        closed(typ, rel, f"is {typ}:{rel}, which it does not list")
+        # A directory took a file's name with no word of it (the repos review).
+        note(f"file:{q} is {typ}:{rel}" + ("" if p.is_file() else ", a directory"
+                                           if p.is_dir() else ", which does not exist"
+                                           + ("" if reading else " yet")))
+        return typ, rel
     joined = q
     if here:
         sub = Path.cwd().resolve().relative_to(cfg.work_root).as_posix()
@@ -298,6 +343,7 @@ def file_target(cfg, name, extra=None, say: bool = True, cache=None,
         note(f"file:{q} is {hits[0][0]}:{hits[0][1]}, the one repo that holds it")
         return hits[0]
     if here:
+        closed(here, joined, "matches nothing in any repo")
         note(f"file:{q} matches nothing in any repo; " + (f"read as {here}:{joined}" if reading
                                                           else f"taken as {here}:{joined}, a new file"))
         return here, joined
@@ -322,8 +368,11 @@ def read_target(cfg, ttype, name, notes) -> tuple:
 def _dirty_paths(cfg) -> list[str]:
     """`git status --porcelain -z` paths, a rename's new name. Split on NUL:
     the line form quotes a path with a space or a non-ASCII byte, and the
-    stamp kept `"caf\\303\\251.txt"`, quotes and all (2026-10-09 review)."""
-    fields = iter(_git(cfg, "status", "--porcelain", "-z").stdout.split("\0"))
+    stamp kept `"caf\\303\\251.txt"`, quotes and all (2026-10-09 review).
+    `--no-optional-locks`: else status rewrites the project's index under
+    index.lock, and the user's own `git add` beside it refuses."""
+    fields = iter(_git(cfg, "--no-optional-locks", "status", "--porcelain", "-z")
+                  .stdout.split("\0"))
     out = []
     for f in fields:
         if f:
@@ -396,6 +445,34 @@ def head_sha(cfg) -> str:
     return _git(cfg, "rev-parse", "--verify", "-q", "HEAD").stdout.strip()
 
 
+_HEADS: ContextVar[dict | None] = ContextVar("symbion_heads", default=None)
+
+
+@contextmanager
+def heads_once():
+    """Within it, check_state reads each repo's HEAD once. A page of checks
+    stamped in a repo the serve does not stand in read that repo's HEAD per
+    row: a home page of 200 took 2.07 s against 0.16 s (2026-10-14). A
+    scope, not a TTL: a read outside one is fresh, as an in-process test
+    that commits and reads back needs. A page or a command is one."""
+    token = _HEADS.set({})
+    try:
+        yield
+    finally:
+        _HEADS.reset(token)
+
+
+def _head_once(cfg) -> str:
+    """head_sha, read once per repo inside heads_once()."""
+    seen = _HEADS.get()
+    if seen is None:
+        return head_sha(cfg)
+    key = str(_root(cfg))
+    if key not in seen:
+        seen[key] = head_sha(cfg)
+    return seen[key]
+
+
 def unmerged(cfg, shas) -> dict:
     """{sha: a branch that holds it} for each commit HEAD cannot reach. One
     walk for all: a merge-base a sha took 0.6 s over one target's resolved
@@ -409,11 +486,13 @@ def unmerged(cfg, shas) -> dict:
             found |= unmerged(cfg.repo(name), shas)
         return found
     shas = [s for s in dict.fromkeys(shas) if _HEX.fullmatch(s)]
-    r = _git(cfg, "rev-list", "--ignore-missing", *shas, "--not", "HEAD", "--") \
-        if shas else None
-    if not r or r.returncode:
-        return {}
-    out, found = r.stdout.split(), {}
+    out, found = [], {}
+    for i in range(0, len(shas), SHA_BATCH):     # --stdin drops --ignore-missing
+        r = _git(cfg, "rev-list", "--ignore-missing", *shas[i:i + SHA_BATCH], "--not", "HEAD",
+                 "--")
+        if r.returncode:
+            return {}
+        out += r.stdout.split()
     for s in shas:
         if any(o.startswith(s.lower()) for o in out):
             b = _git(cfg, "for-each-ref", "--count=1", "--contains", s,
@@ -460,13 +539,9 @@ def check_state(cfg, prov, head: str | None = None):
     if getattr(cfg, "repos", None):
         routed = stamp_cfg(cfg, prov)
         if routed.work_root != cfg.work_root:
-            # The caller's head is its own repo's: another repo's is read
-            # here, once a row.
-            # ponytail: a page of many checks stamped in other repos reads
-            # one HEAD per row; pass a head per repo if the page's time shows it.
-            head = None
+            head = None            # the caller's head is its own repo's
         cfg = routed
-    head = head_sha(cfg) if head is None else head
+    head = _head_once(cfg) if head is None else head
     if not head:
         return ("unverifiable", None)
     key = (str(_root(cfg)), stamp, head)
@@ -525,8 +600,11 @@ def branch_commits(cfg, ref: str, since: str | None = None) -> set:
     return set(r.stdout.split())
 
 
+SHA_BATCH = 500                 # full shas per git call, well under 32,767 characters
+
+
 def subjects(cfg, shas) -> dict:
-    """sha -> subject line, in one batched call.
+    """sha -> subject line, in batched calls.
 
     `--ignore-missing` is load-bearing: without it, `log --no-walk` on a batch
     containing even one unresolvable sha (rebased away, squashed, shallow
@@ -537,8 +615,14 @@ def subjects(cfg, shas) -> dict:
     then renders a bare sha only for the ones actually missing.
 
     `--end-of-options` too: a commit name git does not know is stored as
-    typed, and `--output=PATH` among the shas wrote the log to PATH."""
+    typed, and `--output=PATH` among the shas wrote the log to PATH.
+
+    In batches of SHA_BATCH: a Windows command line holds at most 32,767
+    characters, and 800 full shas raised WinError 206 there (2026-10-16).
+    `--stdin` would not do: git drops `--ignore-missing` for revisions it
+    reads from stdin, and one unknown sha failed the batch."""
     out = {}
+    shas = list(shas)
     if not shas:
         return out
     if getattr(cfg, "repos", None):
@@ -546,15 +630,30 @@ def subjects(cfg, shas) -> dict:
             if left := [s for s in shas if s not in out]:
                 out |= subjects(cfg.repo(name), left)
         return out
-    r = _git(cfg, "log", "--no-walk", "--ignore-missing", "--format=%H%x00%s",
-             "--end-of-options", *shas)
-    if r.returncode != 0:
-        return out
-    for line in r.stdout.splitlines():
-        if "\0" in line:
-            sha, subject = line.split("\0", 1)
-            out[sha] = subject
+    for i in range(0, len(shas), SHA_BATCH):
+        r = _git(cfg, "log", "--no-walk", "--ignore-missing", "--format=%H%x00%s",
+                 "--end-of-options", *shas[i:i + SHA_BATCH])
+        if r.returncode != 0:
+            continue
+        for line in r.stdout.splitlines():
+            if "\0" in line:
+                sha, subject = line.split("\0", 1)
+                out[sha] = subject
     return out
+
+
+def recent(cfg, n: int) -> dict:
+    """sha -> subject for the newest `n` commits on HEAD, newest first: the
+    head of the GUI's commit picker (the user, 2026-10-16). Over a store's
+    several repos, the newest `n` of them all, by commit time. Where git
+    cannot answer (no repo, no commit yet) it is empty."""
+    got = []
+    for c in [cfg.repo(r) for r in cfg.repos] if getattr(cfg, "repos", None) else [cfg]:
+        r = _git(c, "log", f"-n{n}", "--format=%ct%x00%H%x00%s")
+        if r.returncode == 0:
+            got += [ln.split("\0", 2) for ln in r.stdout.splitlines() if ln.count("\0") == 2]
+    got.sort(key=lambda t: -int(t[0]))        # stable: one repo keeps git's order
+    return {sha: subject for _, sha, subject in got[:n]}
 
 
 def oneline(cfg, rng: str, n: int) -> list[str]:
@@ -588,30 +687,39 @@ def target_blobs(cfg, ttype, names) -> dict:
     """`target_blob` for many names in one `hash-object`: a seed sweep stamps
     a whole catalog. A name that is no file here has no entry."""
     cfg = cfg.for_type(ttype)
-    # ponytail: one argv; a catalog past ~10k paths may need chunks (ARG_MAX).
-    paths = {n: p for n in names if (p := _file(cfg, ttype, n))}
-    r = _git(cfg, "hash-object", "--", *paths.values()) if paths else None
-    out = r.stdout.split() if r and r.returncode == 0 else []
+    return _blobs(cfg, [n for n in dict.fromkeys(names) if _file(cfg, ttype, n)])
+
+
+def _blobs(cfg, paths) -> dict:
+    """path -> the blob `hash-object` makes of it, filters applied; {} when
+    git fails. The paths go on stdin, C-quoted: git unquotes a line that
+    starts with `"`, and a name that did failed the whole call."""
+    if not paths:
+        return {}
+    quoted = "".join('"' + p.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                     + '"\n' for p in paths)
+    r = _git(cfg, "hash-object", "--stdin-paths", input=quoted)
+    out = r.stdout.split() if r.returncode == 0 else []
     return dict(zip(paths, out)) if len(out) == len(paths) else {}
 
 
 # (repo, HEAD's sha, the question) -> git's answer, for changed_since: a file
 # history read back from one commit, and the commits from an anchor to it,
 # are the same for good. A serve page of 100 cards asked again on every load,
-# a quarter second of it on a store whose repo has a merge (the owner,
+# a quarter second of it on a store whose repo has a merge (the user,
 # 2026-10-09). A failure is not kept.
 # ponytail: grows with each HEAD and set of files a process asks about, as
 # _RELATIONS does; bound it if a serve's memory ever shows it.
 _HISTORY: dict = {}
 
 
-def _cached_git(cfg, key, *args):
+def _cached_git(cfg, key, *args, input: str | None = None):
     """`_git(cfg, *args)`'s stdout, or None when git failed; kept under
     `key` when `key` names a commit (an unborn HEAD names none)."""
     full = (str(_root(cfg)), *key)
     if key[0] and full in _HISTORY:
         return _HISTORY[full]
-    r = _git(cfg, *args)
+    r = _git(cfg, *args, input=input)
     out = r.stdout if r.returncode == 0 else None
     if key[0] and out is not None:
         _HISTORY[full] = out
@@ -624,12 +732,15 @@ def _file_history(cfg, paths, head: str) -> tuple[dict, float]:
     its parents. A merge has no `--raw` record, so no path lists one; the
     walk lists those that matter to `paths`. NUL-delimited: a header
     `SHA TIME PARENTS`, then per changed path a `:modes blobs status` record
-    and the path. No paths, no walk: an empty pathspec reads every commit."""
+    and the path. No paths, no walk: an empty pathspec reads every commit.
+    The revision and the pathspecs go on stdin, which git reads as it reads
+    them on argv, `:(literal)` included."""
     if not paths:
         return {}, math.inf
-    out = _cached_git(cfg, (head, "log", *paths), "log", "-z", "--topo-order", "--no-renames",
-                      "--raw", "--no-abbrev", "--format=%H %ct %P", head or "HEAD", "--",
-                      *(f":(literal){p}" for p in paths))
+    spec = "".join(f":(literal){p}\n" for p in paths)
+    out = _cached_git(cfg, (head, "log", *paths), "log", "--stdin", "-z", "--topo-order",
+                      "--no-renames", "--raw", "--no-abbrev", "--format=%H %ct %P",
+                      input=f"{head or 'HEAD'}\n--\n{spec}")
     toks = out.split("\0") if out is not None else []
     hist, top, merge, i = {}, None, None, 0
     while i < len(toks):
@@ -683,9 +794,7 @@ def changed_since(cfg, notes, head: str | None = None) -> dict:
 def _changed_since(cfg, notes, head: str | None = None) -> dict:
     """changed_since in one repo: `cfg`'s roots, no routing."""
     files = {n.id: _file(cfg, n.target.type, n.target.name) for n in notes}
-    paths = sorted({p for p in files.values() if p})
-    r = _git(cfg, "hash-object", "--", *paths) if paths else None
-    now = dict(zip(paths, r.stdout.split())) if r and r.returncode == 0 else {}
+    now = _blobs(cfg, sorted({p for p in files.values() if p}))
     moved = sorted({files[n.id] for n in notes if files[n.id]
                     and now.get(files[n.id]) != n.target_blob})
     if moved and head is None:
@@ -733,30 +842,36 @@ def uncommitted(store_dir) -> tuple[int, bool]:
     unconditionally, never only after a write."""
     # ponytail: an untracked notes.jsonl beside a HEAD (only by hand-run git)
     # reads 0; pending_rows would need an ls-files to read it whole.
+    return len(store.entries(store.pending_rows(store_dir))), registry_modified(store_dir)
+
+
+def registry_modified(store_dir) -> bool:
+    """arcs.jsonl changed in the work tree, staged, or untracked and not
+    empty. One status call, without the index lock (store.pending_rows): the
+    page shell read it with three, and the pending rows twice (2026-10-16)."""
     store_dir = Path(store_dir)
-    notes, registry = len(store.entries(store.pending_rows(store_dir))), False
-    for args in (["diff", "--numstat"], ["diff", "--cached", "--numstat"]):
-        if any(line.endswith("arcs.jsonl") for line in _git(store_dir, *args).stdout.splitlines()):
-            registry = True
-    untracked = _git(store_dir, "ls-files", "--others", "--exclude-standard").stdout.split()
-    for rel in untracked:
-        if rel.endswith("arcs.jsonl"):
-            registry = registry or bool((store_dir / rel).read_text(encoding="utf-8").strip())
-    return notes, registry
+    out = _git(store_dir, "--no-optional-locks", "status", "--porcelain", "-z", "--",
+               store.ARCS_FILE).stdout
+    for entry in filter(None, out.split("\0")):
+        if not entry.startswith("??") or (store_dir / entry[3:]).read_text(
+                encoding="utf-8").strip():
+            return True
+    return False
 
 
 def committed(store_dir) -> str:
     """What HEAD took, as `commit` and the GUI's button say it: the `Rows:`
-    trailer, then by name every path but symbion's own two. `add -A` takes
+    trailer, then by name every path but the rows' file. `add -A` takes
     every path in the store, and a plan, then a script, went in under a line
-    that named only the rows (2026-10-02, 2026-10-05). `-z`: a name git
+    that named only the rows (2026-10-02, 2026-10-05); `arcs.jsonl` went in
+    unnamed, though the dry run listed it (2026-10-15). `-z`: a name git
     would quote prints as written."""
     rows = _git(store_dir, "log", "-1", "--format=%(trailers:key=Rows,valueonly)").stdout.strip()
     paths = [p for p in _git(store_dir, "show", "-z", "--name-only", "--format=", "HEAD")
              .stdout.split("\0") if p.strip()]
     if not paths:                                 # a wrap with nothing pending
         return "committed: the message alone, no entries or files"
-    files = [p for p in paths if p not in (store.NOTES_FILE, store.ARCS_FILE)]
+    files = [p for p in paths if p != store.NOTES_FILE]
     said = [f"entries {rows}"] if rows else []
     if files:
         more = f", +{len(files) - 3} more" if len(files) > 3 else ""

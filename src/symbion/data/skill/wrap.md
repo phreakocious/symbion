@@ -8,9 +8,11 @@ above the open entries.
 
 1. **Asks.** Reread your own messages in this session. Each ask you put to
    the user ("say if…", "want me to…?", "should I…?") that no later message
-   of theirs answered is an open `question`. Its first 100 characters name
-   what the work does until an answer. An ask held only in chat, a note, a
-   resolved entry or the handoff is not an open `question`.
+   of theirs answered is an open `question`: the ask in plain words, and when
+   its answers fit in three, `--option` for each, the default first. An ask held only in chat, a note, a
+   resolved entry or the handoff is not an open `question`. Where
+   `symbion schema` lists no `question` kind, the handoff's paragraph names
+   each such ask instead, with what the work does until an answer.
 
 2. **Entries.** What the session learned, decided, found broken or started,
    and no entry holds yet, goes on the object it concerns, after a
@@ -35,7 +37,8 @@ above the open entries.
    item.
 
 3. **Commit.** `symbion commit --dry-run`, in a call of its own, shows what
-   goes in. Then:
+   goes in, and `symbion list --since wrap --limit 0` what was written since
+   the last wrap, each entry with its state and result. Then:
 
    ```bash
    symbion commit --wrap -m - <<'EOF'
@@ -47,8 +50,12 @@ above the open entries.
    EOF
    ```
 
-   The summary lists the open entries, so the paragraph names what was left open
-   in a clause. A why in it names what showed it, as in an entry. `--wrap`
+   The next summary lists first the entries that wait on its reader: someone
+   else wrote their newest word. `symbion summary` shows them now, and the
+   first line names what comes after them. The summary lists the open entries,
+   so the paragraph names what was left open in a clause. A why in it names
+   what showed it, as in an entry. An outcome or a count in it comes from
+   that list, in its words: "mostly held" stays "mostly held". `--wrap`
    commits the message even when no entry changed. The heredoc goes to `-m -`,
    never inside `-m "$( )"`, where bash 3.2 breaks on an apostrophe. The wrap
    does not push unless the project's instructions say so.

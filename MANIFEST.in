@@ -1,3 +1,4 @@
 graft tests
 include docs/*.md
+include docs/images/gui.png
 global-exclude *.py[cod]

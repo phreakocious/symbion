@@ -7,6 +7,10 @@
 // with that word completed, since the arrow keys and a pick both write the
 // option into the field; the menu shows only the word. A value already in
 // the list is not offered.
+// A name may carry a caption, a description the menu shows under it; typing
+// matches the caption too, and a pick writes the name. A long caption is cut
+// with an ellipsis, in a menu no wider than `sb-pick-menu` allows: a
+// 219-character one stretched it to the window's edge.
 // `value`, not `model-value`, as NiceGUI's input: with loopback off,
 // NiceGUI writes an emitted `update:modelValue`'s whole argument list into
 // the prop, and the select then read an array as its model.
@@ -23,18 +27,27 @@ export default {
       hide-selected
       fill-input
       input-debounce="0"
+      popup-content-class="sb-pick-menu"
       @filter="filter"
       @input-value="set"
       @update:model-value="set"
     >
-      <template v-if="tokens" v-slot:option="scope">
+      <template v-slot:option="scope">
         <q-item v-bind="scope.itemProps">
-          <q-item-section>{{ last(scope.opt) }}</q-item-section>
+          <q-item-section>
+            <q-item-label>{{ tokens ? last(scope.opt) : scope.opt }}</q-item-label>
+            <q-item-label v-if="cap(scope.opt)" caption lines="1">{{ cap(scope.opt) }}</q-item-label>
+          </q-item-section>
         </q-item>
       </template>
     </q-select>
   `,
-  props: { value: String, options: Array, tokens: Boolean },
+  props: {
+    value: String,
+    options: Array,
+    tokens: Boolean,
+    captions: { type: Object, default: () => ({}) },
+  },
   emits: ["update:value"],
   data() {
     return { text: this.value, needle: "" };
@@ -46,7 +59,11 @@ export default {
   },
   computed: {
     shown() {
-      const hits = this.options.filter((o) => o.toLowerCase().includes(this.needle));
+      const hits = this.options.filter(
+        (o) =>
+          o.toLowerCase().includes(this.needle) ||
+          this.cap(o).toLowerCase().includes(this.needle),
+      );
       if (!this.tokens) return hits;
       const head = this.text.replace(/[^,\s]*$/, "");
       const have = head.split(SEP).map(word);
@@ -55,6 +72,11 @@ export default {
   },
   methods: {
     last,
+    // Own keys only: `captions.constructor` is every object's, and an
+    // option named `constructor` read it as its caption.
+    cap(o) {
+      return Object.hasOwn(this.captions, o) ? this.captions[o] : "";
+    },
     set(v) {
       this.text = v ?? "";
       this.$emit("update:value", this.text);

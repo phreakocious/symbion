@@ -457,6 +457,65 @@ def test_a_files_gotcha_reaches_a_session_the_first_time_it_touches_the_file(git
     assert _touch(env, "") == "" and _touch(env, "not json") == ""
 
 
+def test_a_subagent_gets_a_gotcha_the_main_agent_already_had(git_repo, tmp_path):
+    """A subagent's calls shared the session's marks, so a row the main agent
+    got never reached a subagent that went on to edit the file (a review,
+    2026-10-16). Claude Code puts the subagent's agent_id in its calls'
+    input; one among a tool's own arguments is no subagent."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    store.add(s, kind="note", target={"type": "file", "name": "README.md"}, author="ann",
+              tags=["gotcha"], body="readme trap")
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env,
+                       input=json.dumps({"session_id": "s1", "hook_event_name": "SessionStart"}))
+    assert r.returncode == 0, r
+
+    def call(args=None, **extra):
+        return _touch(env, {"session_id": "s1", **extra, "tool_name": "Read",
+                            "tool_input": {"file_path": f"{git_repo}/README.md", **(args or {})}})
+    assert "readme trap" in call()
+    assert call() == "", "the main agent: once"
+    assert "readme trap" in call(agent_id="a1", agent_type="general-purpose")
+    assert call(agent_id="a1") == "", "a subagent: once too"
+    assert "readme trap" in call(agent_id="a2")
+    assert call({"agent_id": "a9"}) == "", "a tool's argument named agent_id is not the call's"
+
+
+def test_a_gotcha_fires_on_its_own_file_and_again_at_its_first_edit(git_repo, tmp_path):
+    """A row on README.md fired on a Read of src/README.md and was then spent
+    for the session (a clean-room review, 2026-10-13), and a Bash call that
+    only named a file spent its edit-time trap the same way (dogfood,
+    2026-10-14). A name matches at a path boundary, from the repo's root; an
+    edit matches on the file it edits, not the text it writes, and gets the
+    trap once more."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    store.add(s, kind="note", target={"type": "file", "name": "README.md"}, author="ann",
+              tags=["gotcha"], body="readme trap")
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
+
+    def call(sid, tool, **tool_input):
+        return _touch(env, {"session_id": sid, "tool_name": tool, "tool_input": tool_input})
+
+    for sid in ("s1", "s2"):
+        r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                           env=env, input=json.dumps({"session_id": sid,
+                                                      "hook_event_name": "SessionStart"}))
+        assert r.returncode == 0, r
+    for tool, args in (("Read", {"file_path": f"{git_repo}/src/README.md"}),
+                       ("Bash", {"command": "cat docs/README.md OLD_README.md README.md.bak"}),
+                       ("Edit", {"file_path": f"{git_repo}/a.md", "new_string": "see README.md"})):
+        assert call("s1", tool, **args) == "", (tool, args)
+    assert "readme trap" in call("s1", "Bash", command="wc -l README.md")
+    assert call("s1", "Read", file_path=f"{git_repo}/README.md") == "", "once per session"
+    assert "readme trap" in call("s1", "Edit", file_path=f"{git_repo}/README.md",
+                                 old_string="a", new_string="b"), "again at the first edit"
+    assert call("s1", "Write", file_path=f"{git_repo}/README.md", content="b") == ""
+    assert call("s1", "Read", file_path=f"{git_repo}/README.md") == ""
+    assert "readme trap" in call("s2", "Bash", command="cat ./README.md")
+
+
 def test_a_failed_call_gets_its_files_gotcha_too(git_repo, tmp_path):
     """A Bash call that exited non-zero, when a trap has most likely just
     bitten, heard nothing: Claude Code sends a failed call to
@@ -480,7 +539,7 @@ def test_a_failed_call_gets_its_files_gotcha_too(git_repo, tmp_path):
 
 def test_a_gotcha_line_says_its_age_its_files_churn_and_how_to_retire_it(git_repo, tmp_path):
     """A gotcha has no status, so a stale one read as true at every touch
-    (the owner, 2026-10-14). A commit count alone cannot say stale: every
+    (the user, 2026-10-14). A commit count alone cannot say stale: every
     file gotcha in one store had changed since, by one commit to hundreds. So the
     line gives the age and the churn, and how to retire the row: the agent,
     in the file at that moment, is the one placed to judge it."""

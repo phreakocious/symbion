@@ -31,7 +31,7 @@ So seven labels sit on four shapes, and the shapes are combinations of three bit
 | `idea` | ✓ | ✓ | |
 | `check` | | | ✓ |
 
-One legal combination has no built-in: `status` + `verdict`. That is the pre-registration a research project asks for — a check written before the data exists, provenance stamped at commitment, open until the result lands. It falls out of the model; it is not a feature. (Reversed 2026-10-10: `prediction` ships as the eighth default, `status` + `verdict`. A cold-start store offered no such kind, so an agent asked to write its prediction down before a run filed a `note` and appended the result before the first commit, which rewrote the row in place: the store could no longer show the prediction came first. Adopters had already declared `prediction` with these bits. A store `init` made keeps the table it was given, so its owner adds the line; `add` names it when it refuses the label.)
+One legal combination has no built-in: `status` + `verdict`. That is the pre-registration a research project asks for — a check written before the data exists, provenance stamped at commitment, open until the result lands. It falls out of the model; it is not a feature. (Reversed 2026-10-10: `prediction` ships as the eighth default, `status` + `verdict`. A cold-start store offered no such kind, so an agent asked to write its prediction down before a run filed a `note` and appended the result before the first commit, which rewrote the row in place: the store could no longer show the prediction came first. Adopters had already declared `prediction` with these bits. A store `init` made keeps the table it was given, so its user adds the line; `add` names it when it refuses the label.)
 
 A store kept in the ancestor's vocabulary declares the labels it already uses under this spec, adds one, and keeps every word; its migration is the three non-kind substitutions from the vocabulary spec plus one catalog line per target type.
 
@@ -57,7 +57,7 @@ note     = { when = "a durable fact that fits nothing else: a gotcha, a footgun,
 decision = { when = "an ADR: a judgment call not obvious from the diff" }
 bug      = { status = true, when = "a known-broken thing to return to; resolve when fixed" }
 task     = { status = true, when = "a concrete next action; with --arc-id, a checklist box in that arc" }
-question = { status = true, when = "needs the owner's answer before work can proceed; resolve --body carries it" }
+question = { status = true, when = "needs the user's answer before work can proceed; resolve --body carries it" }
 idea     = { status = true, parked = true, when = "a parked thought; resolve --add-tag adopted or retired, --body says why" }
 check    = { verdict = true, when = "a dated verification: --checked what ran, --result what it said" }
 ```
@@ -116,7 +116,7 @@ kinds  (symbion.toml [kinds]; absent = these defaults)   rows
   decision  plain            31  an ADR: a judgment call not obvious from the diff
   bug       status           12  a known-broken thing to return to; resolve when fixed
   task      status           58  a concrete next action; with --arc-id, a checklist box in that arc
-  question  status            9  needs the owner's answer before work can proceed; resolve --body carries it
+  question  status            9  needs the user's answer before work can proceed; resolve --body carries it
   idea      status parked     6  a parked thought; resolve --add-tag adopted or retired, --body says why
   check     verdict          19  a dated verification: --checked what ran, --result what it said
 targets

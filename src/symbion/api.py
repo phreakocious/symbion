@@ -11,6 +11,7 @@ writers at all (tests/test_gui_seam.py).
 from __future__ import annotations
 
 import difflib
+import itertools
 import math
 import os
 import re
@@ -157,8 +158,12 @@ def author_default() -> str:
     attribution self-configuring. Claude comes last: a Codex or a Hermes
     launched from a Claude Code session inherits CLAUDECODE, and the innermost
     agent is the one writing."""
-    if os.environ.get("SYMBION_AUTHOR"):
-        return os.environ["SYMBION_AUTHOR"]
+    return os.environ.get("SYMBION_AUTHOR") or shell_author()
+
+
+def shell_author() -> str:
+    """author_default without $SYMBION_AUTHOR: the agent whose shell runs
+    this, else the git user. A reader that differs from it was set by hand."""
     if os.environ.get("CODEX_THREAD_ID"):
         return "codex"
     if os.environ.get("HERMES_AGENT"):
@@ -294,6 +299,15 @@ def _canonicalizer(ctx: Ctx):
             pools[typ] = catalog.pool(ctx.cfg, typ)
         got = catalog.canonical(ctx.cfg, typ, name,
                                 pending=pending.get(typ, ()), candidates=pools[typ])
+        # No name a catalog lists has a `.` or `..` segment, unless it says
+        # so (a `file:` one is a path, above): `--ref doc:../x.py` stored a
+        # junk target at exit 0 (the user, 2026-10-19).
+        if got not in pools[typ] and \
+                (seg := next((s for s in got.split("/") if s in (".", "..")), None)):
+            raise catalog.CatalogError(
+                f"{typ}:{got} has a '{seg}' segment, which no name the {typ} catalog lists "
+                f"has" + ("; a doc: name is its path within the store's docs/"
+                          if typ == "doc" else ""))
         pending.setdefault(typ, []).append(got)
         return {"type": typ, "name": got}
     return one
@@ -548,6 +562,39 @@ def check_measurements(m) -> None:
                              f"omit it, or say what it measured")
 
 
+def check_options(o) -> None:
+    """A question's answers: one to three strings, each one line of at most
+    60 characters (a button's label), no two alike. Refused by name, as
+    check_measurements refuses; the kind rule is store.check_fields'. More
+    than three is the user's rule (2026-10-16): such a question is asked in
+    prose, and the person answers in text."""
+    if not isinstance(o, (list, tuple)) or not o:
+        raise ValueError(f"options is a list of one to three answers, not {o!r}")
+    if len(o) > 3:
+        raise ValueError("options holds at most three answers; a question with more is "
+                         "asked in prose, and the person answers in text")
+    for i, v in enumerate(o, 1):
+        if not isinstance(v, str):
+            raise ValueError(f"option {i} is a string, not {v!r}")
+        if not v.strip():
+            raise ValueError(f"option {i} is empty")
+        if len(v.strip().splitlines()) > 1:        # \n, \r, \x85, U+2028 and the rest
+            raise ValueError(f"option {i} holds a line break: an answer is one line")
+        if len(v.strip()) > 60:
+            raise ValueError(f"option {i} is over 60 characters: a button's label, "
+                             f"not a paragraph")
+    seen = {}
+    for v in o:
+        if (k := v.strip().casefold()) in seen:
+            raise ValueError(f"options repeat: {seen[k]!r} and {v!r}")
+        seen[k] = v
+
+
+def _stripped_options(o) -> list:
+    check_options(o)
+    return [v.strip() for v in o]
+
+
 def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
     """A `list --json`-shaped row -> `store.add_many` fields: shape checked,
     kind/type/status validated, names NFC'd (resolution happens under the
@@ -584,6 +631,7 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
                          f"(`symbion schema` lists the verdict kinds)")
     if row.get("measurements") is not None:
         check_measurements(row["measurements"])
+    options = _stripped_options(row["options"]) if row.get("options") is not None else None
     check_arc_targets(ctx, [t, *refs])
     later = bool(ctx.cfg.repos) and spec.verdict and not external
     return dict(
@@ -591,7 +639,7 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
         target=t,
         body=row.get("body") or "", status=row.get("status"),
         checked=row.get("checked"), result=row.get("result"),
-        measurements=row.get("measurements"),
+        measurements=row.get("measurements"), options=options,
         arc_id=check_arc(ctx, row.get("arc_id")), due=row.get("due"),
         tags=list(row.get("tags") or ()),
         author=row.get("author") or author,
@@ -655,6 +703,109 @@ def why_unverifiable(prov) -> str:
     return "commit unavailable"
 
 
+# The most a dropped file may weigh: NiceGUI's socket takes a message of up
+# to 1 MB (python-socketio's default, which NiceGUI keeps), and the file
+# viewer reads at most 500,000 characters (the drop design, 2026-10-15).
+DROP_BYTES = 500_000
+
+
+def object_path(ctx: Ctx, typ: str | None, name) -> Path | None:
+    """The file a `typ:name` target names, resolved: under the store's docs/
+    for `doc`, else under the type's checkout. None with no root or no name,
+    or when the name leads out of its root (`..`, a symlink out): a name is
+    typed text."""
+    cfg = None if typ == "doc" else ctx.cfg.for_type(typ)
+    root = ctx.store_dir / "docs" if cfg is None else cfg.work_root
+    if not root or not name:
+        return None
+    root = Path(root).resolve()
+    path = (root / name).resolve()
+    return path if path.is_relative_to(root) else None
+
+
+def as_dropped(path: Path) -> str | None:
+    """A file's text as a browser reads a dropped one (TextDecoder): UTF-8,
+    a leading BOM dropped, CRLF kept. None for a file that cannot be
+    dropped: too big, or not UTF-8."""
+    try:
+        if path.stat().st_size > DROP_BYTES + 3:        # 3: a BOM
+            return None
+        return path.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def known_files(ctx: Ctx, name: str, text: str) -> list[tuple[str, str]]:
+    """Every (type, name) a catalog lists whose file has the base name `name`
+    and holds `text`, read as a dropped file is. A browser gives a dropped
+    file's name, never its path, so the content decides. A file two catalogs
+    list (init's template pairs `file` with `test`) is one file, under the
+    first type."""
+    base = catalog.nfc(name)
+    hits, seen = [], set()
+    for typ in sorted(ctx.cfg.catalogs):
+        try:
+            names = catalog.names(ctx.cfg, typ, allow_empty=True)
+        except catalog.CatalogError:
+            continue                    # a broken catalog knows no file
+        for n in names:
+            if catalog.nfc(n).rsplit("/", 1)[-1] != base:
+                continue
+            path = object_path(ctx, typ, n)
+            if path and path not in seen and path.is_file() and as_dropped(path) == text:
+                seen.add(path)
+                hits.append((typ, n))
+    return hits
+
+
+def _doc_name(name: str) -> str:
+    """A doc's name as `save_doc` takes it, NFC'd: a path inside docs/ with
+    no part that is empty or starts with a dot. A dropped `.gitignore`
+    would change what git sees in docs/."""
+    name = catalog.nfc((name or "").strip())
+    if (not name or name.startswith("/") or "\\" in name
+            or any(not p or p.startswith(".") for p in name.split("/"))):
+        raise ValueError(f"cannot save a doc as {name!r}: name a path inside docs/, "
+                         f"with no part that is empty or starts with a dot")
+    return name
+
+
+def save_doc(ctx: Ctx, name: str, text: str) -> str:
+    """Write `text` to the store's docs/NAME and return NAME. It never
+    overwrites: NAME holding the same text writes nothing, and other text
+    refuses. The file is made exclusively, so two writers cannot both make
+    one name."""
+    name = _doc_name(name)
+    path = object_path(ctx, "doc", name)
+    if path is None:                    # a symlink in docs/ that leads out
+        raise ValueError(f"cannot save a doc as {name!r}: it leads out of docs/")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "x", encoding="utf-8", newline="") as f:
+            f.write(text)
+    except FileExistsError:
+        if as_dropped(path) != text:
+            raise ValueError(f"docs/{name} holds other text; give the doc another name") \
+                from None
+    return name
+
+
+def free_doc_name(ctx: Ctx, name: str, text: str) -> str:
+    """`name`, or the first `stem-2.ext`, `stem-3.ext` … that `save_doc`
+    takes: free, or holding `text` already."""
+    name = _doc_name(name)
+    stem, dot, ext = name.rpartition(".")
+    if not stem or "/" in ext:          # no extension: `notes` -> `notes-2`
+        stem, dot, ext = name, "", ""
+    for k in itertools.count(1):
+        cand = name if k == 1 else f"{stem}-{k}{dot}{ext}"
+        path = object_path(ctx, "doc", cand)
+        if path is None:                # under a symlink out: every number is too
+            raise ValueError(f"cannot save a doc as {cand!r}: it leads out of docs/")
+        if not path.exists() or as_dropped(path) == text:
+            return cand
+
+
 def rewritable(ctx: Ctx, note_id: str, *, author: str) -> bool:
     """Whether `author`'s edit of note_id's chain changes its tip in place
     (store.rewritable). Read outside the lock: for words shown before a
@@ -705,7 +856,8 @@ def add_fields(ctx: Ctx, fields) -> list:
         if not f.get("author"):
             raise ValueError(f"{_entry(i, len(fields))}author is required")
     return store.add_many(ctx.store_dir, fields, target_types=ctx.target_types,
-                          canonicalize=lambda rows: _stamped(ctx, canonicalize_rows(ctx, rows)))
+                          canonicalize=lambda rows: _stamped(ctx, canonicalize_rows(ctx, rows)),
+                          refuse_twins=True)
 
 
 def _stamped(ctx: Ctx, rows) -> list[dict]:
@@ -780,6 +932,8 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
     check_arc(ctx, fields.get("arc_id"))
     if add_measurements:
         check_measurements(add_measurements)
+    if fields.get("options") is not None:
+        fields["options"] = _stripped_options(fields["options"])
     if fields.get("status") == "resolved":
         tip = store.chain_tip(store.load(ctx.store_dir), note_id)
         if tip.spec.status and tip.spec.verdict and store.read_status(tip) == "open":
@@ -863,18 +1017,34 @@ def undo(ctx: Ctx, note_id: str | None, *, author: str, apply: bool = True) -> d
     return store.undo(ctx.store_dir, note_id, mine, apply)
 
 
+def _docs_named(ctx: Ctx, keep) -> list[str]:
+    """The docs/ files, store-relative, that the pending rows a commit takes
+    name as target or ref. A name that leads out of docs/ names nothing:
+    `doc:../notes.jsonl` would stage every pending row."""
+    rows = store.pending_rows(ctx.store_dir)
+    taken = store.with_bases(rows, keep)
+    names = sorted({o.get("name") for r in rows if taken(r)
+                    for o in (r.get("target") or {}, *(r.get("refs") or ()))
+                    if isinstance(o, dict) and o.get("type") == "doc" and o.get("name")})
+    root = ctx.store_dir.resolve()
+    paths = (object_path(ctx, "doc", n) for n in names)
+    return [p.relative_to(root).as_posix() for p in paths if p and p.is_file()]
+
+
 def commit(ctx: Ctx, message: str, *, author: str | None = None,
            everyone: bool = False, wrap: bool = False) -> bool:
     """A commit is not off this disk until a push, and a bare `git push`
     needs an upstream: set it here when the store has an origin, so the
     push hint the CLI prints works on the first try. With `author` (the
-    GUI), only that author's pending rows go in; with `everyone`, every
-    row; else the caller's own rows (store.own_rows) and every file. `wrap`
-    marks a session's end: the message is the next session's handoff."""
+    GUI), only that author's pending rows go in, and the new docs/ files
+    they name: a doc saved from the GUI had no other way in. With `everyone`,
+    every row; else the caller's own rows (store.own_rows) and every file.
+    `wrap` marks a session's end: the message is the next session's handoff."""
     keep = (None if everyone else (lambda r: r.get("author") == author) if author
             else own_rows(ctx))
     ok = store.commit(ctx.store_dir, message, ctx.cfg, keep=keep, files=not author,
-                      wrap=(author or author_default()) if wrap else None)
+                      wrap=(author or author_default()) if wrap else None,
+                      paths=_docs_named(ctx, keep) if author else ())
     gitref.set_upstream(ctx.store_dir)
     return ok
 

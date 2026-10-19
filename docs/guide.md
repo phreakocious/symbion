@@ -81,7 +81,8 @@ session start the hook gives the agent `symbion summary` and shows you one line 
 entry and, while `symbion serve` runs, its address. The gotcha hook runs
 `gotchas.sh` after each Read, Edit, Write, NotebookEdit and Bash call, failed
 calls included (a Bash command that exits non-zero is one): the first time a
-session's call names a file that an entry tagged `gotcha` is on, the agent
+session's call names a file that an entry tagged `gotcha` is on, and again the
+first time it edits that file, the agent
 gets that entry's lead, its age, how many commits have changed the file since,
 and the command that retires it: a gotcha has no status, and the agent in
 the file is the one placed to judge whether it still holds. It reads a list
@@ -149,7 +150,7 @@ print as plain text, and the PowerShell hook prints all of it that way.
 
 | output | meaning |
 |---|---|
-| `symbion: open outside arcs: bug 0, task 0, question 0, prediction 0` (`; N open in arcs` when arcs hold any), then a line per arc and the open entries | working |
+| `symbion: open outside arcs: bug 0, task 0, question 0, prediction 0` (`; N open in arcs` when arcs hold any, `; N parked` when any open entry is parked), then a line per arc and the open entries | working |
 | `symbion --dir ../other-notes: open outside arcs: …` | working, on a store this repo's tree does not name (`--dir`, `SYMBION_DIR`, or a cwd inside a store); the header names it, so two summaries in one session can be told apart |
 | either, then `  N entries not yet in the store's git (symbion commit)` | working; `/symbion wrap` at session end commits them |
 | either, then `… (symbion commit --all once their session has ended)` | the entries are another session's, and `symbion commit` takes only yours: `--all` takes them once that session has ended |
@@ -173,8 +174,8 @@ finds in the project, so put the line in that file:
 - At the start of a session, run `symbion summary` unless a hook already printed it.
 ```
 
-If that instruction file is gitignored or its owner reviews every change to it,
-propose the line to the owner instead of writing it.
+If that instruction file is gitignored, or someone reviews every change to it,
+propose the line to the user instead of writing it.
 
 **Several repos that change together.** Make one store, list the repos under
 `[repos]` in its `symbion.toml`, and run `symbion --dir ../<store> init --yes`
@@ -252,26 +253,97 @@ takes them too, for a session that ended without committing.
 symbion serve        # the one command that needs the gui extra
 ```
 
-![The notebook page of symbion serve: a sidebar of places and open counts by kind, and boards of entry cards](images/gui.png)
+![The Summary page of symbion serve: what waits on you and what is due, then boards of entry cards by kind, beside a sidebar of places and open counts by kind](images/gui.png)
 
 A local page on a port of the store's own, the same at every restart, so a link
 to an entry stays good (`serve` prints it, and `--port` picks another). It has:
 
-- boards: by kind on the notebook, by target on the targets page;
+- a Summary page: what waits on you (a question someone else wrote last, or
+  your own entry someone else answered), the last wrap's handoff, and what
+  is due, then boards by kind. Each entry shows once;
+- a peek: a click on an entry's words opens it beside the page, whole, with
+  its earlier versions; `j`/`k` move to the next or previous entry, and in
+  the peek `x` resolves, `s` stars, `e` edits, `a` answers, `o` opens its
+  page. A click with a modifier opens the entry's page in a new tab;
+- answers on a question someone else wrote last: a button for each answer
+  the asker gave with `--option`, the default first, and a field for your
+  own words. The answer goes below the question, as you, and the question
+  stays open for its asker to act on;
+- boards by target on the targets page;
+- a Docs page: every markdown file an entry is on or points at, the
+  project's and the store's `docs/`, the most named first, each with its
+  entries, the open ones among them, and a button that opens it;
+- the sidebar's kinds, each with what it is for when hovered: the `when`
+  the store's `symbion.toml` gives it;
 - an entry list where every tag, kind, author and target is a filter link;
 - a search box (`/`): its text filters the page as you type, and Enter
   searches the whole store (every word, literally, in any case, a phrase in
   double quotes as one word, or a pasted entry id), as a pause in the typing
   does once nothing on the page matches;
+- a palette (`⌘K`, or `Ctrl K`): the places, the top bar's actions, and
+  entries by words or by an id's tail, here first, then a count and a link
+  for every other store a `serve` runs on. Enter peeks at an entry here, and
+  `⌘`/`Ctrl` Enter opens a row's page in a new tab;
 - a new entry from any page (`n`), on that page's object or any other: `#tag`
   and `!kind` in its body set its tags and kind, and Shift Enter adds it and
   starts the next;
+- a file dropped on any page starts an entry: a file a catalog lists (the
+  project's, or the store's `docs/`) is its target, other text its body
+  (anything but markdown as a block of code, so its `#` and `!` words stay
+  text), and text over 2,000 characters can be saved to the store's `docs/`
+  with the entry pointing at it. With an entry open, the file joins its refs,
+  or its text goes in at the cursor;
 - a page per note: a rule in its body marks where each amendment joined it,
   with who added it and when, and its earlier versions show an edit as a
   diff; a tag index, and arc checklists you tick;
 - commit and push buttons, shown while there is something to commit or push.
-  The commit button takes only the entries written as you, so an agent's
-  pending entries stay for it to commit.
+  The commit button takes only the entries written as you, and the `docs/`
+  files they name, so an agent's pending entries stay for it to commit;
+- a reload button, shown when an entry was written or edited after the page
+  was drawn: by an agent, at a terminal, or in another tab. The page does not
+  redraw by itself. In the installed app, the icon's badge counts the entries
+  others wrote since you last opened a page.
+
+Chrome and Edge can install the page as an app (the install icon in the
+address bar). Each store is an app of its own, because each has its own port.
+With tabbed mode, its pages open as tabs in one app window, each tab named by
+its page alone. On a desktop,
+tabbed mode is behind `chrome://flags/#enable-desktop-pwas-tab-strip`; without
+it, the app opens in a plain window. An app installed from an older symbion,
+which served no manifest, stays a plain window: remove it and install it again.
+The app's window has no status bar, so the address of the link under the
+pointer shows at its bottom left.
+
+Chrome opens a link to the app's pages in the app only when the link is
+clicked inside Chrome. A link from another program, such as a terminal or a
+mail client, opens in a browser tab with an **Open in app** button (Chromium
+issue 330282442). On macOS, a URL router set as the default browser can send
+those links to the app, but not as they are: the app's shim keeps only a link
+whose scheme the app registers, and drops an `http:` one, so the app opens on
+its start page. The app registers `web+symbion:`, and its `/go` page turns
+such a link back into the page it names. With
+[Finicky](https://github.com/johnste/finicky), `~/.finicky.js` names the
+store's address, the app as it is named in `~/Applications/Chrome
+Apps.localized/`, and the rewrite:
+
+```js
+export default {
+  defaultBrowser: "Google Chrome",
+  rewrite: [{
+    match: "http://127.0.0.1:PORT/*",
+    // a new string: the URL's protocol setter keeps http:
+    url: (url) => url.href.replace(/^http:/, "web+symbion:"),
+  }],
+  handlers: [{
+    match: "web+symbion://127.0.0.1:PORT/*",
+    browser: "STORE · symbion",
+  }],
+};
+```
+
+The first such link asks, once, whether the app may open `web+symbion` links.
+An app installed before symbion registered the scheme learns it when Chrome
+next updates the app: close its windows and open it again.
 
 `?` lists the keys. It writes as **you**: `SYMBION_AUTHOR`, else git
 `user.name`, shown at the foot of the sidebar, or in the top bar on a window

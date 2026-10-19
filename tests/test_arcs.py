@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from symbion import store
 
@@ -201,3 +203,18 @@ def test_archiving_an_archived_arc_keeps_its_date(tmp_path):
     again = store.archive_arc(tmp_path, a.id, _clock=at(2))
     assert again == first == store.load_arcs(tmp_path)[0]
     assert first.archived_at.startswith("2026-01-01"), first
+
+
+def test_an_arc_edit_keeps_a_field_a_newer_symbion_wrote(tmp_path):
+    """Any arc's edit writes every arc line again, so a field a newer symbion
+    added to one arc went from it at another's rename (the user,
+    2026-10-19)."""
+    a = store.create_arc(tmp_path, "a", "", "item")
+    b = store.create_arc(tmp_path, "b", "", "item")
+    path = store.arcs_path(tmp_path)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    path.write_text("".join(json.dumps(r | ({"later": "x"} if r["id"] == a.id else {})) + "\n"
+                            for r in rows), encoding="utf-8")
+    store.rename_arc(tmp_path, b.id, "b2")
+    rows = {r["id"]: r for r in map(json.loads, path.read_text(encoding="utf-8").splitlines())}
+    assert rows[a.id].get("later") == "x" and rows[b.id]["name"] == "b2"

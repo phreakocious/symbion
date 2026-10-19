@@ -79,7 +79,11 @@ class Config:
         return replace(self, project_root=roots[0], work_root=roots[1], repos={}, here=None)
 
     def for_type(self, target_type) -> "Config":
-        """`repo(target_type)` for a listed repo's type, else this config."""
+        """`repo(target_type)` for a listed repo's type, else this config. A
+        `doc` is a file in the store's own docs/, so its commands run at the
+        store's root wherever the caller stands."""
+        if target_type == "doc" and self.store is not None:
+            return replace(self, project_root=self.store, work_root=self.store, repos={}, here=None)
         return self.repo(target_type) if target_type in self.repos else self
 
     def missing(self, name) -> str | None:
@@ -282,7 +286,7 @@ def _claims(cand: Path, store: Path) -> Path | None:
 def uncomment_hint(store, name: str) -> str | None:
     """The commented `name =` lines that would declare catalog type `name`,
     or None. The starter toml ships its catalogs commented out, and "catalog
-    types are declared in ... under [catalogs]" left a new store's owner to
+    types are declared in ... under [catalogs]" left the user of a new store to
     find the line and the [renames] pair (2026-10-09)."""
     p = Path(store) / CONFIG_FILE
     try:
@@ -334,6 +338,12 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
         raise ValueError(f"[catalogs] file in {p} sits beside [repos]: a store with repos has "
                          f"no file type. Move the command under the repo it lists: "
                          f"{next(iter(repos))} = {catalogs['file']!r}")
+    # Each type reads its own [renames] entry, so this one would follow no
+    # repo's renames, and each renamed file would read `stale`.
+    if repos and "file" in (d.get("renames") or {}):
+        raise ValueError(f"[renames] file in {p} sits beside [repos]: a store with repos has "
+                         f"no file type, so write it under each repo whose renames it follows: "
+                         f"{next(iter(repos))} = {d['renames']['file']!r}")
     for name in repos:
         catalogs.setdefault(name, FILE_CATALOG)
     catalogs.setdefault("doc", DOC_CATALOG)

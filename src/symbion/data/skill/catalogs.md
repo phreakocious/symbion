@@ -11,7 +11,9 @@ hub writing with `--dir ../<sat>-notes`), it runs in the store's own project,
 and a note on stderr says so; check stamps come from there too. A typed name
 matches as SKILL.md says, with one addition: a read (`list --target`, `context
 --target`) first takes a name the store already holds, so entries on a deleted
-file stay readable by its old name.
+file stay readable by its old name. A line may add a tab and a description:
+only the GUI's pickers show it, and everything else reads the part before the
+tab.
 
 ## Repos: one store over several repos
 
@@ -46,8 +48,8 @@ wins:
 
 Outside every repo, only a path, or a name exactly one repo holds, answers. A
 `[catalogs]` type that is no repo's runs in the repo you stand in, and is
-refused outside every one. `[catalogs] file` beside `[repos]` makes every
-command refuse, naming the repo to move it under. The summary's `repos in
+refused outside every one. `[catalogs] file` or `[renames] file` beside
+`[repos]` makes every command refuse, naming the repo to move it under. The summary's `repos in
 <store>:` line gives each repo's path from the cwd.
 
 A `check` is stamped in its target's repo (a repo's type, or the repo that
@@ -109,6 +111,14 @@ ambiguous. Any other exit is an error and stores nothing. A resolver never
 falls back to the built-in match. It runs in the root of the current worktree,
 so `tools/` above is the project's, and under the store's lock: `symbion list`
 works there, and a write waits on the lock.
+
+A catalog that lists every legal name, such as an inventory's hosts, can
+refuse the rest: `[resolvers] TYPE = "closed"`. The built-in match still
+picks, and a name it finds nowhere in the catalog is refused, with the near
+names, on a write and on a read. A read still takes a name the store already
+holds, and `supersede` keeps a target it does not rename, so entries on a
+host the catalog dropped stay readable and editable. `file:./x` and a new file
+in a `[repos]` repo meet the closed catalog too.
 
 A piped catalog must fail when its producer fails, or a failed producer reads
 as an empty catalog, and with a resolver every name mints as new. dash refuses

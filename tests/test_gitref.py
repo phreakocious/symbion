@@ -245,6 +245,28 @@ def test_a_catalog_miss_says_when_the_path_is_on_the_default_branch(repo, capsys
     assert "taken as typed\n" in err and "worktree" not in err, err
 
 
+def test_a_catalog_miss_names_the_worktree_that_holds_the_path(repo, capsys, monkeypatch):
+    """A catalog lists the checkout you stand in, so `file:spec.md`,
+    committed only in a linked `feat` worktree, read as a typo from the main
+    checkout (2026-10-13). The note names that worktree from the cwd, and its
+    branch; from the linked one, a file only the main checkout holds."""
+    wt = repo.parent / "app-feat"
+    _run(repo, "worktree", "add", "-q", "-b", "feat", str(wt))
+    (wt / "spec.md").write_text("x")
+    _run(wt, "add", "-A")
+    _run(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "spec")
+    monkeypatch.chdir(repo)
+    catalog.match(Config(project_root=repo, catalogs={"file": "true"}), "file", "spec.md", ["f0"])
+    assert "taken as typed; it is in ../app-feat (feat)\n" in capsys.readouterr().err
+    (repo / "draft.md").write_text("x")             # untracked: on no branch
+    monkeypatch.chdir(wt)
+    cfg = Config(project_root=repo, work_root=wt, catalogs={"file": "true"})
+    catalog.match(cfg, "file", "draft.md", ["f0"])
+    assert "taken as typed; it is in ../p (main)\n" in capsys.readouterr().err
+    catalog.match(cfg, "file", "nowhere.md", ["f0"])
+    assert "taken as typed\n" in capsys.readouterr().err
+
+
 def test_a_catalog_miss_says_when_the_path_is_a_gitignored_file_here(repo, capsys):
     """`git ls-files --others --exclude-standard` drops an ignored file, so a
     task on a gitignored CLAUDE.md got the typo's note, and the agent spent a
@@ -366,6 +388,73 @@ def test_subjects_never_reads_a_stored_name_as_an_option(repo, tmp_path):
     assert not planted.exists()
 
 
+def test_subjects_asks_git_in_batches_and_finds_every_sha(repo, monkeypatch):
+    """A Windows command line holds at most 32,767 characters: 800 shas
+    raised WinError 206 there (2026-10-16). Each batch keeps
+    --ignore-missing, and a set, as `list` passes, is taken."""
+    cfg = Config(project_root=repo)
+    for i in range(3):
+        (repo / f"g{i}").write_text("y")
+        _run(repo, "add", "-A")
+        _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", f"g{i}")
+    shas = _run(repo, "rev-list", "HEAD").split()
+    calls, real = [], gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda *a: calls.append(a) or real(*a))
+    monkeypatch.setattr(gitref, "SHA_BATCH", 2)
+    got = gitref.subjects(cfg, {*shas, "0" * 40})
+    assert set(got) == set(shas)
+    assert [len(a) - a.index("--end-of-options") - 1 for a in calls] == [2, 2, 2]
+
+
+def test_a_list_that_grows_with_the_store_stays_off_the_command_line(repo, monkeypatch):
+    """A Windows command line holds at most 32,767 characters, and a store's
+    paths past that raised WinError 206 there (2026-10-16). hash-object
+    and the file history read their paths on stdin; rev-list, which drops
+    --ignore-missing for revisions on stdin, asks in batches. A name that
+    opens with a quote is hashed as itself (not on Windows, which refuses it)."""
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    names = ["alpha.txt", "beta.txt"] + ([] if os.name == "nt" else ['"q" gamma.txt'])
+    for n in names:
+        (repo / n).write_text("v0")
+    _run(repo, "add", "-A")
+    _commit_at(repo, "v0", "2030-01-01T00:00:00+00:00")
+    rows = [_file_row(cfg, n, f"2030-01-02T00:00:0{i}+00:00") for i, n in enumerate(names)]
+    for n in names:
+        (repo / n).write_text("v1")
+    _commit_at(repo, "v1", "2030-01-03T00:00:00+00:00")
+    _run(repo, "checkout", "-q", "-b", "side")
+    for i in range(5):
+        (repo / "alpha.txt").write_text(f"side {i}")
+        _commit_at(repo, f"side {i}", "2030-01-04T00:00:00+00:00")
+    side = _run(repo, "rev-list", "main..side").split()
+    _run(repo, "checkout", "-q", "main")
+    calls, real = [], gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda *a, **kw: calls.append(a[1:]) or real(*a, **kw))
+    monkeypatch.setattr(gitref, "SHA_BATCH", 2)
+    assert gitref.target_blobs(cfg, "file", names) == \
+        {n: _run(repo, "hash-object", "--", n) for n in names}
+    assert gitref.commits_since(cfg, rows) == {r.id: 1 for r in rows}
+    assert gitref.unmerged(cfg, [*side, "0" * 40]) == {s: "side" for s in side}
+    asked = [a for a in calls if a[0] in ("hash-object", "log")]
+    assert asked and not [a for a in asked if any(n in arg for arg in a for n in names)], asked
+    assert [sum(bool(gitref._HEX.fullmatch(x)) for x in a) for a in calls
+            if a[0] == "rev-list"] == [2, 2, 2]
+
+
+def test_recent_lists_the_newest_commits_on_head_newest_first(repo):
+    cfg = Config(project_root=repo)
+    head, parent = _run(repo, "rev-parse", "HEAD"), _run(repo, "rev-parse", "HEAD~1")
+    assert gitref.recent(cfg, 1) == {head: "c1"}
+    assert list(gitref.recent(cfg, 30).items()) == [(head, "c1"), (parent, "c0")]
+
+
+def test_recent_is_empty_where_git_has_no_commits(tmp_path):
+    """Outside any repo, and on an unborn HEAD: no error, no commits."""
+    assert gitref.recent(Config(project_root=None), 5) == {}
+    subprocess.run(["git", "init", "-q", str(tmp_path / "e")], check=True)
+    assert gitref.recent(Config(project_root=tmp_path / "e"), 5) == {}
+
+
 def test_uncommitted_counts_appended_rows_exactly(tmp_path):
     """`git status --porcelain` cannot do this: 200 appended notes are still
     one changed path."""
@@ -387,6 +476,57 @@ def test_uncommitted_is_zero_on_a_clean_store(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t",
                     "-c", "user.email=t@t", "commit", "-q", "-m", "base"], check=True)
     assert gitref.uncommitted(tmp_path) == (0, False)
+
+
+def test_the_reads_never_rewrite_an_index(tmp_path, repo):
+    """A porcelain `git diff` or `git status` rewrites the index, under
+    index.lock, when a tracked file's stat data is stale, and a `git add`
+    beside it refuses: a `symbion commit` failed so while the GUI polled
+    (2026-10-16). In a scratch repo, 4 of 400 adds refused beside a
+    `git diff --numstat` loop, 0 beside plumbing. `--no-optional-locks`
+    stops `status`, not `diff`."""
+    from symbion import cli, store
+    s = tmp_path / "s"
+    store.ensure_store(s)
+    _run(s, "add", "-A")
+    _run(s, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base")
+    for r in (s, repo):
+        for f in r.iterdir():
+            if f.is_file():
+                os.utime(f, (0, 0))          # stale stat data, the same bytes
+    before = {r: os.stat(r / ".git" / "index") for r in (s, repo)}
+    assert store.pending_rows(s) == []
+    assert gitref.uncommitted(s) == (0, False)
+    assert cli._ignored_paths(s, "archive") == []
+    assert gitref._dirty_paths(Config(project_root=repo)) == []
+    for r, st in before.items():
+        now = os.stat(r / ".git" / "index")
+        assert (now.st_ino, now.st_mtime_ns) == (st.st_ino, st.st_mtime_ns), r.name
+
+
+def test_the_registry_reads_changed_staged_or_new_with_rows(tmp_path):
+    """arcs.jsonl is rewritten in place, so its flag is a boolean: changed in
+    the work tree, staged, or untracked and not empty. Every other test read
+    it False."""
+    from symbion import store
+    store.ensure_store(tmp_path)
+    arcs = tmp_path / store.ARCS_FILE
+    commit = ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m")
+    _run(tmp_path, "add", "-A")
+    _run(tmp_path, *commit, "base")
+    seen = [gitref.uncommitted(tmp_path)[1]]
+    arcs.write_text('{"id": "a"}\n')
+    seen.append(gitref.uncommitted(tmp_path)[1])            # changed
+    _run(tmp_path, "add", "-A")
+    seen.append(gitref.uncommitted(tmp_path)[1])            # staged
+    _run(tmp_path, *commit, "arc")
+    seen.append(gitref.uncommitted(tmp_path)[1])            # committed
+    _run(tmp_path, "rm", "-q", "--cached", store.ARCS_FILE)
+    _run(tmp_path, *commit, "untrack")
+    seen.append(gitref.uncommitted(tmp_path)[1])            # untracked, a row in it
+    arcs.write_text("")
+    seen.append(gitref.uncommitted(tmp_path)[1])            # untracked, empty
+    assert seen == [False, True, True, False, True, False]
 
 
 def test_a_stash_is_not_an_unpushed_commit(tmp_path):

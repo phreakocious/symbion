@@ -6,6 +6,7 @@ import random
 import re
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import sysconfig
@@ -101,6 +102,32 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
         if status == 200:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=2) as r:
                 icon = r.headers["content-type"], r.read()
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/manifest.webmanifest",
+                                        timeout=2) as r:
+                manifest = r.headers["content-type"], json.loads(r.read())
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/palette?q=", timeout=5) as r:
+                rows = r.headers["content-type"], json.loads(r.read())
+
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a):
+                    return None
+            opener = urllib.request.build_opener(NoRedirect)
+
+            def go(to):
+                try:
+                    with opener.open(f"http://127.0.0.1:{port}/go?to="
+                                     f"{urllib.parse.quote(to, safe='')}", timeout=2) as r:
+                        return r.status, None
+                except urllib.error.HTTPError as e:
+                    return e.code, e.headers.get("location")
+            goes = [go(f"web+symbion://127.0.0.1:{port}/notes?id=x"),
+                    go("web+symbion://example.com/notes?id=x"),
+                    go(f"http://127.0.0.1:{port}/notes?id=x")]
+            pngs = []
+            for i in manifest[1]["icons"]:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{i['src']}",
+                                            timeout=2) as r:
+                    pngs.append((i["sizes"], r.headers["content-type"], r.read()))
     finally:
         if os.name == "nt":
             p.send_signal(STOP)
@@ -123,6 +150,33 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     # cannot fetch.
     assert 'href="/favicon.ico"' in page, page[:2000]
     assert icon == ("image/svg+xml", FAVICON.read_bytes()), icon
+    # The manifest makes the GUI an installable app, its pages tabs in one
+    # window; its icons are PNGs, which an SVG alone did not give, and opaque:
+    # 8-bit RGB, no alpha (IHDR bit depth and colour type 2).
+    assert '<link rel="manifest" href="/manifest.webmanifest">' in page, page[:2000]
+    assert manifest[0] == "application/manifest+json", manifest
+    assert manifest[1]["display_override"] == ["tabbed"], manifest
+    # A captured link opens a new tab: a reused one would leave its page.
+    assert manifest[1]["launch_handler"] == {"client_mode": "navigate-new"}, manifest
+    # A link another program opens reaches the app through its shim only as a
+    # scheme the manifest registers: a router rewrites http: to web+symbion:,
+    # and /go sends it on to the page. Only this serve's address and the other
+    # running serves' are followed.
+    assert manifest[1]["protocol_handlers"] == \
+        [{"protocol": "web+symbion", "url": "/go?to=%s"}], manifest
+    assert goes == [(302, f"http://127.0.0.1:{port}/notes?id=x"), (404, None), (404, None)], goes
+    # The ⌘K palette's rows, which the page's script asks for as one types.
+    assert rows[0] == "application/json" and rows[1][0]["head"] == "go to", rows
+    # Frame and active tab differ, or the current tab cannot be told apart;
+    # the top bar is the active tab's colour, so the tab runs into it.
+    from symbion.gui.theme import DARK_CSS, quasar_colors
+    bar = re.search(r"\.sb-header \{[^}]*background: var\(--q-([a-z-]+)\)", DARK_CSS)[1]
+    assert manifest[1]["background_color"] == quasar_colors()[bar.replace("-", "_")], (bar, manifest)
+    assert (manifest[1]["theme_color"], manifest[1]["background_color"]) == \
+        ("#181825", "#11111b"), manifest
+    assert [(s, t, b[:8], struct.unpack(">II", b[16:24]), b[24:26]) for s, t, b in pngs] == \
+        [(f"{n}x{n}", "image/png", b"\x89PNG\r\n\x1a\n", (n, n), b"\x08\x02")
+         for n in (192, 512)], [p[:2] for p in pngs]
     # What tells Dark Reader the page is already dark: ui.run(dark=True) writes
     # the color-scheme meta its detector reads first; shell() adds its lock.
     assert re.search(r'name="color-scheme"\s+content="dark"', page), page[:2000]
@@ -168,7 +222,7 @@ def _command(pid) -> list[str]:
 def test_restart_re_execs_every_serve_in_its_own_terminal(tmp_path):
     """A serve runs the symbion it started with, so a code change or an
     upgrade reached none of the serves a person had running until each was
-    restarted by hand (the owner, 2026-10-07). `serve --restart` re-execs
+    restarted by hand (the user, 2026-10-07). `serve --restart` re-execs
     each in place: the same process, so the same terminal, and with
     --no-browser, so no tab opens. It needs no store: run from anywhere."""
     store.ensure_store(tmp_path / "s")
@@ -291,9 +345,9 @@ def test_a_serve_writes_in_no_agent_session(tmp_path, monkeypatch):
 def test_a_second_serve_on_a_store_takes_its_links_when_the_first_stops(tmp_path, monkeypatch,
                                                                          capsys):
     """Two serves on one store left two records, and the other stores'
-    sidebars linked either. The first stays the one they link (the owner,
+    sidebars linked either. The first stays the one they link (the user,
     2026-10-01). The second says so and records too: when the first stops,
-    even killed outright, the links go to the second (the owner, 2026-10-01:
+    even killed outright, the links go to the second (the user, 2026-10-01:
     the second recorded nothing, so it was never linked)."""
     from symbion import api
     from symbion.gui import serve, servers
@@ -335,8 +389,8 @@ def test_a_second_serve_on_a_store_takes_its_links_when_the_first_stops(tmp_path
 
 def test_a_scratch_store_records_only_into_a_scratch_cache(tmp_path, monkeypatch):
     """A scratch serve started without XDG_CACHE_HOME was listed in the
-    owner's sidebar (2026-10-05). A store under a temp root records only
-    when the cache is under one too, as a test's is; the owner's cache is
+    user's sidebar (2026-10-05). A store under a temp root records only
+    when the cache is under one too, as a test's is; the user's cache is
     not, even when XDG_CACHE_HOME names it."""
     from symbion.gui import servers
     scratch = tmp_path / "tmp"
@@ -348,7 +402,7 @@ def test_a_scratch_store_records_only_into_a_scratch_cache(tmp_path, monkeypatch
 
 
 def test_a_stores_port_is_its_names_and_the_same_on_every_machine(tmp_path):
-    """The owner, 2026-10-02: a row link must not go stale when its serve
+    """The user, 2026-10-02: a row link must not go stale when its serve
     restarts. Each store takes a port derived from its name, so a restart,
     another session, or a clone on another machine gets the same one. The
     values are pinned: a change to the formula moves every link."""
@@ -428,7 +482,7 @@ def test_an_explicit_port_wins_without_a_warning(tmp_path, monkeypatch, capsys):
 
 
 def test_a_taken_port_names_its_holder(tmp_path, monkeypatch, capsys):
-    """The owner, 2026-10-02: collisions can be detected. Two names can give
+    """The user, 2026-10-02: collisions can be detected. Two names can give
     one port; the later serve takes a free port and says whose serve holds
     its own, or that no symbion serve does. Another serve on this store
     already has its own warning, and gets no second one."""

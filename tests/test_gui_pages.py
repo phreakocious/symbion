@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import re
 import subprocess
 import sys
+from datetime import date, timedelta
 
 import pytest
 
 pytest.importorskip("nicegui")
 
+from nicegui import ElementFilter, ui   # noqa: E402
 from nicegui.testing import User        # noqa: E402
+from nicegui.testing.user_interaction import UserInteraction  # noqa: E402
 
 from symbion import api, gitref, store  # noqa: E402
 from symbion.gui.pages import build_page  # noqa: E402
@@ -30,6 +35,26 @@ def _count(user: User) -> str:
     """The count line, whole: `should_see("1 note")` also passes on "21 notes"."""
     (label,) = user.find(marker="result-count").elements
     return label.text
+
+
+def _nav_n(item) -> str:
+    """A sidebar kind's count, found by its class: its tooltip comes after it."""
+    (n,) = [c for c in item.default_slot.children if "sb-nav-n" in c.classes]
+    return n.text
+
+
+def test_the_template_rule_the_shell_deletes_is_still_niceguis():
+    """chrome._ESM_JS deletes NiceGUI's `#esm-fallback ~ *`, which cost 4.5 s
+    a style pass with a large file in the viewer (2026-10-16). When a NiceGUI
+    upgrade drops or renames the rule, the script deletes nothing: drop it."""
+    from pathlib import Path
+
+    import nicegui
+
+    from symbion.gui import chrome
+    template = (Path(nicegui.__file__).parent / "templates" / "index.html").read_text()
+    assert "#esm-fallback ~ * {" in template
+    assert "selectorText === '#esm-fallback ~ *'" in chrome._ESM_JS
 
 
 async def test_the_menu_button_takes_the_theme_colour(user: User, ctx_with_notes):
@@ -72,7 +97,7 @@ async def test_the_commit_button_shows_a_hooks_refusal(user: User, ctx_with_note
 
 async def test_the_commit_button_sits_left_of_new_note(user: User, ctx_with_notes):
     """To its right, New note moved whenever the commit button came or went
-    (the owner, 2026-10-02). Element ids rise in the order they are built."""
+    (the user, 2026-10-02). Element ids rise in the order they are built."""
     await user.open("/notes")
     (commit,) = user.find(marker="commit-button").elements
     (new,) = user.find(marker="new-note").elements
@@ -101,7 +126,7 @@ def _commit_with_origin(ctx, tmp_path_factory):
 
 async def test_the_push_button_shows_unpushed_commits_and_pushes_them(
         user: User, ctx_with_notes, tmp_path, tmp_path_factory):
-    """After the GUI committed, pushing took a terminal (the owner, 2026-10-01)."""
+    """After the GUI committed, pushing took a terminal (the user, 2026-10-01)."""
     await user.open("/notes")
     await user.should_not_see(marker="push-button")      # no remote: nowhere to push
     _commit_with_origin(ctx_with_notes, tmp_path_factory)
@@ -119,7 +144,7 @@ async def test_the_push_button_shows_unpushed_commits_and_pushes_them(
 
 async def test_the_git_buttons_follow_commits_and_pushes_made_elsewhere(
         user: User, ctx_with_notes, tmp_path, tmp_path_factory, monkeypatch):
-    """A commit at a terminal left the commit button on the page (the owner,
+    """A commit at a terminal left the commit button on the page (the user,
     2026-10-01): each button is read again on a timer."""
     from symbion.gui import chrome
     monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
@@ -139,10 +164,87 @@ async def test_the_git_buttons_follow_commits_and_pushes_made_elsewhere(
     assert "1" in [e.text for e in button.default_slot.children], "sam's is not ada's"
 
 
+async def _until(cond, seconds: float = 3.0) -> None:
+    for _ in range(int(seconds / 0.02)):
+        if cond():
+            return
+        await asyncio.sleep(0.02)
+    assert cond()
+
+
+async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_notes, tmp_path,
+                                                       monkeypatch):
+    """A page drew the store once: an entry an agent wrote showed only after
+    a reload, and nothing said one was due (the user's pick, 2026-10-16)."""
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    def words():                         # user.find raises on none
+        with user:
+            return [[e.text for e in b.default_slot.children]
+                    for b in ElementFilter(marker="stale-button")]
+
+    await user.open("/notes")
+    await asyncio.sleep(0.3)                                    # a few ticks
+    assert words() == []
+    api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
+                             "body": "gamma"}, author="sam")      # as at a terminal
+    await _until(lambda: words() == [["1", "new"]])
+    beta = next(n for n in store.load(tmp_path) if n.body == "beta body")
+    api.supersede(ctx_with_notes, beta.id, author="sam", body="beta revised")
+    await _until(lambda: words() == [["2", "new or changed"]])
+    user.find(marker="stale-button").click()
+    await user.should_see("gamma")
+    await asyncio.sleep(0.3)
+    await user.should_not_see(marker="stale-button")
+
+
+async def test_the_app_badge_counts_other_writers_entries_since_a_page_was_drawn(
+        user: User, create_user, ctx_with_notes, monkeypatch):
+    """The installed app's icon counts what others wrote since this writer
+    last drew a page: the writer's own entries are no news, and drawing any
+    page clears it. Every page of one writer sends the same count: the app
+    has one icon, and its tabs would each set it to their own."""
+    from nicegui.outbox import Outbox
+
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    sent: dict[str, list[int]] = {}
+    emit = Outbox._emit
+
+    async def record(self, message):
+        # A javascript_rule reads a `request_id`, which a call that awaits
+        # no answer lacks.
+        _, kind, data = message
+        if kind == "run_javascript" and (m := re.fullmatch(r"sbBadge\((\d+)\)", data["code"])):
+            sent.setdefault(self._client().id, []).append(int(m[1]))
+        await emit(self, message)
+
+    def last(u: User):
+        return sent.get(u._client.id, [None])[-1]
+
+    def note(body, author):
+        api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
+                                 "body": body}, author=author)
+
+    monkeypatch.setattr(Outbox, "_emit", record)
+    await user.open("/notes")
+    await _until(lambda: last(user) == 0)
+    note("gamma", "sam")
+    await _until(lambda: last(user) == 1)
+    note("delta", "ada")
+    await asyncio.sleep(0.3)
+    assert last(user) == 1, "ada's own entry is no news to ada"
+    tab = create_user()
+    await tab.open("/tags")
+    await _until(lambda: last(tab) == 0 and last(user) == 0)
+    note("epsilon", "sam")
+    await _until(lambda: last(tab) == 1 and last(user) == 1)
+
+
 async def test_the_commit_button_commits_only_its_authors_rows(user: User, ctx_with_notes,
                                                               tmp_path):
     """It took an agent's pending rows under the GUI's message (2026-10-09);
-    the owner: "serve should only be allowed to commit its own rows"."""
+    the user: "serve should only be allowed to commit its own rows"."""
     await user.open("/notes")
     (button,) = user.find(marker="commit-button").elements
     assert "1" in [e.text for e in button.default_slot.children]
@@ -199,14 +301,14 @@ async def test_a_superseded_id_opens_its_current_row(user: User, ctx_with_notes)
     await user.should_see("beta revised")
     assert _count(user).startswith("1 of 2 entries match")
     # and says why it came: the search showed the current row and nothing
-    # of the id that brought it (the owner, 2026-10-09)
+    # of the id that brought it (the user, 2026-10-09)
     (said,) = user.find(marker="superseded-by").elements
     assert said.text == f"{kept} was superseded; this is its current entry"
 
 
 async def test_shift_enter_adds_a_note_and_keeps_the_composer_open(
         user: User, ctx_with_notes, monkeypatch):
-    """The owner, 2026-10-01: shift+enter adds another note. ⌘Enter reloads
+    """The user, 2026-10-01: shift+enter adds another note. ⌘Enter reloads
     the page, which closes the composer after each note."""
     from nicegui import ui
     reloads = []
@@ -286,7 +388,7 @@ async def test_earlier_versions_show_their_target(user: User, ctx_with_notes):
 
 async def test_a_rows_page_marks_each_amendment_with_who_added_it(user: User, ctx_with_notes):
     """A seam, not a diff: most supersedes are appends, and a diff of one is
-    the whole old body unchanged (the owner, 2026-10-08). On the row's page
+    the whole old body unchanged (the user, 2026-10-08). On the row's page
     only, for now."""
     ctx = ctx_with_notes
     first = next(n.id for n in store.load(ctx.store_dir) if n.body == "beta body")
@@ -329,7 +431,7 @@ async def test_earlier_versions_show_an_edit_as_a_diff(user: User, ctx_with_note
 
 async def test_an_earlier_version_says_what_the_next_changed(user: User, ctx_with_notes):
     """A version that changed one path in a long `checked` and nothing else
-    showed both versions whole, and nothing said what differed (the owner,
+    showed both versions whole, and nothing said what differed (the user,
     2026-10-09)."""
     ctx = ctx_with_notes
     nid = api.add(ctx, {"kind": "check", "target": {"type": "item", "name": "w"},
@@ -398,10 +500,14 @@ async def test_an_unknown_param_does_not_silently_widen_the_result(
 
 async def test_tab_title_leads_with_the_project_name(user: User, ctx_with_notes):
     """Several stores open in several tabs; the tab strip truncates from the
-    right, so the project name goes first and 'symbion' is the suffix."""
-    await user.open("/")
+    right, so the project name goes first and the page follows. In the
+    installed app's tabbed window, one store's, the tab is the page alone: a
+    search's text in it ends no script. `_client`: see the first test."""
+    await user.open("/notes?q=a</script>b")
     assert user.client.resolve_title() == \
-        f"{ctx_with_notes.cfg.project_root.name} · symbion"
+        f"{ctx_with_notes.cfg.project_root.name} · search: a</script>b"
+    assert 'if (matchMedia("(display-mode: tabbed)").matches) ' \
+        'document.title = "search: a\\u003c/script>b"</script>' in user._client.head_html
 
 
 async def test_header_brand_names_the_project(user: User, ctx_with_notes):
@@ -456,7 +562,7 @@ from symbion import store   # noqa: E402
 async def test_a_recent_board_holds_young_rows_and_those_current_at_head(
         user: User, repo, tmp_path):
     """The 25 newest checks of any age filled the board, nearly all `behind`
-    (the owner, 2026-10-02). An old row still current at HEAD stays: in a
+    (the user, 2026-10-02). An old row still current at HEAD stays: in a
     quiet repo it is the live state. The rest are one link away."""
     import json
 
@@ -489,25 +595,27 @@ async def test_a_recent_board_holds_young_rows_and_those_current_at_head(
 
 async def test_a_board_past_its_cap_keeps_the_newest_and_every_due_row(
         user: User, repo, tmp_path, monkeypatch):
-    """`/` drew every open row (the owner, 2026-10-09). A board now draws
+    """`/` drew every open row (the user, 2026-10-09). A board now draws
     its newest few, and a row due soon or past due wherever it falls: a cut
-    must not hide a reminder."""
+    must not hide a reminder. On a target's board: on `/`, a row due soon
+    has a board of its own."""
     from datetime import date
     monkeypatch.setitem(build_page.__globals__, "BOARD_ROWS", 2)   # why: the PAGE_ROWS test
     ctx = api.resolve(str(tmp_path))
     for body, due in (("oldest, due today", date.today().isoformat()), ("second", None),
                       ("third", None), ("newest", None)):
-        api.add(ctx, {"kind": "task", "target": {"type": "item", "name": body}, "body": body,
+        api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "widget"}, "body": body,
                       **({"due": due} if due else {})}, author="ada")
     build_page(ctx, author="ada")
-    await user.open("/")
+    await user.open("/targets")
     for body in ("newest", "third", "oldest, due today"):
         await user.should_see(body)
     await user.should_not_see("second")
     (aside,) = user.find(marker="board-aside").elements
-    assert (aside.text, aside.props["href"]) == ("· 1 more", "/notes?kind=task&status=open")
+    assert (aside.text, aside.props["href"]) == ("· 1 more · 4 entries",
+                                                 "/object?type=item&name=widget")
     (count,) = [e for e in user.find(marker="board-count").elements
-                if e.parent_slot.parent.default_slot.children[0].text == "open task"]
+                if e.parent_slot.parent.default_slot.children[0].text == "item: widget"]
     assert count.text == "3"
 
 
@@ -526,6 +634,245 @@ async def test_home_renders_one_board_per_visible_status_kind_and_per_verdict_ki
     boards = {e.text: e.parent_slot.parent.default_slot.children[1].text
               for e in user.find(marker="board-title").elements}
     assert boards == {"open anomaly": "1", "priority": "0", "recent audit": "0"}, boards
+
+
+def _board_ids(user: User) -> dict[str, list[str]]:
+    """Each board's title -> the ids of its cards, in page order."""
+    out = {}
+    for t in user.find(marker="board-title").elements:
+        section = t.parent_slot.parent.parent_slot.parent
+        out[t.text] = [e.props["data-id"] for e in sorted(section.descendants(), key=lambda e: e.id)
+                       if "note-row" in e._markers]
+    return out
+
+
+async def test_the_summary_leads_with_what_waits_on_the_person(user: User, ctx_with_notes):
+    """`waits` counts every open row another writer wrote last, which for the
+    person is every agent's own task and parked idea. The person's page asks
+    less: a question someone else wrote last, or the person's own entry that
+    someone else answered (the user's pick, 2026-10-16). Each shows once."""
+    def add(kind, body, author, **extra):
+        return api.add(ctx_with_notes, {"kind": kind, "target": {"type": "project", "name": None},
+                                        "body": body, **extra}, author=author).id
+    asked = add("question", "is it blue", "sam")
+    answered = add("question", "is it red", "sam")
+    api.supersede(ctx_with_notes, answered, author="ada", append_body="no")
+    hers = add("task", "ada's ask", "ada")
+    api.supersede(ctx_with_notes, hers, author="sam", append_body="done: look?")
+    sams = add("task", "sam's own", "sam")
+    bet = add("prediction", "it holds", "ada", checked="the run")      # asks nothing until due
+    api.supersede(ctx_with_notes, bet, author="sam", append_body="a first run held")
+    due = add("task", "due thing", "ada", due=(date.today() + timedelta(days=1)).isoformat())
+    await user.open("/")
+    boards = _board_ids(user)
+    assert sorted(boards["waiting on you"]) == sorted([asked, hers]), boards
+    assert boards["due soon"] == [due], boards
+    assert boards["open question"] == [answered], boards
+    assert boards["open task"] == [sams], boards
+
+
+def _q(ctx, body, author="sam", kind="question", options=None):
+    return api.add(ctx, {"kind": kind, "target": {"type": "project", "name": None},
+                         "body": body, **({"options": options} if options else {})},
+                   author=author).id
+
+
+def _head(tmp_path, nid):
+    return next(n for n in store.heads(store.load(tmp_path)) if n.id == nid)
+
+
+async def test_a_question_draws_a_button_per_option_default_first(user: User, ctx_with_notes,
+                                                                  tmp_path):
+    """A question's answers are its own data, the default first (the user,
+    2026-10-16): a button per option, in order, the first marked, the field
+    beside them. A pick goes below the question as the person, and the
+    question stays open for its asker to act on and resolve."""
+    q = _q(ctx_with_notes, "Ship the fix?",
+           options=["ship it", "hold for a Chrome check", "ask again"])
+    await user.open("/")
+    buttons = sorted(user.find(marker="answer-option").elements, key=lambda e: e.id)
+    assert [b.text for b in buttons] == ["ship it", "hold for a Chrome check", "ask again"]
+    assert [b._props.get("icon") for b in buttons] == ["check", None, None]
+    assert [b.props.get("color") for b in buttons] == [None, None, None]
+    user.find(marker="answer-field")                 # the field stays beside the buttons
+    user.find(marker="answer-option", content="hold for a Chrome check").click()
+    head = _head(tmp_path, q)
+    assert (head.body.rstrip().endswith("hold for a Chrome check"), head.author,
+            store.read_status(head)) == (True, "ada", "open")
+    await user.open("/")
+    await user.should_not_see(marker="answer-row")       # ada wrote the newest word
+
+
+async def test_a_question_without_options_takes_typed_words_only(user: User, ctx_with_notes,
+                                                                 tmp_path):
+    """Every question written under the old convention is one of these: its
+    `Default: … Flip:` prose stays, no button is parsed out of it, and the
+    person answers in text."""
+    bare = _q(ctx_with_notes, 'Default: port 80. Flip: say "8080".')
+    await user.open("/")
+    await user.should_not_see(marker="options")
+    (row,) = user.find(marker="answer-row").elements
+    assert [b for b in row.descendants() if isinstance(b, ui.button)] == []
+    user.find(marker="answer-field").type("8080").trigger("keydown.enter")
+    assert _head(tmp_path, bare).body.rstrip().endswith("8080")
+    assert _head(tmp_path, bare).author == "ada"
+
+
+async def test_a_question_not_waiting_on_the_person_lists_its_options(user: User,
+                                                                      ctx_with_notes):
+    """Where no buttons draw (the person's own question, one they answered),
+    the options show as a meta row, as measurements do: the answer below
+    reads against its alternatives, and the card shows what `show` prints."""
+    own = _q(ctx_with_notes, "Mine?", author="ada", options=["keep", "drop"])
+    answered = _q(ctx_with_notes, "Theirs?", options=["yes", "no"])
+    api.supersede(ctx_with_notes, answered, author="ada", append_body="no")
+    await user.open("/notes")
+    await user.should_see("Mine?")
+    await user.should_not_see(marker="answer-row")
+    rows = sorted(user.find(marker="options").elements, key=lambda e: e.id)
+    # One label with the CLI's separator: three phrases parted by gaps alone
+    # read as one run of words in a browser shot (2026-10-17).
+    assert all(isinstance(r, ui.label) for r in rows)
+    assert sorted(r.text for r in rows) == ["options: keep | drop", "options: yes | no"]
+
+
+async def test_only_a_question_someone_else_wrote_last_takes_answers(user: User,
+                                                                     ctx_with_notes):
+    _q(ctx_with_notes, "Default: yes. sam's task", kind="task")
+    _q(ctx_with_notes, "Default: yes. ada asks herself", author="ada")
+    closed = _q(ctx_with_notes, "Default: yes. settled")
+    api.supersede(ctx_with_notes, closed, author="sam", status="resolved")
+    await user.open("/notes")
+    await user.should_see("settled")
+    await user.should_not_see(marker="answer-row")
+
+
+def _peek(user: User, nid: str) -> None:
+    """What the page's script sends for a plain click on a card's text, or j/k."""
+    UserInteraction(user, {user.client.layout}, None).trigger("sbPeek", {"id": nid})
+
+
+async def test_a_peek_shows_the_whole_entry_beside_the_page(user: User, ctx_with_notes):
+    """A card's text led to the entry's own page, and back to the board took
+    a Back and a scroll (the user's pick, 2026-10-16). The peek is that page's
+    entry, beside the board: the whole body, and its earlier versions."""
+    long = "start " + "word " * 80 + "the end"
+    nid = _q(ctx_with_notes, long, kind="task")
+    api.supersede(ctx_with_notes, nid, author="ada", append_body="and a reply")   # a version
+    await user.open("/")
+    await user.should_not_see("the end")                  # the board clips it
+    _peek(user, nid)
+    with user.scope(marker="peek"):
+        await user.should_see("the end")
+        await user.should_see("and a reply")
+        await user.should_see(marker="history")
+
+
+async def test_a_peek_of_an_earlier_version_shows_its_entry(user: User, ctx_with_notes):
+    nid = _q(ctx_with_notes, "first words", kind="task")
+    earlier = api.supersede(ctx_with_notes, nid, author="ada", body="second words").supersedes
+    assert earlier                                  # ada's edit of sam's entry keeps one
+    await user.open("/")
+    _peek(user, earlier)
+    with user.scope(marker="peek"):
+        await user.should_see(marker="note-row")             # the event is handled async
+        first = min(user.find(marker="note-row").elements, key=lambda e: e.id)   # then history
+        assert first.props["data-id"] == nid
+    _peek(user, "999999-fff")
+    with user.scope(marker="peek"):
+        await user.should_see("no entry 999999-fff in this store")
+
+
+async def test_the_pick_is_lit_only_while_the_peek_is_open(user: User, ctx_with_notes):
+    """The user, 2026-10-16: the peek's highlight stayed on its card after
+    the panel was gone. The card keeps `sb-picked`, j/k's place; the layout
+    carries `sb-peeking` while the peek shows, and the highlight's rule needs
+    both. Every way to close the peek (its button, Esc, a click beside it)
+    sets the drawer's value."""
+    nid = _q(ctx_with_notes, "look at me", kind="task")
+    await user.open("/")
+    layout = user.client.layout
+    assert "sb-peeking" not in layout.classes
+    _peek(user, nid)
+    await _until(lambda: "sb-peeking" in layout.classes)
+    user.find(marker="peek-close").click()
+    await _until(lambda: "sb-peeking" not in layout.classes)
+    # the peek's keys read the same class: under scrollbar-gutter, the drawer's
+    # left edge read a closed peek as open, and x resolved its hidden entry
+    from symbion.gui import chrome
+    assert ".q-layout.sb-peeking" in chrome._PEEK_JS
+
+
+def _finds(roots, selector) -> bool:
+    """Whether `selector`, descendant parts each a `.class` or the tag
+    `input`, finds an element under `roots`: a ui.input draws its <input>
+    inside it, a ui.textarea a <textarea>."""
+    *outer, last = selector.split()
+    for part in outer:
+        roots = [e for r in roots for e in (r, *r.descendants()) if part[1:] in e.classes]
+    return any((isinstance(e, ui.input) and not isinstance(e, ui.textarea)) if last == "input"
+               else (last[1:] in e.classes) for r in roots for e in (r, *r.descendants()))
+
+
+async def test_every_key_and_palette_action_presses_a_drawn_element(
+        user: User, ctx_with_notes, tmp_path_factory):
+    """The keys and the palette's actions click through CSS classes, and a
+    renamed class turned its key off with no error: the script's
+    querySelector finds nothing and returns (a review, 2026-10-17). Each
+    selector is read from the code, so a new key or action is checked here
+    with no edit. The peek's keys look inside the peek."""
+    from symbion.gui import chrome, palette
+    maps = re.findall(r"const (sb(?:Peek)?Keys) = \{(.*?)\};", chrome._KEYS_JS + chrome._PEEK_JS,
+                      re.S)
+    wanted = {(".sb-peek " if name == "sbPeekKeys" else "") + s
+              for name, body in maps for s in re.findall(r"'(\.[^']+)'", body)}
+    wanted |= {a[2] for a in palette._ACTIONS}
+    assert len(wanted) >= 13, f"the scan read {sorted(wanted)}: the pattern broke"
+    _commit_with_origin(ctx_with_notes, tmp_path_factory)            # push is live
+    nid = _q(ctx_with_notes, "Keep it?", options=["keep it", "drop it"])   # sam asks ada
+    _q(ctx_with_notes, "ada's own", author="ada", kind="note")       # commit and undo are live
+    await user.open("/")
+    _peek(user, nid)
+    await _until(lambda: "sb-peeking" in user.client.layout.classes)
+    with user.scope(marker="peek"):
+        await user.should_see(marker="answer-field")
+    missing = sorted(s for s in wanted if not _finds([user.client.layout], s))
+    assert not missing, missing
+
+
+async def test_a_write_in_the_peek_reloads_the_page_and_peeks_again(user: User, ctx_with_notes,
+                                                                    tmp_path):
+    """The user, 2026-10-16: a question answered in the peek stayed on the
+    board, since a write there redrew the peek alone. It reloads the page, as
+    a card's write does, and the page opens the peek on the entry again."""
+    nid = _q(ctx_with_notes, "Keep it?", options=["keep it", "drop it"])
+    await user.open("/")
+    assert _board_ids(user)["waiting on you"] == [nid]
+    first = user.client
+    _peek(user, nid)
+    with user.scope(marker="peek"):
+        await user.should_see(marker="answer-option")
+        user.find(marker="answer-option", content="keep it").click()
+    await _until(lambda: user.client is not first)
+    assert _head(tmp_path, nid).body.rstrip().endswith("keep it")
+    boards = _board_ids(user)
+    assert "waiting on you" not in boards and boards["open question"] == [nid], boards
+    await _until(lambda: "sb-peeking" in user.client.layout.classes)
+    with user.scope(marker="peek"):
+        await user.should_see("keep it")
+
+
+async def test_the_summary_shows_the_last_wrap(user: User, ctx_with_notes):
+    """The handoff the last session left is the first thing `summary` prints
+    to an agent; the person's page showed none of it."""
+    await user.open("/")
+    assert "last wrap" not in _board_ids(user)
+    api.commit(ctx_with_notes, "Wrapped the importer\n\nNext: the dry run.", everyone=True,
+               wrap=True)
+    await user.open("/")
+    assert "last wrap" in _board_ids(user)
+    await user.should_see("Wrapped the importer")
+    await user.should_see("Next: the dry run.")
 
 
 async def test_arc_page_hides_the_seed_button_without_an_eligible_task(user: User, repo, tmp_path):
@@ -720,9 +1067,9 @@ async def test_the_tags_page_names_near_duplicates(user: User, repo, tmp_path):
     """`flaky-test` beside `flaky-tests` split one subject in an adopter
     store; the page said "near-synonyms are drift" and showed none."""
     ctx = api.resolve(str(tmp_path))
-    for tags in (["flaky-test"], ["flaky-test"], ["flaky-tests"], ["other"]):
+    for i, tags in enumerate((["flaky-test"], ["flaky-test"], ["flaky-tests"], ["other"])):
         api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
-                      "body": "b", "tags": tags}, author="ada")
+                      "body": f"b{i}", "tags": tags}, author="ada")
     build_page(ctx, author="ada")
     await user.open("/tags")
     near = [e.text for e in user.find(marker="tag-near").elements]
@@ -798,7 +1145,7 @@ async def test_a_board_names_the_open_rows_an_arc_holds(user: User, repo, tmp_pa
     assert aside.text == "· 2 in arcs"
     assert aside.props["href"] == "/notes?kind=task&status=open"
     (side,) = user.find(marker="open-task").elements
-    assert side.default_slot.children[-1].text == "3"        # 1 on the board + 2
+    assert _nav_n(side) == "3"        # 1 on the board + 2
 
 
 async def test_the_top_bar_names_the_writer_while_the_sidebar_hides(user: User, ctx_with_notes):
@@ -827,7 +1174,7 @@ async def test_the_fonts_ship_in_the_package_and_load_from_the_gui(user: User, c
     assert "data/fonts/*" in meta["tool"]["setuptools"]["package-data"]["symbion"]
 
 
-# ---- the owner's GUI rows of 2026-10-01 ----
+# ---- the user's GUI rows of 2026-10-01 ----
 
 def _crumbs(user: User) -> list[str]:
     (row,) = user.find(marker="crumbs").elements
@@ -836,14 +1183,64 @@ def _crumbs(user: User) -> list[str]:
 
 async def test_the_top_bar_ends_in_the_pages_title(user: User, ctx_with_notes):
     """A title under the bar left a band of nothing above it. A "Notebook"
-    crumb before each title was one level deep (the owner, 2026-10-13)."""
-    for path, title in (("/", "Notebook"), ("/tags", "Tags"), ("/arcs", "Arcs"),
+    crumb before each title was one level deep (the user, 2026-10-13)."""
+    for path, title in (("/", "Summary"), ("/tags", "Tags"), ("/arcs", "Arcs"), ("/docs", "Docs"),
                         ("/object?type=item&name=widget", "item: widget"),
                         ("/notes?kind=bug", "kind=bug")):
         await user.open(path)
         (here,) = user.find(marker="page-title").elements
         assert here.text == title, path
         assert _crumbs(user) == [title], path
+    (home,) = user.find(marker="place-home").elements
+    assert [c.text for c in home.default_slot.children if isinstance(c, ui.label)] == ["Summary"]
+
+
+async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_path,
+                                                         monkeypatch):
+    """The user, 2026-10-16: "add Docs below Arcs in the sidebar and show all
+    the documents we know about". Every markdown file an entry is on or
+    cites: the repo's, then the store's docs/, the most named first, each with
+    its entries and the open ones among them, and a read button where the
+    viewer can show it. Past BOARD_ROWS, a link shows them all."""
+    ctx = api.resolve(str(tmp_path))
+    (repo / "README.md").write_text("# hi\n")
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs" / "plan.md").write_text("# plan\n")
+    for kind, typ, name, refs in (("task", "item", "README.md", []),
+                                  ("note", "item", "x", [("item", "README.md")]),
+                                  ("task", "item", "gone.md", []),
+                                  ("note", "doc", "plan.md", []),
+                                  ("task", "item", "x.py", [])):
+        api.add(ctx, {"kind": kind, "target": {"type": typ, "name": name}, "body": "about it",
+                      "refs": [{"type": t, "name": n} for t, n in refs]}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    await user.should_see(marker="place-docs")
+    await user.open("/docs")
+    got = {}
+    for board in ("docs-repo", "docs-store"):
+        with user.scope(marker=board):
+            links = sorted(user.find(marker="doc-link").elements, key=lambda e: e.id)
+            counts = sorted(user.find(marker="doc-count").elements, key=lambda e: e.id)
+            got[board] = [(a.text, " ".join(c.text for c in n.default_slot.children))
+                          for a, n in zip(links, counts)]
+            got[board + " read"] = len(user.find(marker="file-open").elements)
+    assert got == {"docs-repo": [("item: README.md", "2 · 1 open"), ("item: gone.md", "1 · 1 open")],
+                   "docs-repo read": 1,
+                   "docs-store": [("plan.md", "1 entry")], "docs-store read": 1}
+    monkeypatch.setitem(build_page.__globals__, "BOARD_ROWS", 2)
+    for i in range(2):
+        api.add(ctx, {"kind": "note", "target": {"type": "doc", "name": f"d{i}.md"},
+                      "body": "more"}, author="ada")
+    await user.open("/docs")
+    with user.scope(marker="docs-store"):
+        assert len(user.find(marker="doc-link").elements) == 2
+        (more,) = user.find(marker="docs-more").elements
+        assert (more.text, more.props["href"]) == ("+1 more", "/docs?all=1")
+    await user.open("/docs?all=1")
+    with user.scope(marker="docs-store"):
+        assert len(user.find(marker="doc-link").elements) == 3
+        await user.should_not_see(marker="docs-more")
 
 
 async def test_new_note_opens_on_the_pages_object(user: User, ctx_with_notes, tmp_path):
@@ -860,7 +1257,7 @@ async def test_new_note_opens_on_the_pages_object(user: User, ctx_with_notes, tm
 
 
 async def test_the_composer_puts_a_note_on_any_target(user: User, repo, tmp_path):
-    """The owner, 2026-10-01: the GUI put a note only on the project, or on
+    """The user, 2026-10-01: the GUI put a note only on the project, or on
     the object of the page it opened from. The name field offers the names
     this store has used for the type, and a catalog's for a catalog type."""
     store.ensure_store(tmp_path)
@@ -905,7 +1302,7 @@ async def test_new_note_on_an_arc_page_starts_in_that_arc(user: User, repo, tmp_
 
 
 async def test_new_note_from_a_kind_view_starts_as_that_kind(user: User, ctx_with_notes):
-    """The owner, 2026-10-11: a note added from a kind= view should be that
+    """The user, 2026-10-11: a note added from a kind= view should be that
     kind, and the button should say so. A kind this store lacks (a stale
     bookmark) leaves the default."""
     await user.open("/notes?kind=task")
@@ -931,8 +1328,68 @@ async def test_the_keys_list_names_the_shortcuts_and_the_kinds(user: User, ctx_w
                           "alone starts with them")
 
 
+async def test_the_help_icon_opens_how_symbion_works(user: User, repo, tmp_path):
+    """The user, 2026-10-15: every doc was written for agents at a CLI, and
+    a person in the GUI needs the model. It opens from its own icon, under
+    the keyboard's, in the markdown viewer, with this store's own kinds in
+    place of the marker, each with its `when`: the words are the store's,
+    written in symbion.toml for wherever they show (the user, 2026-10-17)."""
+    (tmp_path / "symbion.toml").write_text(
+        '[kinds]\nnote = {}\nchore = { status = true, when = "a small thing to tidy" }\n'
+        'bug = { status = true, when = "a known-broken thing to return to; resolve when fixed" }\n')
+    ctx = api.resolve(str(tmp_path))
+    build_page(ctx, author="ada")
+    await user.open("/")
+    user.find(marker="help-open").click()
+    await user.should_see(marker="file-view")
+    (view,) = user.find(marker="file-view").elements
+    assert view.content.startswith("# How symbion works")
+    assert "This store's kinds:\n\n- **note** (record)\n" in view.content
+    assert "- **chore** (open until resolved): a small thing to tidy\n" in view.content
+    # a default kind too: the file's own prose for it stands in the file alone
+    assert "- **bug** (open until resolved): a known-broken thing to return to; resolve when fixed\n" \
+        in view.content
+    assert "<!-- kinds -->" not in view.content and "default kinds" not in view.content
+
+
+async def test_a_kind_in_the_sidebar_says_what_it_is_for(user: User, repo, tmp_path):
+    """The user, 2026-10-16: a kind's words are defined in symbion.toml and
+    treated as its colour is. A sidebar kind's tooltip is its name and
+    properties, then the `when` the store gives it, a default's by default;
+    none for a kind with no `when`. The help's own prose for a default kind
+    stays on the help page."""
+    (tmp_path / "symbion.toml").write_text(
+        '[kinds]\nnote = {}\nchore = { status = true, when = "a small thing to tidy" }\n'
+        'bug = { status = true, when = "a known-broken thing to return to; resolve when fixed" }\n')
+    ctx = api.resolve(str(tmp_path))
+    build_page(ctx, author="ada")
+    await user.open("/")
+    tips = {}
+    for mark in ("open-bug", "open-chore", "kind-note"):
+        (item,) = user.find(marker=mark).elements
+        tips[mark] = [[w.text for w in t.descendants() if isinstance(w, ui.label)]
+                      for t in item.descendants() if isinstance(t, ui.tooltip)]
+    assert tips == {"open-bug": [["bug · open until resolved",
+                                  "A known-broken thing to return to; resolve when fixed"]],
+                    "open-chore": [["chore · open until resolved", "A small thing to tidy"]],
+                    "kind-note": []}
+
+
+def test_the_help_file_holds_the_default_kinds():
+    """The file is read on GitHub too, where the block stands as written: a
+    line per default kind, in plain words, with that kind's properties. It
+    drifts the day a default kind is added, removed or changes a property."""
+    from symbion.gui.chrome import HELP, _KINDS_BLOCK, kind_line
+    from symbion.kinds import DEFAULT_KINDS
+    (block,) = _KINDS_BLOCK.findall(HELP.read_text(encoding="utf-8"))
+    lines = [ln for ln in block.splitlines() if ln.startswith("- **")]
+    assert [ln.split("**")[1] for ln in lines] == list(DEFAULT_KINDS)
+    for ln, (label, k) in zip(lines, DEFAULT_KINDS.items()):
+        assert ln.startswith(kind_line(label, k).split(": ")[0] + ": "), ln
+
+
 async def test_the_sidebar_lists_the_newest_closed_rows(user: User, repo, tmp_path):
-    """The owner, 2026-10-01: "sidebar should show recently closed items"."""
+    """The user, 2026-10-01: "sidebar should show recently closed items"."""
     ctx = api.resolve(str(tmp_path))
     ids = [api.add(ctx, {"kind": "task", "target": {"type": "item", "name": f"t{i}"},
                          "body": f"task {i}"}, author="ada").id for i in range(6)]
@@ -950,7 +1407,7 @@ async def test_the_sidebar_lists_the_newest_closed_rows(user: User, repo, tmp_pa
 
 async def test_the_sidebar_counts_open_parked_rows_under_their_own_head(
         user: User, repo, tmp_path):
-    """The owner, 2026-10-02: "parked items should be included in the
+    """The user, 2026-10-02: "parked items should be included in the
     sidebar (ideas are invisible today)". Under "parked", not "open": a
     parked row stays out of the open views."""
     ctx = api.resolve(str(tmp_path))
@@ -960,7 +1417,7 @@ async def test_the_sidebar_counts_open_parked_rows_under_their_own_head(
     await user.open("/")
     (side,) = user.find(marker="open-idea").elements
     assert side.props["href"] == "/notes?kind=idea&status=open"
-    assert side.default_slot.children[-1].text == "1"
+    assert _nav_n(side) == "1"
     assert side.parent_slot.children[0].text == "parked"
 
 
@@ -977,10 +1434,10 @@ async def test_the_sidebar_lists_the_kinds_with_no_status_under_records(
     await user.open("/")
     (side,) = user.find(marker="kind-decision").elements
     assert side.props["href"] == "/notes?kind=decision"
-    assert side.default_slot.children[-1].text == "2"
+    assert _nav_n(side) == "2"
     assert side.parent_slot.children[0].text == "records"
     (note,) = user.find(marker="kind-note").elements
-    assert note.default_slot.children[-1].text == "0"
+    assert _nav_n(note) == "0"
 
 
 def test_the_viewer_reads_only_text_it_knows_inside_the_checkout(repo, tmp_path):
@@ -995,23 +1452,25 @@ def test_the_viewer_reads_only_text_it_knows_inside_the_checkout(repo, tmp_path)
     (repo / "logo.png").write_bytes(b"\x89PNG")
     (tmp_path / "out.md").write_text("outside")
     for name in ("docs/a.md", "x.py", "Makefile"):
-        assert view_path(ctx, name) == (repo / name).resolve(), name
+        assert view_path(ctx, name) == ((repo / name).resolve(), None), name
     for name in ("../out.md", str(tmp_path / "out.md"), "logo.png",
                  "gone.md", "docs", None):
         assert view_path(ctx, name) is None, name
 
 
 def test_the_viewer_reads_a_doc_from_the_store_not_the_checkout(repo, tmp_path):
-    """A `doc` name is a path from the store's root, and the checkout's file
-    at the same path is another file."""
+    """A `doc` name is a path within the store's docs/, and the checkout's
+    file at the same path is another file."""
     from symbion.gui.notes import view_path
     ctx = api.resolve(str(tmp_path))
     for root in (repo, tmp_path):
-        (root / "docs").mkdir()
+        (root / "docs").mkdir(exist_ok=True)
         (root / "docs" / "a.md").write_text("# A")
-    assert view_path(ctx, "docs/a.md", "doc") == (tmp_path / "docs" / "a.md").resolve()
-    assert view_path(ctx, "docs/a.md") == (repo / "docs" / "a.md").resolve()
-    assert view_path(ctx, "../p/f", "doc") is None
+    (tmp_path / "top.md").write_text("# the store's, not a doc")
+    assert view_path(ctx, "a.md", "doc") == ((tmp_path / "docs" / "a.md").resolve(), None)
+    assert view_path(ctx, "docs/a.md") == ((repo / "docs" / "a.md").resolve(), None)
+    for name in ("../top.md", "../p/f"):
+        assert view_path(ctx, name, "doc") is None, name
 
 
 def test_the_viewer_refuses_symlinks_outside_the_checkout(repo, tmp_path, symlink):
@@ -1023,7 +1482,7 @@ def test_the_viewer_refuses_symlinks_outside_the_checkout(repo, tmp_path, symlin
 
 
 async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
-    """The owner, 2026-10-02: ".md files should be viewable in a modal
+    """The user, 2026-10-02: ".md files should be viewable in a modal
     markdown viewer". From the card's target and refs, and the file's page."""
     ctx = api.resolve(str(tmp_path))
     (repo / "README.md").write_text("# Read me\n\nthe *whole* file")
@@ -1037,6 +1496,10 @@ async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
     build_page(ctx, author="ada")
     await user.open("/notes")
     assert len(user.find(marker="file-open").elements) == 2    # a target, a ref; not other.md
+    for b in user.find(marker="file-open").elements:   # with its chip, so a wrap keeps them together
+        pair = b.parent_slot.parent
+        assert "sb-pair" in pair.classes
+        assert any("sb-chip" in c.classes for c in pair.default_slot.children if c is not b)
     user.find(marker="file-open").click()
     await user.should_see(marker="file-view")
     (view,) = user.find(marker="file-view").elements
@@ -1046,8 +1509,45 @@ async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
     assert sorted(labels, key=str) == ["", "read the file"]   # the page's own, the ref's
 
 
+async def test_a_file_only_the_default_branch_holds_opens_from_there(user: User, repo, tmp_path):
+    """The user, 2026-10-15: a ref to a .tf file had no view button. The
+    file was on main and not in the branch checked out, and the viewer read
+    the worktree alone. It reads the default branch's copy, and says so."""
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t",  # noqa: E731
+                                     "-c", "user.email=t@t", *a], check=True,
+                                    capture_output=True)
+    base = git("rev-parse", "HEAD").stdout.decode().strip()
+    (repo / "infra").mkdir()
+    (repo / "infra" / "main.tf").write_text('resource "aws_instance" "web" {}\n')
+    git("add", "-A")
+    git("commit", "-q", "-m", "infra")
+    git("checkout", "-q", "-b", "wip", base)
+    assert not (repo / "infra" / "main.tf").exists()
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "refs": [{"type": "item", "name": "infra/main.tf"}], "body": "see it"},
+            author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    user.find(marker="file-open").click()
+    await user.should_see(marker="file-view")
+    (view,) = user.find(marker="file-view").elements
+    assert "aws_instance" in view.props["innerHTML"]
+    await user.should_see("infra/main.tf, as on main")
+
+
+def test_the_viewer_knows_terraform_files_pygments_leaves_unnamed():
+    """pygments names a lexer for .tf and not for .tfvars or .tfstate, so
+    those got no view button (the user, 2026-10-15)."""
+    from symbion.gui.notes import _lexer
+    assert _lexer("env/dev.tfvars").aliases[0] == "terraform"
+    assert _lexer("terraform.tfstate").aliases[0] == "json"
+    assert _lexer("main.tf").aliases[0] == "terraform"
+    assert _lexer("notes.unknownext") is None
+
+
 async def test_a_code_target_opens_coloured_in_a_dialog(user: User, repo, tmp_path):
-    """The owner, 2026-10-11: as markdown opens in a viewer, so should the
+    """The user, 2026-10-11: as markdown opens in a viewer, so should the
     other files we can read, code most of all. A fence in the file stays
     inside the one block."""
     ctx = api.resolve(str(tmp_path))
@@ -1067,6 +1567,110 @@ async def test_a_code_target_opens_coloured_in_a_dialog(user: User, repo, tmp_pa
     await user.open("/object?type=item&name=blob.py")
     user.find(marker="file-open").click()
     assert user.notify.contains("blob.py is not text")
+
+
+async def test_the_viewer_shows_its_file_in_the_file_manager(user: User, repo, tmp_path,
+                                                             monkeypatch):
+    """The user, 2026-10-16: "is open in finder even a possibility?" The
+    viewer's button runs the reveal command on the file it shows, and so
+    does a shift-click on a card's read button, with no viewer."""
+    import asyncio
+    from pathlib import Path
+    ctx = api.resolve(str(tmp_path))
+    (repo / "x.py").write_text("x = 1\n")
+    api.add(ctx, {"kind": "note", "target": {"type": "item", "name": "x.py"},
+                  "body": "about it"}, author="ada")
+    got = tmp_path / "revealed"
+    notes = build_page.__globals__["view_button"].__globals__
+    monkeypatch.setitem(notes, "_reveal_cmd", lambda p: [
+        sys.executable, "-c", "import sys; open(sys.argv[1], 'w').write(sys.argv[2])",
+        str(got), str(p)])
+
+    async def revealed():
+        for _ in range(100):
+            if got.exists():
+                break
+            await asyncio.sleep(0.05)
+        path = Path(got.read_text()).resolve()
+        got.unlink()
+        return path
+
+    build_page(ctx, author="ada")
+    await user.open("/notes")                # the card's button; the page has none
+    user.find(marker="file-open").click()
+    await user.should_see(marker="file-reveal")
+    user.find(marker="file-reveal").click()
+    assert await revealed() == (repo / "x.py").resolve()
+    await user.open("/notes")
+    user.find(marker="file-open").trigger("click", {"shiftKey": True})
+    assert await revealed() == (repo / "x.py").resolve()
+    await user.should_not_see(marker="file-view")
+
+
+async def test_the_viewer_card_takes_the_focus_so_page_keys_scroll_it(user: User, repo,
+                                                                      tmp_path):
+    """The user, 2026-10-16: "modal viewer - page up/down don't work". A
+    key scrolls the focused element or a scroller around it. Quasar's dialog
+    focused its own inner node, the parent of the card that scrolls, so the
+    keys scrolled nothing. It focuses an `[autofocus][tabindex]` element
+    first. Checked in Chrome: no client JS runs here."""
+    ctx = api.resolve(str(tmp_path))
+    (repo / "x.py").write_text("x = 1\n")
+    api.add(ctx, {"kind": "note", "target": {"type": "item", "name": "x.py"},
+                  "body": "about it"}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/object?type=item&name=x.py")
+    user.find(marker="file-open").click()
+    await user.should_see(marker="file-view")
+    (view,) = user.find(marker="file-view").elements
+    card = view.parent_slot.parent
+    assert "sb-md-card" in card.classes
+    assert card.props.get("autofocus") is True and card.props.get("tabindex") == "-1"
+
+
+async def test_a_file_on_disk_gets_reveal_and_editor_buttons_on_its_page(user: User, repo,
+                                                                         tmp_path, monkeypatch):
+    """The user, 2026-10-16: show in Finder and open in the editor sit on
+    the target's page, beside its read button, for a file the viewer cannot
+    show too. The editor's link is VS Code's, its path quoted."""
+    from pathlib import Path
+    from urllib.parse import unquote
+    ctx = api.resolve(str(tmp_path))
+    (repo / "a b.py").write_text("x = 1\n")
+    (repo / "pic.png").write_bytes(b"\x89PNG\0")
+    for name in ("a b.py", "pic.png"):
+        api.add(ctx, {"kind": "note", "target": {"type": "item", "name": name},
+                      "body": "about it"}, author="ada")
+    notes = build_page.__globals__["view_button"].__globals__
+    monkeypatch.setitem(notes, "_reveal_cmd", lambda p: ["reveal", str(p)])
+    build_page(ctx, author="ada")
+    await user.open("/object?type=item&name=a%20b.py")
+    await user.should_see(marker="file-reveal")
+    (link,) = user.find(marker="file-editor").elements
+    href = link.props["href"]
+    assert href.startswith("vscode://file/") and href.endswith("/a%20b.py"), href
+    rest = unquote(href.removeprefix("vscode://file"))
+    assert Path(rest[1:] if sys.platform == "win32" else rest) == (repo / "a b.py").resolve()
+    await user.open("/object?type=item&name=pic.png")
+    await user.should_see(marker="file-editor")
+    await user.should_not_see(marker="file-open")
+
+
+def test_the_reveal_command_selects_the_file_and_never_opens_it(monkeypatch, tmp_path):
+    """`open -R` and `/select,` select the file; a headless Linux gets no
+    button, and a desktop one opens the folder."""
+    from symbion.gui.notes import _reveal_cmd
+    f = tmp_path / "a b.py"
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert _reveal_cmd(f) == ["open", "-R", str(f)]
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert _reveal_cmd(f) == ["explorer", f"/select,{f}"]
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    assert _reveal_cmd(f) is None
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert _reveal_cmd(f) == ["xdg-open", str(tmp_path)]
 
 
 async def test_the_sidebar_links_the_source(user: User, ctx_with_notes):
@@ -1097,7 +1701,7 @@ async def test_a_filter_that_hides_every_card_searches_the_store(user: User, ctx
                                                                  monkeypatch):
     """The page's script sends the text after a pause once its filter hides
     every card: a superseded id matched no card and read as a row that was
-    gone (the owner, 2026-10-05). The page that shows that search stays."""
+    gone (the user, 2026-10-05). The page that shows that search stays."""
     from nicegui import ui
     await user.open("/tags")
     user.find(marker="search").trigger("update:value", "beta")
@@ -1113,7 +1717,7 @@ async def test_a_filter_that_hides_every_card_searches_the_store(user: User, ctx
 
 async def test_the_sidebar_links_the_other_stores_a_serve_runs_on(user: User, repo, tmp_path,
                                                                     monkeypatch):
-    """The owner, 2026-10-01: switch stores in the GUI. One `serve` per store
+    """The user, 2026-10-01: switch stores in the GUI. One `serve` per store
     keeps each store's author and repo; each records itself while it runs,
     and the sidebar links the others. A dead serve's record is dropped, and
     a record that does not parse is skipped."""
@@ -1251,7 +1855,7 @@ async def test_a_page_of_boards_counts_commits_since_once(user: User, repo, tmp_
 async def test_the_undo_button_asks_with_what_it_takes_back(user: User, repo, tmp_path,
                                                            monkeypatch):
     """A misclick on resolve or the star takes two clicks to take back (the
-    owner, 2026-10-01), and so does a note added to the wrong store, which
+    user, 2026-10-01), and so does a note added to the wrong store, which
     took a `git restore` (2026-10-13). An undo icon in the top bar while the
     store's last write is yours and uncommitted; its dialog says what the
     undo changes. A timed notice set a deadline the store does not have, and
@@ -1292,11 +1896,33 @@ async def test_the_undo_button_asks_with_what_it_takes_back(user: User, repo, tm
     await user.should_not_see(marker="undo-button")
 
 
+async def test_an_undo_another_write_overtook_says_why(user: User, repo, tmp_path, monkeypatch):
+    """The user looked for the undo icon to take back a test entry, and it
+    was gone: an agent had written since, and the one level is the newest
+    write's (2026-10-16). While the person has an uncommitted write,
+    the icon stays, dimmed, and a click names the write that holds the level."""
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "body": "mine"}, author="ada")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")    # an agent's write
+    theirs = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                           "body": "theirs"}, author="claude")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    await user.should_not_see(marker="undo-button")
+    user.find(marker="undo-gone").click()
+    await user.should_see(f"the last write is not yours: it was the add of {theirs.id} by claude")
+    api.commit(ctx, "c", author="ada")
+    await user.open("/notes")
+    await user.should_not_see(marker="undo-gone")          # nothing of hers is left to undo
+
+
 async def test_a_store_with_repos_names_the_store_not_the_repo_the_serve_stands_in(
         user: User, tmp_path, monkeypatch):
     """The serve is the store's (one per store, on the store's port), so a
     store over several repos takes the store's name, as the CLI's repos line
-    does, whichever repo the serve started in (the owner, 2026-10-14)."""
+    does, whichever repo the serve started in (the user, 2026-10-14)."""
     r = tmp_path / "net"
     r.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True)
@@ -1306,6 +1932,6 @@ async def test_a_store_with_repos_names_the_store_not_the_repo_the_serve_stands_
     monkeypatch.chdir(r)
     build_page(api.resolve(), author="ada")
     await user.open("/")
-    assert user.client.resolve_title() == "work-notes · symbion"
+    assert user.client.resolve_title() == "work-notes · Summary"
     (brand,) = user.find(marker="brand").elements
     assert brand.text == "work-notes"

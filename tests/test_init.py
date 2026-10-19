@@ -100,14 +100,19 @@ def test_init_links_by_junction_where_windows_refuses_a_symlink(repo, tmp_path, 
 
 
 def test_init_writes_a_store_readme_once(repo, tmp_path, capsys):
-    """The owner, 2026-10-05: a store should say what it is. A person who
+    """The user, 2026-10-05: a store should say what it is. A person who
     opens the store's repo, on a forge or a disk, met bare JSONL. A re-run
     keeps the file, edited or not."""
     s = tmp_path / "store"
     assert run("init", "--yes", store_dir=s) == 0
     text = (s / "README.md").read_text()
-    assert f"`{repo.name}`" in text and "https://github.com/phreakocious/symbion" in text
+    assert "https://github.com/phreakocious/symbion" in text
+    # Written once, so it stays true when a second repo shares the store
+    # (an adoption report, 2026-10-13): `the store of app` did not.
+    flat = " ".join(text.split())
+    assert f"first set up for `{repo.name}`" in flat and "store of" not in flat, text
     assert "banner.png" in text and "notes.jsonl" in text and "symbion summary" in text
+    assert "`docs/`" in text and (s / "docs").is_dir()
     (s / "README.md").write_text("ours\n")
     capsys.readouterr()
     assert run("init", "--yes", store_dir=s) == 0
@@ -233,9 +238,20 @@ def test_merge_hook_waits_for_the_skill_link_the_hook_runs(repo, tmp_path, capsy
 
 
 def test_init_labels_the_pointer_by_what_git_will_take(repo, tmp_path, capsys):
+    """`(git: not ignored)` said nothing of what to do (an adoption report,
+    2026-10-13). A tracked pointer is a real mode, so the note offers both
+    ways, and a pointer git already tracks gets neither."""
     (repo / ".gitignore").write_text(".claude/\n")
     assert run("init", "--yes", store_dir=repo.parent / "other-notes") == 0
-    assert "-> ../other-notes (git: not ignored)" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "-> ../other-notes (git: not ignored)" in out
+    assert ("note: commit .symbion so each clone reads this store, or keep it out of "
+            "git: echo .symbion >> .git/info/exclude") in out, out
+    subprocess.run(["git", "-C", str(repo), "add", ".symbion"], check=True)
+    assert run("init", "--yes", "--repoint", store_dir=repo.parent / "third-notes") == 0
+    out = capsys.readouterr().out
+    assert "-> ../third-notes (was " in out and "(git: tracked)" in out, out
+    assert "keep it out of git" not in out
 
 
 def test_summary_points_at_the_user_skill_before_a_write(repo, tmp_path, capsys):
@@ -315,7 +331,7 @@ def test_a_file_target_on_a_new_store_names_the_lines_that_declare_it(repo, tmp_
 def test_init_at_a_16_colour_terminal_names_the_fix(repo, tmp_path, term, tty, says):
     """At 16 colours the palette falls back to plainer colours, and the
     terminal usually does more than its TERM says: init, run by a person,
-    names the fix. An agent has no tty, so it hears nothing (the owner,
+    names the fix. An agent has no tty, so it hears nothing (the user,
     2026-10-06)."""
     env = {k: v for k, v in os.environ.items() if k not in ("COLORTERM", "NO_COLOR")}
     env.update(TERM=term, FORCE_COLOR="1", HOME=str(tmp_path))
@@ -388,7 +404,7 @@ def test_init_on_the_default_store_is_quiet_about_a_pointer_that_names_it(repo, 
     """The pointer is compared by where it RESOLVES, not by existing.
     Measured 2026-09-22 in two adopting projects: `.symbion` read
     `../<name>-notes`, the default store itself, and a re-run of init told
-    the owner to delete it as stale."""
+    the user to delete it as stale."""
     default = repo.parent / f"{repo.name}-notes"
     value = f"../{default.name}" if form == "relative" else str(default.resolve())
     (repo / ".symbion").write_text(value + "\n")
@@ -446,7 +462,7 @@ def test_init_leaves_a_project_that_reads_a_store_on_it(repo, tmp_path, capsys, 
 
 
 def test_init_without_yes_lists_each_change_and_makes_none(repo, tmp_path, capsys):
-    """The owner's call, 2026-10-01: init is installed from pipx, so whoever
+    """The user's call, 2026-10-01: init is installed from pipx, so whoever
     runs it has not read its source, and two of its writes are instruction
     surfaces every Claude Code session reads. A run without --yes names each
     path and what it would do to it, writes nothing, and exits 1, so a run

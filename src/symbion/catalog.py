@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import difflib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -46,9 +47,10 @@ def posix_sh() -> str | None:
 
 
 # The store's own docs/, built in so `--ref doc:NAME` holds in every store: a
-# row's long detail lives in a file there (the owner, 2026-10-14). A name is
-# its path from the store's root. A [catalogs] `doc` entry replaces it.
-DOC_CATALOG = 'git -C "${SYMBION_DIR:?}" ls-files --cached --others --exclude-standard docs'
+# row's long detail lives in a file there (the user, 2026-10-14). A name is
+# its path within docs/: `doc:docs/x.md` said docs twice (the user,
+# 2026-10-15). A [catalogs] `doc` entry replaces it.
+DOC_CATALOG = 'git -C "${SYMBION_DIR:?}/docs" ls-files --cached --others --exclude-standard'
 
 
 def run_configured(cfg, cmd: str, input: str | None = None):
@@ -84,6 +86,13 @@ def run_configured(cfg, cmd: str, input: str | None = None):
     env = dict(os.environ)
     if getattr(cfg, "store", None) is not None:
         env["SYMBION_DIR"] = str(cfg.store)
+    # git C-quotes a path with a byte over 0x7f while core.quotePath is on,
+    # its default: `git ls-files` listed `"caf\303\251.md"`, and no typed
+    # name matched it. Set here, it reaches the commands a store's toml
+    # already holds. Git before 2.31 ignores it and quotes as before.
+    k = int(env.get("GIT_CONFIG_COUNT") or 0)
+    env.update({"GIT_CONFIG_COUNT": str(k + 1), f"GIT_CONFIG_KEY_{k}": "core.quotePath",
+                f"GIT_CONFIG_VALUE_{k}": "false"})
     # Its own session, so a timeout kills what the shell forked too:
     # subprocess.run's timeout kills only the shell, and its children ran on
     # after the error said killed (found 2026-10-02). Out of the terminal's
@@ -137,26 +146,54 @@ def _lines(stdout: str) -> list[str]:
     """The protocol's line rule, shared by catalogs and resolvers: blank lines
     go, every other line is VERBATIM. Stripping would silently rename a legal
     path with a trailing space, and the task it seeds then never matches the
-    catalog again."""
+    catalog again. A catalog then splits each line at its first tab
+    (`_split`)."""
     return [ln for ln in stdout.splitlines() if ln.strip()]
 
 
+def _split(lines: list[str]) -> list[tuple[str, str]]:
+    """Each catalog line as (name, description): the name is the part before
+    the first tab, verbatim, and the description the rest, stripped. A line
+    whose name is blank is skipped, as a blank line is."""
+    rows = [(n, d.strip()) for n, _, d in (ln.partition("\t") for ln in lines)]
+    return [(n, d) for n, d in rows if n.strip()]
+
+
 def names(cfg, target_type: str, *, allow_empty: bool = False) -> list[str]:
-    """The catalog's names, verbatim. Non-zero exit is an error whatever stdout
-    holds — checked BEFORE emptiness, so a failed producer never reads as an
-    empty catalog. `allow_empty` is for a caller holding a query to resolve
-    (see `pool`); a sweep must leave it off."""
+    """The catalog's names: each line up to its first tab, verbatim.
+    Non-zero exit is an error whatever stdout holds — checked BEFORE
+    emptiness, so a failed producer never reads as an empty catalog.
+    `allow_empty` is for a caller holding a query to resolve (see `pool`); a
+    sweep must leave it off."""
+    return [n for n, _ in _entries(cfg, target_type, allow_empty)]
+
+
+def described(cfg, target_type: str) -> dict:
+    """Each name the catalog lists with its description ('' for none), in
+    the catalog's order; a repeated name keeps its first. Only the GUI's
+    pickers read a description (the user, 2026-10-15): every other reader
+    takes `names`. An empty catalog is an empty dict."""
+    out: dict = {}
+    for n, d in _entries(cfg, target_type, True):
+        out.setdefault(n, d)
+    return out
+
+
+def _entries(cfg, target_type: str, allow_empty: bool) -> list[tuple[str, str]]:
     cmd = cfg.catalogs.get(target_type)
     if cmd is None:
         raise CatalogError(f"no catalog command for type {target_type!r}: add one under [catalogs] in symbion.toml")
     if why := cfg.missing(target_type):
         raise CatalogError(f"{why}; its entries still read, and a write on {target_type!r} "
                            f"waits for the repo")
-    r = run_configured(cfg.for_type(target_type), cmd)
-    if r.returncode != 0:
-        raise CatalogError(f"catalog {target_type!r} exited {r.returncode}: {cmd}\n"
-                           f"{r.stderr.strip()[:400]}")
-    out = _lines(r.stdout)
+    if cmd == DOC_CATALOG and cfg.store is not None and not Path(cfg.store, "docs").is_dir():
+        out = []                         # git -C cannot enter a docs/ not yet made
+    else:
+        r = run_configured(cfg.for_type(target_type), cmd)
+        if r.returncode != 0:
+            raise CatalogError(f"catalog {target_type!r} exited {r.returncode}: {cmd}\n"
+                               f"{r.stderr.strip()[:400]}")
+        out = _split(_lines(r.stdout))
     if not out and not allow_empty:
         # Silent-empty is indistinguishable from a real result: seeding would
         # create 0 tasks and report success.
@@ -208,6 +245,18 @@ def pool(cfg, target_type: str) -> list[str]:
         f"Declare a resolver for {target_type!r} in symbion.toml to mint one.")
 
 
+CLOSED = "closed"
+
+
+def resolver(cfg, target_type: str) -> str | None:
+    """The [resolvers] command for `target_type`, or None where the built-in
+    rule picks: no entry, or `closed` (the user, 2026-10-14: an opt-in
+    catalog that takes only the names it lists). Like `[renames] TYPE =
+    "git"`, the keyword names a built-in, never a command."""
+    cmd = cfg.resolvers.get(target_type)
+    return None if cmd == CLOSED else cmd
+
+
 def resolve_with(cfg, target_type: str, query: str, candidates) -> str:
     """The configured resolver, per the protocol: stdin is the NFC query then
     one candidate per line; exit 0 → first non-blank stdout line is the name
@@ -235,8 +284,10 @@ def resolve_with(cfg, target_type: str, query: str, candidates) -> str:
     return lines[0]
 
 
-def match(cfg, target_type: str, query: str, candidates) -> str:
+def match(cfg, target_type: str, query: str, candidates, earlier=()) -> str:
     """The one picker: the declared resolver, else the built-in rule.
+    `earlier`: candidates no catalog listed, which this write's earlier
+    entries took, so a pick of one does not claim the catalog.
 
     A built-in miss is taken as typed, by design (a catalog disambiguates,
     it does not whitelist) -- but silently, so a typo'd or deleted path
@@ -248,34 +299,52 @@ def match(cfg, target_type: str, query: str, candidates) -> str:
     The note says "taken", not "stored": this is the one picker for reads and
     writes both, and it does not know the verb, so a `list --name` miss used
     to promise a write the read never made (adopter report, 2026-09-28). A
-    batch write, which does know, still says "stored" (cli's from-json note)."""
+    batch write, which does know, still says "stored" (cli's from-json note).
+
+    A closed catalog refuses the miss instead. A read of a name the store
+    holds never gets here (gitref.canon_name takes it first)."""
     cfg = cfg.for_type(target_type)       # its notes ask the repo the name is in
-    if target_type in cfg.resolvers:
+    if resolver(cfg, target_type):
         return resolve_with(cfg, target_type, query, candidates)
     got = resolve(query, candidates)
     if got not in candidates:
         from . import gitref            # late: gitref imports this module
         b = gitref.only_on_default_branch(cfg, got)
         where = (f"; it is on {b}, not in this worktree" if b else
-                 "; it is a gitignored file in this worktree" if gitref.ignored_here(cfg, got) else "")
-        # 0.9: a typo scored 0.97 to 0.98 against its file in this repo, and a
-        # new file 0.84 against its siblings, which share its directory. Case
-        # is folded: 'load balancer' scored 0.85 against 'Load Balancer'.
-        folded = {}
-        for c in candidates:
-            folded.setdefault(c.casefold(), []).append(c)
-        near = [c for f in difflib.get_close_matches(got.casefold(), list(folded), n=3,
-                                                     cutoff=0.9) for c in folded[f]]
-        guess = f"; did you mean {', '.join(map(repr, near))}?" if near else ""
+                 "; it is a gitignored file in this worktree" if gitref.ignored_here(cfg, got) else
+                 f"; it is in {w}" if (w := gitref.other_worktree(cfg, got)) else "")
+        guess = did_you_mean(got, candidates)
+        if cfg.resolvers.get(target_type) == CLOSED:
+            raise CatalogError(f"{got!r} matches nothing in the {target_type} catalog, which is "
+                               f"closed: it takes only the names it lists{where}{guess} "
+                               f"([resolvers] {target_type} = \"closed\" in symbion.toml)")
         print(f"note: {got!r} matches nothing in the {target_type} catalog; "
               f"taken as typed{where}{guess}", file=sys.stderr)
     elif got != nfc(query):
         # A non-exact pick is never silent:
         # `--name foo` landing on src/foo_test.py must be visible to undo.
         how = "same name but for case" if got.casefold() == nfc(query).casefold() else "unique substring"
-        print(f"note: {query!r} resolved to {got!r} ({how} in the {target_type} catalog)",
-              file=sys.stderr)
+        src = ", from an earlier entry of this write" if got in earlier else \
+            f" in the {target_type} catalog"
+        print(f"note: {query!r} resolved to {got!r} ({how}{src})", file=sys.stderr)
     return got
+
+
+def did_you_mean(query: str, candidates) -> str:
+    """`; did you mean 'a', 'b'?` for the candidates `query` is likely a
+    typo of, else ''. 0.9: a typo scored 0.97 to 0.98 against its file in
+    this repo, and a new file 0.84 against its siblings, which share its
+    directory. Case is folded: 'load balancer' scored 0.85 against 'Load
+    Balancer'. Names that differ only in digits are a series, not a typo:
+    `PR #7` and `PR #8` scored 0.92."""
+    q, folded = query.casefold(), {}
+    for c in candidates:
+        f = c.casefold()
+        if f == q or re.sub(r"\d", "", f) != re.sub(r"\d", "", q):
+            folded.setdefault(f, []).append(c)
+    near = [c for f in difflib.get_close_matches(q, list(folded), n=3, cutoff=0.9)
+            for c in folded[f]]
+    return f"; did you mean {', '.join(map(repr, near))}?" if near else ""
 
 
 def canonical(cfg, target_type: str, name, pending=(), candidates=None):
@@ -285,11 +354,14 @@ def canonical(cfg, target_type: str, name, pending=(), candidates=None):
     repeated query read as ambiguous)."""
     if name is None or target_type in NON_CANONICAL_TYPES:
         return name
+    if target_type == "doc":             # as git prints it, from the store's root
+        name = name.removeprefix("docs/")
     if target_type not in cfg.catalogs:
         return nfc(name)
     base = pool(cfg, target_type) if candidates is None else candidates
     cands = list(dict.fromkeys([*base, *pending]))
-    return match(cfg, target_type, name, cands)
+    return match(cfg, target_type, name, cands,
+                 earlier=set(pending).difference(base) if pending else ())
 
 
 def across(query, pools) -> list[tuple[str, str]]:

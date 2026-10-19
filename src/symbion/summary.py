@@ -107,6 +107,12 @@ def measured(m: dict) -> str:
     return ", ".join(f"{k}={v}" for k, v in m.items())
 
 
+def options_line(o) -> str:
+    """A question's answers on one line, the default first. ` | `, not a
+    comma: an answer is a phrase, and phrases hold commas."""
+    return " | ".join(o)
+
+
 def age_phrase(stamp: str) -> str:
     """`age_days` as words. Under a day is not "today": a check run late
     last night is not today's."""
@@ -181,7 +187,7 @@ def deal_by_kind(rows):
     The header counts open rows per kind; the heads were one newest-first cap
     over all of them, so a kind could be counted and never listed. Measured
     2026-09-28 on an adopter store: a bootstrap wrote its two `question` rows
-    first -- the kind that exists for the owner to answer at session start --
+    first -- the kind that exists for the user to answer at session start --
     and 13 newer rows pushed both into `+6 more open`. Dealing spends the cap
     across the kinds instead, so the smallest kind is the one that survives it
     whole. Keyed on the kinds present, not on any label: a store's [kinds]
@@ -197,7 +203,7 @@ def due_soon(notes, now=None):
     soonest first. In an arc or not: a date is an explicit ask to be reminded,
     and past due outranks every other block. A parked row's date is when to
     come back to it, so it shows from that day on, not a week before (the
-    owner, 2026-10-14)."""
+    user, 2026-10-14)."""
     out = []
     for n in notes:
         state = S.due_state(n.due, now) if n.due and S.read_status(n) == "open" else None
@@ -217,9 +223,9 @@ def wrote_it(reader, author) -> bool:
 def who(reader, raised, last) -> dict:
     """The labels a row prints with: `from` who raised it, and `last` who
     wrote its newest version when that is someone else. Labelled by the head
-    alone, an amendment relabelled a request: the owner's task, amended by
+    alone, an amendment relabelled a request: the user's task, amended by
     Codex, printed `from codex`, and one the reader amended lost its label
-    (the owner's call, 2026-10-02: name both). A row only the reader touched
+    (the user's call, 2026-10-02: name both). A row only the reader touched
     has no label: `last by` the reader on a row of no one else's is noise."""
     by = {"from": raised} if wrote_it(reader, raised) else {}
     if last not in (raised, "unknown") and (by or wrote_it(reader, last)):
@@ -247,8 +253,20 @@ def waits(reader, n) -> bool:
         and wrote_it(reader, n.author)
 
 
-def starred(notes):
-    """#priority notes that have not been explicitly closed.
+def asks(reader, by_id, n) -> bool:
+    """An open row that waits on the person reading the GUI: a question, or
+    the person's own row, whose newest word is someone else's. `waits` is an
+    agent's rule: for the person it held every agent's own task and parked
+    idea. ponytail: a question is the kind named `question`, which no bit
+    tells apart from a task; a store that renames it shows the person's own
+    rows alone (the user's call, 2026-10-16). A bit in [kinds] lifts it."""
+    return (S.read_status(n) == "open" and not (n.spec.status and n.spec.verdict)
+            and wrote_it(reader, n.author)
+            and (n.kind == "question" or _root(by_id, n).author == reader))
+
+
+def is_starred(n) -> bool:
+    """A #priority note that has not been explicitly closed.
 
     Deliberately `read_status != "resolved"` and NOT `status == "open"`:
     read_status is None for note/decision/check, so an == "open" test would
@@ -256,8 +274,11 @@ def starred(notes):
     `supersede <id> --add-tag priority` as how ANY note gets starred.
     "not resolved" is the correct direction: only an explicit close should
     drop it from here."""
-    return [n for n in notes
-            if "priority" in n.tags and S.read_status(n) != "resolved"]
+    return "priority" in n.tags and S.read_status(n) != "resolved"
+
+
+def starred(notes):
+    return [n for n in notes if is_starred(n)]
 
 
 # The empty state is the onboarding surface:
@@ -276,6 +297,7 @@ def empty_summary() -> dict:
         "store": None,
         "open": {},
         "open_in_arcs": 0,
+        "parked": 0,
         "arcs": [],
         "arcs_elided": 0,
         "priority": [],
@@ -307,13 +329,15 @@ def empty_summary() -> dict:
         "skill": None,
         "named_store": None,
         "commit_hint": None,
+        "reader": None,
     }
 
 
-def row_digest(by_id, n, chars, reader, active=frozenset()) -> dict:
+def row_digest(by_id, n, chars, reader, active=frozenset(), now=None) -> dict:
     """One row's fields, the same in every block: a star or a near due
     date moved a row to a block that dropped its `from` and its
-    registration date (2026-09-29). The labels are the row's. `parked`
+    registration date (2026-09-29), and the waiting and due blocks dropped
+    the star (2026-10-15). The labels are the row's. `parked`
     and `arc` say why a printed row is not in the header's counts: a
     session summed the rows against them and reported a counting bug
     (2026-10-12). `active` is the unarchived arc ids."""
@@ -323,11 +347,14 @@ def row_digest(by_id, n, chars, reader, active=frozenset()) -> dict:
             "body": clip(n.body, chars),
             **({"parked": True} if n.spec.parked else {}),
             **({"arc": n.arc_id} if n.arc_id in active else {}),
-            **({"waits": True} if waits(reader, n) else {}),
+            **({"waits": True} | changed(by_id, n) if waits(reader, n) else {}),
             **who(reader, root.author, n.author),
             **({"registered": S.shown(root.created_at)[:10]}
                if n.spec.status and n.spec.verdict else {}),
             **({"amendments": k} if (k := _amendments(by_id, n)) else {}),
+            **({"options": list(n.options)} if n.options else {}),
+            **({"starred_days": age_days(_starred_at(by_id, n), now)}
+               if is_starred(n) else {}),
             **added(by_id, n, reader, chars)}
 
 
@@ -409,13 +436,13 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     by_id = {n.id: n for n in loaded}
 
     def digest(n, chars):
-        return row_digest(by_id, n, chars, reader, active)
+        return row_digest(by_id, n, chars, reader, active, _now)
 
     prereg = [n for n in heads if n.spec.verdict]
     rest = deal_by_kind([n for n in heads if not n.spec.verdict])
     shown = prereg + rest if full else prereg[:PREREG_CAP] + rest[:HEAD_CAP]
     # Open rows by anyone but the reader, parked included, that no block above
-    # prints: an owner's `idea` went unseen by every agent session (measured
+    # prints: a user's `idea` went unseen by every agent session (measured
     # 2026-09-24). None for a reader at a terminal, who is the person.
     printed = shown_above | {n.id for n in shown}
     people = S.newest_first(
@@ -424,8 +451,8 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     o_cap = len(people) if full else PEOPLE_CAP
     # Resolved rows the reader raised or closed that someone else closed, or
     # wrote to the body of, since the reader's newest row. Every block above
-    # lists open rows, so an owner's answer by `resolve --body` closed the
-    # agent's question and never reached it (2026-10-11), and an owner's
+    # lists open rows, so a user's answer by `resolve --body` closed the
+    # agent's question and never reached it (2026-10-11), and a user's
     # correction to an agent's resolve read nowhere (2026-10-12). A re-tag is
     # neither. The reader's newest row stands in for "since you last looked":
     # symbion keeps no session.
@@ -463,26 +490,30 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     p_cap = len(priority) if full else PRIORITY_CAP
     d_cap = len(due) if full else DUE_CAP
     notes_n, registry = gitref.uncommitted(store_dir)
+    wrap = gitref.last_wrap(store_dir, cfg)
+    if wrap:
+        wrap["changed"] = wrap_changes(loaded, by_id, wrap)
     return {
         # The resolved path, so a consumer can gate on "a store exists" and
         # see which one. An absent store answers `empty_summary()`, where this
         # is None; without it the two printed byte-identical JSON at exit 0.
         "store": str(store_dir),
         # A running `serve`'s URL, so an agent can hand the person a row's
-        # page (the owner, 2026-10-01).
+        # page (the user, 2026-10-01).
         "gui": (r := servers.serving(store_dir)) and r["url"],
         # The last wrap's commit message is the handoff (2026-10-12): what
         # the previous session left for this one, read before its rows.
-        "wrap": gitref.last_wrap(store_dir, cfg),
+        "wrap": wrap,
         "repos": repo_rows(cfg),
         "unlisted_repo": unlisted_repo(store_dir, cfg),
         "open": open_counts,
         "open_in_arcs": sum(r["open"] for r in rows),
+        # Parked is quiet, not hidden: fresh agents found no sign one existed
+        # until its date (2026-10-14). The user: a count is enough.
+        "parked": sum(n.spec.parked and S.read_status(n) == "open" for n in notes),
         "arcs": rows[:a_cap],
         "arcs_elided": max(0, len(rows) - a_cap),
-        "priority": [{**digest(n, BODY_CHARS),
-                      "starred_days": age_days(_starred_at(by_id, n), _now)}
-                     for n in priority[:p_cap]],
+        "priority": [digest(n, BODY_CHARS) for n in priority[:p_cap]],
         "priority_elided": max(0, len(priority) - p_cap),
         # The rule SKILL.md stated, which loaded after this text was read
         # and also covered the rows the reader answered last (2026-10-14).
@@ -541,6 +572,37 @@ def _closer(by_id, n):
     return closer
 
 
+def wrap_changes(loaded, by_id, w) -> list[dict]:
+    """Each entry the handoff `w` cites whose head changed after the wrap:
+    the tail as cited, what changed, who changed it and when. A handoff named
+    a question to pick up first after the user had resolved it, and only a
+    block above it said so (2026-10-16)."""
+    at = S.written_at(None, w["at"])
+    one = cite_ids(by_id)
+    out, seen = [], set()
+    for t in _CITE.findall(f"{w['gist']}\n{w['body']}"):
+        try:
+            h = S.chain_tip(loaded, one.get(t) or "")
+        except (KeyError, ValueError):      # another store's id, a shared tail, a cycle
+            continue
+        then = next((m for m in _chain(by_id, h) if S.written_at(m) <= at), None)
+        if h.id in seen or then is None or then.id == h.id:
+            continue
+        seen.add(h.id)
+        was, now = S.read_status(then), S.read_status(h)
+        if now == "resolved" and was != "resolved":
+            c = _closer(by_id, h)
+            out.append({"id": t, "what": "resolved", "by": c.author, "at": c.created_at})
+            continue
+        fields = [f for f in _CHANGED if getattr(h, f) != getattr(then, f)]
+        what = ("reopened" if was == "resolved" else
+                "added to" if h.body != then.body and h.body.startswith(then.body) else
+                "edited" if h.body != then.body or not fields else
+                f"{', '.join(fields)} changed")
+        out.append({"id": t, "what": what, "by": h.author, "at": h.created_at})
+    return out
+
+
 def _root(by_id, n):
     """The first row of n's supersede chain: a pre-registration's commitment.
     An amendment is a new row, so the head's own date is not the
@@ -557,7 +619,7 @@ def written(by_id, n) -> list[str]:
     """`written <when> by <author>` for the version that wrote n's body and,
     when a later link kept that body, the fields the newest link changed and
     who changed them. An edit keeps the id, so the head's author read as the
-    body's: an agent's bug the owner starred read `written … by` the owner
+    body's: an agent's bug the user starred read `written … by` the user
     (2026-10-12). When someone else raised it, the line names them first: a
     gotcha the user wrote and the agent amended read `written … by` the
     agent (2026-10-14)."""
@@ -594,7 +656,7 @@ def _amendments(by_id, n) -> int:
     it. A digest prints the body's start, so an amendment never reaches it:
     a prediction's corrected time printed its typo until it resolved
     (dogfood, 2026-09-30). Read off seams(), not a prefix test of its own: a
-    question the owner trimmed and answered in one save read `+1 amendment`
+    question the user trimmed and answered in one save read `+1 amendment`
     beside the two that `show` marked (2026-10-11)."""
     return sum(not above for _, _, _, above, _ in seams(by_id, n))
 
@@ -605,7 +667,7 @@ def seams(by_id, n) -> list[tuple[int, str, str, bool, bool]]:
     `at`; `edited` when the same link also changed the text it kept, so the
     line does not pass a rewrite off as the original (2026-10-14). Most
     supersedes are appends, and a diff of one is the whole old body unchanged
-    (the owner, 2026-10-08). One link can add both above and below: a
+    (the user, 2026-10-08). One link can add both above and below: a
     prepend, then an append that rewrote the uncommitted row in place. A
     link that edited the old body reads through _edit_seams. An in-place
     edit of an uncommitted row leaves no link, so no seam."""
@@ -632,7 +694,7 @@ def _edit_seams(old: str, new: str, out, author: str, created_at: str):
     """seams() across a link that edited the old body, by a word diff as
     gui.notes.edited() reads one. A seam stays beside the kept words next to
     it. Text after the last kept words that starts a paragraph is the link's
-    own: the owner cut a sentence from an agent's question and answered below
+    own: the user cut a sentence from an agent's question and answered below
     it in one save, and read as a rewrite the answer joined the question with
     no seam (2026-10-11). An edit in the last paragraph writes no paragraph,
     so it gets none."""
@@ -737,9 +799,9 @@ def links(notes, n) -> list[str]:
 def added(by_id, n, reader, chars) -> dict:
     """`added` and `added_by`: the first line that the newest amendment by
     someone other than the reader added, unless the body's clip to `chars`
-    already shows it. An owner's answer appended to a question sits at the
+    already shows it. A user's answer appended to a question sits at the
     body's end, and a digest prints the start: two sessions in a row relayed
-    answered decisions as pending, `last by <owner>` the only sign
+    answered decisions as pending, `last by <name>` the only sign
     (2026-10-07). The newest such amendment, not the head: the reader's own
     `noted` after an answer would hide it again.
 
@@ -751,7 +813,7 @@ def added(by_id, n, reader, chars) -> dict:
     as a revision it made an answer nobody acted on read as handled.
 
     `added_earlier`: the same for each other author before the newest, oldest
-    first. The owner answered `approved.`, a reviewer appended a relay, and
+    first. The user answered `approved.`, a reviewer appended a relay, and
     the agent's summary printed the relay alone (2026-10-14)."""
     rewritten, out, seen = False, [], set()
     lead = clip(n.body, chars)
@@ -761,7 +823,7 @@ def added(by_id, n, reader, chars) -> dict:
             fresh = [ln for ln in new.body.splitlines() if ln.strip() and ln not in was]
             if fresh:
                 seen.add(new.author)
-                # The first new line the lead does not show: an owner who
+                # The first new line the lead does not show: a user who
                 # trimmed the lead's last sentence and answered below it
                 # changed the lead first, and the answer never printed
                 # (2026-10-11).
@@ -777,6 +839,25 @@ def added(by_id, n, reader, chars) -> dict:
     return out[0] | ({"added_earlier": out[:0:-1]} if out[1:] else {})
 
 
+def changed(by_id, n) -> dict:
+    """`changed`, `changed_by`, `changed_at`: what n's newest link changed
+    when it changed no text, for a row that waits on the reader, whose
+    newest word that link is. The user starred an idea, and it waited under
+    a line they had added days before, which the agent had answered since
+    (2026-10-16). A star alone reads `starred it`."""
+    prev = by_id.get(n.supersedes) if n.supersedes else None
+    if prev is None or n.body != prev.body:
+        return {}
+    fields = [f for f in _CHANGED if getattr(n, f) != getattr(prev, f)]
+    if not fields:
+        return {}
+    star = fields == ["tags"] and set(n.tags) - set(prev.tags) == {"priority"} \
+        and set(prev.tags) <= set(n.tags)
+    what = "starred it" if star else \
+        "changed its " + ", ".join("due date" if f == "due" else f for f in fields)
+    return {"changed": what, "changed_by": n.author, "changed_at": n.created_at}
+
+
 def added_lines(a) -> list[dict]:
     """Each line added() found, oldest first."""
     return [*a.get("added_earlier", ()), a] if a.get("added") else []
@@ -784,7 +865,7 @@ def added_lines(a) -> list[dict]:
 
 def _seamed(by_id, n, link, line) -> bool:
     """Does `line` sit in text a seam gives to `link`? An edit that wrote no
-    paragraph of its own has none: an agent's rewrite of a row the owner had
+    paragraph of its own has none: an agent's rewrite of a row the user had
     amended printed `claude added …` with a reworded sentence of the first
     version, beside no amendment count (2026-10-12). A body written onto an
     empty one is all the link's own, and seams() marks no seam there."""
@@ -852,9 +933,10 @@ def _count(n: int, noun: str) -> str:
 
 
 def _labelled(paint, r, first=None) -> str:
-    """A summary row with its own labels: `from <author>`, on a
-    pre-registration its registration date, and its amendment count, in
-    whichever block it prints. `first` leads the author labels."""
+    """A summary row with its own labels: `priority` on a starred row,
+    `from <author>`, on a pre-registration its registration date, and its
+    amendment count, in whichever block it prints. `first` leads the author
+    labels."""
     by = ", ".join([*([first] if first else []), *([paint("waits on you", "warn")]
                                                    if r.get("waits") else []),
                     *(f"{label} {r[k]}" for label, k in (("from", "from"), ("last by", "last"))
@@ -864,10 +946,16 @@ def _labelled(paint, r, first=None) -> str:
         (f", registered {r['registered']}" if r.get("registered") else "")
     amd = f", +{_count(r['amendments'], 'amendment')}" if r.get("amendments") else ""
     star = f", starred {r['starred_days']}d ago" if r.get("starred_days") else ""
-    line = (by and by + " ") + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
-                                        label=r["kind"] + reg + amd + star)
+    line = (paint("priority", "warn") + " " if "starred_days" in r else "") + \
+        (by and by + " ") + row_line(paint, r["kind"], r["target"], r["body"], r["id"],
+                                     label=r["kind"] + reg + amd + star)
     for a in added_lines(r):
         line += f"\n    {paint(added_label(a), 'meta')} {paint(a['added'], 'body')}"
+    if r.get("options"):          # a question's answers, whole: the body clipped
+        line += f"\n    {paint('options:', 'meta')} {paint(options_line(r['options']), 'body')}"
+    if r.get("changed"):
+        line += "\n    " + paint(f"{r['changed_by']} {r['changed']} {when_added(r['changed_at'])}",
+                               "meta")
     return line
 
 
@@ -875,7 +963,9 @@ def render_summary(d: dict, paint=plain) -> str:
     counts = ", ".join(f"{paint(label, 'kind:' + label)} {n}" for label, n in d["open"].items())
     # `bug 0` beside a bug filed in an arc read as bug-free (2026-09-27).
     in_arcs = f"; {d['open_in_arcs']} open in arcs" if d.get("open_in_arcs") else ""
+    in_arcs += f"; {d['parked']} parked" if d.get("parked") else ""
     named = f" {d['named_store']}" if d.get("named_store") else ""
+    named += f" (for {d['reader']})" if d.get("reader") else ""
     out = [f"symbion{named}: open outside arcs: "
            f"{counts or 'no status kinds declared'}{in_arcs}"]
     if d.get("repos"):
@@ -914,7 +1004,7 @@ def render_summary(d: dict, paint=plain) -> str:
     # bare `*` beside a header that disagreed with it read as a bug in the
     # tool at first sight (measured 2026-09-20).
     for p in d["priority"]:
-        out.append(f"  {paint('priority', 'warn')} " + _labelled(paint, p))
+        out.append("  " + _labelled(paint, p))
     if d["priority_elided"]:
         out.append("  " + paint(f"+{d['priority_elided']} more priority (--full)", "meta"))
     for c in d.get("closed", ()):
@@ -956,6 +1046,9 @@ def render_summary(d: dict, paint=plain) -> str:
                                 f"bypassed symbion): counted neither open nor resolved; first "
                                 f"{d.get('no_status_first')} -- "
                                 f"supersede <id> --status open|resolved", "bad"))
+    if d.get("fitted"):
+        out.append("  " + paint(f"{_count(d['fitted'], 'row')} more cut to fit the session-start "
+                                f"hook's limit: `symbion summary` prints them", "meta"))
     if d.get("full") and not (d["arcs_elided"] or d["priority_elided"] or d.get("heads_elided")
                               or d.get("due_elided") or d.get("people_elided") or d.get("waiting_elided")
                               or d.get("closed_elided")):
@@ -969,6 +1062,12 @@ def render_summary(d: dict, paint=plain) -> str:
             since += f" ({', '.join(f'{k} {v}' for k, v in w['commits_by_repo'].items())})"
         out.append(f"  last wrap by {w['author']}, {when_added(w['at'])}{since}: {w['gist']}")
         out.extend("    " + paint(ln, "body") for ln in w["body"].splitlines())
+        if changed := w.get("changed"):
+            # ponytail: six, since the hook's cap counts this line; `--json` has all
+            said = "; ".join(f"{c['id']} {c['what']} by {c['by']} {when_added(c['at'])}"
+                             for c in changed[:6])
+            more = f"; +{len(changed) - 6} more (--json)" if len(changed) > 6 else ""
+            out.append("    " + paint(f"since the wrap: {said}{more}", "warn"))
     if d.get("gui"):
         out.append(f"  symbion serve: {d['gui']}; when you point the user at an entry, "
                    f"link it: {d['gui']}/notes?id=<id>")
@@ -981,6 +1080,34 @@ def render_summary(d: dict, paint=plain) -> str:
         out.append(f"  before a write: load the symbion skill ({d['skill']}); "
                    f"`symbion schema` lists this store's kinds")
     return "\n".join(out)
+
+
+# Claude Code saves a hook's text past 10,000 characters to a file and gives
+# the agent only its path and first 2,000 characters (its hooks reference,
+# "JSON output", since 2.1.89), and the handoff prints last. Counted as a
+# JavaScript string counts, in UTF-16 units, with a margin under the cap.
+HOOK_CHARS = 9_800
+# The blocks `fit` trims, least needed first.
+_TRIM = ("heads", "people", "arcs", "closed", "priority", "due", "waiting")
+
+
+def fit(d: dict, budget: int = HOOK_CHARS) -> dict:
+    """`d` with rows dropped from the end of each block in `_TRIM` order, each
+    counted into its block's `+N more` line, until `render_summary` fits
+    `budget`; `fitted` is how many went. `d` itself is not changed."""
+    d = {**d, "fitted": 1}
+
+    def size():
+        return len(render_summary(d).encode("utf-16-le")) // 2
+    for block in _TRIM:
+        while d.get(block) and size() > budget:
+            d[block] = d[block][:-1]
+            d[f"{block}_elided"] = d.get(f"{block}_elided", 0) + 1
+            d["fitted"] += 1
+    d["fitted"] -= 1
+    if not d["fitted"]:
+        del d["fitted"]
+    return d
 
 
 def one_line(d: dict) -> str:
@@ -1007,10 +1134,13 @@ def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -
     "built at" marker leaves this view and stays on its object. The tag
     means nothing on a status kind here; open work is resolved, not hidden."""
     loaded = S.load(store_dir)
+    named = {}
     if target:
         ttype, _, tname = target.partition(":")
         ttype, tname = gitref.read_target(cfg, ttype, tname or None, loaded)
         rows = S.heads_for(store_dir, ttype, tname, loaded=loaded)
+        # The stored name, not the typed one: `doc:plan` reads `doc:plan.md`.
+        named = {"target": f"{ttype}:{tname or ''}"}
     else:
         notes = S.heads(loaded)
         if commit:
@@ -1032,7 +1162,7 @@ def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -
     since = gitref.commits_since(cfg, rows)
     by_id = {n.id: n for n in loaded}
     return {"store": str(store_dir) if S.exists(store_dir) else None,
-            "gui": (r := servers.serving(store_dir)) and r["url"],
+            "gui": (r := servers.serving(store_dir)) and r["url"], **named,
             "notes": [json_row(n, by_id, since[n.id]) for n in rows]}
 
 
@@ -1079,7 +1209,10 @@ def render_schema(d: dict, paint=plain) -> str:
             own = "built in catalog: " if t["catalog"] == catalog.DOC_CATALOG else "catalog: "
             line = (f"  {t['type']:<{w + 22}}  {paint(own, 'meta')}"
                     f"{paint(flatten(t['catalog']), 'body')}")
-            if t.get("resolver"):
+            if t.get("resolver") == catalog.CLOSED:
+                line += (f"\n  {'':<{w + 22}}  {paint('closed: ', 'meta')}"
+                         f"{paint('a name the catalog does not list is refused', 'body')}")
+            elif t.get("resolver"):
                 line += (f"\n  {'':<{w + 22}}  {paint('resolver: ', 'meta')}"
                          f"{paint(flatten(t['resolver']), 'body')}")
             if t.get("repo"):

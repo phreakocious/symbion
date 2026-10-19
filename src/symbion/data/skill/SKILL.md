@@ -79,8 +79,8 @@ A target is `TYPE:NAME`:
 
 A catalog name resolves to the exact name, else a unique substring, else the
 name equal but for case. Several substring matches refuse. A name that matches
-nothing is a new target, stored as typed: a catalog guides a name, and does not
-limit it. `add` names each of these on stderr.
+nothing is a new target, stored as typed: a catalog guides a name, and limits it
+only when closed (`catalogs.md`). `add` names each of these on stderr.
 
 A `file:` path (`./x.py`, `../x.py`, absolute) is read from where you stand. A
 bare name (`x.py`, `src/x.py`) is matched from the repo's root. A target is a
@@ -95,8 +95,8 @@ supersede and resolve it by that id. Commands take a unique tail of an id:
 cite the 10-character tail (`412907-3be`). An id cited in a body is a link:
 `show` lists each cited entry with its state, and each entry that cites this one.
 
-`supersede <id>` edits an entry: `--body` rewrites it, `--append` adds below,
-`--prepend` adds above, and tags, refs, the target and the due date change alike.
+`supersede <id> --body TEXT` rewrites an entry; with `--append` or `--prepend`,
+TEXT goes below or above. Tags, refs, the target and the due date change alike.
 `resolve <id>` closes a status entry, and its `--body` goes below. A committed
 entry is never deleted, and `list --all` shows its earlier versions. `undo <id>`
 takes back this session's last write while no commit has run since.
@@ -123,14 +123,16 @@ subagent, or another model you hand work to, writes under its own name
 A write is pending until `symbion commit`, and on this disk only until
 `symbion push`. `commit` takes the entries this session wrote, under any author,
 and the store's changed files; `--all` takes other sessions' entries too, and
-`--dry-run` lists what it would take.
+`--dry-run` lists what it would take. Each write and each commit says what is
+still pending or unpushed.
 
 ## Reading
 
 `list --grep PATTERN` finds entries, `show <id> <id>…` reads them in one call,
-and `context --target TYPE:NAME` gives every entry on one object. `list --overdue`
-and `--due-by DATE` compare due dates. With `--json`, `list -h` names the keys; a
-guessed key reads `null`.
+and `context --target TYPE:NAME` gives every entry on one object. `list` prints
+one page and says on stderr how many entries it hides. `--overdue` and `--due-by
+DATE` compare due dates. With `--json`, `list -h` names the keys; a guessed key
+reads `null`.
 
 An entry is what was true when it was written. An entry on a file says how many
 commits have changed the file since (`commits_since`), and a check says how
@@ -152,16 +154,16 @@ they said it, or ask a `question`.
 Every later session reads an entry whole, so each write to it, a new entry or an
 addition, is a few sentences, about 500 characters: the claim, what showed it,
 what to do. It names a function, not a line. Detail goes in a file you write
-under the store's `docs/`; the entry names it by its path from the store's root
-(`--ref doc:docs/NAME.md`), and `symbion commit` takes the file. When the fact changes,
-`supersede --body` rewrites the entry; `--append` adds to it. `list --grep`
-finds an entry before you write its twin.
+under the store's `docs/`; the entry names it by its path there
+(`--ref doc:NAME.md`), and `symbion commit` takes the file. When the fact changes,
+`supersede --body` rewrites the entry; `--append --body` adds to it. `list
+--grep` finds an entry before you write its twin.
 
 A trap, such as a test that passes alone and fails in its file's run or a step
-that must come before an edit, goes on its file tagged `gotcha`: in Claude
-Code, the first call in each session that names the file prints its first 200
-characters, so the trap and its fix fit in them. One trap is one entry; a
-how-to is a plain note.
+that must come before an edit, goes on its file tagged `gotcha`: in Claude Code,
+the first call in each session or subagent that names the file prints its first
+200 characters, and its first edit of the file prints them again, so the trap
+and its fix fit in them. One trap is one entry; a how-to is a plain note.
 
 A `check` reaches no open view, so a running job also needs a `task` due at
 its end, resolved with the result. A result the user reports from this tree
@@ -169,12 +171,13 @@ is a `check` whose `--checked` names who ran it; one from another tree or day is
 on its commit. A pre-registration whose window closes unrun takes a new
 `--due`, not a resolve.
 
-An open `question` holds the work only if the user's instructions say so; a
-default that ships goes in its first 100 characters beside the ask, with how to
-flip it. When someone answers your question below it, act on the answer and
-resolve the question. `--ref` puts an
-object in reach of `context --target`, where prose does not. `priority` marks
-what the next session must act on.
+An open `question` holds the work only if the user's instructions say so. One
+whose answers fit in three gives them as `--option`, the default first, and its
+body is the question in plain words; one with more, or none that fit, gives no
+options, and the user answers in text. When someone answers your question below
+it, act on the answer and resolve the question. `--ref` puts an object in reach
+of `context --target`, where prose does not. `priority` marks what the next
+session must act on.
 
 `--body` is markdown. A body with backticks or `$` goes through `--body-file -`
 and a quoted heredoc (`<<'EOF'`): inside double quotes, the shell runs each
@@ -193,8 +196,8 @@ beside this file.
 ## Session end
 
 The store is the project's one open list. A session ends when the user says
-so, and its wrap (`/symbion wrap`, or any tool's wrap) follows `wrap.md`,
-beside this file.
+so, or, in a run the user left to you, when you judge the work done. Its wrap
+(`/symbion wrap`, or any tool's wrap) follows `wrap.md`, beside this file.
 
 ## Bugs in symbion
 

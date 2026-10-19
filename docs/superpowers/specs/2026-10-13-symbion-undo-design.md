@@ -2,12 +2,12 @@
 
 **Date:** 2026-10-13
 **Status:** Built.
-**Relates to:** the owner's request for an undo (2026-10-01), and the in-place edit
+**Relates to:** the user's request for an undo (2026-10-01), and the in-place edit
 (`store.rewritable`), whose earlier text no disk holds.
 
 ## The need
 
-The owner asked for an undo, in the CLI and the GUI. Two cases carry it:
+The user asked for an undo, in the CLI and the GUI. Two cases carry it:
 
 - **A misclick.** In the GUI a resolve or a star is one click, and nothing
   takes it back except a second write, which leaves a trace of both.

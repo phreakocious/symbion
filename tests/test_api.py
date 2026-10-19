@@ -2,11 +2,12 @@ import inspect
 import subprocess
 from datetime import datetime, timedelta
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
 
-from symbion import api, catalog, cli, gitref, store
+from symbion import api, catalog, cli, config, gitref, store
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
 
@@ -295,6 +296,10 @@ _NON_WRITERS = {
     "commit",            # writes git, not a note
     "own_rows",          # a read: which pending rows `commit` would take
     "push",              # ditto
+    "object_path",       # a read: where a target's file sits
+    "known_files",       # a read: which catalog file a dropped file is
+    "save_doc",          # writes a docs/ file, never a row; a doc has no author
+    "free_doc_name",     # a read: the first doc name save_doc takes
 }
 
 
@@ -618,7 +623,7 @@ def test_a_bang_names_the_kind_only_for_a_declared_kind():
 
 
 def test_a_bang_takes_a_kind_cut_short_while_it_names_one():
-    """The owner, 2026-10-01: `!b` is enough, and with task and tame both
+    """The user, 2026-10-01: `!b` is enough, and with task and tame both
     declared, nothing until `!tas` or `!tam`."""
     kinds = ("note", "notebook", "task", "tame", "bug")
     assert api.harvest_kind("!b login fails", kinds) == ("bug", "login fails")
@@ -853,7 +858,7 @@ def test_keep_refs_compares_the_refs_once_their_names_resolve(repo, tmp_path):
 def test_sequential_adds_see_the_store(repo, tmp_path):
     ctx = api.resolve(str(reading_store(tmp_path)))
     api.add(ctx, _row("40.40"), author="t")
-    assert api.add(ctx, _row("40.45"), author="t").target.name == "40.40"
+    assert api.add(ctx, _row("40.45", body="y"), author="t").target.name == "40.40"
     assert api.add(ctx, _row("44.00"), author="t").target.name == "44.00", \
         "3.6 away: outside the 1.0 window, its own target"
 
@@ -992,3 +997,231 @@ def test_the_catalog_runs_once_per_supersede_not_once_per_ref(repo, tmp_path):
                         refs=[{"type": "file", "name": "parser"}, {"type": "file", "name": "lexer"}])
     assert [r.name for r in new.refs] == ["src/parser.py", "src/lexer.py"]
     assert (tmp_path / "cat.calls").read_text().count("run") == 1
+
+
+def _file_catalog(store_dir):
+    """A store `init` made lists no repo file until its toml declares one."""
+    (store_dir / "symbion.toml").write_text(f'[catalogs]\nfile = "{config.FILE_CATALOG}"\n')
+
+
+def test_object_path_keeps_a_name_inside_its_root(repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    assert api.object_path(ctx, "file", "f") == (repo / "f").resolve()
+    assert api.object_path(ctx, "doc", "x.md") == (tmp_path / "docs" / "x.md").resolve()
+    assert api.object_path(ctx, "file", "../escape") is None
+    assert api.object_path(ctx, "doc", "../notes.jsonl") is None
+
+
+def test_known_files_finds_a_repo_file_by_its_name_and_text(repo, tmp_path):
+    _file_catalog(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "app.py").write_text("print(1)\n", newline="\n")    # Windows wrote CRLF
+    ctx = api.resolve(str(tmp_path))
+    assert api.known_files(ctx, "app.py", "print(1)\n") == [("file", "src/app.py")]
+    # The same name with other text is a stranger.
+    assert api.known_files(ctx, "app.py", "print(2)\n") == []
+
+
+def test_known_files_lists_every_identical_copy(repo, tmp_path):
+    _file_catalog(tmp_path)
+    for d in ("a", "b"):
+        (repo / d).mkdir()
+        (repo / d / "__init__.py").write_text("")
+    ctx = api.resolve(str(tmp_path))
+    assert api.known_files(ctx, "__init__.py", "") == [("file", "a/__init__.py"),
+                                                       ("file", "b/__init__.py")]
+
+
+def test_known_files_reads_a_drop_as_a_browser_does(repo, tmp_path):
+    """TextDecoder drops a leading BOM and keeps CRLF: a file read any other
+    way is a stranger to its own drop."""
+    _file_catalog(tmp_path)
+    (repo / "w.txt").write_bytes(b"\xef\xbb\xbfone\r\ntwo\r\n")
+    ctx = api.resolve(str(tmp_path))
+    assert api.known_files(ctx, "w.txt", "one\r\ntwo\r\n") == [("file", "w.txt")]
+
+
+def test_known_files_finds_a_doc_by_a_decomposed_name(repo, tmp_path):
+    """A Mac may give a dropped file's name decomposed; catalog names are
+    composed."""
+    (tmp_path / "docs" / "café.md").write_text("# notes\n", newline="\n")
+    ctx = api.resolve(str(tmp_path))
+    nfd = unicodedata.normalize("NFD", "café.md")
+    assert api.known_files(ctx, nfd, "# notes\n") == [("doc", "café.md")]
+
+
+def test_save_doc_writes_once_and_never_overwrites(repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    assert api.save_doc(ctx, "plans/x.md", "one\n") == "plans/x.md"
+    doc = tmp_path / "docs" / "plans" / "x.md"
+    assert doc.read_text() == "one\n"
+    assert api.save_doc(ctx, "plans/x.md", "one\n") == "plans/x.md"    # the same text: kept
+    with pytest.raises(ValueError, match="holds other text"):
+        api.save_doc(ctx, "plans/x.md", "two\n")
+    assert doc.read_text() == "one\n"
+
+
+def test_save_doc_keeps_crlf(repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    api.save_doc(ctx, "w.txt", "a\r\nb\r\n")
+    assert (tmp_path / "docs" / "w.txt").read_bytes() == b"a\r\nb\r\n"
+
+
+@pytest.mark.parametrize("name", ["", "/abs.md", "../out.md", "a/../b.md", ".gitignore",
+                                  "a/.hidden/b.md", "a//b.md", "a\\b.md"])
+def test_save_doc_refuses_a_name_that_leaves_docs_or_hides(repo, tmp_path, name):
+    """A dropped `.gitignore` would change what git sees in docs/."""
+    ctx = api.resolve(str(tmp_path))
+    before = sorted(p for p in tmp_path.rglob("*") if ".git" not in p.parts)
+    with pytest.raises(ValueError, match="cannot save a doc"):
+        api.save_doc(ctx, name, "x")
+    assert sorted(p for p in tmp_path.rglob("*") if ".git" not in p.parts) == before
+
+
+def test_free_doc_name_reuses_the_same_text_and_numbers_other_text(repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    api.save_doc(ctx, "x.md", "one\n")
+    assert api.free_doc_name(ctx, "x.md", "one\n") == "x.md"
+    assert api.free_doc_name(ctx, "x.md", "two\n") == "x-2.md"
+    api.save_doc(ctx, "x-2.md", "two\n")
+    assert api.free_doc_name(ctx, "x.md", "three\n") == "x-3.md"
+    assert api.free_doc_name(ctx, "notes", "n") == "notes"
+
+
+def test_free_doc_name_refuses_a_directory_that_leads_out_of_docs(repo, tmp_path, symlink):
+    """Under a symlink out of docs/, every numbered name leads out too: the
+    search for a free one never ended."""
+    out = tmp_path / "elsewhere"
+    out.mkdir()
+    symlink(tmp_path / "docs" / "out", out, directory=True)
+    ctx = api.resolve(str(tmp_path))
+    with pytest.raises(ValueError, match="leads out of docs/"):
+        api.free_doc_name(ctx, "out/x.md", "t")
+
+
+def test_a_gui_commit_takes_the_docs_its_rows_name(repo, tmp_path):
+    """The GUI's commit took no files, so a doc saved from the GUI waited for
+    an agent's commit, and a pushed entry named a doc the remote lacked."""
+    ctx = api.resolve(str(tmp_path))
+    api.save_doc(ctx, "kept.md", "k\n")
+    api.save_doc(ctx, "loose.md", "l\n")
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "refs": ["doc:kept.md"], "body": "see the doc"}, author="ada")
+    assert api.commit(ctx, "m", author="ada")
+    tracked = subprocess.run(["git", "-C", str(tmp_path), "ls-files", "docs"],
+                             capture_output=True, text=True).stdout.split()
+    assert tracked == ["docs/kept.md"]
+
+
+def test_a_gui_commit_stages_nothing_for_a_ref_out_of_docs(repo, tmp_path):
+    """`git add -- docs/../notes.jsonl` would stage every pending row. A
+    write refuses that name now (2026-10-19), but an older symbion stored
+    it as typed, so the row is written below the api."""
+    ctx = api.resolve(str(tmp_path))
+    api.save_doc(ctx, "a.md", "a\n")
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "body": "theirs"}, author="sam")
+    store.add(tmp_path, kind="note", target={"type": "project", "name": None},
+              refs=[{"type": "doc", "name": "../notes.jsonl"}], body="mine", author="ada")
+    api.commit(ctx, "m", author="ada")
+    assert [r["author"] for r in store.pending_rows(tmp_path)] == ["sam"]
+
+
+def _tracked_docs(store_dir):
+    return subprocess.run(["git", "-C", str(store_dir), "ls-files", "docs"],
+                          capture_output=True, text=True).stdout.split()
+
+
+def test_a_gui_commit_leaves_another_writers_edit_to_a_tracked_doc(repo, tmp_path):
+    """A resolve copies its base's refs, so a GUI commit of one took an
+    agent's uncommitted edit to the doc the task named."""
+    ctx = api.resolve(str(tmp_path))
+    api.save_doc(ctx, "plan.md", "v1\n")
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "refs": ["doc:plan.md"], "body": "the plan"}, author="agent")
+    api.commit(ctx, "m", everyone=True)
+    (tmp_path / "docs" / "plan.md").write_text("v2, half written\n")
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "refs": ["doc:plan.md"], "body": "read it"}, author="ada")
+    api.commit(ctx, "m", author="ada")
+    head = subprocess.run(["git", "-C", str(tmp_path), "show", "HEAD:docs/plan.md"],
+                          capture_output=True, text=True).stdout
+    assert head == "v1\n"
+
+
+def test_a_gui_commit_reads_a_doc_name_literally(repo, tmp_path):
+    """`git add -- docs/[ab].md` is a glob: it took docs/a.md and docs/b.md."""
+    ctx = api.resolve(str(tmp_path))
+    for name in ("[ab].md", "a.md", "b.md"):
+        api.save_doc(ctx, name, name)
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "refs": ["doc:[ab].md"], "body": "see it"}, author="ada")
+    api.commit(ctx, "m", author="ada")
+    assert _tracked_docs(tmp_path) == ["docs/[ab].md"]
+
+
+def test_a_gui_commit_skips_a_doc_the_store_ignores(repo, tmp_path):
+    """`git add` of an ignored path exits 1, and every GUI commit by that
+    author refused while the row was pending."""
+    ctx = api.resolve(str(tmp_path))
+    with open(tmp_path / ".gitignore", "a") as f:
+        f.write("*.tmp\n")
+    api.save_doc(ctx, "kept.md", "k\n")
+    api.save_doc(ctx, "scratch.tmp", "s\n")
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "refs": ["doc:kept.md", "doc:scratch.tmp"], "body": "both"}, author="ada")
+    assert api.commit(ctx, "m", author="ada")
+    assert _tracked_docs(tmp_path) == ["docs/kept.md"]
+
+
+def test_known_files_counts_a_file_two_catalogs_list_once(repo, tmp_path):
+    """init's template pairs `file` with a `test` catalog: a dropped test
+    file read as two files, and never became the target."""
+    (tmp_path / "symbion.toml").write_text(
+        f'[catalogs]\nfile = "{config.FILE_CATALOG}"\n'
+        f"test = \"{config.FILE_CATALOG} 'tests/test_*.py'\"\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_x.py").write_text("def test(): pass\n", newline="\n")
+    ctx = api.resolve(str(tmp_path))
+    assert api.known_files(ctx, "test_x.py", "def test(): pass\n") == [("file", "tests/test_x.py")]
+
+
+_Q = {"kind": "question", "target": {"type": "project", "name": None}, "body": "Ship it?"}
+
+
+@pytest.mark.parametrize("bad, said", [
+    ([], "one to three"), ("a", "one to three"), (["a", "b", "c", "d"], "at most three"),
+    (["a", " "], "option 2 is empty"), (["a", 3], "option 2 is a string"),
+    (["x" * 61], "over 60 characters"), (["a\nb"], "line break"), (["a\rb"], "line break"),
+    (["a\u2028b"], "line break"),
+    (["Ship", "ship "], "options repeat"),
+])
+def test_check_options_refuses_by_name(bad, said):
+    """A question's answers, judged as check_measurements judges its numbers
+    (the user, 2026-10-16: follow measurements). Three at most: a question
+    with more is asked in prose, and the person answers in text."""
+    with pytest.raises(ValueError, match=said):
+        api.check_options(bad)
+
+
+def test_check_options_takes_a_stripped_list_in_order(repo, tmp_path):
+    assert api.check_options([" ship ", "hold"]) is None
+    ctx = api.resolve(str(tmp_path))
+    assert api.fields_from_row(ctx, {**_Q, "options": [" ship ", "hold"]}, "t")["options"] \
+        == ["ship", "hold"]
+
+
+def test_from_json_row_options_are_judged(repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    with pytest.raises(ValueError, match="one to three"):
+        api.fields_from_row(ctx, {**_Q, "options": "a"}, "t")
+    with pytest.raises(ValueError, match="only a question takes answers"):
+        api.fields_from_row(ctx, {**_Q, "kind": "task", "options": ["a"]}, "t")
+
+
+def test_supersede_judges_a_given_options_list(repo, tmp_path):
+    ctx = api.resolve(str(tmp_path))
+    q = api.add(ctx, {**_Q, "options": ["a"]}, author="sam")
+    with pytest.raises(ValueError, match="at most three"):
+        api.supersede(ctx, q.id, author="sam", options=["a", "b", "c", "d"])
+    assert api.supersede(ctx, q.id, author="sam", options=[" x", "y "]).options == ("x", "y")

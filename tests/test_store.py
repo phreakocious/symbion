@@ -5,6 +5,7 @@ except ImportError:                     # Windows
     import msvcrt
 import json
 import os
+import re
 from datetime import datetime
 
 import pytest
@@ -29,6 +30,17 @@ def _write_raw_legacy_row(store_dir, **overrides):
     row.update(overrides)
     with open(store.notes_path(store_dir), "a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
+
+
+def test_every_store_has_a_docs_dir(tmp_path):
+    """docs/ is part of every store (the user, 2026-10-15): a new one has it,
+    and one made before then has it from its next write."""
+    s = tmp_path / "s"
+    store.ensure_store(s)
+    assert (s / "docs").is_dir()
+    (s / "docs").rmdir()
+    store.add(s, kind="note", target={"type": "project", "name": None}, body="x")
+    assert (s / "docs").is_dir()
 
 
 def test_add_then_load_round_trips(tmp_path):
@@ -1163,10 +1175,30 @@ def test_a_row_written_with_evidence_loads_and_drops_it(tmp_path):
     assert "evidence" not in store.note_to_dict(loaded[0])
 
 
+@pytest.mark.parametrize("committed", [False, True], ids=["in place", "new version"])
+def test_an_edit_keeps_a_field_a_newer_symbion_wrote(tmp_path, committed):
+    """A key this symbion does not know is a newer one's field, and an edit
+    writes it back: the head dropped it (2026-10-16), so an older install's
+    resolve took a question's options off it (the user, 2026-10-19)."""
+    from types import SimpleNamespace
+    n = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
+                  body="x", author="ann")
+    path = store.notes_path(tmp_path)
+    row = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps(row | {"later": {"a": [1, None]}}) + "\n", encoding="utf-8")
+    if committed:
+        assert store.commit(tmp_path, "c", SimpleNamespace(git_name="t", git_email="t@t"))
+    store.supersede(tmp_path, n.id, author="ann", tags=("t",))
+    head, = store.heads(store.load(tmp_path))
+    assert head.tags == ("t",) and store.note_to_dict(head).get("later") == {"a": [1, None]}
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [r.get("later") for r in rows] == [{"a": [1, None]}] * (2 if committed else 1)
+
+
 def test_undo_takes_back_the_last_write_whole(tmp_path, monkeypatch):
     """One level: an add, an edit of a committed row, an in-place edit
     (whose earlier text is on no disk), a batch and an arc each come back as
-    they were, sessions file included (the owner, 2026-10-01)."""
+    they were, sessions file included (the user, 2026-10-01)."""
     from types import SimpleNamespace
     cfg = SimpleNamespace(git_name="t", git_email="t@t")
     project = {"type": "project", "name": None}
@@ -1270,3 +1302,65 @@ def test_supersede_and_rename_check_new_names_and_never_inherited_ones(tmp_store
     with pytest.raises(ValueError, match="unknown target type: 'file'"):
         store.rename_target(tmp_store, "item", "x", "y", author="t", new_type="file",
                             target_types={"item"})
+
+
+def _question(tmp_path, options, kind="question", **fields):
+    return store.add(tmp_path, kind=kind, target={"type": "project", "name": None},
+                     body="Ship it?", options=options, **fields)
+
+
+def test_options_round_trip_in_order(tmp_path):
+    """A question's answers are data, the default first (the user,
+    2026-10-16): the order is the datum, so the list is kept as given,
+    where measurements sort by name."""
+    _question(tmp_path, ["ship", "hold", "ask"])
+    store.add(tmp_path, kind="question", target={"type": "project", "name": None}, body="?")
+    by_body = {n.body: n for n in store.load(tmp_path)}
+    with_, without = by_body["Ship it?"], by_body["?"]
+    assert with_.options == ("ship", "hold", "ask")
+    assert store.note_to_dict(with_)["options"] == ["ship", "hold", "ask"]
+    assert without.options is None and store.note_to_dict(without)["options"] is None
+
+
+def test_options_are_refused_on_any_kind_but_question(tmp_path):
+    kinds = K.read_kinds(tmp_path)
+    with pytest.raises(ValueError, match="options on kind 'task': only a question takes answers"):
+        store.check_fields("task", kinds["task"], {"options": ["a"]})
+    store.check_fields("question", kinds["question"], {"options": ["a"]})
+    with pytest.raises(ValueError, match="options on kind 'task'"):
+        _question(tmp_path, ["a"], kind="task")
+
+
+def test_a_kind_change_off_question_keeps_or_clears_its_options(tmp_path):
+    """A supersede inherits the tip's fields, and --kind can move a question
+    to a task (they share bits): the rule judges the row as written, so the
+    move is refused unless the same write clears the list."""
+    q = _question(tmp_path, ["ship", "hold"])
+    with pytest.raises(ValueError, match="options on kind 'task'"):
+        store.supersede(tmp_path, q.id, kind="task")
+    moved = store.supersede(tmp_path, q.id, kind="task", options=None)
+    assert (moved.kind, moved.options) == ("task", None)
+    t = store.add(tmp_path, kind="task", target={"type": "item", "name": "t"}, body="t")
+    back = store.supersede(tmp_path, t.id, kind="question", options=["a", "b"])
+    assert back.options == ("a", "b")
+
+
+def test_filter_grep_reads_options(tmp_path):
+    q = _question(tmp_path, ["ship", "hold for a check"])
+    found = store.query(store.load(tmp_path), grep=re.compile("hold"))
+    assert [n.id for n in found] == [q.id]
+
+
+def test_a_renamed_kind_drops_inherited_options_instead_of_refusing_every_write(tmp_path):
+    """The reference renames a kind with a [kinds] edit and a sed over
+    notes.jsonl. Done to `question`, every row with options then refused
+    every write, resolve and rename included, and the GUI's buttons raised
+    (review, 2026-10-17). An inherited field the kind cannot hold is dropped
+    on the next write, as a legacy `checked` on a note is; a kind CHANGE in
+    the same write still refuses."""
+    (tmp_path / "symbion.toml").write_text('[kinds]\nask = { status = true }\n')
+    _write_raw_legacy_row(tmp_path, kind="ask", status="open", options=["a", "b"])
+    (old,) = store.load(tmp_path)
+    assert store.unholdable(old) == ["options"]
+    new = store.supersede(tmp_path, "legacy-1", tags=["t"])
+    assert (new.options, new.tags) == (None, ("t",))
