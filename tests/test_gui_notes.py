@@ -232,6 +232,31 @@ async def test_a_behind_badge_lists_the_commits_since_its_stamp(user: User, repo
     await user.should_see(f"stamped at {n.provenance['sha'][:7]}")       # the tooltip
 
 
+async def test_a_diverged_badge_names_the_branch_that_holds_it(user: User, repo, tmp_path):
+    """A check run on another live branch read `diverged` in red, as a stamp
+    to re-run does, and so did each of the demo store's newest checks (the
+    user, 2026-10-22). It names the branch, in the colour `behind` takes."""
+    import subprocess
+
+    def git(*argv):
+        subprocess.run(["git", *argv], check=True, cwd=repo, capture_output=True)
+    git("checkout", "-q", "-b", "topic")
+    git("commit", "-q", "--allow-empty", "-m", "on topic")
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "check", "target": {"type": "commit", "name": "HEAD"},
+                      "checked": "x", "result": "y"}, author="ada")
+    git("checkout", "-q", "main")
+    git("commit", "-q", "--allow-empty", "-m", "on main")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (chip,) = user.find(marker="check-state").elements
+    assert (chip.text, "sb-chip-notable" in chip.classes) == ("diverged — on topic", True)
+
+
 def test_a_tip_names_the_stamp_or_nothing():
     from symbion.gui.notes import check_tip
     sha = "0123456789abcdef"
@@ -1631,3 +1656,52 @@ def test_changes_names_an_options_change(tmp_path):
     assert "options" not in changes(q, same)
     new = store.supersede(tmp_path, same.id, author="ada", options=["a", "c"])
     assert "options" in changes(same, new)
+
+
+def test_a_card_age_reads_the_stopped_clock(monkeypatch):
+    from symbion.gui.notes import ago
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:00:00Z")    # far from any real today
+    assert ago("2026-01-08T12:00:00+00:00") == "2d"
+
+
+async def test_reveal_starts_no_process_when_read_only(user: User, monkeypatch):
+    """The reveal button runs a process on the machine that serves the page,
+    and the editor button links a path there: on the public demo neither may
+    act (the spec, 2026-10-22)."""
+    from pathlib import Path
+    from symbion.gui import notes
+
+    def no_process(*a, **k):
+        raise AssertionError("a read-only serve started a process")
+    monkeypatch.setattr(notes.subprocess, "run", no_process)
+    monkeypatch.setattr(notes, "_reveal_cmd", lambda path: ["true"])
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+
+    @ui.page("/t")
+    def page():
+        notes.file_buttons(Path("/x/y.md"))
+
+    await user.open("/t")
+    (editor,) = user.find(marker="file-editor").elements
+    assert "href" not in editor.props
+    user.find(marker="file-reveal").click()
+    await user.should_see("Read-only demo:")
+
+
+def test_a_read_only_viewer_reads_only_files_git_tracks(repo, tmp_path, monkeypatch):
+    """The public demo's viewer served any viewable file under the checkout,
+    a gitignored one included (a reviewer, 2026-10-22). Read-only, it reads
+    what git tracks: what the leak scan read."""
+    import subprocess
+    from symbion.gui.notes import view_path
+    (repo / ".gitignore").write_text("secret.md\n")
+    (repo / "README.md").write_text("# tracked\n")
+    subprocess.run(["git", "add", ".gitignore", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c1"],
+                   cwd=repo, check=True)
+    (repo / "secret.md").write_text("canary\n")
+    ctx = api.resolve(str(tmp_path))
+    assert view_path(ctx, "secret.md", "file") is not None        # a local serve reads it
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    assert view_path(ctx, "secret.md", "file") is None
+    assert view_path(ctx, "README.md", "file")[0].name == "README.md"

@@ -356,7 +356,8 @@ machine, `--host 0.0.0.0` listens on every address and `--allow` names who may
 connect, an address or a network, once each: `symbion serve --host 0.0.0.0
 --allow 192.168.1.0/24`. This machine always may, and `serve` refuses a `--host`
 past loopback with no `--allow`. There is no login: every machine allowed writes
-as the serve's author.
+as the serve's author. `--read-only` serves a public demo: every control answers
+with a notice, and nothing writes.
 
 One `serve` per store: run it in each project, and each one's sidebar links
 the other stores a `serve` is running on, on this machine. Each running

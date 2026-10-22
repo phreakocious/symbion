@@ -665,3 +665,22 @@ def test_restart_ends_with_a_count_so_a_cut_pipe_shows(monkeypatch, capsys):
     monkeypatch.setattr(servers, "signal_all", lambda restart: [("stopped", r)])
     assert cli._serve_all(restart=False) == 0
     assert capsys.readouterr().out.splitlines()[-1] == "stopped 1 of 1 serve"
+
+
+def test_read_only_is_set_before_the_page_is_built(tmp_path, monkeypatch):
+    """`serve --read-only` sets SYMBION_READ_ONLY before anything renders, so
+    the --reload worker, which re-execs serve's argv, inherits it too (the
+    spec, 2026-10-22)."""
+    from symbion import api
+    from symbion.gui import serve
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("SYMBION_READ_ONLY", "")          # restored at teardown
+    seen = []
+    monkeypatch.setattr(serve, "build_page",
+                        lambda ctx, author: seen.append(os.environ.get("SYMBION_READ_ONLY")))
+    monkeypatch.setattr(serve.ui, "run",
+                        lambda **kw: seen.append(os.environ.get("SYMBION_READ_ONLY")))
+    store.ensure_store(tmp_path / "s")
+    serve.main(api.resolve(str(tmp_path / "s")), author="t", port=1111, show=False,
+               read_only=True)
+    assert seen == ["1", "1"]

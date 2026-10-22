@@ -145,9 +145,13 @@ def pick_free_port(preferred: int, host: str = "127.0.0.1") -> int:
 
 
 def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False,
-         argv=(), host: str = "127.0.0.1", allow=()) -> int:
+         argv=(), host: str = "127.0.0.1", allow=(), read_only: bool = False) -> int:
     """`argv` is the CLI's own, `--dir` included: --reload re-runs it.
-    `allow` is ip_network objects: who besides this machine may connect."""
+    `allow` is ip_network objects: who besides this machine may connect.
+    `read_only` serves the public demo: every write refuses (store.read_only),
+    set before anything renders so --reload's worker inherits it."""
+    if read_only:
+        os.environ["SYMBION_READ_ONLY"] = "1"
     # The person's rows belong to no agent session, though the shell that
     # started the serve may run in one (store.session_key).
     for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
@@ -208,7 +212,8 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
     url = local_url(host, port)
     mine = None
     if top:
-        print(f"symbion → {url}  (writing as {author})", flush=True)
+        print(f"symbion → {url}  ({'read-only, viewing' if read_only else 'writing'} as "
+              f"{author})", flush=True)
         if not loopback(host):
             print(f"listening on {host}, port {port}, for this machine and "
                   f"{', '.join(map(str, allow))}. There is no login: each of them "

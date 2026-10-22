@@ -1364,3 +1364,27 @@ def test_a_renamed_kind_drops_inherited_options_instead_of_refusing_every_write(
     assert store.unholdable(old) == ["options"]
     new = store.supersede(tmp_path, "legacy-1", tags=["t"])
     assert (new.options, new.tags) == (None, ("t",))
+
+
+def test_symbion_now_stops_the_clock(monkeypatch):
+    """The public demo serves a snapshot whose ages must read as on the day it
+    was taken, however long it is served (the user, 2026-10-22)."""
+    from datetime import timezone
+    from symbion import summary as summ
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:00:00Z")    # far from any real today
+    assert store._utcnow() == datetime(2026, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
+    assert summ.age("2026-01-08T12:00:00+00:00") == "2d"
+    assert summ.age_days("2026-01-03T12:00:00+00:00") == 7
+    assert summ.age("2026-01-11T00:00:00+00:00") == "now"      # newer than the clock
+
+
+def test_symbion_now_refuses_a_time_without_an_offset(monkeypatch):
+    """A clock that slipped to the real one would read `5w ago` with no error
+    anywhere; a time with no offset would read as the host's local time."""
+    from datetime import timezone
+    for bad in ("2026-10-22T19:47:54", "yesterday"):
+        monkeypatch.setenv("SYMBION_NOW", bad)
+        with pytest.raises(store.BadClock, match="SYMBION_NOW"):
+            store._utcnow()
+    monkeypatch.setenv("SYMBION_NOW", "")
+    assert abs((store._utcnow() - datetime.now(timezone.utc)).total_seconds()) < 5

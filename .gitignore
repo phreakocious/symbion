@@ -9,3 +9,4 @@ dist/
 
 # Claude Design writes its screenshots here
 Claude outputs/
+.worktrees/

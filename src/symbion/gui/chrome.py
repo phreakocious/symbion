@@ -16,8 +16,8 @@ from .. import store as S
 from .. import summary as summ
 from . import servers
 from .filters import href
-from .notes import (FILE_MD_EXTRAS, add_form, ago, fenced, kind_class, peek_entry, say_after_reload,
-                    show_said, undo_dialog, viewer)
+from .notes import (FILE_MD_EXTRAS, add_form, ago, demo_says, fenced, kind_class, peek_entry,
+                    say_after_reload, show_said, undo_dialog, viewer)
 from .theme import (DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, kind_css, quasar_colors,
                     root_vars_css)
 
@@ -510,13 +510,23 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                     last = ui.link(label, to) if to else ui.label(label)
                 last.classes("sb-here").mark("page-title")
             ui.space()
+            if S.read_only():
+                # The public demo: a visitor from a link learns what they see,
+                # and where to get it (the spec, 2026-10-22).
+                with ui.row(wrap=False).classes("items-center gap-1 text-body sb-demo") \
+                        .mark("demo-banner"):
+                    ui.label("read-only demo of")
+                    ui.link(f"symbion {metadata.version('symbion')}", SOURCE + "#readme",
+                            new_tab=True).mark("demo-link")
             # Left of New entry, so that button stays put as these come and go
             # (the user, 2026-10-02).
             _git_buttons(ctx, author, heads)
             _new_note_button(ctx, author, *new, kind=kind)
             _search_box(q, keep or {})
             with ui.element("div").classes("sb-who-top sb-narrow") \
-                    .tooltip(f"writing as {author}: identity stamped on every write made here"):
+                    .tooltip(f"viewing as {author}: a read-only demo, which writes nothing"
+                             if S.read_only() else
+                             f"writing as {author}: identity stamped on every write made here"):
                 ui.label((author or "?")[:1]).classes("sb-avatar")
                 ui.label(author).classes("sb-badge").mark("author-badge-top")
     # Beside the page from PEEK_WIDE up, over it below, where a panel beside
@@ -663,6 +673,8 @@ def _offer_doc(ctx, name: str, text: str, use_body, made: dict, open_form) -> No
             .classes("w-full").mark("drop-doc-name")
 
         def save():
+            if demo_says("saves the doc in the store"):
+                return
             try:
                 saved = api.save_doc(ctx, field.value, text)
             except ValueError as e:
@@ -819,8 +831,11 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
             _other_stores(ctx)
         with ui.element("div").classes("sb-who"):
             ui.label((author or "?")[:1]).classes("sb-avatar")
-            ui.label(f"writing as {author}").classes("sb-badge").mark("author-badge") \
-                .tooltip("identity stamped on every write made here")
+            ro = S.read_only()
+            ui.label(f"{'viewing' if ro else 'writing'} as {author}").classes("sb-badge") \
+                .mark("author-badge") \
+                .tooltip("whose view this is; the demo writes nothing" if ro
+                         else "identity stamped on every write made here")
             with ui.element("div").classes("sb-who-icons"):
                 ui.button(icon="keyboard", on_click=_once(lambda: _keys_dialog(ctx))) \
                     .props('flat dense round size=sm aria-label="keyboard shortcuts"') \
@@ -1023,7 +1038,8 @@ def _git_buttons(ctx, author: str, heads) -> None:
         if state[6] != sent[0]:
             sent[0] = state[6]
             ui.run_javascript(f"sbBadge({state[6]})")
-    ui.timer(_GIT_EVERY, tick, immediate=False)    # the page has just read it
+    if not S.read_only():           # nothing changes there: only anonymous load
+        ui.timer(_GIT_EVERY, tick, immediate=False).mark("git-poll")    # the page has just read it
 
 
 def _stale_button(new: int, changed: int, by: list) -> None:
@@ -1049,6 +1065,8 @@ def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> Non
         return
 
     def _do():
+        if demo_says("commits the store"):
+            return
         try:
             ok = api.commit(ctx, "entries: via symbion serve", author=author)
         except RuntimeError as e:     # a hook refused: no reload, so it stays read
@@ -1077,6 +1095,8 @@ def _push_button(ctx, n: int | None) -> None:
     async def _do():
         # A thread: a push waits on the network, and the event loop serves
         # every open page.
+        if demo_says("pushes the store"):
+            return
         r = await run.io_bound(api.push, ctx, capture=True)
         if r.returncode:
             ui.notify(r.stderr.strip() or f"git push exited {r.returncode}", type="negative",

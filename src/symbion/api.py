@@ -775,6 +775,8 @@ def save_doc(ctx: Ctx, name: str, text: str) -> str:
     overwrites: NAME holding the same text writes nothing, and other text
     refuses. The file is made exclusively, so two writers cannot both make
     one name."""
+    if store.read_only():
+        raise store.ReadOnly()
     name = _doc_name(name)
     path = object_path(ctx, "doc", name)
     if path is None:                    # a symlink in docs/ that leads out
@@ -1054,6 +1056,8 @@ def push(ctx: Ctx, *, capture: bool = False) -> subprocess.CompletedProcess:
     first. At a terminal git's progress, prompts and refusals are its own
     words. `capture` is for a caller with no terminal (the GUI): they come
     back as text, and git may not prompt, which would wait forever."""
+    if store.read_only():
+        raise store.ReadOnly()
     gitref.set_upstream(ctx.store_dir)
     kw = dict(capture_output=True, text=True, encoding="utf-8", stdin=subprocess.DEVNULL,
               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}) if capture else {}

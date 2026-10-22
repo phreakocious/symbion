@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import os
 import re
+from bisect import bisect_right
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from itertools import pairwise, zip_longest
 from pathlib import Path
@@ -21,6 +22,12 @@ WAITING_CAP = 10
 CLOSED_CAP = 5
 DUE_CAP = 10
 DUE_DAYS = 7      # how far ahead the due block looks
+# An open row no one has touched through this many active days (days anyone
+# wrote a row) is named, up to the cap. Active days, not calendar days: by
+# the calendar, most stores read wholly old after a week their projects sat
+# idle (measured 2026-10-22).
+UNTOUCHED_DAYS = 5
+UNTOUCHED_CAP = 3
 HEAD_CHARS = 100
 BODY_CHARS = 200
 GOTCHA_CHARS = 200    # what the gotcha hook gives a session of a row
@@ -74,7 +81,7 @@ def age_days(created_at: str, now: datetime | None = None) -> int:
     created = datetime.fromisoformat(created_at)
     if created.tzinfo is None:
         created = created.astimezone()
-    return max(0, ((now or datetime.now().astimezone()) - created).days)
+    return max(0, ((now or S.now_shown()) - created).days)
 
 
 _UNITS = ((3600, 60, "m"), (86400, 3600, "h"), (14 * 86400, 86400, "d"),
@@ -87,7 +94,7 @@ def age(stamp: str, now: datetime | None = None) -> str:
     then = datetime.fromisoformat(stamp)
     if then.tzinfo is None:
         then = then.astimezone()
-    s = max(0.0, ((now or datetime.now().astimezone()) - then).total_seconds())
+    s = max(0.0, ((now or S.now_shown()) - then).total_seconds())
     if s < 60:
         return "now"
     for below, size, unit in _UNITS:
@@ -243,14 +250,25 @@ def pending(n, state=None) -> bool:
                 and n.result is None)
 
 
-def waits(reader, n) -> bool:
+def _worded(reader, by_id, n):
+    """The version that holds n's newest word for the reader: the head, less
+    each newest link by someone else that changed no text. Someone else's
+    options on the reader's questions made them wait on the reader
+    (2026-10-22), and the user ruled out every edit with no body text: a
+    star, a tag, a due date, an arc. The reader's own edit still answers."""
+    chain = list(_chain(by_id, n))
+    return next((new for new, old in pairwise(chain)
+                 if new.body != old.body or not wrote_it(reader, new.author)), chain[-1])
+
+
+def waits(reader, by_id, n) -> bool:
     """An open row whose newest word is someone else's waits on the reader:
     a request, or an answer to the reader's own row. One the reader wrote
     last is answered, though someone else raised it. A pre-registration asks
     for nothing until it comes due, when the due block prints it: one in the
     user's words read `waits on you` for days (2026-10-14)."""
     return S.read_status(n) == "open" and not (n.spec.status and n.spec.verdict) \
-        and wrote_it(reader, n.author)
+        and wrote_it(reader, _worded(reader, by_id, n).author)
 
 
 def asks(reader, by_id, n) -> bool:
@@ -261,7 +279,7 @@ def asks(reader, by_id, n) -> bool:
     tells apart from a task; a store that renames it shows the person's own
     rows alone (the user's call, 2026-10-16). A bit in [kinds] lifts it."""
     return (S.read_status(n) == "open" and not (n.spec.status and n.spec.verdict)
-            and wrote_it(reader, n.author)
+            and wrote_it(reader, _worded(reader, by_id, n).author)
             and (n.kind == "question" or _root(by_id, n).author == reader))
 
 
@@ -312,6 +330,9 @@ def empty_summary() -> dict:
         "heads_elided": 0,
         "due": [],
         "due_elided": 0,
+        "untouched": [],
+        "untouched_elided": 0,
+        "park_kind": None,
         "uncommitted_notes": 0,
         "registry_modified": False,
         "unreadable": 0,
@@ -347,7 +368,7 @@ def row_digest(by_id, n, chars, reader, active=frozenset(), now=None) -> dict:
             "body": clip(n.body, chars),
             **({"parked": True} if n.spec.parked else {}),
             **({"arc": n.arc_id} if n.arc_id in active else {}),
-            **({"waits": True} | changed(by_id, n) if waits(reader, n) else {}),
+            **({"waits": True} | changed(by_id, n) if waits(reader, by_id, n) else {}),
             **who(reader, root.author, n.author),
             **({"registered": S.shown(root.created_at)[:10]}
                if n.spec.status and n.spec.verdict else {}),
@@ -403,6 +424,7 @@ def repos_line(d: dict) -> str:
 def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     loaded = S.load(store_dir)
     notes = S.heads(loaded)
+    by_id = {n.id: n for n in loaded}
     bad = S.load_malformed(store_dir)
     bad_arcs = S.load_arcs_malformed(store_dir)
     acts = [a for a in S.load_arcs(store_dir) if not a.archived]
@@ -417,7 +439,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     # reader's own rows, and three of four fresh agents read the lines under
     # the count as those rows (2026-10-14). One that is also due keeps its
     # phrase there.
-    waiting = S.newest_first(n for n in notes if waits(reader, n))
+    waiting = S.newest_first(n for n in notes if waits(reader, by_id, n))
     w_cap = len(waiting) if full else WAITING_CAP
     due_all = due_soon(notes, _now)
     due_of = {n.id: st for n, st in due_all}
@@ -426,18 +448,32 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     priority = [n for n in starred(notes) if n.id not in shown_above]
     shown_above |= {n.id for n in priority}
     unstated = no_status(notes)
+    # Open rows untouched through UNTOUCHED_DAYS active days, oldest first: the
+    # oldest open rows are often done or dead and still open (2026-10-22). A
+    # due date, a pre-registration, waiting on the reader and an arc each
+    # reach a row already.
+    days = sorted({S.written_at(n).astimezone(timezone.utc).date() for n in loaded})
+
+    def active_days(n) -> int:
+        return len(days) - bisect_right(days, S.written_at(n).astimezone(timezone.utc).date())
+    untouched = sorted((n for label, k in kinds.items() if k.status and not k.parked
+                        for n in open_outside_arcs(notes, label, active)
+                        if n.id not in shown_above and not n.due and not n.spec.verdict
+                        and not waits(reader, by_id, n) and active_days(n) >= UNTOUCHED_DAYS),
+                       key=lambda n: (S.written_at(n), n.id))
+    u_cap = len(untouched) if full else UNTOUCHED_CAP
+    shown_above |= {n.id for n in untouched}
     heads = [n for label, k in kinds.items() if k.status and not k.parked
              for n in open_outside_arcs(notes, label, active) if n.id not in shown_above]
     heads = S.newest_first(heads)
-    # A pre-registration (status + verdict) has a deadline, and newest-first
-    # under one cap pushed an open prediction off the list for many sessions
-    # while its answer went into a handoff file (2026-09-24). Its own cap,
-    # ahead of the rest, keeps the ceiling.
-    by_id = {n.id: n for n in loaded}
 
     def digest(n, chars):
         return row_digest(by_id, n, chars, reader, active, _now)
 
+    # A pre-registration (status + verdict) has a deadline, and newest-first
+    # under one cap pushed an open prediction off the list for many sessions
+    # while its answer went into a handoff file (2026-09-24). Its own cap,
+    # ahead of the rest, keeps the ceiling.
     prereg = [n for n in heads if n.spec.verdict]
     rest = deal_by_kind([n for n in heads if not n.spec.verdict])
     shown = prereg + rest if full else prereg[:PREREG_CAP] + rest[:HEAD_CAP]
@@ -536,6 +572,11 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
                  "past": past, "days": days, "phrase": due_phrase((past, days))}
                 for n, (past, days) in due[:d_cap]],
         "due_elided": max(0, len(due) - d_cap),
+        "untouched": [{**digest(n, HEAD_CHARS), "active_days": active_days(n)}
+                      for n in untouched[:u_cap]],
+        "untouched_elided": max(0, len(untouched) - u_cap),
+        # The kind that parks a status row, named in the untouched line's ways out.
+        "park_kind": next((label for label, k in kinds.items() if k.status and k.parked), None),
         "uncommitted_notes": notes_n,
         "registry_modified": registry,
         "unreadable_arcs": len(bad_arcs),
@@ -841,10 +882,11 @@ def added(by_id, n, reader, chars) -> dict:
 
 def changed(by_id, n) -> dict:
     """`changed`, `changed_by`, `changed_at`: what n's newest link changed
-    when it changed no text, for a row that waits on the reader, whose
-    newest word that link is. The user starred an idea, and it waited under
-    a line they had added days before, which the agent had answered since
-    (2026-10-16). A star alone reads `starred it`."""
+    when it changed no text, on a row that waits on the reader for an
+    earlier link's text. The user starred an idea, and it waited under a line
+    they had added days before, which the agent had answered since
+    (2026-10-16); since 2026-10-22 a star alone waits on no one. A star reads
+    `starred it`."""
     prev = by_id.get(n.supersedes) if n.supersedes else None
     if prev is None or n.body != prev.body:
         return {}
@@ -1022,6 +1064,22 @@ def render_summary(d: dict, paint=plain) -> str:
         out.append("  " + _labelled(paint, h))
     if d.get("heads_elided"):
         out.append("  " + paint(f"+{d['heads_elided']} more open (--full)", "meta"))
+    if n := len(d.get("untouched", ())) + d.get("untouched_elided", 0):
+        one, shown = n == 1, len(d.get("untouched", ()))
+        park = (f"; park until a date, `symbion supersede ID --kind {d['park_kind']} --due DATE`"
+                if d.get("park_kind") else "")
+        out.append("  " + paint(
+            f"{_count(n, 'open entry')} untouched for {UNTOUCHED_DAYS} or more active days "
+            f"(days anyone wrote an entry here)"
+            f"{f', the oldest {shown} below' if 0 < shown < n else ''}: after the user's "
+            f"first request, check {'it' if one else 'each'} against the repo and the store, "
+            f"then suggest a plan: resolve, citing what settled it; a question, for what only "
+            f"the user can decide{park}; or the work, if it still stands", "warn"))
+    for r in d.get("untouched", ()):
+        lead = paint(f"untouched {r['active_days']} active days", "meta")
+        out.append(f"  {lead} " + _labelled(paint, r))
+    if d.get("untouched_elided"):
+        out.append("  " + paint(f"+{d['untouched_elided']} more untouched (--full)", "meta"))
     if d["uncommitted_notes"] or d["registry_modified"]:
         # Saved on disk, not yet in git: "2 notes uncommitted" read as unsaved.
         bits = []
@@ -1051,7 +1109,7 @@ def render_summary(d: dict, paint=plain) -> str:
                                 f"hook's limit: `symbion summary` prints them", "meta"))
     if d.get("full") and not (d["arcs_elided"] or d["priority_elided"] or d.get("heads_elided")
                               or d.get("due_elided") or d.get("people_elided") or d.get("waiting_elided")
-                              or d.get("closed_elided")):
+                              or d.get("closed_elided") or d.get("untouched_elided")):
         # A --full that lifted nothing otherwise prints the default text
         # byte for byte, and the flag reads as dropped.
         out.append("  " + paint("(--full: nothing was elided)", "meta"))
@@ -1088,7 +1146,7 @@ def render_summary(d: dict, paint=plain) -> str:
 # JavaScript string counts, in UTF-16 units, with a margin under the cap.
 HOOK_CHARS = 9_800
 # The blocks `fit` trims, least needed first.
-_TRIM = ("heads", "people", "arcs", "closed", "priority", "due", "waiting")
+_TRIM = ("heads", "untouched", "people", "arcs", "closed", "priority", "due", "waiting")
 
 
 def fit(d: dict, budget: int = HOOK_CHARS) -> dict:

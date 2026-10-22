@@ -40,6 +40,8 @@ ALLOWED_STORE_READS = {
     "RefsDropped",                               # api.supersede's refusal under keep_refs
     "Twin",                                      # api.add's refusal of an uncommitted twin
     "undoable", "note_from_dict",                # the undo button's read, and its dialog's rows
+    "now_shown",                                 # the clock, which SYMBION_NOW can stop
+    "read_only", "ReadOnly",                     # serve --read-only, and its refusal
 }
 
 # `from <anything> import ..., store [as X], ...` -- the module-object import.
@@ -120,7 +122,8 @@ CLI_STORE_CALLS = ALLOWED_STORE_READS | {
     "pending_rows", "rows_by_author", "NOTES_FILE",       # reads: what commit would take
     "session_key", "sessions",                            # reads: the env's agent session,
                                                           # and the rows each session wrote
-    "_now_iso",                                           # read: the store's clock
+    "_now_iso", "BadClock",                               # read: the store's clock, and
+                                                          # its refusal of a bad SYMBION_NOW
     "ensure_store", "apply_reconciliation",               # the two writes
 }
 
@@ -226,3 +229,32 @@ def test_serve_listens_on_loopback_only(monkeypatch, tmp_path):
     store.ensure_store(tmp_path)
     serve.main(api.resolve(str(tmp_path)), author="t", port=1, show=False)
     assert seen["host"] == "127.0.0.1"
+
+
+GUI_WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
+              "rename_arc", "archive_arc", "undo", "commit", "push", "rename_target",
+              "retype"}                   # test_api's WRITES: every api function that writes
+
+
+def test_every_gui_write_names_what_it_does_when_read_only():
+    """Under `serve --read-only` each control says what it does in a real
+    store before it would write (the user, 2026-10-22: hidden controls "look
+    a bit sparse"). The function or lambda nearest each api write must call
+    `demo_says`, so a new control cannot skip its notice."""
+    import ast
+    missing = []
+    for path in sorted(GUI_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+        scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Attribute) and node.attr in GUI_WRITES
+                    and isinstance(node.value, ast.Name) and node.value.id == "api"):
+                continue
+            scope = parent[node]
+            while not isinstance(scope, scopes):
+                scope = parent[scope]
+            if not any(isinstance(c, ast.Call) and getattr(c.func, "id", None) == "demo_says"
+                       for c in ast.walk(scope)):
+                missing.append(f"{path.name}:{node.lineno} api.{node.attr}")
+    assert not missing, f"no demo_says before: {missing}"

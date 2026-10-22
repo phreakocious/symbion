@@ -116,8 +116,15 @@ where two separate adds would store both.
   (`overdue 2d`, `due in 3d`), and a parked one from its due date on. `list --overdue` lists those past due, `list
   --due-by DATE` those due by then, past due included, and `supersede <id>
   --due ''` clears one.
+- **Untouched entries.** An open entry no one has edited through 5 active days,
+  days on which anyone wrote an entry in the store, prints in the summary, up to
+  3, oldest first. Idle days do not count, and an edit restarts the count. An
+  entry with a due date, a pre-registration, a starred entry, one waiting on
+  the reader and an arc's box are left out.
 - **Time is UTC.** Entries are stamped in UTC, and symbion prints times and reads
   a bare date in UTC. Set `TZ` to print and read them in that zone instead.
+  `SYMBION_NOW=<ISO time with an offset>` stops symbion's clock at that time, for
+  a demo or a test: every age and due date reads against it.
 - **Record finished work as a resolved task**:
   `add task --target … --status resolved --body "done: …"` for this
   session's work that had no ticket, when a later session would otherwise
@@ -165,7 +172,9 @@ where two separate adds would store both.
   may run, default 30; raise it when a slow catalog is killed), `git_name`
   and `git_email` (the author of the store's own commits, default
   `symbion-notes` and `symbion-notes@local`; set your own where a remote
-  refuses a made-up author), and `[provenance] command`, which stamps a
+  refuses a made-up author), `stale_target_noun` (what `arc reconcile` says a
+  stale target is missing, default `catalog entry`; name your catalog's
+  members), and `[provenance] command`, which stamps a
   verdict entry with the JSON object it prints instead of HEAD. That command
   must exit 0; an object with a `sha` reads `behind N` as a HEAD stamp does.
 - **Trust:** the commands in `[catalogs]`, `[resolvers]`, `[renames]` and

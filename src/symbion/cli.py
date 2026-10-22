@@ -1712,6 +1712,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="identity stamped on GUI writes (default: $SYMBION_AUTHOR, "
                          "else git user.name; never an agent's name)")
     sv.add_argument("--no-browser", action="store_true", help="open no browser tab")
+    sv.add_argument("--read-only", action="store_true",
+                    help="a public demo: every control answers with a notice, and nothing "
+                         "writes")
     sv.add_argument("--reload", action="store_true", help="dev: reload on .py changes")
     every = sv.add_mutually_exclusive_group()
     every.add_argument("--restart", action="store_true",
@@ -3215,7 +3218,7 @@ def _dispatch(args, ctx) -> int:
         return gui_serve.main(ctx, author=args.author or api.gui_author(),
                               port=args.port, show=not args.no_browser,
                               reload=args.reload, argv=args.argv,
-                              host=args.host, allow=args.allow)
+                              host=args.host, allow=args.allow, read_only=args.read_only)
 
     if args.cmd == "tags":
         counts = store.tag_counts(store.load(store_dir))
@@ -3605,6 +3608,11 @@ def main(argv=None) -> int:
     for s in (sys.stdin, sys.stdout, sys.stderr):
         if hasattr(s, "reconfigure"):
             s.reconfigure(encoding="utf-8")
+    try:
+        store._now_iso()            # a bad SYMBION_NOW stops every command
+    except store.BadClock as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     try:
         code = _main(argv)
         if sys.stdout is not None:               # None when fd 1 was closed

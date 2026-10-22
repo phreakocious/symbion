@@ -11,7 +11,8 @@ from .. import api
 from .. import store as S
 from .. import summary as summ
 from .filters import href
-from .notes import ago, bare, edit_dialog, id_link, kind_class, target_headline, target_link
+from .notes import (ago, bare, demo_says, edit_dialog, id_link, kind_class, target_headline,
+                    target_link)
 
 
 def seed_all_scopes(ctx) -> set:
@@ -56,6 +57,8 @@ def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
                 # A pre-registration closes with its verdict; the store
                 # refuses a bare resolve, so the tick opens the dialog.
                 edit_dialog(ctx, fu, refresh, author=author, resolving=True)
+                return
+            if demo_says("reopens the box" if done else "resolves the box"):
                 return
             api.supersede(ctx, fu.id, author=author,
                           status="open" if done else "resolved")
@@ -117,6 +120,8 @@ def index(ctx, *, author: str) -> None:
         def _create():
             if not (name.value or "").strip():
                 ui.notify("name required", type="warning")
+                return
+            if demo_says("makes the arc"):
                 return
             act = api.create_arc(ctx, name.value, desc.value or "",
                                       scope.value, author=author)

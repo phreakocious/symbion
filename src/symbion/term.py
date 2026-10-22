@@ -139,7 +139,10 @@ class _CodeTheme(SyntaxTheme):
 
 def help_formatter(plain):
     """The formatter that prints a parser's --help at a terminal, in place
-    of argparse's `plain` class: rich_argparse's, in the palette. The words
+    of argparse's `plain` class: rich_argparse's, in the palette. argparse
+    3.14's own colour cannot take the palette: it measures width with
+    `_colorize.decolor`, which strips only the 16 fixed colours, so a hex
+    colour counts as text and help wraps early. The words
     stay argparse's: its markup is off, since help text holds brackets
     (`'symbion[gui]'`), and section names keep argparse's spelling. The
     wrap is rich's, which keeps a hyphenated word (`near-synonyms`) whole."""

@@ -364,10 +364,16 @@ def _check_badge(ctx, n, git_head=None) -> None:
         text = f"unstamped — {summ.age_phrase(n.created_at)}"
         fixed_tip = (f"written {S.shown(n.created_at)}, before symbion stamped checks: "
                      f"no commit is known for it")
+    elif state == "diverged":
+        # A run on a live branch says look there, not re-run: in red, the
+        # demo store's newest checks read as faults (the user, 2026-10-22).
+        sha = S.stamp_sha(n.provenance)
+        if b := gitref.unmerged(gitref.stamp_cfg(ctx.cfg, n.provenance), [sha]).get(sha):
+            text = f"diverged — on {b}"
     cls = {"current": "sb-chip-good", "behind": "sb-chip-notable", "external": "",
            "pending": "", "unstamped": "",
            "ahead": "sb-chip-notable",
-           "diverged": "sb-chip-bad", "dangling": "sb-chip-bad",
+           "diverged": "sb-chip-notable", "dangling": "sb-chip-bad",
            "unverifiable": "sb-chip-bad"}[state]
     chip = ui.label(text).classes(f"sb-chip {cls}").mark("check-state")
     if fixed_tip:
@@ -463,7 +469,7 @@ def ago(stamp: str, now: datetime | None = None) -> str:
         return S.shown(stamp)
     if then.tzinfo is None:
         then = then.astimezone()
-    secs = max(0, ((now or datetime.now().astimezone()) - then).total_seconds())
+    secs = max(0, ((now or S.now_shown()) - then).total_seconds())
     if secs < 60:
         return "now"
     if secs < 3600:
@@ -500,7 +506,6 @@ def id_link(n) -> None:
 _MORE_LEXERS = {".tfvars": "terraform", ".tfstate": "json"}
 
 
-@functools.lru_cache(maxsize=256)
 @functools.lru_cache(maxsize=1024)
 def _lexer(filename: str):
     """pygments' lexer for a file name, or None. Kept: pygments tries every
@@ -526,6 +531,10 @@ def view_path(ctx, name, ttype=None):
     if path is None:
         return None
     if path.is_file():
+        # Read-only, the public demo: only what git tracks, which the leak
+        # scan read; a gitignored file was readable (a reviewer, 2026-10-22).
+        if S.read_only() and ttype != "doc" and not gitref.tracked(ctx.cfg.for_type(ttype), path):
+            return None
         return (path, None) if _viewable(path.name) else None
     # ponytail: the default branch only; a file only another branch holds reads nothing
     cfg = None if ttype == "doc" else ctx.cfg.for_type(ttype)   # a repo's row: its repo's file
@@ -549,6 +558,23 @@ def _viewable(filename: str) -> bool:
 
 # ponytail: the whole file in one dialog; page it if a large one is slow.
 VIEW_CHARS = 500_000
+
+
+def demo_says(does: str) -> bool:
+    """Under `serve --read-only`, the public demo: show what this control
+    does in a real store, `does` ("stars the entry"), and return True, so
+    the handler stops. False otherwise, and nothing shows."""
+    if not S.read_only():
+        return False
+    ui.notify(f"Read-only demo: in your own store, this {does}.")
+    return True
+
+
+def read_only_refused(e: Exception) -> None:
+    """`app.on_exception`: a write refused under `serve --read-only` that no
+    handler named still answers the click."""
+    if isinstance(e, S.ReadOnly):
+        ui.notify("Read-only demo: nothing here writes.")
 
 
 def _reveal_cmd(path) -> list[str] | None:
@@ -590,13 +616,18 @@ def file_buttons(path) -> None:
     ui.button(icon="folder_open", on_click=lambda: _reveal(cmd)) \
         .props(f'flat dense round size=sm color=muted aria-label="{label}"') \
         .tooltip(label).mark("file-reveal")
-    ui.button(icon="open_in_new") \
-        .props(f'flat dense round size=sm color=muted href="{_editor_url(path)}" '
-               'aria-label="open in VS Code"') \
+    # Read-only, the link would name a path on the serving machine.
+    ro = S.read_only()
+    href = "" if ro else f'href="{_editor_url(path)}" '
+    ui.button(icon="open_in_new",
+              on_click=(lambda: demo_says("opens the file in VS Code")) if ro else None) \
+        .props(f'flat dense round size=sm color=muted {href}aria-label="open in VS Code"') \
         .tooltip("open in VS Code").mark("file-editor")
 
 
 async def _reveal(cmd: list[str]) -> None:
+    if demo_says("shows the file on the machine that serves this page"):
+        return
     try:
         r = await run.io_bound(subprocess.run, cmd, capture_output=True, text=True,
                                timeout=10)
@@ -712,9 +743,12 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
         with ui.element("div").classes("sb-note-main"):
             _note_content(ctx, n, compact, hit, show_target, seams, diff_to)
             # ponytail: a question is the kind named `question`, as in
-            # summary.asks.
+            # summary.asks, whose newest word skips someone else's edit that
+            # changed no text: a load per such card (a few ms at a few thousand rows).
             if actions and n.kind == "question" and status == "open" \
-                    and summ.wrote_it(author, n.author):
+                    and summ.wrote_it(author, n.author) \
+                    and (n.supersedes is None
+                         or summ.asks(author, {r.id: r for r in S.load(ctx.store_dir)}, n)):
                 _answer_row(ctx, n, author, refresh)
             elif n.options:
                 _options_row(n)
@@ -729,15 +763,16 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                 on_resolve = lambda n=n: edit_dialog(ctx, n, refresh, author=author,
                                                      resolving=True)
             else:
-                on_resolve = lambda n=n: (api.supersede(ctx, n.id, author=author,
-                                                        status="resolved"),
-                                          refresh())
+                on_resolve = lambda n=n: demo_says("resolves the entry") or (
+                    api.supersede(ctx, n.id, author=author, status="resolved"), refresh())
             ui.button(icon="check", on_click=on_resolve) \
                 .props('flat round dense aria-label="resolve"').classes("sb-resolve") \
                 .tooltip("resolve").mark("note-resolve")
         if actions:
             with ui.element("div").classes("sb-actions"):
                 def _star(n=n, has_pri=has_pri):
+                    if demo_says("unstars the entry" if has_pri else "stars the entry"):
+                        return
                     api.retag(ctx, n.id, add=() if has_pri else ("priority",),
                               rm=("priority",) if has_pri else (), author=author)
                     refresh()
@@ -763,6 +798,8 @@ def _answer_row(ctx, n, author: str, refresh) -> None:
     user called that a fragile contract and the entries it bred robotic."""
     def answer(text: str) -> None:
         if not (text := text.strip()):
+            return
+        if demo_says("adds your answer below the question"):
             return
         try:
             api.supersede(ctx, n.id, author=author, append_body=text)
@@ -955,6 +992,8 @@ def undo_dialog(ctx, author: str) -> None:
     back (the user, 2026-10-13). It replaced a timed notice, which set a
     deadline the store does not have, and whose undo did nothing as it
     faded."""
+    if demo_says("takes back the last write"):
+        return
     try:
         u = api.undo(ctx, None, author=author, apply=False)
     except S.UndoRefused as e:
@@ -975,6 +1014,8 @@ def undo_dialog(ctx, author: str) -> None:
 
         def _do():
             dialog.close()
+            if demo_says("takes back the last write"):
+                return
             try:
                 done = api.undo(ctx, (u["removed"] + u["changed"] + u["arcs"] + [None])[0],
                                 author=author)
@@ -1108,6 +1149,8 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             gone = [t for t in n.tags if t not in final]
             kept = [t for t in tip.tags if t not in gone]
             arc_v = arc.value or None
+            if demo_says("saves the edit"):
+                return
             try:
                 api.supersede(ctx, n.id, author=author, **text,
                               tags=kept + [t for t in final if t not in n.tags and t not in kept],
@@ -1423,6 +1466,8 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
                 row["result"] = result.value or None
             if kinds[kind.value].status:
                 row["due"] = (due.value or "").strip() or None
+            if demo_says("adds the entry"):
+                return
             try:
                 added = api.add(ctx, row, author=author)
             except (ValueError, catalog.CatalogError) as e:  # ambiguous, closed, bad ref type

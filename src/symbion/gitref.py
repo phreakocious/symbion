@@ -32,8 +32,21 @@ def _git(cfg_or_path, *args, input: str | None = None):
         # question answers as it does for a departed sha -- a failed run --
         # so a check reads `unverifiable`, a subject falls back to its sha.
         return subprocess.CompletedProcess(["git", *args], 128, "", "not a git repository")
+    if store.read_only():
+        # A read-only serve shows a frozen snapshot, so each distinct question
+        # has one answer a process. The public demo asked about 60 a render,
+        # 59 distinct over 5 renders: 5 s a page on its box, 2 s answered once
+        # (2026-10-22).
+        key = (str(root), args, input)
+        if key not in _ANSWERS:
+            _ANSWERS[key] = subprocess.run(["git", "-C", str(root), *args], input=input,
+                                           capture_output=True, text=True, encoding="utf-8")
+        return _ANSWERS[key]
     return subprocess.run(["git", "-C", str(root), *args], input=input,
                           capture_output=True, text=True, encoding="utf-8")
+
+
+_ANSWERS: dict = {}
 
 
 def _root(cfg_or_path):
@@ -182,6 +195,11 @@ def ignored_here(cfg, name) -> bool:
     root = getattr(cfg, "work_root", None)
     return bool(root and name and Path(root, name).exists()
                 and _git(cfg, "check-ignore", "-q", "--", name).returncode == 0)
+
+
+def tracked(cfg, path) -> bool:
+    """`path`, inside this worktree, is a file git tracks."""
+    return _git(cfg, "ls-files", "--error-unmatch", "--", str(path)).returncode == 0
 
 
 def canon_name(cfg, target_type, name, stored=()):

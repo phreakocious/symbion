@@ -448,7 +448,24 @@ LOCK_FILE = ".lock"
 # 2026-09-05's local wall clock): a local date beside a UTC one in the same
 # view read as a day's disagreement. Rows stamped before keep their offset or,
 # older still, none; `written_at` orders all three as instants.
+class BadClock(ValueError):
+    """`SYMBION_NOW` holds no ISO 8601 time with an offset."""
+
+
 def _utcnow() -> datetime:
+    """The one clock. `SYMBION_NOW` stops it: the public demo serves a
+    snapshot whose ages must read as on its day (the user, 2026-10-22). A
+    time with no offset refuses, as it would read as the host's own zone;
+    an empty value is unset."""
+    if v := os.environ.get("SYMBION_NOW"):
+        try:
+            t = datetime.fromisoformat(v)
+        except ValueError:
+            t = None
+        if t is None or t.tzinfo is None:
+            raise BadClock(f"SYMBION_NOW={v}: not an ISO 8601 time with an offset, "
+                           "such as 2026-10-22T19:47:54Z")
+        return t.astimezone(timezone.utc)
     return datetime.now(timezone.utc)
 
 
@@ -559,6 +576,20 @@ def arcs_path(store) -> Path:
     return Path(store) / ARCS_FILE
 
 
+class ReadOnly(Exception):
+    """A write while `SYMBION_READ_ONLY` is set."""
+
+    def __init__(self):
+        super().__init__("read-only: nothing here writes")
+
+
+def read_only() -> bool:
+    """`serve --read-only` sets SYMBION_READ_ONLY for the public demo, and
+    every write then refuses: at `_lock`, and in `api.save_doc` and
+    `api.push`, the two writes that do not take it. Any non-empty value."""
+    return bool(os.environ.get("SYMBION_READ_ONLY"))
+
+
 @contextmanager
 def _lock(store, undoable: bool = True):
     """Exclusive lock over the whole store, held for one mutation.
@@ -569,6 +600,8 @@ def _lock(store, undoable: bool = True):
 
     An `undoable` hold copies the files a write changes before it runs, and
     keeps the copy as the one undo level if the write changed them (`undo`)."""
+    if read_only():
+        raise ReadOnly()
     p = Path(store) / LOCK_FILE
     p.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)
@@ -621,7 +654,10 @@ def require_store(store) -> None:
     """Every write's first step: only `symbion init` creates a store. A write
     that created one forked a renamed repo's, a mistyped --dir's or a stale
     SYMBION_DIR's store, printing an ordinary id (2026-09-11). A store that
-    exists still gets any piece it lacks."""
+    exists still gets any piece it lacks, but not under read-only: that ran
+    before the lock refused, and made `docs/` (a reviewer, 2026-10-22)."""
+    if read_only():
+        raise ReadOnly()
     if not exists(store):
         raise ValueError(f"no store at {store}; run `symbion init`")
     ensure_store(store)

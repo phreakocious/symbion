@@ -747,6 +747,21 @@ async def test_only_a_question_someone_else_wrote_last_takes_answers(user: User,
     await user.should_not_see(marker="answer-row")
 
 
+async def test_someone_elses_options_on_the_persons_question_draw_no_answers(user: User,
+                                                                           ctx_with_notes):
+    """An agent's options on the person's own question drew the person
+    buttons to answer it, while `summary.asks` no longer counted it as
+    waiting on them (2026-10-22). Text below it still does."""
+    own = _q(ctx_with_notes, "Mine?", author="ada")
+    api.supersede(ctx_with_notes, own, author="sam", options=["keep", "drop"])
+    await user.open("/notes")
+    await user.should_see("options: keep | drop")
+    await user.should_not_see(marker="answer-row")
+    api.supersede(ctx_with_notes, own, author="sam", append_body="keep, I think")
+    await user.open("/notes")
+    await user.should_see(marker="answer-row")
+
+
 def _peek(user: User, nid: str) -> None:
     """What the page's script sends for a plain click on a card's text, or j/k."""
     UserInteraction(user, {user.client.layout}, None).trigger("sbPeek", {"id": nid})
@@ -1935,3 +1950,100 @@ async def test_a_store_with_repos_names_the_store_not_the_repo_the_serve_stands_
     assert user.client.resolve_title() == "work-notes · Summary"
     (brand,) = user.find(marker="brand").elements
     assert brand.text == "work-notes"
+
+
+async def test_a_read_only_page_says_so_and_links_the_readme(user: User, ctx_with_notes,
+                                                            monkeypatch):
+    """A visitor who lands on the public demo from a link learns what they
+    see and where to get it, and no badge says they write (the spec,
+    2026-10-22)."""
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    await user.open("/")
+    await user.should_see("read-only demo of")
+    (link,) = user.find(marker="demo-link").elements
+    assert link.props["href"].endswith("#readme")
+    await user.should_see("viewing as ada")
+    await user.should_not_see("writing as ada")
+
+
+async def test_a_refusal_reaches_the_visitor_as_a_notice(user: User, ctx_with_notes, tmp_path,
+                                                        monkeypatch, caplog):
+    """A control with no notice of its own still answers a click: the refusal
+    below it becomes the fallback notice, after an await too, and nothing
+    changes. Every real control names its own (the seam test's
+    test_every_gui_write_names_what_it_does_when_read_only); this is the net
+    under one that does not. NiceGUI logs the refusal, so such a control
+    shows in the serve's log."""
+    from nicegui import run
+    nid = store.heads(store.load(tmp_path))[0].id
+    before = (tmp_path / "notes.jsonl").read_bytes()
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+
+    async def push():
+        await run.io_bound(api.push, ctx_with_notes, capture=True)
+
+    @ui.page("/t")
+    def page():
+        ui.button("star", on_click=lambda: api.retag(ctx_with_notes, nid, add=("priority",),
+                                                     author="ada")).mark("bare-star")
+        ui.button("push", on_click=push).mark("bare-push")
+
+    await user.open("/t")
+    user.find(marker="bare-star").click()
+    await user.should_see("Read-only demo: nothing here writes.")
+    user.notify.messages.clear()
+    user.find(marker="bare-push").click()
+    await user.should_see("Read-only demo: nothing here writes.", retries=40)
+    assert (tmp_path / "notes.jsonl").read_bytes() == before
+    assert "read-only: nothing here writes" in caplog.text
+    caplog.clear()
+
+
+async def test_each_control_names_what_it_does_when_read_only(user: User, ctx_with_notes,
+                                                             tmp_path, monkeypatch):
+    """The public demo's controls teach instead of acting: each says what it
+    does in a real store, and the fallback notice never shows (the user,
+    2026-10-22)."""
+    _q(ctx_with_notes, "Ship it?", options=["ship it", "hold"])
+    before = (tmp_path / "notes.jsonl").read_bytes()
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    await user.open("/notes")
+    for marker, does in (("note-star", "stars the entry"),
+                         ("note-resolve", "resolves the entry"),
+                         ("answer-option", "adds your answer below the question"),
+                         ("commit-button", "commits the store"),
+                         ("undo-button", "takes back the last write")):
+        user.find(marker=marker).click()
+        await user.should_see(f"Read-only demo: in your own store, this {does}.")
+    assert not user.notify.contains("nothing here writes"), user.notify.messages
+    assert (tmp_path / "notes.jsonl").read_bytes() == before
+
+
+async def test_the_stopped_clock_keeps_a_check_on_the_recent_board(user: User, repo, tmp_path,
+                                                                  monkeypatch):
+    """The demo serves a snapshot for months: under SYMBION_NOW a check from
+    five days before the clock stays on `/`'s recent board, as on its day."""
+    import subprocess
+    ctx = api.resolve(str(tmp_path))
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-05T12:00:00Z")    # far from any real today
+    api.add(ctx, {"kind": "check", "target": {"type": "item", "name": "rig"},
+                  "checked": "the rig run", "result": "ok"}, author="ada")
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "later"], cwd=repo, check=True)
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:00:00Z")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    await user.should_see("the rig run")
+
+
+async def test_a_read_only_page_polls_no_git_and_names_no_path(user: User, ctx_with_notes,
+                                                              monkeypatch):
+    """Nothing changes under read-only, so a tab's git poll is load from
+    anonymous visitors on a shared box; and `/` names the store, not its
+    path on the serving machine (a reviewer, 2026-10-22)."""
+    await user.open("/")
+    assert user.find(marker="git-poll").elements
+    await user.should_see(str(ctx_with_notes.store_dir))
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    await user.open("/")
+    await user.should_not_see(marker="git-poll")
+    await user.should_not_see(str(ctx_with_notes.store_dir))

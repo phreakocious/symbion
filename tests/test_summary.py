@@ -1066,3 +1066,126 @@ def test_a_question_prints_its_options_under_its_row(tmp_path):
     text = summary.render_summary(data)
     assert len(body) > summary.HEAD_CHARS and body not in text
     assert "\n    options: ship as checked | wait for a second run\n" in text + "\n", text
+
+
+def _day(i):
+    return f"2026-10-{i + 1:02d}T12:00:00+00:00"
+
+
+def _untouched_store(s, active_after):
+    """A task written on day 0, then one note on each of `active_after` days:
+    days anyone wrote an entry, which are what an entry's age counts."""
+    t = store.add(s, kind="task", target={"type": "item", "name": "old"}, body="old work",
+                  author="claude", created_at=_day(0)).id
+    for i in range(active_after):
+        store.add(s, kind="note", target={"type": "item", "name": f"n{i}"}, body="x",
+                  author="claude", created_at=_day(20 + i))
+    return t
+
+
+def test_an_entry_untouched_through_five_active_days_is_named(tmp_path):
+    """The user, 2026-10-22: an open entry no one has touched while
+    the store was worked on gets named, so the agent checks it and suggests a
+    plan. Days with no write in the store do not count: by calendar days,
+    most stores read wholly old because their projects sat idle."""
+    cfg = Config(project_root=tmp_path)
+    t = _untouched_store(tmp_path, summary.UNTOUCHED_DAYS)
+    data = summary.summary(tmp_path, cfg)
+    assert [(r["id"], r["active_days"]) for r in data["untouched"]] == [(t, summary.UNTOUCHED_DAYS)]
+    assert t not in [h["id"] for h in data["heads"]], "each row prints once"
+
+
+def test_calendar_days_without_a_write_do_not_age_an_entry(tmp_path):
+    cfg = Config(project_root=tmp_path)
+    _untouched_store(tmp_path, summary.UNTOUCHED_DAYS - 1)
+    assert summary.summary(tmp_path, cfg)["untouched"] == []
+
+
+def test_a_touch_restarts_the_count(tmp_path, monkeypatch):
+    """A committed row's edit is a new version, stamped now. An uncommitted
+    row's edit rewrites it in place and keeps its stamp, so commit first."""
+    cfg = Config(project_root=tmp_path)
+    t = _untouched_store(tmp_path, summary.UNTOUCHED_DAYS)
+    assert store.commit(tmp_path, "rows", cfg)
+    monkeypatch.setattr(store, "_now_iso", lambda: _day(30))
+    store.supersede(tmp_path, t, author="claude", append_body="waits on the 8.0 release")
+    assert summary.summary(tmp_path, cfg)["untouched"] == []
+
+
+def test_untouched_leaves_out_what_another_block_or_the_date_covers(tmp_path):
+    """Starred, due-dated, waiting on the reader, an arc's box, parked, and a
+    pre-registration each have a block or a date that already reaches them."""
+    cfg = Config(project_root=tmp_path)
+    act = store.create_arc(tmp_path, "x", "", "item")
+
+    def old(kind="task", **kw):
+        return store.add(tmp_path, kind=kind, target={"type": "item", "name": kind},
+                         body="old", created_at=_day(0), **{"author": "claude", **kw}).id
+    old(tags=["priority"])
+    old(due="2026-12-01")
+    old(author="human")
+    old(arc_id=act.id)
+    old(kind="idea")
+    old(kind="prediction", checked="a run")
+    for i in range(summary.UNTOUCHED_DAYS):
+        store.add(tmp_path, kind="note", target={"type": "item", "name": f"n{i}"}, body="x",
+                  author="claude", created_at=_day(20 + i))
+    assert summary.summary(tmp_path, cfg, reader="claude")["untouched"] == []
+
+
+def test_untouched_names_the_oldest_by_active_days_up_to_its_cap(tmp_path):
+    cfg = Config(project_root=tmp_path)
+    ids = [store.add(tmp_path, kind="bug", target={"type": "item", "name": f"b{i}"},
+                     body="old", author="claude", created_at=_day(i)).id
+           for i in range(summary.UNTOUCHED_CAP + 2)]
+    for i in range(summary.UNTOUCHED_DAYS):
+        store.add(tmp_path, kind="note", target={"type": "item", "name": f"n{i}"}, body="x",
+                  author="claude", created_at=_day(20 + i))
+    data = summary.summary(tmp_path, cfg)
+    assert [r["id"] for r in data["untouched"]] == ids[:summary.UNTOUCHED_CAP]
+    assert data["untouched_elided"] == 2
+    assert {h["id"] for h in data["heads"]}.isdisjoint(ids), \
+        "an elided untouched row is counted once, under +N more untouched"
+    assert len(summary.summary(tmp_path, cfg, full=True)["untouched"]) == len(ids)
+    text = summary.render_summary(data)
+    assert f"{len(ids)} open entries untouched for 5 or more active days (days anyone wrote an " \
+           f"entry here), the oldest {summary.UNTOUCHED_CAP} below: after" in text, \
+        "`check each` is the rows printed, not the count"
+
+
+def test_untouched_renders_its_ways_out_with_the_stores_parked_kind(tmp_path):
+    cfg = Config(project_root=tmp_path)
+    t = _untouched_store(tmp_path, summary.UNTOUCHED_DAYS)
+    text = summary.render_summary(summary.summary(tmp_path, cfg))
+    assert "1 open entry untouched for 5 or more active days (days anyone wrote an entry " \
+           "here): after the user's first request, check it against the repo and the store, " \
+           "then suggest a plan" in text, text
+    assert "symbion supersede ID --kind idea --due DATE" in text
+    assert f"  untouched {summary.UNTOUCHED_DAYS} active days [task] item:old  old work  {t}" in text
+
+
+def test_untouched_offers_no_park_in_a_store_with_no_parked_kind(tmp_path):
+    cfg = Config(project_root=tmp_path)
+    _declare(tmp_path, '[kinds]\ntask = { status = true }\nnote = {}\n')
+    _untouched_store(tmp_path, summary.UNTOUCHED_DAYS)
+    text = summary.render_summary(summary.summary(tmp_path, cfg))
+    assert "untouched for" in text and "--kind" not in text, text
+
+
+def test_a_row_waiting_on_the_reader_past_its_cap_is_counted_there_alone(tmp_path, monkeypatch):
+    cfg = Config(project_root=tmp_path)
+    monkeypatch.setattr(summary, "WAITING_CAP", 0)
+    store.add(tmp_path, kind="task", target={"type": "item", "name": "ask"}, body="old ask",
+              author="human", created_at=_day(0))
+    for i in range(summary.UNTOUCHED_DAYS):
+        store.add(tmp_path, kind="note", target={"type": "item", "name": f"n{i}"}, body="x",
+                  author="claude", created_at=_day(20 + i))
+    data = summary.summary(tmp_path, cfg, reader="claude")
+    assert data["waiting_elided"] == 1 and data["untouched"] == []
+
+
+def test_every_block_with_an_elided_count_is_one_fit_can_trim():
+    """A list block left out of `_TRIM` can push the hook's text past its cap
+    (until this test, only a note in the store said so)."""
+    assert {k.removesuffix("_elided") for k in summary.empty_summary() if k.endswith("_elided")} \
+        == set(summary._TRIM)

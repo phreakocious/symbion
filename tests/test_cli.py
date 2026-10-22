@@ -4777,7 +4777,9 @@ def test_a_waiting_row_says_what_its_newest_word_changed(tmp_path, capsys, monke
     `phreakocious added 5d ago: …`, a link the agent had answered since: a
     link that changes fields and no text printed nothing (2026-10-16). The
     newest link, when someone else's, says what it changed, under the lines
-    added before it."""
+    added before it. Since 2026-10-22 such a link alone waits on no one
+    (test_an_edit_by_someone_else_with_no_text_waits_on_no_one), so here
+    someone else's text comes before it."""
     monkeypatch.setenv("SYMBION_AUTHOR", "claude")
 
     def w(*argv):
@@ -4787,9 +4789,11 @@ def test_a_waiting_row_says_what_its_newest_word_changed(tmp_path, capsys, monke
         return nid
     star = w("add", "idea", "--target", "item:star", "--body", "look at this", "--author", "alice")
     star = w("supersede", star, "--append", "--body", "looked: it holds")
+    star = w("supersede", star, "--append", "--body", "and the next one?", "--author", "alice")
     w("supersede", star, "--add-tag", "priority", "--author", "alice")
     tag = w("add", "task", "--target", "item:tag", "--body", "do this", "--author", "alice")
     tag = w("supersede", tag, "--append", "--body", "on it")
+    tag = w("supersede", tag, "--append", "--body", "and that", "--author", "alice")
     w("supersede", tag, "--add-tag", "later", "--due", "2030-01-01", "--author", "alice")
     w("supersede", w("add", "task", "--target", "item:mine", "--body", "m"), "--add-tag", "x")
     run("summary", "--full", store_dir=tmp_path)
@@ -4798,10 +4802,39 @@ def test_a_waiting_row_says_what_its_newest_word_changed(tmp_path, capsys, monke
           for name in ("star", "tag", "mine")}
     assert lines[at["star"] + 1] == "    alice starred it just now", lines
     assert lines[at["tag"] + 1] == "    alice changed its due date, tags just now", lines
-    assert sum(" just now" in ln for ln in lines) == 2, "the reader's own retag is no news"
+    assert sum("starred it" in ln or "changed its" in ln for ln in lines) == 2, \
+        "the reader's own retag is no news"
     run("summary", "--json", store_dir=tmp_path)
     w_ = {r["target"]: r for r in json.loads(capsys.readouterr().out)["waiting"]}
     assert (w_["item:star"]["changed"], w_["item:star"]["changed_by"]) == ("starred it", "alice")
+
+
+def test_an_edit_by_someone_else_with_no_text_waits_on_no_one(tmp_path, capsys, monkeypatch):
+    """Someone else's options on the agent's own questions put each in its
+    `wait on you` block (2026-10-22). The user ruled out every edit with
+    no body text: options, a star, a tag, a due date, an arc. Text below
+    still waits, and the GUI's `asks` reads as `waits` does."""
+    monkeypatch.setenv("SYMBION_AUTHOR", "claude")
+
+    def w(*argv):
+        assert run(*argv, store_dir=tmp_path) == 0
+        nid = capsys.readouterr().out.strip()
+        _commit(tmp_path, capsys)             # each edit its own row
+        return nid
+    arc = w("arc", "create", "--name", "x")
+    for name, *edit in (("opts", "--option", "a", "--option", "b"), ("star", "--add-tag", "priority"),
+                        ("tag", "--add-tag", "later"), ("due", "--due", "2030-01-01"),
+                        ("arc", "--arc-id", arc), ("text", "--append", "--body", "and this?")):
+        nid = w("add", "question", "--target", f"item:{name}", "--body", "which?")
+        w("supersede", nid, *edit, "--author", "alice")
+    run("summary", "--json", store_dir=tmp_path)
+    d = json.loads(capsys.readouterr().out)
+    assert [r["target"] for r in d["waiting"]] == ["item:text"], d["waiting"]
+    assert [r["target"] for r in d["priority"]] == ["item:star"], "a star still prints"
+    loaded = store.load(tmp_path)
+    by_id = {n.id: n for n in loaded}
+    assert [n.target.name for n in store.heads(loaded)
+            if summ.asks("claude", by_id, n)] == ["text"]
 
 
 def test_an_answer_below_an_edited_lead_still_prints(tmp_path, capsys, monkeypatch):
@@ -5303,6 +5336,19 @@ def test_reconcile_reports_a_prediction_as_needing_a_result(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "STALE    thing:stale2" in out and "needs --result" in out
     assert "applied: 0 re-targeted and 0 re-pointed (renamed, whole store), 1 resolved (stale), 1 skipped (needs --result)" in out
+
+
+def test_reconcile_names_what_a_stale_target_lacks_in_the_store_s_words(tmp_path, capsys):
+    """`stale_target_noun` names a catalog's members in the STALE line; a
+    store that catalogs atlas entries says so, not "catalog entry"."""
+    (tmp_path / "symbion.toml").write_text(
+        'stale_target_noun = "live atlas entry"\n[catalogs]\nthing = "echo live1"\n')
+    run("arc", "create", "--name", "x", "--scope", "thing", store_dir=tmp_path)
+    aid = store.load_arcs(tmp_path)[0].id
+    run("arc", "seed", aid, "--scope", "thing", "--name", "stale1", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("arc", "reconcile", aid, store_dir=tmp_path) == 0
+    assert "STALE    thing:stale1  (no live atlas entry)" in capsys.readouterr().out
 
 
 def test_reconcile_apply_alone_reports_zero_skipped(tmp_path, capsys):
@@ -6827,7 +6873,7 @@ def _doc_flags(text):
             words = line.replace("|", " ").split()
         lines += [w for w in words if " " in w]
         for i, w in enumerate(words):
-            if w not in verbs or (i and words[i - 1] != "symbion"):
+            if w not in verbs or (i and not words[i - 1].endswith("symbion")):
                 continue
             cmd = (w, words[i + 1]) if w == "arc" and words[i + 1:i + 2] and \
                 words[i + 1] in arcverbs else (w,)
@@ -6852,6 +6898,8 @@ def test_the_doc_scan_reads_a_quoted_argument_as_one_word():
     assert _doc_flags('`symbion add check --checked "pytest --count 50"`') == \
         {(("add",), "--checked")}
     assert _doc_flags("""`x = "set -e; symbion list --json | jq"`""") == {(("list",), "--json")}
+    # catalogs.md's reading catalog: `out=$(symbion` hid its flags (80fc24f).
+    assert _doc_flags("""`x = 'out=$(symbion list --all) && y'`""") == {(("list",), "--all")}
 
 
 @pytest.mark.parametrize("doc", _DOCS, ids=lambda p: p.name)
@@ -7412,3 +7460,11 @@ def test_list_grep_reads_options(tmp_path, capsys):
     capsys.readouterr()
     run("list", "--grep", "hold", "--json", store_dir=tmp_path)
     assert [r["body"] for r in json.loads(capsys.readouterr().out)] == ["Ship it?"]
+
+
+def test_a_bad_symbion_now_stops_every_command(tmp_path, capsys, monkeypatch):
+    store.ensure_store(tmp_path)
+    monkeypatch.setenv("SYMBION_NOW", "2026-10-22T19:47:54")
+    assert run("list", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert "SYMBION_NOW" in err and "2026-10-22T19:47:54Z" in err      # names the form

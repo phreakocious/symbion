@@ -773,3 +773,23 @@ def test_an_ancestor_dated_after_the_anchor_is_not_counted(repo):
     (repo / "f0").write_text("A\nB\nc\nd\nE\n")
     _commit_at(repo, "after", "2030-01-04T00:00:00+00:00")
     assert _since(cfg, row) == 1, "only `after`"
+
+
+def test_a_read_only_serve_asks_git_each_question_once(repo, monkeypatch):
+    """The public demo serves a frozen snapshot from a slow box. A page there
+    asked git about 60 questions a render, 59 distinct over 5 renders, and took
+    5 s; answered once a process, 2 s (2026-10-22). Read-only, each distinct
+    question runs once; otherwise every time."""
+    cfg = Config(project_root=repo)
+    monkeypatch.setattr(gitref, "_ANSWERS", {})
+    runs, real = [], subprocess.run
+    monkeypatch.setattr(gitref.subprocess, "run",
+                        lambda *a, **k: runs.append(a[0]) or real(*a, **k))
+    for _ in range(2):
+        gitref._git(cfg, "rev-parse", "HEAD")
+    assert len(runs) == 2
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    heads = [gitref._git(cfg, "rev-parse", "HEAD") for _ in range(2)]
+    gitref._git(cfg, "rev-parse", "--short", "HEAD")              # another question
+    assert len(runs) == 4
+    assert heads[0].returncode == 0 and heads[0].stdout == heads[1].stdout

@@ -681,6 +681,9 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   .sb-topbar > .sb-stale, .sb-topbar > .sb-undo, .sb-topbar > .sb-commit,
   .sb-topbar > .sb-push { order: 5; }
   .sb-topbar > .sb-search { order: 6; flex: 1; min-width: 0; max-width: none; }
+  /* the public demo's banner, a line of its own: first, it left the title
+     37px at 390 (a reviewer, 2026-10-22) */
+  .sb-topbar > .sb-demo { order: 7; flex-basis: 100%; margin-top: 6px; }
   .sb-palette { margin-top: 8px; max-height: calc(100vh - 16px); }
 }
 """.replace("@WIDE@", str(NARROW + 1)).replace("@NARROW@", str(NARROW)).replace("@TRAILW@", str(_TRAIL_W)) \

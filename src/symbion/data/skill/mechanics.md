@@ -66,9 +66,10 @@ The hook prints `symbion summary`, in this order:
    each other repo's path from here.
 3. `N open entries wait on you`, and below it each of them: the open entries
    whose newest version someone else wrote, up to 10, a due one with its
-   phrase. A pre-registration waits on no one until it comes due. No block
-   below repeats them; elsewhere, such as in what a write prints, a line
-   starts `waits on you`.
+   phrase. An edit by someone else that changes no text (options, a star,
+   a tag, a due date, an arc) does not count. A pre-registration waits on
+   no one until it comes due. No block below repeats them; elsewhere, such
+   as in what a write prints, a line starts `waits on you`.
 4. The due block: each open entry past due or due within 7 days, and each
    parked one from its due date on (`overdue 2d`, `due in 3d`).
 5. A line per arc: its id, done/total, age and name.
@@ -81,13 +82,20 @@ The hook prints `symbion summary`, in this order:
 9. The open entries outside arcs, newest first, dealt one kind at a time so
    no kind crowds out the rest: pre-registrations first, up to 10, then 8
    more.
-10. What is not yet in the store's git, any unreadable line, and the command
+10. `N open entries untouched for 5 or more active days`, then up to 3 of
+    them, oldest first, each led by `untouched N active days`. An active day
+    is a day anyone wrote an entry in the store; an edit to the entry
+    restarts its count. Left out: an entry with a due date, a
+    pre-registration, a starred entry, one waiting on you, and an arc's box.
+    The line names the ways out, and asks for a plan after the user's first
+    request.
+11. What is not yet in the store's git, any unreadable line, and the command
     that fixes each.
-11. `last wrap by <author>, <age>, N commits since: <first line>`, and the
+12. `last wrap by <author>, <age>, N commits since: <first line>`, and the
     rest of that wrap's commit message below it: the previous session's
     handoff. `since the wrap:` under it names each entry the handoff cites
     that changed after the wrap, with what changed and who changed it.
-12. While `symbion serve` runs, its URL and the link form for one entry,
+13. While `symbion serve` runs, its URL and the link form for one entry,
     `<url>/notes?id=<id>`.
 
 Each elided list ends with the flag that shows it: `+N more open (--full)`.

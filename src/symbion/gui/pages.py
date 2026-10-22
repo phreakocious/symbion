@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
-from datetime import datetime, timedelta
+from datetime import timedelta
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Request
@@ -18,8 +18,8 @@ from .. import store as S
 from .. import summary as summ
 from . import arcs, filters, palette, servers
 from .chrome import shell, store_name
-from .notes import (NoteMarkdown, ago, file_buttons, history, link_ids, render_note,
-                    target_href, view_button)
+from .notes import (NoteMarkdown, ago, demo_says, file_buttons, history, link_ids,
+                    read_only_refused, render_note, target_href, view_button)
 from .theme import FAVICON, FONTS_DIR, FONTS_URL, PALETTE
 
 # /notes renders this many rows before "show all": every row is a few dozen
@@ -177,6 +177,7 @@ def _error_pages(ctx, author: str) -> None:
 
 def build_page(ctx, *, author: str) -> None:
     _error_pages(ctx, author)
+    app.on_exception(read_only_refused)
     app.add_static_files(FONTS_URL, FONTS_DIR)
 
     # Makes the GUI an installable app. "tabbed" opens its pages as tabs in
@@ -265,7 +266,9 @@ def build_page(ctx, *, author: str) -> None:
                                                or S.read_status(n) == "open"
                                                or "priority" in n.tags], git_head)
         with ui.column().classes("sb-main gap-5"):
-            ui.label(f"{summ._count(len(heads), 'entry')} · {ctx.store_dir}") \
+            # Read-only, the page is public: the store's name, not its path there.
+            where = store_name(ctx) if S.read_only() else ctx.store_dir
+            ui.label(f"{summ._count(len(heads), 'entry')} · {where}") \
                 .classes("sb-subtitle sb-mono")
             bad = S.load_malformed(ctx.store_dir)
             if bad:
@@ -289,7 +292,7 @@ def build_page(ctx, *, author: str) -> None:
             rows, aside = below(summ.starred(newest))
             _board(ctx, "priority", rows, author, aside=aside,
                    more=filters.href(tag="priority"), git_head=git_head, since=since)
-            young = datetime.now().astimezone() - timedelta(days=RECENT_DAYS)
+            young = S.now_shown() - timedelta(days=RECENT_DAYS)
             for label, k in ctx.kinds.items():
                 if k.verdict:
                     every = [n for n in newest if n.kind == label]
@@ -532,6 +535,8 @@ def build_page(ctx, *, author: str) -> None:
                     rename = ui.input("rename", value=a.name).props("dense outlined")
 
                     def _rename():
+                        if demo_says("renames the arc"):
+                            return
                         if (rename.value or "").strip():
                             api.rename_arc(ctx, id, rename.value)
                             ui.navigate.reload()        # the name is in the top bar
@@ -540,6 +545,8 @@ def build_page(ctx, *, author: str) -> None:
                     ui.space()
 
                     def _archive():
+                        if demo_says("archives the arc"):
+                            return
                         api.archive_arc(ctx, id)
                         ui.navigate.to("/arcs")
 
@@ -551,6 +558,8 @@ def build_page(ctx, *, author: str) -> None:
 
                     if a.target_scope in arcs.seed_all_scopes(ctx) and arcs.seedable(ctx):
                         def _seed():
+                            if demo_says("adds a box per name"):
+                                return
                             try:
                                 # No names: a sweep. The catalog verbatim, no
                                 # resolver; api.seed raises for an empty one.

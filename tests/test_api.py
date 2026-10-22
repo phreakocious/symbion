@@ -1225,3 +1225,76 @@ def test_supersede_judges_a_given_options_list(repo, tmp_path):
     with pytest.raises(ValueError, match="at most three"):
         api.supersede(ctx, q.id, author="sam", options=["a", "b", "c", "d"])
     assert api.supersede(ctx, q.id, author="sam", options=[" x", "y "]).options == ("x", "y")
+
+
+def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
+    """`serve --read-only` runs the public demo, where nothing a visitor does
+    may write, by any control or crafted event (the spec, 2026-10-22). Every
+    public api function is classified here, so a new one must be."""
+    WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
+              "rename_arc", "archive_arc", "undo", "commit", "push", "rename_target",
+              "retype"}
+    READS = {"Ctx", "add_fields", "as_dropped", "as_object", "author_default",
+             "canonicalize_names", "canonicalize_rows", "check_arc", "check_arc_targets",
+             "check_measurements", "check_name", "check_options", "check_refs",
+             "check_target", "fields_from_row", "free_doc_name", "gui_author",
+             "harvest_hashtags", "harvest_kind", "kind_as_type", "known_files", "no_arc",
+             "object_path", "own_rows", "resolve", "rewritable", "seed_names",
+             "shell_author", "verdict_state", "why_unverifiable"}
+    public = {n for n, f in vars(api).items() if callable(f) and not n.startswith("_")
+              and getattr(f, "__module__", None) == "symbion.api"}
+    assert public == WRITES | READS, f"classify: {sorted(public ^ (WRITES | READS))}"
+
+    with (tmp_path / "symbion.toml").open("a") as f:
+        f.write('[catalogs]\nthing = "echo a"\n')
+    ctx = api.resolve(str(tmp_path))
+    row = {"kind": "task", "target": {"type": "item", "name": "x"}, "body": "b"}
+    t = api.add(ctx, row, author="ada")
+    arc = api.create_arc(ctx, "a", "", "item", author="ada")
+    assert api.commit(ctx, "c")
+
+    def state():
+        head = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout
+        return (head, *(p.read_bytes() if p.exists() else None
+                        for p in (tmp_path / "notes.jsonl", tmp_path / "arcs.jsonl")),
+                sorted(p.name for p in (tmp_path / "docs").glob("*")))
+    before = state()
+    calls = {
+        "save_doc": lambda: api.save_doc(ctx, "x.md", "text"),
+        "retag": lambda: api.retag(ctx, t.id, add=("later",), author="bob"),
+        "add": lambda: api.add(ctx, dict(row, body="c"), author="ada"),
+        "add_many": lambda: api.add_many(ctx, [dict(row, body="d")], author="ada"),
+        "supersede": lambda: api.supersede(ctx, t.id, author="bob", append_body="more"),
+        "seed": lambda: api.seed(ctx, arc.id, "item", ["z"], author="ada"),
+        "create_arc": lambda: api.create_arc(ctx, "b", "", "item", author="ada"),
+        "rename_arc": lambda: api.rename_arc(ctx, arc.id, "c"),
+        "archive_arc": lambda: api.archive_arc(ctx, arc.id),
+        "undo": lambda: api.undo(ctx, None, author="ada", apply=False),
+        "commit": lambda: api.commit(ctx, "m"),
+        "push": lambda: api.push(ctx, capture=True),
+        "rename_target": lambda: api.rename_target(ctx, "item", "x", "y", author="ada"),
+        "retype": lambda: api.retype(ctx, "item", "thing", author="ada"),
+    }
+    assert set(calls) == WRITES
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    for name, call in calls.items():
+        with pytest.raises(store.ReadOnly):
+            call()
+        assert state() == before, f"{name} wrote under read-only"
+    monkeypatch.setenv("SYMBION_READ_ONLY", "")          # the value counts, not its presence
+    assert api.add(ctx, dict(row, body="e"), author="ada").body == "e"
+
+
+def test_a_refused_write_makes_no_store_piece_either(tmp_path, monkeypatch):
+    """Every write first fills in a store's missing pieces (`require_store`):
+    under read-only that ran before the lock refused, and made `docs/` (a
+    reviewer, 2026-10-22)."""
+    ctx = api.resolve(str(tmp_path))
+    t = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "x"}, "body": "b"},
+                author="ada")
+    (tmp_path / "docs").rmdir()
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    with pytest.raises(store.ReadOnly):
+        api.supersede(ctx, t.id, author="bob", append_body="more")
+    assert not (tmp_path / "docs").exists()
