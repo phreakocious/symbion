@@ -732,7 +732,25 @@ def test_rename_names_the_rows_whose_body_still_names_the_old_name(repo, tmp_pat
     capsys.readouterr()
     assert run("rename", "a", "b", "--type", "item", store_dir=s) == 0
     err = capsys.readouterr().err
-    assert "a is still in the body of 1 entry:" in err and r"(list --grep '\ba\b')" in err, err
+    assert "a is still in the body of 1 entry:" in err and r"(list --grep '(?-i:\ba\b)')" in err, err
+
+
+def test_rename_names_a_body_that_names_the_old_name_in_its_case(tmp_path, capsys):
+    """An item named in plain words named the rows that used those words
+    capitalized, about something else (2026-10-22). The grep it prints finds
+    the same rows."""
+    s = tmp_path / "s"
+    run("add", "note", "--target", "item:x", "--body", "the Release Notes page", store_dir=s)
+    run("add", "note", "--target", "item:x", "--body", "on the release notes item", store_dir=s)
+    run("add", "note", "--target", "item:release notes", "--body", "b", store_dir=s)
+    capsys.readouterr()
+    assert run("rename", "release notes", "rn", "--type", "item", store_dir=s) == 0
+    err = capsys.readouterr().err
+    hit = [n.id for n in store.heads(store.load(s)) if "release notes" in n.body]
+    assert f"still in the body of 1 entry: {hit[0]};" in err, err
+    pat = shlex.split(err.split("(list --grep ")[1].rstrip(")\n"))[0]
+    assert run("list", "--grep", pat, "--json", store_dir=s) == 0
+    assert [r["id"] for r in json.loads(capsys.readouterr().out)] == hit
 
 
 def test_seed_dry_run_creates_nothing(tmp_path, capsys):
@@ -7468,3 +7486,33 @@ def test_a_bad_symbion_now_stops_every_command(tmp_path, capsys, monkeypatch):
     assert run("list", store_dir=tmp_path) == 1
     err = capsys.readouterr().err
     assert "SYMBION_NOW" in err and "2026-10-22T19:47:54Z" in err      # names the form
+
+
+def test_a_write_under_symbion_read_only_says_so_without_a_traceback(tmp_path, capsys,
+                                                                     monkeypatch):
+    store.ensure_store(tmp_path)
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    assert run("add", "note", "--target", "project", "--body", "b", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: read-only") and "SYMBION_READ_ONLY" in err
+
+
+def test_json_rows_give_their_stamps_in_utc(tmp_path, capsys):
+    """An adoption import keeps a row's local offset, and a row
+    from before offsets were stamped has none: a consumer's string sort of
+    `created_at` misordered them (2026-10-22). JSON gives each in UTC; the
+    file keeps what was written."""
+    from datetime import datetime, timezone
+    for body in ("offset", "naive"):
+        run("add", "note", "--target", "item:x", "--body", body, store_dir=tmp_path)
+    f = tmp_path / store.NOTES_FILE
+    rows = [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines()]
+    rows[0]["created_at"], rows[1]["created_at"] = "2026-10-22T23:00:00+09:00", "2026-09-01T09:00:00"
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    capsys.readouterr()
+    assert run("list", "--json", store_dir=tmp_path) == 0
+    got = {r["body"]: (r["created_at"], r["raised_at"]) for r in json.loads(capsys.readouterr().out)}
+    naive = datetime.fromisoformat("2026-09-01T09:00:00").astimezone().astimezone(timezone.utc)
+    assert got == {"offset": ("2026-10-22T14:00:00+00:00",) * 2,
+                   "naive": (naive.isoformat(),) * 2}
+    assert "2026-10-22T23:00:00+09:00" in f.read_text(encoding="utf-8")

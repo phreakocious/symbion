@@ -179,9 +179,9 @@ it, act on the answer and resolve the question. `--ref` puts an object in reach
 of `context --target`, where prose does not. `priority` marks what the next
 session must act on.
 
-`--body` is markdown. A body with backticks or `$` goes through `--body-file -`
-and a quoted heredoc (`<<'EOF'`): inside double quotes, the shell runs each
-backtick span and expands each `$`.
+`--body` is markdown. Inside double quotes the shell runs each backtick span and
+expands each `$`, in any flag. Put such text in single quotes, or a body in
+`--body-file -` with a quoted heredoc (`<<'EOF'`) after the last flag.
 
 ## Arcs
 

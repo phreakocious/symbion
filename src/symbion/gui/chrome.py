@@ -491,6 +491,13 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     ui.add_head_html(_PEEK_JS)
     ui.add_head_html(_PALETTE_JS)
     ui.add_head_html(_ESM_JS)
+    # Scripts off, as a blocker leaves a page: nothing is drawn, and NiceGUI's
+    # notice blames the browser's ES modules. This says what is missing. The
+    # template styles that notice after this HTML: only !important hides it.
+    ui.add_body_html('<noscript><style>#esm-fallback{display:none!important}</style>'
+                     '<p style="margin:30vh auto 0;max-width:40em;padding:0 16px;'
+                     'text-align:center;color:var(--q-body)">symbion\'s GUI needs '
+                     'JavaScript. Allow scripts for this site, then reload.</p></noscript>')
     heads = S.heads(S.load(ctx.store_dir))
     # value=None: open beside the page on a wide window, a slide-over behind
     # the menu button on a narrow one (open by default, it covered a phone).

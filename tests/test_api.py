@@ -1227,13 +1227,15 @@ def test_supersede_judges_a_given_options_list(repo, tmp_path):
     assert api.supersede(ctx, q.id, author="sam", options=[" x", "y "]).options == ("x", "y")
 
 
+# Every api function that writes. test_gui_seam imports it.
+WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
+          "rename_arc", "archive_arc", "undo", "commit", "push", "rename_target", "retype"}
+
+
 def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
     """`serve --read-only` runs the public demo, where nothing a visitor does
     may write, by any control or crafted event (the spec, 2026-10-22). Every
     public api function is classified here, so a new one must be."""
-    WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
-              "rename_arc", "archive_arc", "undo", "commit", "push", "rename_target",
-              "retype"}
     READS = {"Ctx", "add_fields", "as_dropped", "as_object", "author_default",
              "canonicalize_names", "canonicalize_rows", "check_arc", "check_arc_targets",
              "check_measurements", "check_name", "check_options", "check_refs",

@@ -124,7 +124,8 @@ where two separate adds would store both.
 - **Time is UTC.** Entries are stamped in UTC, and symbion prints times and reads
   a bare date in UTC. Set `TZ` to print and read them in that zone instead.
   `SYMBION_NOW=<ISO time with an offset>` stops symbion's clock at that time, for
-  a demo or a test: every age and due date reads against it.
+  a demo or a test: every age and due date reads against it, and a write is
+  stamped with it, its id too.
 - **Record finished work as a resolved task**:
   `add task --target … --status resolved --body "done: …"` for this
   session's work that had no ticket, when a later session would otherwise

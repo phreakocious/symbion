@@ -231,9 +231,7 @@ def test_serve_listens_on_loopback_only(monkeypatch, tmp_path):
     assert seen["host"] == "127.0.0.1"
 
 
-GUI_WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
-              "rename_arc", "archive_arc", "undo", "commit", "push", "rename_target",
-              "retype"}                   # test_api's WRITES: every api function that writes
+from test_api import WRITES as GUI_WRITES  # noqa: E402
 
 
 def test_every_gui_write_names_what_it_does_when_read_only():

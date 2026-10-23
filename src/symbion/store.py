@@ -192,6 +192,17 @@ def written_at(n, stamp: str | None = None) -> datetime:
     return dt if dt.tzinfo else dt.astimezone()
 
 
+def utc_stamp(stamp: str) -> str:
+    """A stamp in UTC, as rows are written now, for a reader that sorts it as
+    a string: an import keeps a local offset. A stamp that is not ISO stays
+    as written."""
+    try:
+        datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return stamp
+    return written_at(None, stamp).astimezone(timezone.utc).isoformat()
+
+
 def newest_first(rows) -> list:
     """Rows by when they were written, newest first; of rows written in one
     second, the later in `rows` first. Not the id: an edit keeps the row's
@@ -1768,12 +1779,17 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
                                       capture_output=True, text=True, encoding="utf-8").stdout
                 rows = rows_by_author(added_rows(diff))
                 trailers = ([f"Rows: {rows}"] if rows else []) + ([f"Wrap: {wrap}"] if wrap else [])
+                # In UTC by the one clock, as the rows are: git's own read the
+                # local zone, and ignored a stopped clock. A date the caller
+                # set in git's own variables still wins.
+                now = _now_iso()
                 r = subprocess.run(
                     [*git, "-c", f"user.name={cfg.git_name}",
                      "-c", f"user.email={cfg.git_email}", "commit", "-q",
                      *(["--allow-empty"] if empty else []), "-m", message,
                      *(["-m", "\n".join(trailers)] if trailers else [])],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8",
+                    env={"GIT_AUTHOR_DATE": now, "GIT_COMMITTER_DATE": now, **os.environ})
                 if r.returncode == 0:
                     _forget_committed(store)
     if r.returncode:

@@ -100,6 +100,13 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
         # one record, the parent's: the reload worker serves, but never records
         running = [json.loads(f.read_text()) for f in records.glob("*.json")]
         if status == 200:
+            # A raw socket: http.client reads no body after a HEAD, so only
+            # the wire shows one sent.
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+                s.sendall(b"HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                head = b""
+                while chunk := s.recv(65536):
+                    head += chunk
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=2) as r:
                 icon = r.headers["content-type"], r.read()
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/manifest.webmanifest",
@@ -145,10 +152,17 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     # On Windows the console script is a launcher, and the serve runs under it.
     assert os.name == "nt" or running[0]["pid"] == p.pid, running
     assert not list(records.glob("*.json")), "a serve that stopped leaves its record"
+    # A page answers HEAD as it answers GET, with no body: a link checker
+    # sends HEAD, and read the 405 the pages gave it as a broken link. A body
+    # after a HEAD's headers desyncs a proxy's reused connection.
+    assert head.startswith(b"HTTP/1.1 200 ") and head.endswith(b"\r\n\r\n"), head[:2000]
     # ui.run's favicon, which only a served page carries: NiceGUI's own icon
     # is under /_nicegui/. Not an inline data: URL, which Obsidian's web viewer
     # cannot fetch.
     assert 'href="/favicon.ico"' in page, page[:2000]
+    # A browser with scripts blocked is told so, not that it lacks ES modules.
+    assert "<noscript><style>#esm-fallback{display:none!important}</style>" in page
+    assert "GUI needs JavaScript" in page
     assert icon == ("image/svg+xml", FAVICON.read_bytes()), icon
     # The manifest makes the GUI an installable app, its pages tabs in one
     # window; its icons are PNGs, which an SVG alone did not give, and opaque:
@@ -624,12 +638,13 @@ def test_a_serve_past_loopback_needs_allow(tmp_path, monkeypatch, capsys):
     net = ipaddress.ip_network("10.1.0.0/16")
     rc, seen, added = _main_host(tmp_path, monkeypatch, host="0.0.0.0", allow=[net])
     assert rc == 0 and seen["host"] == "0.0.0.0"
-    assert [a["cls"] for a in added] == ["AllowOnly"] and net in added[0]["nets"]
+    assert [a["cls"] for a in added] == ["AllowOnly", "HeadAsGet"]
+    assert net in added[0]["nets"]
     assert "10.1.0.0/16" in capsys.readouterr().out
 
     rc, seen, added = _main_host(tmp_path, monkeypatch)
     assert rc == 0 and seen["host"] == "127.0.0.1"
-    assert [a["cls"] for a in added] == ["HostIsAddress"]
+    assert [a["cls"] for a in added] == ["HostIsAddress", "HeadAsGet"]
 
     # On one address, this machine connects from that address, not loopback.
     rc, seen, added = _main_host(tmp_path, monkeypatch, host="192.0.2.7", allow=[net])
@@ -684,3 +699,22 @@ def test_read_only_is_set_before_the_page_is_built(tmp_path, monkeypatch):
     serve.main(api.resolve(str(tmp_path / "s")), author="t", port=1111, show=False,
                read_only=True)
     assert seen == ["1", "1"]
+
+
+def test_a_wide_read_only_serve_says_nothing_writes(tmp_path, monkeypatch, capsys):
+    """Under --read-only, the --host line said "each of them writes as" (the
+    public demo's review, 2026-10-22)."""
+    import ipaddress
+    from symbion import api
+    from symbion.gui import serve
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("SYMBION_READ_ONLY", "")          # restored at teardown
+    monkeypatch.setattr(serve, "build_page", lambda ctx, author: None)
+    monkeypatch.setattr(serve.ui, "run", lambda **kw: None)
+    monkeypatch.setattr(serve.app, "add_middleware", lambda *a, **kw: None)
+    store.ensure_store(tmp_path / "s")
+    serve.main(api.resolve(str(tmp_path / "s")), author="t", port=1111, show=False,
+               host="0.0.0.0", allow=[ipaddress.ip_network("10.0.0.0/8")], read_only=True)
+    out = capsys.readouterr().out
+    assert "There is no login: each of them reads, and nothing writes." in out, out
+    assert "writes as" not in out

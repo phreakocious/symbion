@@ -160,7 +160,10 @@ def _error_pages(ctx, author: str) -> None:
             ui.label(what).classes("sb-subtitle text-bad").mark("error-detail")
             ui.link("back to the notebook", "/").classes("text-body")
 
-    app.on_page_exception(lambda e: body(500, f"{type(e).__name__}: {e}"))
+    # A read-only serve is a public demo: the text can hold a path on its
+    # machine, and its visitors have no use for it. The log keeps it.
+    app.on_page_exception(lambda e: body(500, type(e).__name__ if S.read_only()
+                                         else f"{type(e).__name__}: {e}"))
 
     @app.exception_handler(404)
     async def _not_found(request: Request, exc: Exception):

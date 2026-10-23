@@ -935,10 +935,12 @@ def json_row(n, by_id, since) -> dict:
     chain's first row: `author` is the head's, so one `supersede --append` by
     a teammate moved a row out of a consumer's filter on its raiser (an agent
     harness, 2026-10-07). `raised_at` is that row's time, for the same reason:
-    by `created_at`, a row amended today read as filed today (2026-10-12)."""
+    by `created_at`, a row amended today read as filed today (2026-10-12).
+    Both stamps in UTC: a consumer's string sort misordered an import's
+    local offsets (2026-10-22)."""
     root = _root(by_id, n)
-    return S.read_dict(n) | {"commits_since": since, "raised_by": root.author,
-                             "raised_at": root.created_at}
+    return S.read_dict(n) | {"created_at": S.utc_stamp(n.created_at), "commits_since": since,
+                             "raised_by": root.author, "raised_at": S.utc_stamp(root.created_at)}
 
 
 _SHA = re.compile(r"[0-9a-f]{40}")

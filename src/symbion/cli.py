@@ -1918,10 +1918,15 @@ def _name_stale_bodies(store_dir, old: str, prefix: bool = False) -> None:
     still read "Fixed in <old>." until a hand supersede (2026-10-02). A commit
     is matched by its 7-character prefix, the form a body cites (`prefix`).
     A name is matched as a word, as `list --grep` would: a substring named
-    every row with an `a` in it after a rename of `a` (2026-10-05)."""
+    every row with an `a` in it after a rename of `a` (2026-10-05). And in
+    its case: an item named in plain words named the rows that used those
+    words capitalized, about something else, and none about the item
+    (2026-10-22)."""
     word = lambda c: c.isalnum() or c == "_"            # noqa: E731, what \b sees
     pat = ((r"\b" if word(old[0]) else "") + re.escape(old)
            + (r"\b" if word(old[-1]) and not prefix else ""))
+    if not prefix:
+        pat = f"(?-i:{pat})"                           # so the printed grep agrees
     grep = re.compile(pat, re.I | re.M)                # list --grep's flags
     hits = store.newest_first(n for n in store.heads(store.load(store_dir))
                               if grep.search(n.body or ""))
@@ -2124,17 +2129,17 @@ def _name_near_tags(store_dir, written) -> None:
 
 
 def _name_unchecked(written) -> None:
-    """A verdict row with no `--checked` still reads `current` or `behind
-    N`, as if something ran: a quarter of the verdict heads in two adopter
-    stores had neither field (2026-09-26). Say so at write; the stamp still dates
-    the commit, so it is a note, not a refusal."""
+    """A verdict row with no `--checked` still reads `current`, `behind N`,
+    `external` or `pending`, as if a run backed it: a quarter of the verdict
+    heads in two adopter stores had neither field (2026-09-26). Say so at
+    write; the stamp still dates the commit, so it is a note, not a refusal."""
     miss = [n for n in written if n.spec.verdict and not n.checked]
     if not miss:
         return
     what = (f"this {miss[0].kind} entry" if len(miss) == 1 else
             f"{len(miss)} entries ({', '.join(sorted({n.kind for n in miss}))})")
-    print(f"note: no --checked on {what}: it reads current or behind N with no run "
-          f"recorded; --checked names what ran", file=sys.stderr)
+    print(f"note: no --checked on {what}: it has a state but names no run; --checked "
+          f"names what ran, or on a prediction, what will run", file=sys.stderr)
 
 
 def _name_dirty(written, external: bool = True) -> None:
@@ -3753,6 +3758,9 @@ def _main(argv) -> int:
         return 1
     except (catalog.CatalogError, catalog.AmbiguousName) as e:
         print(f"error: {e}", file=sys.stderr)
+        return 1
+    except store.ReadOnly as e:
+        print(f"error: {e} (SYMBION_READ_ONLY is set)", file=sys.stderr)
         return 1
     except RuntimeError as e:                    # CatalogError subclasses this;
         print(f"error: {e}", file=sys.stderr)    # its own clause must come first

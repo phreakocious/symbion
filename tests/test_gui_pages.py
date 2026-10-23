@@ -1120,6 +1120,25 @@ async def test_a_page_that_fails_says_why_inside_symbions_chrome(user: User, ctx
     caplog.clear()
 
 
+async def test_a_read_only_page_that_fails_names_only_the_exceptions_type(
+        user: User, ctx_with_notes, caplog, monkeypatch):
+    """The public demo's visitors are not its owner: an exception's text can
+    hold a path on the serving machine. The log keeps it."""
+    from nicegui import ui
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+
+    @ui.page("/boom")
+    def boom():
+        raise RuntimeError("/srv/private/store")
+
+    r = await user.http_client.get("/boom")
+    assert r.status_code == 500
+    assert "RuntimeError" in r.text
+    assert "/srv/private/store" not in r.text
+    assert "/srv/private/store" in caplog.text
+    caplog.clear()
+
+
 async def test_a_long_list_says_what_it_did_not_show(user: User, repo, tmp_path, monkeypatch):
     """/notes renders a page of rows; the rest are named, never silently cut."""
     # Through build_page's own globals, not `import pages`: the `user`

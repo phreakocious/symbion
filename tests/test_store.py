@@ -1388,3 +1388,18 @@ def test_symbion_now_refuses_a_time_without_an_offset(monkeypatch):
             store._utcnow()
     monkeypatch.setenv("SYMBION_NOW", "")
     assert abs((store._utcnow() - datetime.now(timezone.utc)).total_seconds()) < 5
+
+
+def test_a_store_commit_is_stamped_by_symbions_clock_in_utc(tmp_path, monkeypatch):
+    """The store's git log read local time beside rows stamped in UTC
+    (2026-10-22). A stopped clock stamps the commit too."""
+    import subprocess
+    from types import SimpleNamespace
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:00:00Z")
+    store.add(tmp_path, kind="note", target={"type": "project", "name": None},
+              body="b", author="ann")
+    assert store.commit(tmp_path, "c", SimpleNamespace(git_name="t", git_email="t@t"))
+    dates = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%ai%n%ci"],
+                           capture_output=True, text=True, encoding="utf-8").stdout.splitlines()
+    assert dates == ["2026-01-10 12:00:00 +0000"] * 2, dates

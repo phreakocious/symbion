@@ -6,7 +6,7 @@ A notebook and ticket registry for one project, shared by you and your coding
 agent. Bugs, tasks, decisions and verified results go in as dated entries, so
 what a session learned is still there when the next one starts.
 
-**[See it live](https://symbion.nullphase.net/)**: the browser view of a real
+**[Live demo](https://symbion.nullphase.net/)**: the browser view of a real
 project's notebook, read-only.
 
 <img src="https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/session.svg" width="100%" alt="A Claude Code session: symbion's hook hands the agent the open entries; asked to work them, it fixes the bug, resolves its entry, and hands the question back.">

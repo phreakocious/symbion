@@ -82,6 +82,20 @@ class HostIsAddress:
         await self.app(scope, receive, send)
 
 
+class HeadAsGet:
+    """ASGI: a HEAD is answered as its GET. The pages take GET only, and a
+    link checker read their 405 as a broken link. The method changes on a
+    copy of the scope: uvicorn reads its own to send a HEAD no body."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope["method"] == "HEAD":
+            scope = {**scope, "method": "GET"}
+        await self.app(scope, receive, send)
+
+
 async def _refuse(scope, send, body: bytes) -> None:
     if scope["type"] == "websocket":
         await send({"type": "websocket.close", "code": 1008})
@@ -201,6 +215,7 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
         # allowed client's browser can still rebind; a Host list flag
         # closes that if a wide serve ever faces untrusted browsing.
         app.add_middleware(HostIsAddress)
+    app.add_middleware(HeadAsGet)
     # The store's own port, so a link to it outlives a restart (the user,
     # 2026-10-02). `--port` overrides it and is never warned about.
     want = servers.port(ctx.store_dir) if port is None else None
@@ -217,7 +232,8 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
         if not loopback(host):
             print(f"listening on {host}, port {port}, for this machine and "
                   f"{', '.join(map(str, allow))}. There is no login: each of them "
-                  f"writes as {author}.", flush=True)
+                  + ("reads, and nothing writes." if read_only else f"writes as {author}."),
+                  flush=True)
         # For the other serves' sidebars. The first serve on a store stays
         # the one they link while it runs; a second records too, and its
         # links take over when the first stops.
