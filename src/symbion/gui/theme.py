@@ -451,8 +451,8 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 .sb-filtered { display: none !important; }
 
 /* resolve: an empty box, a tick on hover; the 7px radius every .q-btn takes
-   below. A card's is at its right and the toolbar sits beside it; an arc's
-   checklist keeps its boxes on the left, since every row there has one. */
+   below. A card's is at its right and the toolbar sits beside it, an arc's
+   box too (on the left until the user, 2026-10-27). */
 .q-btn.sb-resolve { width: 22px; height: 22px; min-width: 22px; min-height: 22px; padding: 0;
                     margin-top: 1px; border: 1.5px solid var(--q-dim); flex: none; }
 .q-btn.sb-resolve .q-icon { font-size: 14px; }
@@ -473,6 +473,8 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
    foot ended short of a closed card's */
 .sb-resolvable .q-btn.sb-resolve { position: absolute; top: 13px; right: 14px; margin: 0; }
 .sb-resolvable .sb-actions { right: 44px; }
+/* a one-line box: pinned at the top, the box sat on the card's bottom edge */
+.sb-box .q-btn.sb-resolve, .sb-box .sb-actions { top: 50%; transform: translateY(-50%); }
 .sb-starred .sb-actions { opacity: 1; }
 @media (hover: none) { .sb-actions, .q-btn.sb-copy { opacity: 1; } }
 
@@ -531,6 +533,9 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
   .q-notification:not([class*=bg-]) { background: var(--q-panel) !important;
                                       color: var(--q-emph) !important;
                                       border: 1px solid var(--q-border); }
+  /* A notice's lines stay lines: a shared store's commit says its commit,
+     pull and push on one each, and ran them into one (2026-10-27). */
+  .q-notification__message { white-space: pre-line; }
 }
 .q-field--dark .q-field__native, .q-field--dark .q-field__input { color: var(--q-emph) !important; }
 /* Quasar's rgba(255, 255, 255, .7), the one colour off the palette and out of

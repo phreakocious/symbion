@@ -212,3 +212,26 @@ async def test_a_rows_text_links_to_its_note(user: User, seeded):
     await user.open("/t")
     assert {e.props.get("href") for e in user.find(marker="checklist-body").elements} \
         == {f"/notes?id={b.id}"}
+
+
+async def test_a_box_carries_a_cards_star_due_date_and_tags(user: User, seeded):
+    """A box had no star, no due date and no tags, so a priority box looked
+    like any other (the user, 2026-10-27)."""
+    ctx, act = seeded
+    one = next(n for n in store.load(ctx.store_dir) if n.target.name == "one")
+    api.retag(ctx, one.id, add=("priority", "ux"), author="ada")
+    api.supersede(ctx, one.id, author="ada", due="2030-01-01")
+
+    @ui.page("/t")
+    def page():
+        checklist(ctx, act.id, lambda: None, author="ada")
+
+    await user.open("/t")
+    stars = sorted(str(b.props.get("color")) for b in user.find(marker="note-star").elements)
+    assert stars == ["None", "warning"]
+    assert len(user.find(marker="note-due").elements) == 1
+    await user.should_see(marker="tag-ux")
+    rows = [r for r in user.find(marker="checklist-row").elements]
+    assert all("sb-resolvable" in r.classes for r in rows)
+    starred = [r for r in rows if "sb-starred" in r.classes]
+    assert [r.props["data-id"] for r in starred] == [one.id]

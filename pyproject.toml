@@ -1,6 +1,6 @@
 [project]
 name = "symbion"
-version = "0.10.1.dev0"
+version = "0.11.0"
 description = "A notebook and ticket registry for agents: dated rows attached to a commit, a file, an item, an arc or the project, kept in a sibling git repo of JSONL."
 readme = "README.md"
 license = "MIT"
@@ -20,7 +20,8 @@ symbion = "symbion.cli:main"
 
 [project.optional-dependencies]
 gui = ["nicegui>=3.18", "pygments>=2.13"]
-test = ["pytest", "pytest-asyncio", "pytest-xdist"]
+# ruff has no OpenBSD wheel and builds only with Rust; the lint test skips there.
+test = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff>=0.15; platform_system != 'OpenBSD'"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -29,6 +30,11 @@ asyncio_mode = "auto"
 # registered by build_page(ctx) against a resolved store -- and the gui tests
 # declare the pages they need. Empty means "no main file", not "look for one".
 main_file = ""
+
+# pyflakes only: unused and undefined names, which agents leave behind. Style is
+# the codebase's own; tests/test_lint.py runs this.
+[tool.ruff.lint]
+select = ["F"]
 
 [build-system]
 requires = ["setuptools>=77"]

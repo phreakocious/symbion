@@ -6,17 +6,22 @@ import math
 import os
 import posixpath
 import re
+import shlex
+import signal
 import subprocess
 import sys
-from contextlib import contextmanager
+import time
+from collections import Counter
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from . import catalog, config, store
 
 
-def _git(cfg_or_path, *args, input: str | None = None):
+def _git(cfg_or_path, *args, input: str | None = None, errors: str = "strict"):
     """HEAD, branches and dirtiness are per-worktree, so this must run
     against `work_root` (the CURRENT checkout), never `project_root` (which
     is deliberately the MAIN checkout -- see config.project_root). A bare
@@ -25,7 +30,9 @@ def _git(cfg_or_path, *args, input: str | None = None):
 
     A list that grows with the store goes on `input`, never argv: a Windows
     command line holds at most 32,767 characters, and past it the call
-    raises WinError 206 (a store's paths ran well past it, 2026-10-16)."""
+    raises WinError 206 (a store's paths ran well past it, 2026-10-16).
+    `errors="replace"` for text from any commit: an imported history holds
+    bytes that are not UTF-8, and a strict decode raised (2026-10-26)."""
     root = _root(cfg_or_path)
     if root is None:
         # A store named from outside any repository (api.resolve): every git
@@ -37,13 +44,14 @@ def _git(cfg_or_path, *args, input: str | None = None):
         # has one answer a process. The public demo asked about 60 a render,
         # 59 distinct over 5 renders: 5 s a page on its box, 2 s answered once
         # (2026-10-22).
-        key = (str(root), args, input)
+        key = (str(root), args, input, errors)
         if key not in _ANSWERS:
             _ANSWERS[key] = subprocess.run(["git", "-C", str(root), *args], input=input,
-                                           capture_output=True, text=True, encoding="utf-8")
+                                           capture_output=True, text=True, encoding="utf-8",
+                                           errors=errors)
         return _ANSWERS[key]
     return subprocess.run(["git", "-C", str(root), *args], input=input,
-                          capture_output=True, text=True, encoding="utf-8")
+                          capture_output=True, text=True, encoding="utf-8", errors=errors)
 
 
 _ANSWERS: dict = {}
@@ -200,6 +208,15 @@ def ignored_here(cfg, name) -> bool:
 def tracked(cfg, path) -> bool:
     """`path`, inside this worktree, is a file git tracks."""
     return _git(cfg, "ls-files", "--error-unmatch", "--", str(path)).returncode == 0
+
+
+def markdown_files(cfg_or_path) -> list[str]:
+    """The markdown files under a checkout or a directory in one, as the
+    file catalog lists them: tracked, or new and not ignored. Read-only, the
+    public demo, tracked only: the leak scan read those. [] outside a repo."""
+    new = () if store.read_only() else ("--others", "--exclude-standard")
+    r = _git(cfg_or_path, "ls-files", "-z", "--cached", *new, "--", ":(icase)*.md")
+    return list(dict.fromkeys(n for n in r.stdout.split("\0") if n)) if r.returncode == 0 else []
 
 
 def canon_name(cfg, target_type, name, stored=()):
@@ -443,13 +460,23 @@ def provenance_stamp(cfg, spec, repo=None):
     head = r.stdout.strip()
     # The paths, not only the flag: whether an uncommitted CLAUDE.md (no
     # verdict depends on it) should make a stamp dirty cannot be measured
-    # from a boolean (2026-09-27: 26% of 536 adopter stamps dirty).
+    # from a boolean (2026-09-27: about a quarter of adopter stamps dirty).
     paths = _dirty_paths(cfg)
+    # What a rewrite keeps, so `successor` finds the commit's new sha after
+    # git prunes the old one, and the tree for its same-tree test (the
+    # rewritten-stamps design, 2026-10-26). A failure stamps without them.
+    # --no-show-signature: with log.showSignature set, git printed `No
+    # signature` above the format line, and a stamp kept it as its date.
+    r = _git(cfg, "show", "-s", "--no-show-signature", "--format=%ad%x00%s%x00%T",
+             "--date=raw", head, "--", errors="replace")
+    key = r.stdout.rstrip("\n").split("\0") if r.returncode == 0 else []
     return {"sha": head, "dirty": bool(paths), **({"repo": repo} if repo else {}),
+            **(dict(zip(("author_date", "subject", "tree"), key)) if len(key) == 3 else {}),
             **({"dirty_count": len(paths), "dirty_paths": paths[:20]} if paths else {})}
 
 
 _HEX = re.compile(r"[0-9a-fA-F]{4,64}")
+_RAW_DATE = re.compile(r"\d+ [+-]\d{4}")         # git's --date=raw
 # (repo, stamp, HEAD) -> (state, distance). Two commits relate the same way
 # for good, so a long-running `serve` asks git once per stamp per HEAD. A
 # failure is not kept: a fetch can bring the missing object.
@@ -528,7 +555,9 @@ def check_state(cfg, prov, head: str | None = None):
     the stamp is N commits back from this HEAD, or N commits past it.
     `diverged` is kept for what it says -- neither is an ancestor of the
     other. Either of those two whose stamp no branch or tag holds is
-    `dangling`: the run is on a commit only the reflog keeps.
+    `dangling`: the run is on a commit only the reflog keeps. It is
+    `rewritten` instead when one live commit has the stamp commit's author
+    date and subject (`successor`): what an amend or a rebase made of it.
 
     A check stamped dirty:true satisfies sha == HEAD — the common case, since
     the stamp records HEAD at write time — so without precedence it would read
@@ -575,7 +604,9 @@ def check_state(cfg, prov, head: str | None = None):
             only_stamp = only_head = None
         if r.returncode or only_stamp is None:
             # Rebased away, squashed, shallow; an object missing between the two.
-            return ("unverifiable", None)
+            # A pruned stamp still finds its rewrite by the key it keeps.
+            s = successor(cfg, prov, head)
+            return ("rewritten", s.distance) if s else ("unverifiable", None)
         if only_stamp and only_head:
             state = ("diverged", None)             # another line of development
         elif only_stamp:
@@ -591,13 +622,115 @@ def check_state(cfg, prov, head: str | None = None):
     # rebase after the check left it to the reflog, and it read `diverged`,
     # which says "look on that branch" where this says "re-run" (2026-10-06).
     # Asked on every read: a branch can go while a serve keeps one HEAD. A
-    # git error keeps the relation, as before this test existed.
+    # git error keeps the relation, as before this test existed, unless git
+    # has pruned the stamp since the relation was kept: then it reads as the
+    # walk above reads a missing stamp.
     if state[0] in ("ahead", "diverged"):
         r = _git(cfg, "for-each-ref", "--count=1", "--contains", stamp,
                  "refs/heads", "refs/remotes", "refs/tags")
         if r.returncode == 0 and not r.stdout.strip():
-            return ("dangling", None)
+            # After each rewrite, agents typed old-to-new sha maps into their
+            # checks by hand (2026-10-26): git's own metadata names the commit.
+            s = successor(cfg, prov, head)
+            return ("rewritten", s.distance) if s else ("dangling", None)
+        if r.returncode and _git(cfg, "cat-file", "-e", f"{stamp}^{{commit}}").returncode:
+            del _RELATIONS[key]
+            s = successor(cfg, prov, head)
+            return ("rewritten", s.distance) if s else ("unverifiable", None)
     return state
+
+
+class Successor(NamedTuple):
+    """The live commit a rewrite made of a stamp's commit. `state` and
+    `distance` are its own relation to HEAD; `same_tree` is None when the
+    old tree is unknown."""
+    sha: str
+    state: str
+    distance: int | None
+    same_tree: bool | None
+
+
+def _live_commits(cfg, since: int) -> dict:
+    """{(author date, subject): [(sha, tree)]} over the refs the dangling
+    test reads, committed from a day before `since` (epoch seconds) on. A
+    rebase dates its commits now and filter-repo keeps the old dates, so a
+    successor is not older than the stamp's author date; the day is for
+    skew. A full walk of a 63,000-commit repo took 0.8 s, bounded 16 ms
+    (2026-10-26). Kept for one heads_once scope, not across scopes: a serve
+    keeps one HEAD while an agent rewrites a branch in another worktree."""
+    seen, key = _HEADS.get(), ("live", str(_root(cfg)))
+    if seen is not None and key in seen and seen[key][0] <= since:
+        return seen[key][1]
+    # A second build in a scope walks the whole history: `list` reads newest
+    # first, and each older stamp lowered the bound and built it again.
+    # ponytail: two dangling stamps of different ages make every page that
+    # shows them walk it all (0.8 s at 63,000 commits); widen the bound
+    # geometrically if a big repo's store shows that.
+    widen = seen is not None and key in seen
+    floor = datetime.fromtimestamp(since - 86400, timezone.utc).isoformat()
+    r = _git(cfg, "log", "--branches", "--remotes", "--tags", "--no-show-signature",
+             *(() if widen else (f"--since={floor}",)),
+             "--format=%H%x00%ad%x00%s%x00%T", "--date=raw", "--", errors="replace")
+    live: dict = {}
+    # On "\n" only: splitlines() also splits at U+2028 in a subject.
+    for record in r.stdout.split("\n") if r.returncode == 0 else ():
+        if len(f := record.split("\0")) == 4:
+            live.setdefault((f[1], f[2]), []).append((f[0], f[3]))
+    if seen is not None:
+        seen[key] = (-math.inf if widen else since, live)
+    return live
+
+
+def successor(cfg, prov, head: str | None = None) -> Successor | None:
+    """The one live commit with the stamp commit's author date and subject:
+    what an amend, a rebase, a cherry-pick or filter-repo made of it. None
+    for no match or several, as after a reword or a squash. Asked once per
+    stamp in a heads_once scope: `check_state` and the printer both ask."""
+    sha = store.stamp_sha(prov)
+    if not isinstance(sha, str) or not _HEX.fullmatch(sha):
+        return None
+    if getattr(cfg, "repos", None):
+        routed = stamp_cfg(cfg, prov)
+        if routed.work_root != cfg.work_root:
+            head = None            # the caller's head is its own repo's
+        cfg = routed
+    head = _head_once(cfg) if head is None else head
+    # The stored key too: a bare stamp of the same pruned sha finds none.
+    seen, key = _HEADS.get(), ("successor", str(_root(cfg)), sha, head,
+                               *(str(prov.get(k)) for k in ("author_date", "subject", "tree")))
+    if seen is not None and key in seen:
+        return seen[key]
+    found = _successor(cfg, prov, sha, head)
+    if seen is not None:
+        seen[key] = found
+    return found
+
+
+def _successor(cfg, prov, sha, head) -> Successor | None:
+    """successor's search. The key is the stamp's own (provenance_stamp
+    keeps it), else git's while the old commit exists: also when the stamp's
+    date is not git's raw one, as a [provenance] command may write it."""
+    full, date, subject, tree = sha, prov.get("author_date"), prov.get("subject"), prov.get("tree")
+    if not (isinstance(date, str) and isinstance(subject, str) and _RAW_DATE.fullmatch(date)):
+        r = _git(cfg, "show", "-s", "--no-show-signature", "--format=%H%x00%ad%x00%s%x00%T",
+                 "--date=raw", f"{sha}^{{commit}}", "--", errors="replace")
+        got = r.stdout.rstrip("\n").split("\0") if r.returncode == 0 else []
+        if len(got) != 4:
+            return None
+        full, date, subject, tree = got[0], got[1], got[2], tree or got[3]
+    try:
+        since = int(date.split()[0])
+    except (ValueError, IndexError):
+        return None
+    hits = [h for h in _live_commits(cfg, since).get((date, subject), ())
+            if not h[0].startswith(full.lower())]
+    if len(hits) != 1:
+        return None
+    new, new_tree = hits[0]
+    state, distance = check_state(cfg, {"sha": new, "dirty": False}, head)
+    if state not in ("current", "behind", "ahead", "diverged"):
+        return None
+    return Successor(new, state, distance, None if not tree else tree == new_tree)
 
 
 def branch_commits(cfg, ref: str, since: str | None = None) -> set:
@@ -638,7 +771,11 @@ def subjects(cfg, shas) -> dict:
     In batches of SHA_BATCH: a Windows command line holds at most 32,767
     characters, and 800 full shas raised WinError 206 there (2026-10-16).
     `--stdin` would not do: git drops `--ignore-missing` for revisions it
-    reads from stdin, and one unknown sha failed the batch."""
+    reads from stdin, and one unknown sha failed the batch.
+
+    Any commit's subject, read as the rewrite lookup reads it: bytes not
+    UTF-8, a U+2028, or a signature line on stdout raised or split a record
+    (2026-10-26)."""
     out = {}
     shas = list(shas)
     if not shas:
@@ -649,11 +786,12 @@ def subjects(cfg, shas) -> dict:
                 out |= subjects(cfg.repo(name), left)
         return out
     for i in range(0, len(shas), SHA_BATCH):
-        r = _git(cfg, "log", "--no-walk", "--ignore-missing", "--format=%H%x00%s",
-                 "--end-of-options", *shas[i:i + SHA_BATCH])
+        r = _git(cfg, "log", "--no-walk", "--ignore-missing", "--no-show-signature",
+                 "--format=%H%x00%s", "--end-of-options", *shas[i:i + SHA_BATCH],
+                 errors="replace")
         if r.returncode != 0:
             continue
-        for line in r.stdout.splitlines():
+        for line in r.stdout.split("\n"):
             if "\0" in line:
                 sha, subject = line.split("\0", 1)
                 out[sha] = subject
@@ -667,9 +805,10 @@ def recent(cfg, n: int) -> dict:
     cannot answer (no repo, no commit yet) it is empty."""
     got = []
     for c in [cfg.repo(r) for r in cfg.repos] if getattr(cfg, "repos", None) else [cfg]:
-        r = _git(c, "log", f"-n{n}", "--format=%ct%x00%H%x00%s")
+        r = _git(c, "log", f"-n{n}", "--no-show-signature", "--format=%ct%x00%H%x00%s",
+                 errors="replace")
         if r.returncode == 0:
-            got += [ln.split("\0", 2) for ln in r.stdout.splitlines() if ln.count("\0") == 2]
+            got += [ln.split("\0", 2) for ln in r.stdout.split("\n") if ln.count("\0") == 2]
     got.sort(key=lambda t: -int(t[0]))        # stable: one repo keeps git's order
     return {sha: subject for _, sha, subject in got[:n]}
 
@@ -677,8 +816,9 @@ def recent(cfg, n: int) -> dict:
 def oneline(cfg, rng: str, n: int) -> list[str]:
     """`git log --oneline` of a range, newest first, at most `n` lines; []
     when git cannot read the range."""
-    r = _git(cfg, "log", "--format=%h %s", f"-n{n}", rng)
-    return r.stdout.splitlines() if r.returncode == 0 else []
+    r = _git(cfg, "log", "--no-show-signature", "--format=%h %s", f"-n{n}", rng,
+             errors="replace")
+    return [ln for ln in r.stdout.split("\n") if ln] if r.returncode == 0 else []
 
 
 def _file(cfg, ttype, name) -> str | None:
@@ -760,7 +900,7 @@ def _file_history(cfg, paths, head: str) -> tuple[dict, float]:
                       "--no-renames", "--raw", "--no-abbrev", "--format=%H %ct %P",
                       input=f"{head or 'HEAD'}\n--\n{spec}")
     toks = out.split("\0") if out is not None else []
-    hist, top, merge, i = {}, None, None, 0
+    hist, top, merge, i, pos = {}, None, None, 0, -1
     while i < len(toks):
         t = toks[i].lstrip("\n")
         if t.startswith(":") and top and i + 1 < len(toks):
@@ -769,7 +909,7 @@ def _file_history(cfg, paths, head: str) -> tuple[dict, float]:
             continue
         if t:
             sha, ct, *parents = t.split()
-            pos = 0 if top is None else pos + 1
+            pos += 1
             top = (sha, int(ct))
             if len(parents) > 1 and merge is None:
                 merge = pos
@@ -898,19 +1038,33 @@ def committed(store_dir) -> str:
     return "committed" + (": " + "; ".join(said) if said else "")
 
 
-def last_wrap(store_dir, cfg) -> dict | None:
+def last_wrap(store_dir, cfg, side: str | None = None) -> dict | None:
     """The newest store commit a wrap made (`commit --wrap`, a `Wrap:`
     trailer), as summary prints it: subject, body without the trailers, who
     wrapped, when, and how many commits the repo's HEAD gained since (None
     outside a repo). None when no commit carries the trailer. `--since` is
     inclusive to the second, so a repo commit in the wrap's own second
     counts. In a store with [repos], every repo's commits, and
-    `commits_by_repo` names each repo that has some."""
-    out = _git(store_dir, "log", "-1", "--grep=^Wrap: ",
-               "--format=%cI%x00%(trailers:key=Wrap,valueonly)%x00%(trailers)%x00%B").stdout
-    if "\0" not in out:
+    `commits_by_repo` names each repo that has some.
+
+    With `side`, the newest wrap whose `Side:` trailer is `side` or absent:
+    a shared store holds two sides' wraps, and the other's is not your
+    handoff. One `git log`, read newest-first; -z and NUL between the fields,
+    since no commit text holds a NUL (a subject can hold a U+2028, which
+    splitlines would cut)."""
+    # ponytail: with a side, every wrap's text comes back, not the first match's;
+    # thousands of wraps pay for it. Upgrade: log --format=%H, then show the match.
+    out = _git(store_dir, "log", "-z", "--no-show-signature", "--grep=^Wrap: ",
+               *(["-1"] if side is None else []),
+               "--format=%cI%x00%(trailers:key=Wrap,valueonly)%x00"
+               "%(trailers:key=Side,valueonly)%x00%(trailers)%x00%B").stdout
+    f = out.split("\0")
+    for i in range(0, len(f) - 4, 5):
+        at, who, got, trailers, full = f[i:i + 5]
+        if side is None or got.strip() in ("", side):
+            break
+    else:
         return None
-    at, who, trailers, full = out.split("\0", 3)
     gist, _, body = full.strip().removesuffix(trailers.strip()).strip().partition("\n")
     def since(c):
         n = _git(c, "rev-list", "--count", "HEAD", f"--since={at}").stdout.strip()
@@ -927,6 +1081,15 @@ def last_wrap(store_dir, cfg) -> dict | None:
     at = datetime.fromisoformat(at).astimezone(timezone.utc).isoformat(timespec="seconds")
     return {"gist": gist, "body": body.strip(), "author": who.strip(), "at": at,
             "commits_since": n, "commits_by_repo": by_repo}
+
+
+def wraps_since(store_dir, since_iso: str | None) -> dict[str, int]:
+    """Wrap commits per `Side:` trailer since `since_iso` (every one when
+    None). A wrap with no `Side:` names no side, so it counts for none."""
+    out = _git(store_dir, "log", "-z", "--no-show-signature", "--grep=^Wrap: ",
+               *([f"--since={since_iso}"] if since_iso else []),
+               "--format=%(trailers:key=Side,valueonly)").stdout
+    return dict(Counter(v for v in map(str.strip, out.split("\0")) if v))
 
 
 def unpushed(store) -> int | None:
@@ -964,3 +1127,119 @@ def set_upstream(store, write: bool = True) -> str | None:
     _git(store, "config", f"branch.{branch}.remote", "origin")
     _git(store, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
     return f"origin/{branch}"
+
+
+_MERGE_ATTRS = ("notes.jsonl merge=symbion", "arcs.jsonl merge=symbion")
+
+
+def ensure_merge_driver(store) -> bool:
+    """Register `symbion merge-driver` for the store's clone: the config keys
+    and the two attribute lines, in the clone's own git dir, so nothing is
+    committed and a clone without symbion merges as git does. The attributes
+    file lives in the common dir of a linked worktree, so git names it.
+    Returns whether it changed anything."""
+    store = Path(store)
+    out = _git(store, "rev-parse", "--git-path", "info/attributes")
+    if out.returncode != 0:
+        return False
+    attrs = store / out.stdout.strip()               # absolute when git says so
+    # sh word: Windows backslashes would be read as escapes
+    # -P: git runs the driver from the repo root, and `-m` would put that
+    # directory first on sys.path, so a file the store commits could shadow a module
+    driver = f"{shlex.quote(Path(sys.executable).as_posix())} -P -m symbion merge-driver %O %A %B %P"
+    changed = False
+    for key, value in (("merge.symbion.name", "symbion store merge"),
+                       ("merge.symbion.driver", driver)):
+        if _git(store, "config", "--local", "--get", key).stdout.strip() != value:
+            _git(store, "config", "--local", key, value)
+            changed = True
+    text = attrs.read_text(encoding="utf-8") if attrs.exists() else ""
+    missing = [ln for ln in _MERGE_ATTRS if ln not in text.splitlines()]
+    if missing:
+        attrs.parent.mkdir(parents=True, exist_ok=True)
+        lead = "\n" if text and not text.endswith("\n") else ""
+        with open(attrs, "a", encoding="utf-8", newline="\n") as f:
+            f.write(lead + "".join(ln + "\n" for ln in missing))
+        changed = True
+    return changed
+
+
+def run_timed(argv, timeout: float) -> subprocess.CompletedProcess:
+    """Run `argv` with its output captured, stdin closed and git unable to
+    ask for a password. Past `timeout` seconds it is stopped and
+    `subprocess.TimeoutExpired` is raised. On POSIX it runs in a session of
+    its own and the stop reaches every process it started: an ssh git ran
+    has no terminal to prompt on, and none outlives it holding the pipe. On
+    Windows taskkill stops its process tree: kill() stops git alone, and the
+    wait for the pipe its child holds would outlast the timeout."""
+    posix = os.name == "posix"
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                          start_new_session=posix) as p:
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if posix:
+                with suppress(ProcessLookupError):
+                    os.killpg(p.pid, signal.SIGKILL)
+            else:
+                # By path: a bare name is looked up in the cwd first, which may be the store.
+                kill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
+                                    "taskkill.exe")
+                with suppress(OSError, subprocess.SubprocessError):
+                    subprocess.run([kill, "/F", "/T", "/PID", str(p.pid)],
+                                   capture_output=True, stdin=subprocess.DEVNULL, timeout=5)
+                p.kill()                         # if taskkill could not
+            p.communicate()
+            raise
+    return subprocess.CompletedProcess(argv, p.returncode, out, err)
+
+
+def fetch(store, timeout: float) -> str | None:
+    """`git fetch origin`, stopped past `timeout` seconds (run_timed). None
+    when it worked, else one line that says why."""
+    try:
+        r = run_timed(["git", "-C", str(store), "fetch", "-q", "origin"], timeout)
+    except subprocess.TimeoutExpired:
+        return f"git fetch origin took over {timeout:g}s and was stopped"
+    if r.returncode == 0:
+        return None
+    said = next((ln.strip() for ln in r.stderr.split("\n") if ln.strip()),
+                f"exit {r.returncode}, no output")
+    return f"git fetch origin failed: {said}"
+
+
+def behind(store) -> int | None:
+    """The commits on the branch's upstream that HEAD lacks, as of the last
+    fetch; None with no upstream."""
+    out = _git(Path(store), "rev-list", "--count", "HEAD..@{u}").stdout.strip()
+    return int(out) if out.isdigit() else None
+
+
+_FETCH_MARK = "symbion-fetched"
+
+
+def _git_file(store, name) -> Path | None:
+    out = _git(Path(store), "rev-parse", "--git-path", name)
+    return Path(store) / out.stdout.strip() if out.returncode == 0 else None
+
+
+def stamp_fetch(store) -> None:
+    """Record that a fetch was tried, whatever came of it. FETCH_HEAD moves
+    only when a fetch works, so an origin that is down would be tried again
+    by every write."""
+    if mark := _git_file(store, _FETCH_MARK):
+        with suppress(OSError):
+            mark.touch()
+
+
+def fetched_age(store) -> float | None:
+    """Seconds since the store's last fetch, by FETCH_HEAD's time or the
+    last try's (stamp_fetch), whichever is newer; None before the first."""
+    times = []
+    for name in ("FETCH_HEAD", _FETCH_MARK):
+        if path := _git_file(store, name):
+            with suppress(FileNotFoundError):
+                times.append(path.stat().st_mtime)
+    return time.time() - max(times) if times else None

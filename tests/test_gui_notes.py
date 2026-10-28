@@ -184,6 +184,36 @@ async def test_a_check_whose_commit_was_amended_away_reads_dangling(user: User, 
     await user.should_see(f"stamped at {n.provenance['sha'][:7]}, which no branch or tag holds")
 
 
+async def test_a_check_whose_commit_was_amended_without_change_reads_rewritten(user: User, repo,
+                                                                               tmp_path):
+    """The badge follows the commit the amend made, and its tip says how
+    symbion knows: no branch holds the old one."""
+    import os
+    import subprocess
+
+    def git(*a, **env):
+        return subprocess.run(["git", *a], check=True, cwd=repo, capture_output=True, text=True,
+                              env={**os.environ, **env}).stdout.strip()
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "check", "target": {"type": "commit", "name": "HEAD"},
+                      "checked": "x", "result": "y"}, author="ada")
+    later = f"{int(git('show', '-s', '--format=%ct')) + 60} +0000"   # else the same sha
+    git("commit", "-q", "--amend", "--no-edit", GIT_COMMITTER_DATE=later)
+    new, old = git("rev-parse", "HEAD"), n.provenance["sha"]
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see(f"rewritten — as {new[:7]}, same tree, current")
+    user.find(marker="check-state").trigger("mouseenter")
+    await user.should_see(f"stamped at {old[:7]}; rewritten as {new[:7]}, "
+                          f"matched by author date and subject")
+    await user.should_see(f"{new[:7]}, this checkout's HEAD")
+    await user.should_not_see(f"stamped at {new[:7]}")      # one run, one stamp
+
+
 async def test_an_open_pre_registration_badge_reads_pending(user: User, repo, tmp_path):
     """Stamped at registration, before the run: `current` read as run."""
     (tmp_path / "symbion.toml").write_text(
@@ -1154,8 +1184,8 @@ async def test_the_resolve_switch_on_a_pre_registration_needs_its_result(user: U
 
 async def test_edit_dialog_sets_and_clears_due(user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
-    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
-                      "body": "b"}, author="ada")
+    api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                  "body": "b"}, author="ada")
 
     @ui.page("/t")
     def page():
@@ -1572,24 +1602,6 @@ async def test_a_bang_alone_is_an_empty_note(user: User, repo, tmp_path):
     user.find(marker="note-add").click()
     await user.should_see("empty entry")
     assert not store.heads(store.load(tmp_path))
-
-
-async def test_the_edit_dialog_says_whether_the_row_itself_changes(user: User, repo, tmp_path):
-    """It said "the old row is kept" over an edit that rewrites the row: one
-    by its own author before `symbion commit` (store.rewritable)."""
-    ctx = api.resolve(str(tmp_path))
-    rows = {who: api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
-                               "body": f"by {who}"}, author=who) for who in ("ada", "sam")}
-
-    @ui.page("/t/{who}")
-    def page(who: str):
-        render_note(ctx, rows[who], lambda: None, author="ada")
-
-    for who, words in (("ada", "this version is not yet committed, so it changes in place"),
-                       ("sam", "the old entry is kept")):
-        await user.open(f"/t/{who}")
-        user.find(marker="note-edit").click()
-        await user.should_see(words)
 
 
 async def test_a_since_chip_lists_the_commits_it_counts(user: User, repo, tmp_path):

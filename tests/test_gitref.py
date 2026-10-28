@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import pytest
 from symbion import catalog, config, gitref
@@ -152,6 +153,286 @@ def test_a_stamp_no_branch_or_tag_holds_is_dangling(repo):
     assert gitref.check_state(cfg, tip) == ("dangling", None)
 
 
+def _env_git(repo, env, *a):
+    return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True,
+                          check=True, env={**os.environ, **env}).stdout.strip()
+
+
+def _raw_date(repo, rev="HEAD"):
+    return _run(repo, "show", "-s", "--format=%ad", "--date=raw", rev)
+
+
+def _later(repo):
+    """A committer date a minute past HEAD's: within one second, an amend
+    that changes no file makes the same sha."""
+    ct = _run(repo, 'show', '-s', '--no-show-signature', '--format=%ct', 'HEAD')
+    return {"GIT_COMMITTER_DATE": f"{int(ct) + 60} +0000"}
+
+
+def _amend(repo):
+    _env_git(repo, _later(repo), "commit", "-q", "--amend", "--no-edit", "--allow-empty")
+    return _run(repo, "rev-parse", "HEAD")
+
+
+def test_an_amend_with_no_change_reads_rewritten_same_tree_current(repo):
+    """After a rewrite, agents typed old-to-new sha maps into checks by hand.
+    An amend keeps the author date and subject, which find the new commit."""
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False}
+    new = _amend(repo)
+    assert new != prov["sha"]
+    assert gitref.check_state(cfg, prov) == ("rewritten", 0)
+    assert gitref.successor(cfg, prov) == gitref.Successor(new, "current", 0, True)
+
+
+def test_an_amend_that_changes_a_file_reads_rewritten_tree_differs(repo):
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False}
+    (repo / "f0").write_text("changed")
+    _run(repo, "add", "-A")
+    new = _amend(repo)
+    (repo / "f2").write_text("x")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "c2")
+    assert gitref.check_state(cfg, prov) == ("rewritten", 1)
+    assert gitref.successor(cfg, prov) == gitref.Successor(new, "behind", 1, False)
+
+
+def test_a_reworded_commit_stays_dangling(repo):
+    """The subject is half the key: a reword leaves nothing to match."""
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False}
+    _run(repo, "commit", "-q", "--amend", "-m", "other")
+    assert gitref.check_state(cfg, prov) == ("dangling", None)
+
+
+def test_two_live_matches_leave_it_dangling(repo):
+    """Two copies (a cherry-pick to two branches) are no answer to which
+    one the run became."""
+    cfg = Config(project_root=repo)
+    old = _run(repo, "rev-parse", "HEAD")
+    prov = {"sha": old, "dirty": False}
+    (repo / "f0").write_text("changed")
+    _run(repo, "add", "-A")
+    _amend(repo)
+    twin = _env_git(repo, {"GIT_AUTHOR_DATE": _raw_date(repo, old)},
+                    "commit-tree", f"{old}^{{tree}}", "-p", "HEAD", "-m", "c1")
+    _run(repo, "branch", "twin", twin)
+    assert gitref.check_state(cfg, prov) == ("dangling", None)
+
+
+def test_a_re_author_reads_rewritten(repo):
+    """What `filter-repo --mailmap` writes: a new author, the date and
+    subject kept."""
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False}
+    new = _env_git(repo, {"GIT_AUTHOR_NAME": "o", "GIT_AUTHOR_EMAIL": "o@o",
+                          "GIT_AUTHOR_DATE": _raw_date(repo)},
+                   "commit-tree", "HEAD^{tree}", "-p", "HEAD~1", "-m", "c1")
+    _run(repo, "update-ref", "refs/heads/main", new)
+    assert gitref.check_state(cfg, prov) == ("rewritten", 0)
+
+
+def test_a_pruned_stamp_follows_by_its_stored_key(repo):
+    """Once git prunes the old commit, only the stamp holds its key."""
+    gitref._RELATIONS.clear()
+    cfg = Config(project_root=repo)
+    stamp = gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])
+    _amend(repo)
+    _run(repo, "reflog", "expire", "--expire=now", "--all")
+    _run(repo, "gc", "--prune=now", "-q")
+    assert subprocess.run(["git", "-C", str(repo), "cat-file", "-e", stamp["sha"]],
+                          capture_output=True).returncode != 0
+    assert gitref.check_state(cfg, stamp) == ("rewritten", 0)
+    assert gitref.successor(cfg, stamp).same_tree is True
+    bare = {"sha": stamp["sha"], "dirty": False}
+    assert gitref.check_state(cfg, bare) == ("unverifiable", None)
+
+
+def _prune(repo):
+    _run(repo, "reflog", "expire", "--expire=now", "--all")
+    _run(repo, "gc", "--prune=now", "-q")
+
+
+def test_a_stamp_pruned_while_a_serve_keeps_its_head_follows_its_key(repo):
+    """The relation is kept per HEAD, and a serve keeps one HEAD: once git
+    pruned the stamp's commit, its `diverged` stood."""
+    gitref._RELATIONS.clear()
+    cfg = Config(project_root=repo)
+    stamp = gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])
+    _run(repo, "branch", "backup")
+    _amend(repo)
+    assert gitref.check_state(cfg, stamp) == ("diverged", None)
+    _run(repo, "branch", "-q", "-D", "backup")
+    _prune(repo)
+    assert gitref.check_state(cfg, stamp) == ("rewritten", 0)
+
+
+def test_a_bare_stamp_read_first_leaves_a_keyed_one_its_successor(repo):
+    """One scope asks each stamp's successor once, and a bare stamp of the
+    same pruned sha found none."""
+    cfg = Config(project_root=repo)
+    stamp = gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])
+    _amend(repo)
+    _prune(repo)
+    with gitref.heads_once():
+        assert gitref.check_state(cfg, {"sha": stamp["sha"], "dirty": False}) == \
+            ("unverifiable", None)
+        assert gitref.check_state(cfg, stamp) == ("rewritten", 0)
+
+
+def test_a_command_stamps_own_date_falls_back_to_gits_key(repo):
+    """A [provenance] command may write its own author_date: git's raw date
+    is the lookup's, so the commit's own is read while git has it."""
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False,
+            "author_date": "2026-01-10T12:00:00Z", "subject": "c1"}
+    _amend(repo)
+    assert gitref.check_state(cfg, prov) == ("rewritten", 0)
+
+
+def test_a_dirty_stamp_on_an_amended_commit_stays_unverifiable(repo):
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": True}
+    _amend(repo)
+    assert gitref.check_state(cfg, prov) == ("unverifiable", None)
+
+
+def test_a_stamp_still_on_a_backup_branch_reads_diverged(repo):
+    """The old line is live: the lookup is for a stamp no branch holds."""
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False}
+    _run(repo, "branch", "backup")
+    _amend(repo)
+    assert gitref.check_state(cfg, prov) == ("diverged", None)
+
+
+def test_a_successor_made_after_an_earlier_read_is_found_next_scope(repo):
+    """A serve keeps one HEAD while an agent rewrites a branch in another
+    worktree: the next page must see the new commit."""
+    cfg = Config(project_root=repo)
+    _run(repo, "checkout", "-q", "-b", "topic")
+    (repo / "t").write_text("t")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "topic")
+    x, raw, later = _run(repo, "rev-parse", "HEAD"), _raw_date(repo), _later(repo)
+    _run(repo, "checkout", "-q", "main")
+    _run(repo, "branch", "-q", "-D", "topic")
+    prov = {"sha": x, "dirty": False}
+    with gitref.heads_once():
+        assert gitref.check_state(cfg, prov) == ("dangling", None)
+    copy = _env_git(repo, {"GIT_AUTHOR_DATE": raw, **later},
+                    "commit-tree", f"{x}^{{tree}}", "-p", "main", "-m", "topic")
+    _run(repo, "branch", "topic2", copy)
+    with gitref.heads_once():
+        assert gitref.check_state(cfg, prov)[0] == "rewritten"
+
+
+def test_a_line_break_character_in_any_subject_leaves_the_lookup_whole(repo):
+    """The walk reads every live commit's subject. str.splitlines() also
+    splits at U+2028, so one such subject on any branch broke the record and
+    raised, or dropped the record (review, 2026-10-26; store.jsonl_lines keeps
+    the same lesson)."""
+    cfg = Config(project_root=repo)
+    _run(repo, "commit", "-q", "--allow-empty", "-m", "a\u2028b")
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False}
+    _amend(repo)
+    assert gitref.check_state(cfg, prov) == ("rewritten", 0)
+
+
+def test_a_subject_that_is_not_utf8_neither_fails_a_stamp_nor_the_lookup(repo):
+    """Old imported histories hold such bytes; git's output decoded strictly
+    raised at the write and at every read of a dangling check."""
+    cfg = Config(project_root=repo)
+    tree, parent = _run(repo, "rev-parse", "HEAD^{tree}"), _run(repo, "rev-parse", "HEAD")
+
+    def forge(committed):            # as filter-repo keeps them: the message's bytes
+        raw = (f"tree {tree}\nparent {parent}\nauthor t <t@t> 1700000000 +0000\n"
+               f"committer t <t@t> {committed} +0000\n\ncaf\xe9 latin-1\n").encode("latin-1")
+        sha = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "commit", "-w",
+                              "--stdin"], input=raw, capture_output=True, check=True)
+        _run(repo, "update-ref", "refs/heads/main", sha.stdout.decode().strip())
+        return sha.stdout.decode().strip()
+    old = forge(1700000000)
+    stamp = gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])
+    assert stamp["sha"] == old
+    forge(1700000060)
+    assert gitref.check_state(cfg, stamp) == ("rewritten", 0)
+    assert gitref.check_state(cfg, {"sha": old, "dirty": False}) == ("rewritten", 0)
+
+
+def test_the_subject_readers_take_any_commit_text(repo):
+    """`subjects`, `recent` and `oneline` decoded strictly and split at
+    U+2028: a latin-1 subject raised in `list` and the GUI's commit picker,
+    and a line break character cut a record in two."""
+    cfg = Config(project_root=repo)
+    _run(repo, "commit", "-q", "--allow-empty", "-m", "a\u2028b")
+    mid, tree = _run(repo, "rev-parse", "HEAD"), _run(repo, "rev-parse", "HEAD^{tree}")
+    raw = (f"tree {tree}\nparent {mid}\nauthor t <t@t> 1900000000 +0000\n"
+           f"committer t <t@t> 1900000000 +0000\n\ncaf\xe9 latin-1\n").encode("latin-1")
+    top = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
+                         input=raw, capture_output=True, check=True).stdout.decode().strip()
+    _run(repo, "update-ref", "refs/heads/main", top)
+    want = {top: "caf\ufffd latin-1", mid: "a\u2028b"}
+    assert gitref.subjects(cfg, [top, mid]) == want
+    assert gitref.recent(cfg, 2) == want
+    assert gitref.oneline(cfg, "HEAD", 2) == [f"{s[:7]} {want[s]}" for s in (top, mid)]
+
+
+def test_a_signature_shown_by_config_reaches_no_stamp_and_no_lookup(repo, tmp_path):
+    """With log.showSignature, git prints `No signature` and the like on
+    stdout before a signed commit's format line: a stamp stored it as its
+    author date, and the walk raised."""
+    if not shutil.which("ssh-keygen"):
+        pytest.skip("ssh-keygen signs the commit")
+    key = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+    for k, v in (("gpg.format", "ssh"), ("user.signingkey", f"{key}.pub"),
+                 ("log.showSignature", "true")):
+        _run(repo, "config", k, v)
+    _run(repo, "commit", "-q", "-S", "--allow-empty", "-m", "signed")
+    cfg = Config(project_root=repo)
+    stamp = gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])
+    assert stamp["author_date"] == _run(repo, "-c", "log.showSignature=false", "show", "-s",
+                                        "--format=%ad", "--date=raw", "HEAD")
+    assert gitref.subjects(cfg, [stamp["sha"]]) == {stamp["sha"]: "signed"}
+    assert list(gitref.recent(cfg, 1).values()) == ["signed"]
+    assert gitref.oneline(cfg, "HEAD", 1) == [f"{stamp['sha'][:7]} signed"]
+    _amend(repo)
+    assert gitref.check_state(cfg, stamp) == ("rewritten", 0)
+    assert gitref.check_state(cfg, {"sha": stamp["sha"], "dirty": False}) == ("rewritten", 0)
+
+
+def test_a_scope_asks_git_little_for_rewritten_stamps(repo, monkeypatch):
+    """Listed newest first, each older stamp lowered the index's bound and
+    rebuilt it, and the printer asked each stamp's successor a second time:
+    a list of rewritten checks took twice as long as at the base (2026-10-26)."""
+    cfg = Config(project_root=repo)
+    day, stamps = 86400, []
+    base = int(_run(repo, "show", "-s", "--format=%ct", "HEAD"))
+    for i, ago in enumerate((30, 20, 10)):              # three commits, ten days apart
+        at = {"GIT_AUTHOR_DATE": f"{base - ago * day} +0000",
+              "GIT_COMMITTER_DATE": f"{base - ago * day} +0000"}
+        (repo / f"s{i}").write_text("s")
+        _run(repo, "add", "-A")
+        _env_git(repo, at, "commit", "-q", "-m", f"s{i}")
+        stamps.append({"sha": _run(repo, "rev-parse", "HEAD"), "dirty": False})
+    parent = _run(repo, "rev-parse", "HEAD~3")
+    for p in stamps:                                    # a rebase: new committer dates
+        parent = _env_git(repo, {"GIT_AUTHOR_DATE": _raw_date(repo, p["sha"]), **_later(repo)},
+                          "commit-tree", f"{p['sha']}^{{tree}}", "-p", parent,
+                          "-m", _run(repo, "show", "-s", "--format=%s", p["sha"]))
+    _run(repo, "update-ref", "refs/heads/main", parent)
+    calls, real = [], gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda c, *a, **k: calls.append(a[0]) or real(c, *a, **k))
+    with gitref.heads_once():
+        for p in reversed(stamps):                      # newest first, as `list` reads
+            assert gitref.check_state(cfg, p)[0] == "rewritten"
+            assert gitref.successor(cfg, p) is not None
+    assert calls.count("log") <= 2, calls
+    assert calls.count("show") == len(stamps), calls
+
+
 def test_a_stamp_this_checkout_has_not_reached_is_ahead_not_diverged(repo):
     """The stamp is a DESCENDANT of HEAD: the same line of development, read
     from a checkout that lags it. `merge-base --is-ancestor sha HEAD` fails
@@ -294,6 +575,16 @@ def test_provenance_is_stamped_only_for_verdict_kinds(repo):
     assert gitref.provenance_stamp(cfg, K.Kind(status=True, verdict=True))["sha"]
 
 
+def test_a_head_stamp_carries_its_commits_author_date_subject_and_tree(repo):
+    """A rewrite keeps a commit's author date and subject, and they find its
+    successor. Read from git, they are gone once git prunes the old commit,
+    so the stamp keeps them, and the tree for the same-tree test."""
+    p = gitref.provenance_stamp(Config(project_root=repo), K.DEFAULT_KINDS["check"])
+    assert p["author_date"] == _run(repo, "show", "-s", "--format=%ad", "--date=raw", "HEAD")
+    assert p["subject"] == "c1"
+    assert p["tree"] == _run(repo, "rev-parse", "HEAD^{tree}")
+
+
 def test_provenance_override_runs_in_project_root(repo):
     """The override runs with cwd=project_root: a relative-path read only
     resolves if the command's cwd is set correctly."""
@@ -399,7 +690,7 @@ def test_subjects_asks_git_in_batches_and_finds_every_sha(repo, monkeypatch):
         _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", f"g{i}")
     shas = _run(repo, "rev-list", "HEAD").split()
     calls, real = [], gitref._git
-    monkeypatch.setattr(gitref, "_git", lambda *a: calls.append(a) or real(*a))
+    monkeypatch.setattr(gitref, "_git", lambda *a, **k: calls.append(a) or real(*a, **k))
     monkeypatch.setattr(gitref, "SHA_BATCH", 2)
     got = gitref.subjects(cfg, {*shas, "0" * 40})
     assert set(got) == set(shas)
@@ -793,3 +1084,20 @@ def test_a_read_only_serve_asks_git_each_question_once(repo, monkeypatch):
     gitref._git(cfg, "rev-parse", "--short", "HEAD")              # another question
     assert len(runs) == 4
     assert heads[0].returncode == 0 and heads[0].stdout == heads[1].stdout
+
+
+def test_markdown_files_are_the_tracked_and_new_not_ignored_and_read_only_the_tracked(
+        repo, monkeypatch):
+    """The Docs page lists them. The public demo shows only what git tracks:
+    the leak scan read those."""
+    cfg = Config(project_root=repo)
+    monkeypatch.setattr(gitref, "_ANSWERS", {})
+    (repo / "sub").mkdir()
+    for name in ("README.md", "sub/Guide.MD", "secret.md", "notes.txt"):
+        (repo / name).write_text("x\n")
+    (repo / ".gitignore").write_text("secret.md\n")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    assert sorted(gitref.markdown_files(cfg)) == ["README.md", "sub/Guide.MD"]
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    assert gitref.markdown_files(cfg) == ["README.md"]
+    assert gitref.markdown_files(repo / "nowhere") == []

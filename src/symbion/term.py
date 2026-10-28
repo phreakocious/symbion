@@ -159,24 +159,30 @@ def help_formatter(plain):
     return Help
 
 
-def painter(kinds=None):
+def painter(kinds=None, gui=None):
     """A `paint(text, role)` for summary.render_summary and the other plain
     renderers: the text in its role's colour, as the escape codes this
     terminal takes; plain text where _color_system finds none. The width
-    math stays the caller's: a colour code takes no column."""
+    math stays the caller's: a colour code takes no column. With `gui`, a
+    running serve's URL, an `id` opens the entry's page there, as in `list`."""
     system = _color_system()
     if system is None:
         return summ.plain
 
     def paint(text: str, role: str) -> str:
+        if role == "id":
+            return Style(color=_fit(META), link=gui and f"{gui}/notes?id={text}") \
+                .render(text, color_system=system)
         kind = role.removeprefix("kind:")
         c = ROLE[role] if kind == role else kind_hex(kind, (kinds or {}).get(kind))
         return Style(color=_fit(c)).render(text, color_system=system)
     return paint
 
 
-def _state(n, state) -> tuple[str, str]:
+def _state(n, state, successor=None) -> tuple[str, str]:
     st, dist = state
+    if st == "rewritten" and successor is not None:   # a rewrite moved the run's commit
+        return f"{st} {api.rewritten_words(successor)}", WARN
     if st == "unverifiable":
         return f"unverifiable ({api.why_unverifiable(n.provenance)})", BAD
     if st == "dangling":           # on no branch: the run must be redone
@@ -192,11 +198,13 @@ def _state(n, state) -> tuple[str, str]:
     return (st if dist is None else f"{st} {dist}"), WARN
 
 
-def _head(n, *, status, state, due, subject, head, width, gui, since=None) -> tuple[Text, int]:
+def _head(n, *, status, state, due, subject, head, width, gui, since=None,
+          successor=None, side=None) -> tuple[Text, int]:
     """The row's first line, and the column its target starts at. With a
     `width`, a line too long for it gives up the refs count first, then the
     end of its tags, then the end of its target. With `gui`, a running
-    serve's URL, the id opens the row's page there."""
+    serve's URL, the id opens the row's page there. `side` is another
+    side's, for a line that names no author."""
     faded = status == "resolved" or head is not None
     ink = (lambda c: FADED) if faded else (lambda c: c)
     # The link on the id's span only: a Text's own style reaches every span
@@ -221,7 +229,7 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None) -> tu
 
     post = Text()
     if state is not None and head is None:
-        word, color = _state(n, state)
+        word, color = _state(n, state, successor)
         post.append("  " + word, ink(color))
     if since:
         post.append(f"  {summ._count(since, 'commit')} since", ink(META))
@@ -230,6 +238,8 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None) -> tu
         post.append("  " + summ.due_phrase(due), ink(ROLE[summ.due_role(past, days)]))
     if head is not None:
         post.append(f"  superseded → {head.id[-ID_TAIL:]}", FADED)
+    if side:
+        post.append(f"  side {side}", ink(META))
 
     tags = Text("  " + " ".join(f"#{t}" for t in n.tags), ink(META)) if n.tags else Text()
     refs = Text()
@@ -298,15 +308,19 @@ def _details(n, head, state, written=None) -> list[Text]:
 
 
 def print_note(n, *, status, state, due, subject, head, full, gui=None, since=None,
-               seams=(), links=(), written=None) -> None:
+               seams=(), links=(), written=None, successor=None, side=None) -> None:
     """`status` is the chain head's, `state` api.verdict_state's pair and
     `due` store.due_state's pair for an open row, all computed by the caller
     the same way for the pipe line. `gui` is the URL of a serve on the row's
-    store; `seams` summary.seams' for the body; `links` summary.links'."""
+    store; `seams` summary.seams' for the body; `links` summary.links';
+    `successor` gitref.successor's for a `rewritten` state; `side` the side
+    of a row the reader's side did not raise, which the short view names
+    (the full one names it with its author)."""
     con = Console(highlight=False, markup=False, emoji=False, theme=MARKDOWN)
     width = None if full else con.width
     line, indent = _head(n, status=status, state=state, due=due, subject=subject,
-                         head=head, width=width, gui=gui, since=since)
+                         head=head, width=width, gui=gui, since=since, successor=successor,
+                         side=None if full else side)
     if not full:
         con.print(_fitted(line), no_wrap=True, overflow="ellipsis", crop=True)
         teaser = _teaser(n, status == "resolved" or head is not None, indent, width)

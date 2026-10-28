@@ -18,7 +18,8 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
   copy's `src/` first.
 - A `# ponytail: <limit, upgrade path>` comment marks a deliberate simplification.
 - State the mechanism, not where you saw it: no names, paths or data from your other
-  projects in code, tests, docs or commit messages.
+  projects in code, tests, docs or commit messages. No count from any store, this one
+  included; a fixture's zone is never your own.
 
 ## Where things are
 

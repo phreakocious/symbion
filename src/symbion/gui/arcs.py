@@ -11,8 +11,8 @@ from .. import api
 from .. import store as S
 from .. import summary as summ
 from .filters import href
-from .notes import (ago, bare, demo_says, edit_dialog, id_link, kind_class, target_headline,
-                    target_link)
+from .notes import (actions_bar, ago, bare, demo_says, due_chip, edit_dialog, id_link,
+                    kind_class, reading, refusal_shown, target_headline, target_link)
 
 
 def seed_all_scopes(ctx) -> set:
@@ -35,14 +35,17 @@ def seedable(ctx, kind: str = "task") -> bool:
     return bool(spec and spec.status and not spec.parked and not spec.verdict)
 
 
-def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
+def checklist(ctx, arc_id: str, refresh, *, author: str, seen=None) -> None:
     """Head tasks for an arc, not-done first, then by target name, then in
     the order written. Each row carries its clipped body: six boxes on one
     file drew six identical target lines (2026-09-27). A row is the
-    notebook's card, its box the card's resolve box, ticked when done. A
-    bare row (a seeded box) is one line led by its target, and the kind
-    shows only when the arc holds more than one (every row said `task`)."""
-    items = S.arc_items(S.load(ctx.store_dir), arc_id)
+    notebook's card: its box the card's resolve box on the right, ticked
+    when done, and the card's star and edit, due date and tags (on the left
+    with none of those, a starred box looked like any other: the user,
+    2026-10-27). A bare row (a seeded box) is one line led by its target,
+    and the kind shows only when the arc holds more than one (every row said
+    `task`). `seen` is the page's notes.reading."""
+    items = S.arc_items((seen or reading(ctx)).loaded, arc_id)
     items.sort(key=lambda n: (S.read_status(n) == "resolved",
                               (n.target.name or "").lower(), S.written_at(n), n.id))
     if not items:
@@ -60,19 +63,17 @@ def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
                 return
             if demo_says("reopens the box" if done else "resolves the box"):
                 return
-            api.supersede(ctx, fu.id, author=author,
-                          status="open" if done else "resolved")
-            refresh()
+            with refusal_shown():
+                api.supersede(ctx, fu.id, author=author,
+                              status="open" if done else "resolved")
+                refresh()
 
         with ui.element("div").classes(f"sb-note w-full {kind_class(fu.kind)}"
+                                       " sb-has-actions sb-resolvable"
+                                       + (" sb-starred" if "priority" in fu.tags else "")
                                        + (" sb-done" if done else "")
                                        + (" sb-box" if bare(fu) else "")) \
                 .props(f"data-id={fu.id}").mark("checklist-row"):
-            ui.button(icon="check", on_click=_toggle) \
-                .props(f'flat round dense aria-label="{"reopen" if done else "resolve"}"') \
-                .classes("sb-resolve" + (" sb-resolved" if done else "")) \
-                .tooltip("reopen" if done else "resolve") \
-                .mark("checklist-toggle", f"toggle-{fu.id}")   # per-row: find() returns a SET
             with ui.element("div").classes("sb-note-main"):
                 if not bare(fu):
                     # The text is the link to the whole note, as a clipped
@@ -85,17 +86,27 @@ def checklist(ctx, arc_id: str, refresh, *, author: str) -> None:
                 with ui.element("div").classes("sb-note-foot"):
                     if bare(fu):
                         target_headline(fu)
+                    if fu.due:
+                        due_chip(fu, S.read_status(fu))
                     if mixed:
                         ui.label(fu.kind).classes(f"sb-chip sb-kindchip {kind_class(fu.kind)}") \
                             .mark("checklist-kind")
                     if not bare(fu):
                         target_link(fu)
+                    for t in fu.tags:
+                        ui.link(f"#{t}", href(tag=t)).classes("sb-tag").mark(f"tag-{t}")
                     with ui.element("span").classes("sb-note-by"):
                         if done:      # the tick's row: its author ticked it, then
                             ui.label(fu.author).classes("sb-note-meta")
                             ui.label(ago(fu.created_at)).classes("sb-note-meta") \
                                 .tooltip(S.shown(fu.created_at))
                         id_link(fu)
+            ui.button(icon="check", on_click=_toggle) \
+                .props(f'flat round dense aria-label="{"reopen" if done else "resolve"}"') \
+                .classes("sb-resolve" + (" sb-resolved" if done else "")) \
+                .tooltip("reopen" if done else "resolve") \
+                .mark("checklist-toggle", f"toggle-{fu.id}")   # per-row: find() returns a SET
+            actions_bar(ctx, fu, refresh, author=author)
 
 
 def index(ctx, *, author: str) -> None:
@@ -123,9 +134,10 @@ def index(ctx, *, author: str) -> None:
                 return
             if demo_says("makes the arc"):
                 return
-            act = api.create_arc(ctx, name.value, desc.value or "",
-                                      scope.value, author=author)
-            ui.navigate.to(f"/arc?id={quote(act.id)}")
+            with refusal_shown():
+                act = api.create_arc(ctx, name.value, desc.value or "",
+                                     scope.value, author=author)
+                ui.navigate.to(f"/arc?id={quote(act.id)}")
 
         create.on_click(_create)
 

@@ -144,8 +144,10 @@ Hermes Agent has no hook to run: start a session after step 3, and its first
 command should be `symbion summary`.
 
 `session_start.sh` prints one JSON line: the text in the table below is its
-`additionalContext`, what the agent reads, and its `systemMessage` is the one
-line you see at session start. The not-on-PATH line and the `error:` lines
+`additionalContext`, what the agent reads, and its `systemMessage` is what you
+see at session start: one line, and in a [shared store](#share-a-store) above it
+the pull's lines that say `symbion.toml` changed, with the command that shows
+the change, or that a clone runs an older symbion. The not-on-PATH line and the `error:` lines
 print as plain text, and the PowerShell hook prints all of it that way.
 
 | output | meaning |
@@ -247,6 +249,63 @@ wrote; at a plain terminal, your author's. Two sessions on one store each commit
 their own. It names the entries it left and the newest one's age, and `commit --all`
 takes them too, for a session that ended without committing.
 
+## Share a store
+
+Two people, each with their own agents, can keep one store: one git remote and a
+clone for each person. Each person's session start reads their own side's entries,
+and one line says the other side wrote something. The other side's entries arrive
+at a pull, which session start and `commit` run for you.
+
+Shared stores are experimental. A later release may change them, or remove them.
+
+**1. Upgrade symbion** on every machine that holds a clone, first. A symbion from
+before shared stores gives an edit the wrong side.
+
+**2. Switch it on.** The store needs a remote, and the clone needs a `user.name`:
+that name is the side, so each person's must differ. In the first person's clone:
+
+```bash
+git -C ../<repo>-notes remote add origin <url>      # if the store has no remote yet
+git -C ../<repo>-notes config user.name "First Person"
+```
+
+Then add `shared = true` to `../<repo>-notes/symbion.toml`, at the top of the file,
+above the first `[table]` header, under `default_branch` if the file has one:
+
+```toml
+default_branch = "main"
+shared = true
+```
+
+A key below a header belongs to that table: the file `init` writes ends inside
+`[kinds]`, so a line added at its end breaks the store. Then commit, which in a
+shared store also pulls and pushes:
+
+```bash
+symbion commit -m "store: shared"
+```
+
+**3. The second person clones the store** beside their checkout of the project,
+where symbion looks for it (`../<repo>-notes`), and names their side in the clone:
+
+```bash
+git clone <url> ../<repo>-notes
+git -C ../<repo>-notes config user.name "Second Person"
+git -C ../<repo>-notes fetch
+```
+
+The clone brings the `symbion.toml` of the first person, whose commands symbion
+runs: read it first. Run the `fetch` once by hand, on each machine. Session start
+fetches with no terminal, so an unknown ssh host key, or a passphrase with no
+agent, fails there rather than asking.
+
+From then on session start pulls, and `commit` pulls, then pushes. Run `pull` or
+`push` yourself when a line asks: `add`, `resolve` and `supersede` say `origin has N
+new store commits: symbion pull`, and a `commit` that could not reach origin says
+to pull, then push. A pull that cannot finish (a conflict in `symbion.toml` or in
+a file under `docs/`) prints the git commands that end it.
+[The reference](reference.md#shared-stores) has the rest.
+
 ## Browse it (optional)
 
 ```bash
@@ -298,11 +357,13 @@ to an entry stays good (`serve` prints it, and `--port` picks another). It has:
   diff; a tag index, and arc checklists you tick;
 - commit and push buttons, shown while there is something to commit or push.
   The commit button takes only the entries written as you, and the `docs/`
-  files they name, so an agent's pending entries stay for it to commit;
-- a reload button, shown when an entry was written or edited after the page
-  was drawn: by an agent, at a terminal, or in another tab. The page does not
-  redraw by itself. In the installed app, the icon's badge counts the entries
-  others wrote since you last opened a page.
+  files they name, so an agent's pending entries stay for it to commit. In a
+  shared store both buttons pull, then push, as `commit` does at a terminal;
+- a button with a count, shown when an entry was written or edited after the
+  page was drawn: by an agent, at a terminal, or in another tab. The page does
+  not redraw by itself. The button lists those entries beside the page, with
+  a reload at the top. In the installed app, the icon's badge counts the
+  entries others wrote since you last opened a page.
 
 Chrome and Edge can install the page as an app (the install icon in the
 address bar). Each store is an app of its own, because each has its own port.

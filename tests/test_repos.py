@@ -691,6 +691,24 @@ def test_a_check_tip_lists_the_commits_of_its_repo(ws, sym, monkeypatch):
     assert "net moves" in check_tip(ctx.cfg, n.provenance, state, distance)
 
 
+def test_a_rewritten_stamp_is_looked_up_in_its_own_repo(ws, sym, monkeypatch):
+    """Read from another repo, the stamp's successor is still searched for
+    where the stamp was taken, by the state and by the printers that name
+    the successor."""
+    nid = _check(sym, "net:main.tf", at="ansible")
+    net = ws / "tf-net"
+    (net / "x.tf").write_text("x\n")
+    _git(net, "add", "-A")
+    _git(net, "commit", "-q", "--amend", "--no-edit")
+    monkeypatch.chdir(ws / "ansible")
+    ctx, n = api.resolve(), _heads(ws)[0]
+    assert gitref.check_state(ctx.cfg, n.provenance) == ("rewritten", 0)
+    rc, out, err = sym("show", nid, "--json", at="ansible")
+    row = json.loads(out)[0]
+    assert (row["state"], row.get("successor_state"), row.get("same_tree")) == (
+        "rewritten", "current", False), err
+
+
 def test_a_scope_reads_each_repos_head_once(ws, sym, monkeypatch):
     """A page of checks stamped in a repo the serve does not stand in read
     that repo's HEAD once a row: a home page of 200 took 2.07 s against

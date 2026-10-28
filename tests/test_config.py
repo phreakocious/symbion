@@ -184,6 +184,41 @@ def test_load_refuses_a_local_only_that_is_not_a_boolean(repo, tmp_path):
     assert config.load(store, project_root=repo).local_only is True
 
 
+def test_shared_is_a_known_bool_key(tmp_store):
+    assert config.load(tmp_store, project_root=tmp_store).shared is False
+    (tmp_store / "symbion.toml").write_text("shared = true\n")
+    cfg = config.load(tmp_store, project_root=tmp_store)
+    assert cfg.shared is True and cfg.unknown_keys == ()
+
+
+def test_shared_with_local_only_is_refused(tmp_store):
+    (tmp_store / "symbion.toml").write_text("shared = true\nlocal_only = true\n")
+    with pytest.raises(ValueError) as e:
+        config.load(tmp_store, project_root=tmp_store)
+    assert "shared" in str(e.value) and "local_only" in str(e.value)
+
+
+def test_shared_must_be_a_bool(tmp_store):
+    (tmp_store / "symbion.toml").write_text('shared = "yes"\n')
+    with pytest.raises(ValueError, match="write true or false, unquoted"):
+        config.load(tmp_store, project_root=tmp_store)
+
+
+def test_load_names_each_key_no_reader_takes(repo, tmp_path):
+    """`local_onyl = true` read as unset in silence, and `commit` still said
+    "no remote" (2026-10-25). Every key symbion reads loads with none named."""
+    store = tmp_path / "myproj-notes"
+    store.mkdir()
+    (store / "symbion.toml").write_text(
+        f"project_root = '{repo}'\nwork_root = '{repo}'\ndefault_branch = \"main\"\n"  # literal: C:\Users
+        'local_only = true\ncommand_timeout = 5\ngit_name = "n"\ngit_email = "n@n"\n'
+        'stale_target_noun = "x"\n[catalogs]\n[resolvers]\n[renames]\n[repos]\n'
+        '[provenance]\ncommand = "x"\n[kinds]\nnote = {}\n')
+    assert config.load(store, project_root=repo).unknown_keys == ()
+    (store / "symbion.toml").write_text('local_onyl = true\n[provenance]\ncomand = "x"\n')
+    assert config.load(store, project_root=repo).unknown_keys == ("local_onyl", "provenance.comand")
+
+
 @pytest.mark.parametrize("toml, says", [
     ('command_timeout = "5"\n', "command_timeout"),
     ("command_timeout = 0\n", "command_timeout"),

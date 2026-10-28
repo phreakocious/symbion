@@ -300,6 +300,17 @@ def test_init_starter_toml_carries_a_resolvers_block_that_parses(repo, tmp_path)
     assert tomllib.loads(text).get("resolvers", {}) == {}
 
 
+def test_init_starter_toml_offers_shared_above_its_first_table(repo, tmp_path):
+    """The setting was findable only in the docs; uncommented in place, it reads."""
+    d = tmp_path / "store"
+    assert run("init", "--yes", store_dir=d) == 0
+    toml = d / "symbion.toml"
+    text = toml.read_text()
+    assert "\n# shared = true" in text
+    toml.write_text(text.replace("\n# shared = true", "\nshared = true", 1))
+    assert store.shared(d)
+
+
 def test_a_file_target_on_a_new_store_names_the_lines_that_declare_it(repo, tmp_path, capsys):
     """A new store refused `--target file:…` with "catalog types are declared
     in … under [catalogs]", and the README leads with file notes (2026-10-09).
@@ -458,7 +469,27 @@ def test_init_leaves_a_project_that_reads_a_store_on_it(repo, tmp_path, capsys, 
 
     assert run("init", "--yes", "--repoint", store_dir=scratch) == 0
     assert (repo / ".symbion").read_text().strip() == "../scratch-notes"
-    assert f"no longer read from here" in capsys.readouterr().out
+    assert "no longer read from here" in capsys.readouterr().out
+
+
+def test_init_leaves_a_tracked_pointer_whose_store_is_missing_here(repo, tmp_path, capsys):
+    """A shared-store trial, 2026-10-27: a person in another folder layout ran
+    `--dir <their store> init --yes`, and init rewrote the repo's committed
+    `.symbion` to an absolute path. Missing here is not broken: it names the
+    store for every clone in the team's layout, and the next `git commit -a`
+    would break theirs. So a tracked pointer changes only with --repoint."""
+    (repo / ".symbion").write_text("../team-notes\n")
+    _git(repo, "add", ".symbion")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "pointer")
+    mine = tmp_path / "elsewhere" / "team-notes"
+    assert run("init", "--yes", store_dir=mine) == 0
+    assert store.exists(mine), "the store it names is what was asked for"
+    assert (repo / ".symbion").read_text() == "../team-notes\n"
+    out = capsys.readouterr().out
+    assert f"not writing {repo / '.symbion'}: git tracks it" in out and "--repoint" in out, out
+
+    assert run("init", "--yes", "--repoint", store_dir=mine) == 0
+    assert (repo / ".symbion").read_text().strip() == mine.resolve().as_posix()
 
 
 def test_init_without_yes_lists_each_change_and_makes_none(repo, tmp_path, capsys):

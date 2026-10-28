@@ -2,7 +2,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import sysconfig
 from pathlib import Path
 
@@ -573,7 +572,7 @@ def test_a_gotcha_line_says_its_age_its_files_churn_and_how_to_retire_it(git_rep
                             "tool_input": {"file_path": f"{git_repo}/{f}"}})
 
     said = line("serve.py")
-    assert f"is on file:serve.py (written just now; the file has changed in 1 commit since): " \
+    assert "is on file:serve.py (written just now; the file has changed in 1 commit since): " \
            "serve.py trap" in said, said
     assert said.endswith(f" (if it no longer holds: `symbion supersede {tails['serve.py']} "
                          "--add-tag retired`)"), "a gotcha that fits has no more to show"

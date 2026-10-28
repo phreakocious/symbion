@@ -13,6 +13,9 @@ The user asked for an undo, in the CLI and the GUI. Two cases carry it:
   takes it back except a second write, which leaves a trace of both.
 - **An edit in place.** Before `symbion commit`, an edit to your own row rewrites
   it. The text it replaced is on no disk, so a wrong edit cannot be recovered.
+  (2026-10-26: no edit rewrites a row now, so this case is gone. Undo also takes
+  back a secret in the last write after a pre-commit hook refuses the commit: a
+  refused commit no longer ends the level.)
 
 A general undo fights the append-only store. Taking back committed work is a
 new row that reverts it, and needs no new verb.

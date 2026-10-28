@@ -91,7 +91,7 @@ async def test_the_commit_button_shows_a_hooks_refusal(user: User, ctx_with_note
     words = refusing_hook(tmp_path)
     await user.open("/notes")
     user.find(marker="commit-button").click()
-    await user.should_see(words)
+    await user.should_see(words, retries=40)    # the handler is async: it lands after click()
     assert not user.notify.contains("nothing to commit")
 
 
@@ -175,7 +175,9 @@ async def _until(cond, seconds: float = 3.0) -> None:
 async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_notes, tmp_path,
                                                        monkeypatch):
     """A page drew the store once: an entry an agent wrote showed only after
-    a reload, and nothing said one was due (the user's pick, 2026-10-16)."""
+    a reload, and nothing said one was due (the user's pick, 2026-10-16). The
+    button lists those entries in the peek: a reload of a filtered page, as
+    here, shows neither (the user, 2026-10-27)."""
     from symbion.gui import chrome
     monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
     def words():                         # user.find raises on none
@@ -183,7 +185,7 @@ async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_note
             return [[e.text for e in b.default_slot.children]
                     for b in ElementFilter(marker="stale-button")]
 
-    await user.open("/notes")
+    await user.open("/notes?tag=red")
     await asyncio.sleep(0.3)                                    # a few ticks
     assert words() == []
     api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
@@ -193,7 +195,13 @@ async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_note
     api.supersede(ctx_with_notes, beta.id, author="sam", body="beta revised")
     await _until(lambda: words() == [["2", "new or changed"]])
     user.find(marker="stale-button").click()
-    await user.should_see("gamma")
+    with user.scope(marker="peek"):
+        await user.should_see("1 new entry and 1 changed entry since this page was drawn")
+        await user.should_see("gamma")
+        await user.should_see("beta revised")
+        await user.should_not_see("alpha body")
+    await user.should_see(marker="stale-button")                # the page is as it was
+    user.find(marker="drift-reload").click()
     await asyncio.sleep(0.3)
     await user.should_not_see(marker="stale-button")
 
@@ -249,7 +257,7 @@ async def test_the_commit_button_commits_only_its_authors_rows(user: User, ctx_w
     (button,) = user.find(marker="commit-button").elements
     assert "1" in [e.text for e in button.default_slot.children]
     user.find(marker="commit-button").click()
-    await user.should_see("committed: entries ada 1")
+    await user.should_see("committed: entries ada 1", retries=40)
     assert [r["author"] for r in store.pending_rows(tmp_path)] == ["sam"]
 
 
@@ -359,9 +367,7 @@ async def test_a_tail_several_ids_end_in_lists_each(user: User, repo, tmp_path, 
 async def test_a_notes_own_view_lists_its_earlier_versions(user: User, ctx_with_notes):
     """Every version is kept; the GUI showed only the last one."""
     first = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
-    api.commit(ctx_with_notes, "c", everyone=True)          # each edit its own row (store.rewritable)
     mid = api.supersede(ctx_with_notes, first, author="ada", body="beta two").id
-    api.commit(ctx_with_notes, "c", everyone=True)
     last = api.supersede(ctx_with_notes, mid, author="ada", body="beta three").id
     await user.open(f"/notes?id={last}")
     await user.should_see("earlier versions (2)")
@@ -556,7 +562,6 @@ async def test_object_view_handles_a_name_with_a_slash(user: User, repo, tmp_pat
     await user.should_see("slashed target")
 
 
-from symbion import store   # noqa: E402
 
 
 async def test_a_recent_board_holds_young_rows_and_those_current_at_head(
@@ -671,9 +676,9 @@ async def test_the_summary_leads_with_what_waits_on_the_person(user: User, ctx_w
     assert boards["open task"] == [sams], boards
 
 
-def _q(ctx, body, author="sam", kind="question", options=None):
+def _q(ctx, body, author="sam", kind="question", options=None, **extra):
     return api.add(ctx, {"kind": kind, "target": {"type": "project", "name": None},
-                         "body": body, **({"options": options} if options else {})},
+                         "body": body, **({"options": options} if options else {}), **extra},
                    author=author).id
 
 
@@ -723,7 +728,7 @@ async def test_a_question_not_waiting_on_the_person_lists_its_options(user: User
     """Where no buttons draw (the person's own question, one they answered),
     the options show as a meta row, as measurements do: the answer below
     reads against its alternatives, and the card shows what `show` prints."""
-    own = _q(ctx_with_notes, "Mine?", author="ada", options=["keep", "drop"])
+    _q(ctx_with_notes, "Mine?", author="ada", options=["keep", "drop"])
     answered = _q(ctx_with_notes, "Theirs?", options=["yes", "no"])
     api.supersede(ctx_with_notes, answered, author="ada", append_body="no")
     await user.open("/notes")
@@ -760,6 +765,26 @@ async def test_someone_elses_options_on_the_persons_question_draw_no_answers(use
     api.supersede(ctx_with_notes, own, author="sam", append_body="keep, I think")
     await user.open("/notes")
     await user.should_see(marker="answer-row")
+
+
+async def test_no_resolve_ring_beside_a_questions_answers(user: User, ctx_with_notes):
+    """The ring beside the answer buttons closed the question with no answer
+    below it, and the pick was lost (2026-10-24). The asker acts on the
+    answer and resolves the question; the edit dialog still closes it."""
+    q = _q(ctx_with_notes, "Ship the fix?", options=["ship it", "hold"])
+
+    def rings_on(nid):
+        (card,) = [e for e in user.find(marker="note-row").elements if e._props.get("data-id") == nid]
+        return set(card.descendants()) & user.find(marker="note-resolve").elements
+
+    await user.open("/notes")
+    await user.should_see(marker="answer-row")
+    bug = next(n.id for n in store.heads(store.load(ctx_with_notes.store_dir)) if n.kind == "bug")
+    assert (len(rings_on(q)), len(rings_on(bug))) == (0, 1)
+    user.find(marker="answer-option", content="hold").click()
+    await user.open("/notes")
+    await user.should_not_see(marker="answer-row")
+    assert len(rings_on(q)) == 1         # ada's word is in: the ring is back for the asker's view
 
 
 def _peek(user: User, nid: str) -> None:
@@ -852,6 +877,12 @@ async def test_every_key_and_palette_action_presses_a_drawn_element(
     with user.scope(marker="peek"):
         await user.should_see(marker="answer-field")
     missing = sorted(s for s in wanted if not _finds([user.client.layout], s))
+    # A question waiting on ada draws no ring (2026-10-24): its key is checked on the bug.
+    _peek(user, next(n.id for n in store.heads(store.load(ctx_with_notes.store_dir))
+                     if n.kind == "bug"))
+    with user.scope(marker="peek"):
+        await user.should_see("beta body")
+    missing = [s for s in missing if not _finds([user.client.layout], s)]
     assert not missing, missing
 
 
@@ -1235,11 +1266,17 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
     the documents we know about". Every markdown file an entry is on or
     cites: the repo's, then the store's docs/, the most named first, each with
     its entries and the open ones among them, and a read button where the
-    viewer can show it. Past BOARD_ROWS, a link shows them all."""
+    viewer can show it; then those no entry names, but for an ignored one
+    (the user, 2026-10-27). Past BOARD_ROWS, a link shows them all."""
     ctx = api.resolve(str(tmp_path))
     (repo / "README.md").write_text("# hi\n")
+    (repo / "sub").mkdir()
+    (repo / "sub" / "Guide.MD").write_text("# guide\n")
+    (repo / ".gitignore").write_text("secret.md\n")
+    (repo / "secret.md").write_text("# not listed\n")
     (tmp_path / "docs").mkdir(exist_ok=True)
     (tmp_path / "docs" / "plan.md").write_text("# plan\n")
+    (tmp_path / "docs" / "loose.md").write_text("# loose\n")
     for kind, typ, name, refs in (("task", "item", "README.md", []),
                                   ("note", "item", "x", [("item", "README.md")]),
                                   ("task", "item", "gone.md", []),
@@ -1251,6 +1288,8 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
     await user.open("/")
     await user.should_see(marker="place-docs")
     await user.open("/docs")
+    await user.should_see("3 markdown files that entries name, the most named first; "
+                          "then 2 that none do")
     got = {}
     for board in ("docs-repo", "docs-store"):
         with user.scope(marker=board):
@@ -1259,9 +1298,11 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
             got[board] = [(a.text, " ".join(c.text for c in n.default_slot.children))
                           for a, n in zip(links, counts)]
             got[board + " read"] = len(user.find(marker="file-open").elements)
-    assert got == {"docs-repo": [("item: README.md", "2 · 1 open"), ("item: gone.md", "1 · 1 open")],
-                   "docs-repo read": 1,
-                   "docs-store": [("plan.md", "1 entry")], "docs-store read": 1}
+    assert got == {"docs-repo": [("item: README.md", "2 · 1 open"), ("item: gone.md", "1 · 1 open"),
+                                 ("sub/Guide.MD", "0 entries")],
+                   "docs-repo read": 2,
+                   "docs-store": [("plan.md", "1 entry"), ("loose.md", "0 entries")],
+                   "docs-store read": 2}
     monkeypatch.setitem(build_page.__globals__, "BOARD_ROWS", 2)
     for i in range(2):
         api.add(ctx, {"kind": "note", "target": {"type": "doc", "name": f"d{i}.md"},
@@ -1270,10 +1311,10 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
     with user.scope(marker="docs-store"):
         assert len(user.find(marker="doc-link").elements) == 2
         (more,) = user.find(marker="docs-more").elements
-        assert (more.text, more.props["href"]) == ("+1 more", "/docs?all=1")
+        assert (more.text, more.props["href"]) == ("+2 more", "/docs?all=1")
     await user.open("/docs?all=1")
     with user.scope(marker="docs-store"):
-        assert len(user.find(marker="doc-link").elements) == 3
+        assert len(user.find(marker="doc-link").elements) == 4
         await user.should_not_see(marker="docs-more")
 
 
@@ -1519,7 +1560,8 @@ async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
     """The user, 2026-10-02: ".md files should be viewable in a modal
     markdown viewer". From the card's target and refs, and the file's page."""
     ctx = api.resolve(str(tmp_path))
-    (repo / "README.md").write_text("# Read me\n\nthe *whole* file")
+    (repo / "README.md").write_text("# Read me\n\nthe *whole* file\n\n"
+                                    "```mermaid\nflowchart LR\n  a --> b\n```\n")
     api.add(ctx, {"kind": "note", "target": {"type": "item", "name": "README.md"},
                   "body": "about it"}, author="ada")
     api.add(ctx, {"kind": "note", "target": {"type": "item", "name": "other.md"},
@@ -1538,6 +1580,10 @@ async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
     await user.should_see(marker="file-view")
     (view,) = user.find(marker="file-view").elements
     assert "the *whole* file" in view.content
+    # a diagram, drawn in mermaid's dark theme (the user, 2026-10-27); the
+    # fixture runs no JS, so the drawing itself was checked in a browser
+    assert view.props["use-mermaid"]
+    assert "```mermaid\n%%{init: {'theme': 'dark'}}%%\nflowchart LR" in view.content
     await user.open("/object?type=item&name=README.md")
     labels = [b.props.get("label") for b in user.find(marker="file-open").elements]
     assert sorted(labels, key=str) == ["", "read the file"]   # the page's own, the ref's
@@ -1789,7 +1835,6 @@ async def test_a_page_of_check_badges_reads_head_once(user: User, repo, tmp_path
     aid = api.create_arc(ctx, "A", "", "mixed", author="ada").id
     api.add(ctx, {"kind": "check", "target": {"type": "arc", "name": aid},
                   "checked": "about the arc", "result": "ok"}, author="ada")
-    api.commit(ctx, "c", everyone=True)                     # each edit its own row (store.rewritable)
     last = api.supersede(ctx, ids[0], author="ada", result="still ok").id
     build_page(ctx, author="ada")
     calls = []
@@ -2066,3 +2111,243 @@ async def test_a_read_only_page_polls_no_git_and_names_no_path(user: User, ctx_w
     await user.open("/")
     await user.should_not_see(marker="git-poll")
     await user.should_not_see(str(ctx_with_notes.store_dir))
+
+
+def _side(store_dir, name):
+    subprocess.run(["git", "-C", str(store_dir), "config", "user.name", name], check=True)
+
+
+@pytest.fixture
+def shared(repo, tmp_path):
+    """A shared store read from side A: `_side` switches the side a write is made as."""
+    (tmp_path / "symbion.toml").write_text("shared = true\n")
+    _side(tmp_path, "A")
+    ctx = api.resolve(str(tmp_path))
+    build_page(ctx, author="ada")
+    return ctx
+
+
+def _both_sides_ask(ctx, store_dir):
+    """(mine, theirs): an open question from each side, by an agent called sam."""
+    mine = _q(ctx, "is it blue")
+    _side(store_dir, "B")
+    theirs = _q(ctx, "is it red")
+    _side(store_dir, "A")
+    return mine, theirs
+
+
+async def test_home_leaves_out_the_other_sides_questions(user: User, shared, tmp_path):
+    """The person's page is their session start: what waits on them, and what
+    is due, are their side's. The boards below it are the store, both sides."""
+    mine, theirs = _both_sides_ask(shared, tmp_path)
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    due_mine = _q(shared, "ours", kind="task", due=tomorrow)
+    _side(tmp_path, "B")
+    due_theirs = _q(shared, "theirs", kind="task", due=tomorrow)
+    _side(tmp_path, "A")
+    await user.open("/")
+    boards = _board_ids(user)
+    assert boards["waiting on you"] == [mine], boards
+    assert boards["open question"] == [theirs], boards
+    assert boards["due soon"] == [due_mine], boards
+    assert boards["open task"] == [due_theirs], boards
+
+
+async def test_home_shows_the_readers_sides_wrap(user: User, shared, tmp_path):
+    _q(shared, "one")
+    api.commit(shared, "A's handoff", everyone=True, wrap=True)
+    _side(tmp_path, "B")
+    _q(shared, "two")
+    api.commit(shared, "B's handoff", everyone=True, wrap=True)
+    _side(tmp_path, "A")
+    await user.open("/")
+    await user.should_see("A's handoff")
+    await user.should_not_see("B's handoff")
+
+
+async def test_notes_name_the_other_sides_author(user: User, shared, tmp_path):
+    _both_sides_ask(shared, tmp_path)
+    await user.open("/notes")
+    await user.should_see("sam (B)")
+
+
+async def test_the_arc_page_names_the_other_sides_author(user: User, shared, tmp_path):
+    act = api.create_arc(shared, "camp", "d", "item", author="ada")
+    _side(tmp_path, "B")
+    (box,) = api.seed(shared, act.id, "item", ["widget"], author="sam")
+    api.supersede(shared, box.id, author="sam", status="resolved")
+    _side(tmp_path, "A")
+    await user.open(f"/arc?id={act.id}")
+    await user.should_see("sam (B)")
+
+
+async def test_the_other_sides_question_has_no_answer_box(user: User, shared, tmp_path):
+    """It waits on the other side's person, not on this one."""
+    mine, theirs = _both_sides_ask(shared, tmp_path)
+    await user.open(f"/notes?id={mine}")
+    await user.should_see(marker="answer-field")
+    await user.open(f"/notes?id={theirs}")
+    await user.should_not_see(marker="answer-field")
+
+
+async def test_the_commit_button_shows_a_missing_user_name(user: User, shared, tmp_path):
+    """A shared store's write names the clone's missing user.name; the button raised it."""
+    _q(shared, "pending", author="ada")
+    subprocess.run(["git", "-C", str(tmp_path), "config", "--unset", "user.name"], check=True)
+    await user.open("/notes")
+    user.find(marker="commit-button").click()
+    await user.should_see("config user.name NAME", retries=40)
+
+
+def _git(d, *args) -> str:
+    return subprocess.run(["git", "-C", str(d), *args], check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+@pytest.fixture
+def synced(shared, tmp_path, tmp_path_factory):
+    """`shared` pushed to an origin, and B's clone of it, which writes there."""
+    origin = tmp_path_factory.mktemp("origin") / "store.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "shared")
+    _git(tmp_path, "remote", "add", "origin", str(origin))
+    _git(tmp_path, "push", "-q", "-u", "origin", "HEAD")
+    b = tmp_path_factory.mktemp("b") / "store"
+    subprocess.run(["git", "clone", "-q", str(origin), str(b)], check=True, capture_output=True)
+    _side(b, "B")
+    return shared, b, origin
+
+
+def _publish(b, body) -> str:
+    """A row B writes, commits and pushes."""
+    rid = _q(api.resolve(str(b)), body)
+    api.commit(api.resolve(str(b)), "B's", everyone=True)
+    _git(b, "push", "-q")
+    return rid
+
+
+async def test_a_shared_stores_commit_button_pulls_then_pushes(user: User, synced, tmp_path):
+    """As `commit` does at a terminal; the GUI's commit stayed on this disk."""
+    ctx, b, origin = synced
+    theirs, mine = _publish(b, "from B"), _q(ctx, "from A", author="ada")
+    await user.open("/notes")
+    user.find(marker="commit-button").click()
+    await user.should_see("pushed 2 commits to origin", retries=40)
+    held = _git(origin, "show", f"{_git(tmp_path, 'branch', '--show-current')}:notes.jsonl")
+    assert theirs in held and mine in held and gitref.unpushed(tmp_path) == 0
+
+
+async def test_a_shared_stores_push_button_pulls_first(user: User, synced, tmp_path):
+    """Once origin moved, a bare push was refused with git's own `git pull` hint."""
+    ctx, b, origin = synced
+    _q(ctx, "from A", author="ada")
+    api.commit(ctx, "A's", everyone=True)           # as at a terminal, before origin moved
+    theirs = _publish(b, "from B")
+    await user.open("/notes")
+    user.find(marker="push-button").click()
+    await user.should_see("pulled 1 commit from origin/", retries=40)
+    await user.should_see("pushed 2 commits to origin", retries=40)
+    assert theirs in (tmp_path / "notes.jsonl").read_text() and gitref.unpushed(tmp_path) == 0
+
+
+@pytest.mark.parametrize("s, last", [
+    (api.Synced(api.Pulled(conflicts=["symbion.toml"])),
+     "not pushed: git cannot merge symbion.toml; `symbion pull` at a terminal names the "
+     "commands that finish the merge"),
+    (api.Synced(api.Pulled(), timed_out=True), "not pushed: the push ran too long and was stopped"),
+    (api.Synced(api.Pulled(), pushed=subprocess.CompletedProcess([], 1, "", "! [rejected] x\n")),
+     "push failed: ! [rejected] x")])
+def test_a_shared_stores_sync_says_each_way_its_push_waits(ctx_with_notes, s, last):
+    from symbion.gui import chrome
+    said, failed = chrome._synced(ctx_with_notes, s)
+    assert failed and said[-1] == last, said
+
+
+async def test_a_shared_stores_commit_says_why_its_push_waits(user: User, synced, tmp_path):
+    ctx, b, origin = synced
+    _git(tmp_path, "remote", "set-url", "origin", str(tmp_path / "nowhere.git"))
+    _q(ctx, "from A", author="ada")
+    await user.open("/notes")
+    user.find(marker="commit-button").click()
+    await user.should_see("not pushed: the pull failed: git fetch origin failed", retries=40)
+    assert gitref.unpushed(tmp_path) == 1 and not store.pending_rows(tmp_path)
+
+
+@pytest.mark.parametrize("page", ["/targets", "/object?type=item&name=widget", "/arc?id=camp"])
+async def test_every_page_that_prints_rows_names_the_other_sides_author(user: User, shared,
+                                                                        tmp_path, page):
+    api.create_arc(shared, "camp", "d", "item", author="ada")
+    _side(tmp_path, "B")
+    for typ, name in (("item", "widget"), ("arc", "camp")):
+        api.add(shared, {"kind": "task", "target": {"type": typ, "name": name},
+                         "body": f"on the {name}"}, author="sam")
+    _side(tmp_path, "A")
+    await user.open(page)
+    await user.should_see("sam (B)")
+
+
+async def test_the_peek_names_the_other_sides_author(user: User, shared, tmp_path):
+    mine, theirs = _both_sides_ask(shared, tmp_path)
+    await user.open("/")
+    _peek(user, theirs)
+    with user.scope(marker="peek"):
+        await user.should_see("sam (B)")
+
+
+def _no_user_name(store_dir):
+    subprocess.run(["git", "-C", str(store_dir), "config", "--unset", "user.name"], check=True)
+
+
+@pytest.mark.parametrize("click", ["note-resolve", "note-star", "checklist-toggle", "new-arc-create"])
+async def test_a_write_a_clone_with_no_user_name_cannot_make_is_told(user: User, shared,
+                                                                    tmp_path, click):
+    """The click raised into NiceGUI's log and did nothing."""
+    _q(shared, "a task", kind="task")
+    act = api.create_arc(shared, "camp", "d", "item", author="ada")
+    api.seed(shared, act.id, "item", ["widget"], author="ada")
+    _no_user_name(tmp_path)
+    before = len(store.load(tmp_path)), len(store.load_arcs(tmp_path))
+    await user.open({"checklist-toggle": f"/arc?id={act.id}", "new-arc-create": "/arcs"}
+                    .get(click, "/notes?kind=task"))
+    if click == "new-arc-create":
+        user.find(marker="new-arc-name").type("other")
+    user.find(marker=click).click()
+    await user.should_see("config user.name NAME")
+    assert (len(store.load(tmp_path)), len(store.load_arcs(tmp_path))) == before
+
+
+@pytest.mark.parametrize("click, write", [("arc-rename", "rename_arc"), ("arc-archive", "archive_arc")])
+async def test_an_arc_write_the_store_refuses_is_told(user: User, shared, monkeypatch, click, write):
+    def refuse(*a, **k):
+        raise ValueError("the store refuses this")
+    act = api.create_arc(shared, "camp", "d", "item", author="ada")
+    monkeypatch.setattr(api, write, refuse)
+    await user.open(f"/arc?id={act.id}")
+    user.find(marker=click).click()
+    await user.should_see("the store refuses this")
+
+
+@pytest.mark.parametrize("is_shared", [True, False], ids=["shared", "unshared"])
+@pytest.mark.parametrize("page", ["/", "/notes", "/targets", "/object?type=item&name=widget",
+                                  "/arc?id=camp"])
+async def test_a_page_reads_the_clones_side_once_however_many_questions_it_shows(
+        user: User, repo, tmp_path, monkeypatch, is_shared, page):
+    """Each open question another wrote asked the store for its side and its
+    rows again: a fork of `git config` and a load a card."""
+    if is_shared:
+        (tmp_path / "symbion.toml").write_text("shared = true\n")
+        _side(tmp_path, "A")
+    ctx = api.resolve(str(tmp_path))
+    api.create_arc(ctx, "camp", "d", "item", author="ada")
+    for target in ({"type": "item", "name": "widget"}, {"type": "arc", "name": "camp"}):
+        for i in range(3):
+            api.add(ctx, {"kind": "question", "target": target, "body": f"is it {i}"},
+                    author="sam")
+    build_page(ctx, author="ada")
+    calls = []
+    real = store.shared_side
+    monkeypatch.setattr(store, "shared_side", lambda s: calls.append(s) or real(s))
+    await user.open(page)
+    await user.should_see("is it 2")
+    assert len(calls) == 1, calls

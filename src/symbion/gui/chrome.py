@@ -11,13 +11,13 @@ from pathlib import Path
 
 from nicegui import app, run, ui
 
-from .. import api, gitref
+from .. import api, gitref, merge
 from .. import store as S
 from .. import summary as summ
 from . import servers
 from .filters import href
 from .notes import (FILE_MD_EXTRAS, add_form, ago, demo_says, fenced, kind_class, peek_entry,
-                    say_after_reload, show_said, undo_dialog, viewer)
+                    reading, render_note, say_after_reload, show_said, undo_dialog, viewer)
 from .theme import (DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, kind_css, quasar_colors,
                     root_vars_css)
 
@@ -148,7 +148,8 @@ if (matchMedia('(display-mode: standalone), (display-mode: tabbed)').matches) {
 </script>"""
 
 # The peek: a plain click on a card's text, or j/k, shows the entry beside the
-# page (`sbPeek`, which `_peek_panel` takes); a modified click keeps the
+# page (`sbPeek`, which `_peek_panel` takes), and so does a click on a card the
+# stale button lists in the peek (`_drift_list`); a modified click keeps the
 # browser's own new tab, on every card alike (the user, 2026-10-15). The other
 # keys press the peek's own buttons, so each does what its button does. Open
 # is read from where the drawer sits: it slides off the right edge when closed.
@@ -177,7 +178,7 @@ function sbPeekOpen() {
 document.addEventListener('click', e => {
   if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
   const t = e.target.closest ? e.target : null;
-  const card = t && t.closest('.sb-main .sb-note[data-id]');
+  const card = t && t.closest('.sb-main .sb-note[data-id], .sb-drift .sb-note[data-id]');
   if (!card || getSelection().toString()) return;      // selecting words, not picking
   const control = t.closest('a, button, input, textarea, label, .q-btn');
   if (control && !control.matches('a.sb-note-open')) return;   // a link or control of its own
@@ -527,7 +528,8 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                             new_tab=True).mark("demo-link")
             # Left of New entry, so that button stays put as these come and go
             # (the user, 2026-10-02).
-            _git_buttons(ctx, author, heads)
+            # the peek is made below; a click on the stale button comes later
+            _git_buttons(ctx, author, heads, lambda: show_drift())
             _new_note_button(ctx, author, *new, kind=kind)
             _search_box(q, keep or {})
             with ui.element("div").classes("sb-who-top sb-narrow") \
@@ -540,7 +542,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     # it left the cards too narrow to read.
     with ui.right_drawer(value=False, fixed=True, bordered=False) \
             .props(f"width={PEEK_WIDTH} breakpoint={PEEK_WIDE - 1}").classes("sb-peek") as peek:
-        _peek_panel(ctx, author, peek)
+        show_drift = _peek_panel(ctx, author, peek, heads)
     # The pick is lit while the peek is open: it stayed lit after the panel
     # was gone (the user, 2026-10-16). The card keeps `sb-picked`, j/k's
     # place; every way to close the peek sets the drawer's value.
@@ -558,12 +560,33 @@ PEEK_WIDTH = 440
 PEEK_WIDE = 1280
 
 
-def _peek_panel(ctx, author: str, drawer) -> None:
+def _drift_list(ctx, author: str, drawn: dict) -> None:
+    """What the stale button counts, newest first, as compact cards: a click
+    on one peeks it."""
+    now = S.heads(S.load(ctx.store_dir))
+    new, changed, _ = _drift(drawn, now)
+    with ui.row(wrap=False).classes("items-center w-full"):
+        ui.label(f"{_what(new, changed) or 'nothing new'} since this page was drawn") \
+            .classes("text-body").mark("drift-head")
+        ui.space()
+        ui.button("reload page", icon="refresh", on_click=lambda: ui.navigate.reload()) \
+            .props("flat dense no-caps no-wrap color=notable").classes("shrink-0") \
+            .mark("drift-reload")
+    rd, git_head = reading(ctx), gitref.head_sha(ctx.cfg)
+    with ui.element("div").classes("sb-drift w-full"):
+        for n in S.newest_first([n for n in now if drawn.get(n.id) != n]):
+            render_note(ctx, n, lambda: None, author=author, show_target=True, compact=True,
+                        actions=False, git_head=git_head, seen=rd)
+
+
+def _peek_panel(ctx, author: str, drawer, heads):
     """The entry `_PEEK_JS` names in an `sbPeek` event, as its own page shows
     it. A write in it reloads the page, as a card's write does, and the page
     opens the peek on the entry again: redrawn alone, the peek left an
-    answered question on the board (the user, 2026-10-16)."""
+    answered question on the board (the user, 2026-10-16). Returns what opens
+    it on `_drift_list` of `heads`, the entries the page drew."""
     shown = [None]
+    drawn = {n.id: n for n in heads}
 
     def wrote() -> None:
         app.storage.tab[_PEEKED] = shown[0]
@@ -571,14 +594,18 @@ def _peek_panel(ctx, author: str, drawer) -> None:
 
     @ui.refreshable
     def body():
-        if shown[0]:
+        if shown[0] is _DRIFT:
+            _drift_list(ctx, author, drawn)
+        elif shown[0]:
             peek_entry(ctx, shown[0], author, wrote)
 
     with ui.element("div").classes("sb-peek-inner").mark("peek"):
         with ui.row(wrap=False).classes("items-center w-full sb-peek-head"):
             ui.space()
-            ui.button(icon="open_in_new", color=None,
-                      on_click=lambda: shown[0] and ui.navigate.to(href(id=shown[0]))) \
+            # `o` clicks it hidden too
+            page = ui.button(icon="open_in_new", color=None,
+                             on_click=lambda: shown[0] not in (None, _DRIFT)
+                             and ui.navigate.to(href(id=shown[0]))) \
                 .props('flat dense round aria-label="open its page"').classes("sb-peek-page") \
                 .tooltip("open its page (o)")
             ui.button(icon="close", color=None, on_click=drawer.hide) \
@@ -588,6 +615,7 @@ def _peek_panel(ctx, author: str, drawer) -> None:
 
     def show(nid) -> None:
         shown[0] = nid
+        page.set_visibility(nid is not _DRIFT)
         body.refresh()
         drawer.show()
     ui.on("sbPeek", lambda e: show((e.args or {}).get("id")))
@@ -602,9 +630,11 @@ def _peek_panel(ctx, author: str, drawer) -> None:
                                   "?.classList.add('sb-picked')")
                 show(nid)
     client.on_connect(again)
+    return lambda: show(_DRIFT)
 
 
 _PEEKED = "sb-peeked"
+_DRIFT = object()           # the peek's other content: `_drift_list`
 
 
 def _once(build):
@@ -957,8 +987,8 @@ _DRAWN: dict = {}
 def _drift(drawn: dict, now) -> tuple[int, int, list]:
     """(new, changed, by) between the entries a page drew, {id: entry}, and
     the heads `now`: entries it lacks, entries edited or taken back since,
-    and who wrote them. Whole entries compare: an edit of the writer's own
-    uncommitted entry rewrites its line, and keeps its id and its time."""
+    and who wrote them. Whole entries compare: an edit and an undo each keep
+    the id."""
     new = [n for n in now if n.id not in drawn]
     changed = [n for n in now if n.id in drawn and drawn[n.id] != n]
     gone = len(drawn.keys() - {n.id for n in now})
@@ -977,7 +1007,7 @@ def git_state(ctx, author: str) -> tuple:
             gitref.unpushed(ctx.store_dir), S.undoable(ctx.store_dir))
 
 
-def _git_buttons(ctx, author: str, heads) -> None:
+def _git_buttons(ctx, author: str, heads, on_stale) -> None:
     """Undo, commit and push, read again every `_GIT_EVERY` seconds and redrawn
     when a count moves: a commit or push made at a terminal left them on the
     page, and rows written there never showed the commit button (the user,
@@ -1013,7 +1043,7 @@ def _git_buttons(ctx, author: str, heads) -> None:
     @ui.refreshable
     def buttons(state):
         if state[5][:2] != (0, 0):
-            _stale_button(*state[5])
+            _stale_button(*state[5], on_stale)
         if state[4]:
             # No label to compute: the dialog says what the undo takes back.
             ui.button(icon="undo", on_click=lambda: undo_dialog(ctx, author)) \
@@ -1049,38 +1079,74 @@ def _git_buttons(ctx, author: str, heads) -> None:
         ui.timer(_GIT_EVERY, tick, immediate=False).mark("git-poll")    # the page has just read it
 
 
-def _stale_button(new: int, changed: int, by: list) -> None:
+def _what(new: int, changed: int) -> str:
+    return " and ".join([*([summ._count(new, "new entry")] if new else []),
+                         *([summ._count(changed, "changed entry")] if changed else [])])
+
+
+def _stale_button(new: int, changed: int, by: list, on_click) -> None:
     """The store changed since this page drew it: another writer, a terminal,
     another tab. The page does not redraw by itself: the cards would move
-    under the reader."""
-    what = " and ".join([*([summ._count(new, "new entry")] if new else []),
-                         *([summ._count(changed, "changed entry")] if changed else [])])
-    with ui.button(icon="refresh", on_click=lambda: ui.navigate.reload()) \
+    under the reader. A click lists those entries in the peek, with the
+    reload at its top: a reload redraws only what the page filters for, so
+    on an arc or a search it showed none of them (the user, 2026-10-27)."""
+    with ui.button(icon="refresh", on_click=on_click) \
             .props("flat dense no-caps color=notable").classes("px-2 sb-stale") \
             .mark("stale-button") \
-            .tooltip(f"reload this page: {what} since it was drawn"
+            .tooltip(f"what changed: {_what(new, changed)} since this page was drawn"
                      + (f", by {', '.join(by)}" if by else "")):
         ui.label(str(new + changed))
         ui.label("changed" if not new else "new or changed" if changed else "new") \
             .classes("sb-btn-word")
 
 
+def _synced(ctx, s) -> tuple[list[str], bool]:
+    """What api.sync did, as a shared store's `commit` says it at a terminal
+    (cli._pull_then_push), less the commands a terminal runs: the pull's
+    lines, then the push's, and whether the push waits."""
+    p = s.pulled
+    said = [*filter(None, [p.recovered]), *(merge.said_split(kept, new) for kept, new in p.splits),
+            *p.dropped, *p.notices(ctx)]
+    if p.conflicts:
+        return [*said, f"not pushed: git cannot merge {' '.join(p.conflicts)}; `symbion pull` "
+                       f"at a terminal names the commands that finish the merge"], True
+    if p.error:
+        return [*said, f"not pushed: the pull failed: {p.error}"], True
+    if p.merged:
+        said.append(f"pulled {summ._count(p.merged, 'commit')} from {p.upstream}")
+    if s.timed_out:
+        return [*said, "not pushed: the push ran too long and was stopped"], True
+    if s.pushed.returncode:
+        why = s.pushed.stderr.strip() or f"git push exited {s.pushed.returncode}"
+        return [*said, f"push failed: {why}"], True
+    return [*said, f"pushed {summ._count(s.carried, 'commit')} to origin"], False
+
+
 def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> None:
     """The store is a sibling git repo. A GUI that writes but cannot commit
-    only grows the number the SessionStart hook nags about."""
+    only grows the number the SessionStart hook nags about. In a shared
+    store a commit pulls, then pushes, as `commit` does at a terminal."""
     if not n and not registry:
         return
+    shared = S.shared(ctx.store_dir)
 
-    def _do():
+    async def _do():
         if demo_says("commits the store"):
             return
         try:
             ok = api.commit(ctx, "entries: via symbion serve", author=author)
-        except RuntimeError as e:     # a hook refused: no reload, so it stays read
+        except (RuntimeError, S.NoSide) as e:     # a hook refused: no reload, so it stays read
             ui.notify(str(e), type="negative", multi_line=True,
                       close_button="dismiss", timeout=0)
             return
-        say_after_reload(gitref.committed(ctx.store_dir) if ok else "nothing to commit")
+        said, failed = [gitref.committed(ctx.store_dir) if ok else "nothing to commit"], False
+        if ok and shared and gitref.unpushed(ctx.store_dir) is not None:
+            try:                                  # a thread: the pull and push wait on origin
+                more, failed = _synced(ctx, await run.io_bound(api.sync, ctx))
+            except Exception as e:                # the commit is made: say why the push waits
+                more, failed = [f"not pushed: {str(e) or type(e).__name__}"], True
+            said += more
+        say_after_reload("\n".join(said), failed)
         ui.navigate.reload()
 
     # On a phone the word goes and the count stays: the icon says commit.
@@ -1088,21 +1154,31 @@ def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> Non
             .classes("px-2 sb-commit").mark("commit-button") \
             .tooltip(f"git commit {author}'s entries" + (
                 f"; {summ._count(others, 'entry')} by other writers stay pending for them"
-                if others else "")):
+                if others else "") + ("; then pull from origin and push" if shared else "")):
         ui.label("commit").classes("sb-btn-word")
         ui.label(str(n) if n else "registry")
 
 
 def _push_button(ctx, n: int | None) -> None:
     """Committed is not off this disk. Quieter than commit: nothing here is
-    at risk of being lost by a crash, only by the disk."""
+    at risk of being lost by a crash, only by the disk. In a shared store it
+    pulls first, as a commit does: a bare push is refused once origin moves."""
     if not n:                       # None: no remote, nowhere to push
         return
+    shared = S.shared(ctx.store_dir)
 
     async def _do():
         # A thread: a push waits on the network, and the event loop serves
         # every open page.
         if demo_says("pushes the store"):
+            return
+        if shared:
+            try:
+                said, failed = _synced(ctx, await run.io_bound(api.sync, ctx))
+            except Exception as e:
+                said, failed = [f"not pushed: {str(e) or type(e).__name__}"], True
+            say_after_reload("\n".join(said), failed)
+            ui.navigate.reload()
             return
         r = await run.io_bound(api.push, ctx, capture=True)
         if r.returncode:
@@ -1114,6 +1190,7 @@ def _push_button(ctx, n: int | None) -> None:
 
     with ui.button(icon="cloud_upload", on_click=_do).props("flat dense no-caps color=muted") \
             .classes("px-2 sb-push").mark("push-button") \
-            .tooltip(f"git push the store: {summ._count(n, 'commit')} not on its remote"):
+            .tooltip(("pull from origin, then push" if shared else "git push the store")
+                     + f": {summ._count(n, 'commit')} not on its remote"):
         ui.label("push").classes("sb-btn-word")
         ui.label(str(n))

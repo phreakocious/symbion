@@ -12,6 +12,12 @@ from pathlib import Path
 from .catalog import DOC_CATALOG, NON_CANONICAL_TYPES
 
 CONFIG_FILE = "symbion.toml"
+# Every top-level key `load` reads, and [kinds] (kinds.read_kinds): a key load
+# starts to read goes here too. Any other reads as unset, so a command names it;
+# a warning, not a refusal, so an older symbion still reads a newer toml.
+KNOWN_KEYS = ("catalogs", "command_timeout", "default_branch", "git_email", "git_name",
+              "kinds", "local_only", "project_root", "provenance", "renames", "repos",
+              "resolvers", "shared", "stale_target_noun", "work_root")
 # A repo's catalog under [repos] unless [catalogs] names the repo: every file
 # git lists, committed or not, less what it ignores.
 FILE_CATALOG = "git ls-files --cached --others --exclude-standard"
@@ -44,6 +50,8 @@ class Config:
     command_timeout: int = 30
     # A store with no remote on purpose: `commit` stops saying so.
     local_only: bool = False
+    # Two people's agents on one store, a clone per side (the shared-stores design).
+    shared: bool = False
     # The store this Config was loaded from, so configured commands can hand
     # a nested symbion the SAME store: `--dir` is argv and cannot be inherited,
     # SYMBION_DIR is. None for a hand-built Config (test fixtures), which then
@@ -59,6 +67,9 @@ class Config:
     # The cwd's main worktree as resolved, before [repos] cleared the roots:
     # `init` installs there, and the summary names it when [repos] lacks it.
     cwd_root: Path | None = None
+    # symbion.toml's keys outside KNOWN_KEYS, as written; [provenance]'s as
+    # `provenance.KEY`. cli.main names them.
+    unknown_keys: tuple = ()
 
     def __post_init__(self):
         if self.work_root is None:
@@ -194,6 +205,18 @@ def tree_store(root: Path, work: Path | None = None) -> Path:
     if pointed is not None:
         return pointed
     return (root.parent / f"{root.name}-notes").resolve()
+
+
+def loose_pointer(cwd: Path) -> Path | None:
+    """The store a `.symbion` names in `cwd`, or in its nearest ancestor with
+    one, for a directory in no git repo: it names the store as `--dir` would.
+    Without it, a folder of notes or docs with a pointer refused every
+    command as `not a git repository` (the user, 2026-10-27). Nearest, as git
+    finds its own root: a command from a subdirectory reads the same store."""
+    for d in (cwd, *cwd.parents):
+        if (d / POINTER_FILE).exists() or (d / POINTER_FILE).is_symlink():
+            return _pointer(d)
+    return None
 
 
 def store_owner(store) -> Path | None:
@@ -360,6 +383,12 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
     local_only = d.get("local_only", False)
     if not isinstance(local_only, bool):
         raise ValueError(f"local_only in {p} is {local_only!r}: write true or false, unquoted")
+    shared = d.get("shared", False)
+    if not isinstance(shared, bool):
+        raise ValueError(f"shared in {p} is {shared!r}: write true or false, unquoted")
+    if shared and local_only:
+        raise ValueError(f"shared and local_only in {p} are both true: a shared store syncs "
+                         f"through its remote, and local_only says it has none; keep one")
     # These reached subprocess as they were, and a quoted number or a bare
     # one ended in a TypeError traceback there (2026-10-09 review).
     timeout = d.get("command_timeout", 30)
@@ -394,8 +423,11 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
         provenance_command=prov.get("command"),
         command_timeout=timeout,
         local_only=local_only,
+        shared=shared,
         store=Path(store).resolve(),
         repos=repos,
         here=here,
         cwd_root=cwd_root,
+        unknown_keys=tuple(sorted(set(d) - set(KNOWN_KEYS)))
+        + tuple(f"provenance.{k}" for k in sorted(set(prov) - {"command"})),
     )

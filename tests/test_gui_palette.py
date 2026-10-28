@@ -75,6 +75,41 @@ def test_a_word_finds_places_then_entries_open_first_then_the_whole_search(repo,
     assert g["entries here"]["aside"] == "open first"
 
 
+def test_a_type_and_a_colon_lists_that_types_targets_by_the_words_after_it(repo, tmp_path):
+    """Every item's `item:NAME` holds `item:`: the two most named were all
+    it showed."""
+    ctx = api.resolve(str(tmp_path))
+    for name in ("thing one", "thing two", "thing three", "other"):
+        _add(ctx, "note", "x", target=("item", name))
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs" / "thing.md").write_text("x\n")
+    _add(ctx, "note", "x", target=("doc", "thing.md"))
+
+    def names(q):
+        return [r["href"].split("name=")[1] for r in _groups(ctx, q)["go to"]["rows"]]
+    # the most named first; a tie, the newest first
+    assert names("item:") == ["other", "thing%20three", "thing%20two", "thing%20one"]
+    assert names("Item:THING o") == ["thing%20two", "thing%20one"]
+    assert names("doc:thing") == ["thing.md"]
+    # with no type, two of every type as before
+    assert names("thing") == ["thing.md", "thing%20three"]
+    assert "go to" not in _groups(ctx, "nope:")
+
+
+def test_arc_and_a_colon_lists_the_arcs_active_first(repo, tmp_path):
+    """No entry has an arc as its target, so `arc:` named no type the
+    palette counted, and listed nothing."""
+    ctx = api.resolve(str(tmp_path))
+    old, one, two = (api.create_arc(ctx, name, "", "item", author="ada").id
+                     for name in ("ship zero", "ship one", "other two"))
+    api.archive_arc(ctx, old)
+
+    def ids(q):
+        return [r["href"].split("id=")[1] for r in _groups(ctx, q)["go to"]["rows"]]
+    assert ids("arc:") == [one, two, old]
+    assert ids("Arc:ship") == [one, old]
+
+
 def test_an_entrys_words_are_escaped_and_only_the_words_marked(repo, tmp_path):
     """The box sets this html as is: a body is anyone's text."""
     ctx = api.resolve(str(tmp_path))

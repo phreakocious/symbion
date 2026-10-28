@@ -13,10 +13,11 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from difflib import SequenceMatcher
 from types import SimpleNamespace
+from typing import NamedTuple
 from urllib.parse import quote
 
 from markdown_it.token import Token
@@ -35,9 +36,18 @@ from .filters import href
 # A checkout's markdown file, in the viewer, is read by ui.markdown (markdown2).
 # It carries code-style identifiers (snake_case_module), and markdown2's
 # default emphasis mangles intra-word underscores to <em>; `code-friendly`
-# keeps *asterisk* emphasis and disables underscore emphasis. A row body is
-# read in term.body_parser instead, as at a terminal.
-FILE_MD_EXTRAS = ["fenced-code-blocks", "tables", "code-friendly"]
+# keeps *asterisk* emphasis and disables underscore emphasis; `mermaid` draws
+# a ```mermaid block. A row body is read in term.body_parser instead, as at a
+# terminal.
+FILE_MD_EXTRAS = ["fenced-code-blocks", "tables", "code-friendly", "mermaid"]
+
+# Mermaid's default theme draws dark lines on the dark page. A block's own
+# init, after this one, still wins.
+_MERMAID = re.compile(r"^```mermaid[ \t]*\n", re.M)
+
+
+def dark_mermaid(text: str) -> str:
+    return _MERMAID.sub(lambda m: m.group(0) + "%%{init: {'theme': 'dark'}}%%\n", text)
 
 
 def _highlight(code: str, lang: str, _attrs: str) -> str:
@@ -323,14 +333,15 @@ def arc_headline(ctx, n) -> None:
 TIP_COMMITS = 8
 
 
-def check_tip(cfg, prov, state, distance) -> str:
+def check_tip(cfg, prov, state, distance, at=None) -> str:
     """What the badge was measured against. The chip lit up on hover and a
     click did nothing (the user, 2026-09-08); `behind N` asks the reader to
-    go and look at N commits, so the tip lists them."""
+    go and look at N commits, so the tip lists them. `at` names the commit
+    for a rewritten stamp's successor, which no run was stamped at."""
     sha = S.stamp_sha(prov)
     if not sha or state == "external":
         return ""
-    at = f"stamped at {sha[:7]}"
+    at = at or f"stamped at {sha[:7]}"
     if state == "current":
         return f"{at}, this checkout's HEAD"
     if state == "diverged":
@@ -338,6 +349,11 @@ def check_tip(cfg, prov, state, distance) -> str:
     if state == "dangling":
         return (f"{at}, which no branch or tag holds: an amend, a rebase or a deleted "
                 f"branch left it behind. Re-run the check to stamp a live commit")
+    if state == "rewritten" and (s := gitref.successor(cfg, prov)):
+        tree = {True: "; same tree", False: "; the tree differs"}.get(s.same_tree, "")
+        moved = {"sha": s.sha, **({"repo": prov["repo"]} if "repo" in prov else {})}
+        return (f"{at}; rewritten as {s.sha[:7]}, matched by author date and subject{tree}\n"
+                + check_tip(cfg, moved, s.state, s.distance, at=s.sha[:7]))
     if state not in ("behind", "ahead"):
         return at
     cfg = gitref.stamp_cfg(cfg, prov)            # the commits of the stamp's repo
@@ -370,8 +386,10 @@ def _check_badge(ctx, n, git_head=None) -> None:
         sha = S.stamp_sha(n.provenance)
         if b := gitref.unmerged(gitref.stamp_cfg(ctx.cfg, n.provenance), [sha]).get(sha):
             text = f"diverged — on {b}"
+    elif state == "rewritten" and (s := gitref.successor(ctx.cfg, n.provenance, git_head)):
+        text = f"rewritten — {api.rewritten_words(s)}"
     cls = {"current": "sb-chip-good", "behind": "sb-chip-notable", "external": "",
-           "pending": "", "unstamped": "",
+           "pending": "", "unstamped": "", "rewritten": "sb-chip-notable",
            "ahead": "sb-chip-notable",
            "diverged": "sb-chip-notable", "dangling": "sb-chip-bad",
            "unverifiable": "sb-chip-bad"}[state]
@@ -420,7 +438,7 @@ def _since_chip(ctx, n, since: int) -> None:
     chip.on("mouseenter", _fill)
 
 
-def _due_chip(n, status) -> None:
+def due_chip(n, status) -> None:
     """Words while the row can still fire, the bare date once it cannot: a
     resolved row is never late."""
     state = S.due_state(n.due) if status == "open" else None
@@ -570,6 +588,32 @@ def demo_says(does: str) -> bool:
     return True
 
 
+@contextmanager
+def refusal_shown():
+    """A write the store refuses, with the words that name its fix (a shared
+    store's clone with no user.name is one): shown, as the add form shows it.
+    Raised out of a click handler it only reached NiceGUI's log, and the click
+    did nothing. The rest of the block is skipped."""
+    try:
+        yield
+    except (ValueError, catalog.CatalogError) as e:
+        ui.notify(str(e), type="negative")
+
+
+class Reading(NamedTuple):
+    """The store as this clone's reader sees it: its side, its rows (`seen_from`
+    that side) and those by id. A page makes one and hands it to its cards."""
+    side: str | None
+    loaded: list
+    by_id: dict
+
+
+def reading(ctx) -> Reading:
+    side = S.read_side(ctx.store_dir)
+    loaded = summ.seen_from(S.load(ctx.store_dir), side)
+    return Reading(side, loaded, {n.id: n for n in loaded})
+
+
 def read_only_refused(e: Exception) -> None:
     """`app.on_exception`: a write refused under `serve --read-only` that no
     handler named still answers the click."""
@@ -696,7 +740,7 @@ def view_button(ctx, name, label: str = "", ttype=None):
 
         def fill():
             if md:
-                ui.markdown(text, extras=FILE_MD_EXTRAS).mark("file-view")
+                ui.markdown(dark_mermaid(text), extras=FILE_MD_EXTRAS).mark("file-view")
             else:
                 NoteMarkdown(fenced(text, path.name if path else name)).mark("file-view")
         # a path: its case is its name
@@ -710,10 +754,18 @@ def view_button(ctx, name, label: str = "", ttype=None):
                  + (f" · shift-click: {_reveal_label()}" if revealable else "")).mark("file-open")
 
 
+def _waits_on_you(n, author, rd: Reading) -> bool:
+    """summary.asks for the person at this page, on their side's rows: the
+    other side's question waits on that side's person."""
+    return summ.on_side(rd.by_id, n, rd.side) and (n.supersedes is None
+                                                   or summ.asks(author, rd.by_id, n))
+
+
 def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                 base: dict | None = None, compact: bool = False, hit=(),
                 actions: bool = True, git_head: str | None = None,
-                since: int | None = None, seams=(), diff_to=None) -> None:
+                since: int | None = None, seams=(), diff_to=None,
+                seen: Reading | None = None) -> None:
     """One note row: a card. What it says first, then one line of where it
     points and what it is, the resolve ring on its left and star and edit
     over its corner. Every chip is a link into the filtered view -- that is
@@ -727,13 +779,22 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     the row's gitref.commits_since, counted once by a page of many cards.
     `seams` are summary.seams' for the body. `diff_to` is the row that
     superseded this one: the card says what it changed, marks the words of a
-    changed checked or result, and shows a rewritten body as a diff."""
+    changed checked or result, and shows a rewritten body as a diff. `seen` is
+    the page's reading of the store, made once: a card makes its own when the
+    page gives none."""
     def narrow(**kv):
         return href(**{**(base or {}), **kv})
 
     status = S.read_status(n)
     has_pri = "priority" in n.tags
-    resolvable = actions and n.spec.status and status == "open"
+    # ponytail: a question is the kind named `question`, as in
+    # summary.asks, whose newest word skips someone else's edit that
+    # changed no text. A page hands its cards one reading of the store; a card
+    # without it reads the store itself (a few ms at a few thousand rows).
+    answering = actions and n.kind == "question" and status == "open" \
+        and summ.wrote_it(author, n.author) and _waits_on_you(n, author, seen or reading(ctx))
+    # No ring beside the answers: it closed the question and lost the pick (2026-10-24).
+    resolvable = actions and n.spec.status and status == "open" and not answering
     cls = f"sb-note w-full {kind_class(n.kind)}"
     if actions:
         cls += " sb-has-actions" + (" sb-starred" if has_pri else "")
@@ -742,13 +803,7 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
             .props(f"data-id={n.id}").mark("note-row"):
         with ui.element("div").classes("sb-note-main"):
             _note_content(ctx, n, compact, hit, show_target, seams, diff_to)
-            # ponytail: a question is the kind named `question`, as in
-            # summary.asks, whose newest word skips someone else's edit that
-            # changed no text: a load per such card (a few ms at a few thousand rows).
-            if actions and n.kind == "question" and status == "open" \
-                    and summ.wrote_it(author, n.author) \
-                    and (n.supersedes is None
-                         or summ.asks(author, {r.id: r for r in S.load(ctx.store_dir)}, n)):
+            if answering:
                 _answer_row(ctx, n, author, refresh)
             elif n.options:
                 _options_row(n)
@@ -763,29 +818,41 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                 on_resolve = lambda n=n: edit_dialog(ctx, n, refresh, author=author,
                                                      resolving=True)
             else:
-                on_resolve = lambda n=n: demo_says("resolves the entry") or (
-                    api.supersede(ctx, n.id, author=author, status="resolved"), refresh())
+                def on_resolve(n=n):
+                    if demo_says("resolves the entry"):
+                        return
+                    with refusal_shown():
+                        api.supersede(ctx, n.id, author=author, status="resolved")
+                        refresh()
             ui.button(icon="check", on_click=on_resolve) \
                 .props('flat round dense aria-label="resolve"').classes("sb-resolve") \
                 .tooltip("resolve").mark("note-resolve")
         if actions:
-            with ui.element("div").classes("sb-actions"):
-                def _star(n=n, has_pri=has_pri):
-                    if demo_says("unstars the entry" if has_pri else "stars the entry"):
-                        return
-                    api.retag(ctx, n.id, add=() if has_pri else ("priority",),
-                              rm=("priority",) if has_pri else (), author=author)
-                    refresh()
+            actions_bar(ctx, n, refresh, author=author)
 
-                ui.button(icon="star" if has_pri else "star_outline", color=None,
-                          on_click=_star) \
-                    .props("flat dense round size=sm" + (" color=warning" if has_pri else "")
-                           + ' aria-label="toggle priority"') \
-                    .classes("sb-star").tooltip("toggle #priority").mark("note-star")
-                ui.button(icon="edit", color=None,
-                          on_click=lambda n=n: edit_dialog(ctx, n, refresh, author=author)) \
-                    .props('flat dense round size=sm aria-label="edit"').classes("sb-edit") \
-                    .tooltip("supersede / edit").mark("note-edit")
+
+def actions_bar(ctx, n, refresh, *, author: str) -> None:
+    """Star and edit over a card's corner; a row that has it carries
+    `sb-has-actions`, and `sb-starred` when tagged priority."""
+    has_pri = "priority" in n.tags
+    with ui.element("div").classes("sb-actions"):
+        def _star():
+            if demo_says("unstars the entry" if has_pri else "stars the entry"):
+                return
+            with refusal_shown():
+                api.retag(ctx, n.id, add=() if has_pri else ("priority",),
+                          rm=("priority",) if has_pri else (), author=author)
+                refresh()
+
+        ui.button(icon="star" if has_pri else "star_outline", color=None,
+                  on_click=_star) \
+            .props("flat dense round size=sm" + (" color=warning" if has_pri else "")
+                   + ' aria-label="toggle priority"') \
+            .classes("sb-star").tooltip("toggle #priority").mark("note-star")
+        ui.button(icon="edit", color=None,
+                  on_click=lambda: edit_dialog(ctx, n, refresh, author=author)) \
+            .props('flat dense round size=sm aria-label="edit"').classes("sb-edit") \
+            .tooltip("supersede / edit").mark("note-edit")
 
 
 def _answer_row(ctx, n, author: str, refresh) -> None:
@@ -898,7 +965,7 @@ def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) 
     on the left; who wrote it, when, and its id on the right."""
     with ui.element("div").classes("sb-note-foot"):
         if n.due:
-            _due_chip(n, status)
+            due_chip(n, status)
         ui.link(n.kind, narrow(kind=n.kind)) \
             .classes(f"sb-chip sb-kindchip {kind_class(n.kind)}").mark("note-kind")
         if status:
@@ -953,7 +1020,8 @@ def peek_entry(ctx, note_id: str, author: str, refresh) -> None:
     """The entry as its own page shows it, for the peek beside a page: the
     current version of the chain `note_id` is in, where each amendment
     joined it, and its earlier versions. `refresh` runs after a write in it."""
-    every = S.load(ctx.store_dir)
+    rd = reading(ctx)
+    every = rd.loaded
     try:
         n = S.chain_tip(every, note_id)
     except (KeyError, ValueError):            # no such row, or a looped chain
@@ -962,17 +1030,18 @@ def peek_entry(ctx, note_id: str, author: str, refresh) -> None:
     git_head = gitref.head_sha(ctx.cfg)
     render_note(ctx, n, refresh, author=author, show_target=True, git_head=git_head,
                 since=gitref.commits_since(ctx.cfg, [n], git_head).get(n.id),
-                seams=summ.seams({r.id: r for r in every}, n))
+                seams=summ.seams(rd.by_id, n), seen=rd)
     history(ctx, every, n, author, git_head)
 
 
 _SAID = "sb-said"
 
 
-def say_after_reload(text: str) -> None:
+def say_after_reload(text: str, failed: bool = False) -> None:
     """A notice for the page a reload brings: one made before the reload
-    died with the page, so `committed …` never showed (2026-10-13)."""
-    app.storage.tab[_SAID] = text
+    died with the page, so `committed …` never showed (2026-10-13). A
+    `failed` one stays until dismissed, as a refusal does."""
+    app.storage.tab[_SAID] = [text, failed]
 
 
 def show_said() -> None:
@@ -982,7 +1051,12 @@ def show_said() -> None:
     def _show():
         with client:
             if said := app.storage.tab.pop(_SAID, None):
-                ui.notify(said)
+                text, failed = said
+                if failed:
+                    ui.notify(text, type="negative", multi_line=True, close_button="dismiss",
+                              timeout=0)
+                else:
+                    ui.notify(text, multi_line="\n" in text)
     client.on_connect(_show)
 
 
@@ -1037,9 +1111,7 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
     status+verdict row: the result is required and the row closes on save."""
     with ui.dialog() as dialog, ui.card().classes("bg-panel"):
         ui.label("resolve — the result is the verdict" if resolving
-                 else "edit — this version is not yet committed, so it changes in place"
-                 if api.rewritable(ctx, n.id, author=author)
-                 else "supersede — the old entry is kept").classes("sb-stat-label")
+                 else "edit — its earlier version is kept").classes("sb-stat-label")
         # What the entry is on, picked as the new-entry form's header picks
         # it: the dialog could change neither (a tester, 2026-10-15). An
         # untouched target is not sent, so a departed one never resolves again.

@@ -3,7 +3,6 @@ import subprocess
 from datetime import datetime, timedelta
 import sys
 import unicodedata
-from pathlib import Path
 
 import pytest
 
@@ -146,6 +145,17 @@ def test_why_unverifiable_separates_the_three_causes():
     assert api.why_unverifiable({"sha": "abc"}) == "commit unavailable"
 
 
+def test_rewritten_words():
+    """An old stamp with no `tree`, its commit pruned, gives no tree word:
+    unknown must not read as either answer."""
+    sha = "4e1a9c2" + "0" * 33
+    assert (api.rewritten_words(gitref.Successor(sha, "behind", 3, False))
+            == "as 4e1a9c2, tree differs, behind 3")
+    assert (api.rewritten_words(gitref.Successor(sha, "current", 0, True))
+            == "as 4e1a9c2, same tree, current")
+    assert api.rewritten_words(gitref.Successor(sha, "diverged", None, None)) == "as 4e1a9c2, diverged"
+
+
 def test_cli_seed_errors_keep_their_old_text_and_route(repo, tmp_path, capsys):
     """Regression for a lift bug that slipped through green because nothing
     asserted stderr: cli's `arc seed` branch must not wrap
@@ -196,8 +206,6 @@ def test_retag_reads_tags_from_the_chain_TIP_not_the_named_row(repo, tmp_path):
     first = store.add(tmp_path, kind="note", target={"type": "project", "name": None},
                       body="b", tags=["a"])
     tip = store.supersede(tmp_path, first.id, author="t", tags=["a", "b"])
-    api.commit(ctx, "c")                     # so the retag appends (store.rewritable)
-
     out = api.retag(ctx, tip.supersedes, add=["c"], author="t")     # the version first wrote
 
     assert set(out.tags) == {"a", "b", "c"}, "tip's tags must survive"
@@ -286,7 +294,6 @@ _NON_WRITERS = {
     "check_arc",           # pure: refuses an arc id that names no arc
     "check_arc_targets",   # pure: the same, for arc: targets and refs
     "check_target",        # pure: a target's shape, type and name
-    "rewritable",          # a read: whether an edit by `author` would rewrite
     "add_fields",   # takes fields, not a row -- no single keyword-only author
                     # for this audit to see; it demands one per row itself
                     # (raises ValueError, not TypeError) -- see
@@ -296,6 +303,8 @@ _NON_WRITERS = {
     "commit",            # writes git, not a note
     "own_rows",          # a read: which pending rows `commit` would take
     "push",              # ditto
+    "pull",              # writes git, and moves no row's author
+    "sync",              # pull, then push
     "object_path",       # a read: where a target's file sits
     "known_files",       # a read: which catalog file a dropped file is
     "save_doc",          # writes a docs/ file, never a row; a doc has no author
@@ -568,7 +577,25 @@ def test_cli_list_author_filters(repo, tmp_path, capsys):
 def test_harvest_pulls_hashtags_out_of_the_body():
     assert api.harvest_hashtags("#gui replace the art") == (["gui"], "replace the art")
     assert api.harvest_hashtags("be creative :) #gui") == (["gui"], "be creative :)")
-    assert api.harvest_hashtags("do #gui the thing") == (["gui"], "do the thing")
+    assert api.harvest_hashtags("do it #gui #ux") == (["gui", "ux"], "do it")
+
+
+def test_a_tag_between_words_keeps_its_word_in_the_sentence():
+    """The user, 2026-10-27: a tag typed as a word of the sentence became a
+    tag and left a hole. A leading or trailing one, past a list's or a
+    quote's mark or before the full stop, still goes."""
+    for body, out in (("do #gui the thing", "do gui the thing"),
+                      ("the #gui, the cli", "the gui, the cli"),
+                      ("fix #gui #ux now", "fix gui ux now"),
+                      ("fix the thing #gui.", "fix the thing."),
+                      ("- #gui fix it", "- fix it"),
+                      ("1. #gui fix it", "1. fix it"),
+                      ("> #gui a quote", "> a quote"),
+                      ("a word\n#gui\nanother", "a word\n\nanother"),
+                      ("x #gui y `#c` z", "x gui y `#c` z")):
+        assert api.harvest_hashtags(body)[1] == out, body
+    # a kind's bang goes wherever it stands
+    assert api.harvest_kind("fix !bug it", ("bug",)) == ("bug", "fix it")
 
 
 def test_harvest_keeps_the_body_s_own_spacing():
@@ -784,7 +811,6 @@ def test_api_seed_passes_the_kind_through(repo, tmp_path):
 import threading
 import time
 
-from symbion import catalog
 from _resolvers import reading_store, calls
 
 
@@ -1229,20 +1255,21 @@ def test_supersede_judges_a_given_options_list(repo, tmp_path):
 
 # Every api function that writes. test_gui_seam imports it.
 WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
-          "rename_arc", "archive_arc", "undo", "commit", "push", "rename_target", "retype"}
+          "rename_arc", "archive_arc", "undo", "commit", "push", "pull", "sync",
+          "rename_target", "retype"}
 
 
 def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
     """`serve --read-only` runs the public demo, where nothing a visitor does
     may write, by any control or crafted event (the spec, 2026-10-22). Every
     public api function is classified here, so a new one must be."""
-    READS = {"Ctx", "add_fields", "as_dropped", "as_object", "author_default",
+    READS = {"Ctx", "Pulled", "Synced", "add_fields", "as_dropped", "as_object", "author_default",
              "canonicalize_names", "canonicalize_rows", "check_arc", "check_arc_targets",
              "check_measurements", "check_name", "check_options", "check_refs",
              "check_target", "fields_from_row", "free_doc_name", "gui_author",
              "harvest_hashtags", "harvest_kind", "kind_as_type", "known_files", "no_arc",
-             "object_path", "own_rows", "resolve", "rewritable", "seed_names",
-             "shell_author", "verdict_state", "why_unverifiable"}
+             "object_path", "own_rows", "resolve", "seed_names",
+             "rewritten_words", "shell_author", "verdict_state", "why_unverifiable"}
     public = {n for n, f in vars(api).items() if callable(f) and not n.startswith("_")
               and getattr(f, "__module__", None) == "symbion.api"}
     assert public == WRITES | READS, f"classify: {sorted(public ^ (WRITES | READS))}"
@@ -1275,6 +1302,8 @@ def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
         "undo": lambda: api.undo(ctx, None, author="ada", apply=False),
         "commit": lambda: api.commit(ctx, "m"),
         "push": lambda: api.push(ctx, capture=True),
+        "pull": lambda: api.pull(ctx),
+        "sync": lambda: api.sync(ctx),
         "rename_target": lambda: api.rename_target(ctx, "item", "x", "y", author="ada"),
         "retype": lambda: api.retype(ctx, "item", "thing", author="ada"),
     }

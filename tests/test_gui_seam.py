@@ -42,6 +42,8 @@ ALLOWED_STORE_READS = {
     "undoable", "note_from_dict",                # the undo button's read, and its dialog's rows
     "now_shown",                                 # the clock, which SYMBION_NOW can stop
     "read_only", "ReadOnly",                     # serve --read-only, and its refusal
+    "read_side", "NoSide",                       # a shared store's reader, and a write's refusal
+    "shared",                                    # a shared store's buttons pull, then push
 }
 
 # `from <anything> import ..., store [as X], ...` -- the module-object import.
@@ -124,6 +126,12 @@ CLI_STORE_CALLS = ALLOWED_STORE_READS | {
                                                           # and the rows each session wrote
     "_now_iso", "BadClock",                               # read: the store's clock, and
                                                           # its refusal of a bad SYMBION_NOW
+    "_pull_aside",                                        # read: a killed pull's copy, for
+                                                          # the hint at an unparseable toml
+    "shared",                                             # read: the store's setting, for
+                                                          # the sync a hook and a commit run
+    "Busy",                                               # the lock's refusal: a hook's pull
+                                                          # gives up on a store held too long
     "ensure_store", "apply_reconciliation",               # the two writes
 }
 

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from bisect import bisect_right
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from itertools import pairwise, zip_longest
@@ -21,6 +23,7 @@ PEOPLE_CAP = 3
 WAITING_CAP = 10
 CLOSED_CAP = 5
 DUE_CAP = 10
+OTHERS_CAP = 3    # other sides a shared store's session start names
 DUE_DAYS = 7      # how far ahead the due block looks
 # An open row no one has touched through this many active days (days anyone
 # wrote a row) is named, up to the cap. Active days, not calendar days: by
@@ -139,7 +142,8 @@ def due_phrase(state) -> str:
 def plain(text: str, role: str) -> str:
     """The pipe's paint. Every text renderer takes a `paint(text, role)`
     and a terminal passes term.painter()'s; `role` is a colour's name there
-    (`meta`, `body`, `warn`...) or `kind:<label>`. What a pipe prints must
+    (`meta`, `body`, `warn`...), `kind:<label>`, or `id`, an entry's id,
+    which a terminal links to a running serve. What a pipe prints must
     not change, so plain returns the text untouched."""
     return text
 
@@ -155,7 +159,7 @@ def row_line(paint, kind: str, target: str, body: str, id_: str, label: str = ""
     type_, colon, name = target.partition(":")
     tgt = paint(type_ + colon, "meta") + paint(name, "text") if name else paint(target, "text")
     return (f"{paint(f'[{label or kind}]', 'kind:' + kind)} {tgt}  "
-            f"{paint(body, 'body')}  {paint(id_, 'meta')}")
+            f"{paint(body, 'body')}  {paint(id_, 'id')}")
 
 
 def open_notes(notes, kind):
@@ -313,6 +317,7 @@ def empty_summary() -> dict:
     <path>`; the SessionStart hook stays silent by its own check first."""
     return {
         "store": None,
+        "sync": [],
         "open": {},
         "open_in_arcs": 0,
         "parked": 0,
@@ -332,6 +337,8 @@ def empty_summary() -> dict:
         "due_elided": 0,
         "untouched": [],
         "untouched_elided": 0,
+        "others": [],
+        "others_elided": 0,
         "park_kind": None,
         "uncommitted_notes": 0,
         "registry_modified": False,
@@ -421,10 +428,37 @@ def repos_line(d: dict) -> str:
     return f"{line}; file:PATH is read from where you stand, REPO:PATH from that repo's root"
 
 
-def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
-    loaded = S.load(store_dir)
-    notes = S.heads(loaded)
+def side_of(by_id, n) -> str | None:
+    """The side n belongs to: its first version's, so another side's edit
+    does not move it. None for a row written outside shared mode."""
+    return _root(by_id, n).side
+
+
+def seen_from(loaded, side) -> list:
+    """`loaded` as `side` reads it: a version another side wrote names that
+    side with its author, `claude (B)`, so every rule that asks whether
+    someone else wrote a row (wrote_it, who, waits) reads the other side's
+    agents as someone else. For reads only: never write what it returns.
+    With no side, `loaded` itself."""
+    if side is None:
+        return loaded
+    return [replace(v, author=f"{v.author} ({v.side})")
+            if v.side not in (None, side) and v.author != v.side else v for v in loaded]
+
+
+def on_side(by_id, n, side) -> bool:
+    """Is n on `side`'s session start: that side's, or no side's. Every row
+    reads there when `side` is None."""
+    return side is None or side_of(by_id, n) in (None, side)
+
+
+def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None) -> dict:
+    """`side` is the reader's in a shared store, else None: session start
+    is that side's, and each other side reaches it as one line, `others`."""
+    loaded = seen_from(S.load(store_dir), side)
+    every = S.heads(loaded)
     by_id = {n.id: n for n in loaded}
+    notes = [n for n in every if on_side(by_id, n, side)]
     bad = S.load_malformed(store_dir)
     bad_arcs = S.load_arcs_malformed(store_dir)
     acts = [a for a in S.load_arcs(store_dir) if not a.archived]
@@ -452,13 +486,25 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     # oldest open rows are often done or dead and still open (2026-10-22). A
     # due date, a pre-registration, waiting on the reader and an arc each
     # reach a row already.
-    days = sorted({S.written_at(n).astimezone(timezone.utc).date() for n in loaded})
+    # The reader's side's days, and a sideless version's: a partner writing
+    # daily must not age the reader's rows into this block.
+    days = sorted({S.written_at(n).astimezone(timezone.utc).date() for n in loaded
+                   if side is None or n.side in (None, side)})
 
     def active_days(n) -> int:
         return len(days) - bisect_right(days, S.written_at(n).astimezone(timezone.utc).date())
+    # An open question that cites an entry carries the ask already: a triage
+    # question stood beside this block's ask to check each (2026-10-25). An
+    # open question's cite only: across stores, a newer cite from
+    # any row was a passing mention as often as a triage (2026-10-27).
+    one = cite_ids(by_id)
+    asked = {S.chain_tip(loaded, i).id for q in notes
+             if q.kind == "question" and S.read_status(q) == "open"
+             for t in _CITE.findall(q.body or "") if (i := one.get(t))}
     untouched = sorted((n for label, k in kinds.items() if k.status and not k.parked
                         for n in open_outside_arcs(notes, label, active)
                         if n.id not in shown_above and not n.due and not n.spec.verdict
+                        and n.id not in asked
                         and not waits(reader, by_id, n) and active_days(n) >= UNTOUCHED_DAYS),
                        key=lambda n: (S.written_at(n), n.id))
     u_cap = len(untouched) if full else UNTOUCHED_CAP
@@ -512,9 +558,17 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         n for n in notes if since and S.read_status(n) == "resolved" and answered(n))
     c_cap = len(closed) if full else CLOSED_CAP
 
-    rows = []
+    rows, in_arcs = [], 0
     for a in acts:
         done, total = S.arc_progress(notes, a.id)
+        in_arcs += total - done             # the reader's side's open boxes, in either side's arc
+        if side is not None:
+            # Another side's arc lists while a box of the reader's in it is open: the
+            # header's `N open in arcs` counts that box, and no other line shows it.
+            if a.side not in (None, side) and total == done:
+                continue
+            # Both sides' boxes: an arc is its creator's checklist, and either side files in it.
+            done, total = S.arc_progress(every, a.id)
         # Age, because `0/10` on a 31-minute-old arc read as stalled and a
         # dead one reads the same (measured 2026-09-20).
         rows.append({"id": a.id, "done": done, "total": total,
@@ -526,9 +580,21 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
     p_cap = len(priority) if full else PRIORITY_CAP
     d_cap = len(due) if full else DUE_CAP
     notes_n, registry = gitref.uncommitted(store_dir)
-    wrap = gitref.last_wrap(store_dir, cfg)
+    wrap = gitref.last_wrap(store_dir, cfg, side)
     if wrap:
         wrap["changed"] = wrap_changes(loaded, by_id, wrap)
+    others = []
+    if side is not None:
+        since = wrap["at"] if wrap else None
+        cut = since and S.written_at(None, since)
+        # Heads, as `list --side NAME --since wrap` reads them: the line counts what it lists.
+        wrote = Counter(k for n in every if (k := side_of(by_id, n)) not in (None, side)
+                        and (cut is None or S.written_at(n) >= cut))
+        wraps = {k: n for k, n in gitref.wraps_since(store_dir, since).items() if k != side}
+        others = [{"side": k, "rows": wrote[k], "wraps": wraps.get(k, 0), "since": since}
+                  for k in sorted(wrote.keys() | wraps.keys(),
+                                  key=lambda k: (-wrote[k] - wraps.get(k, 0), k))]
+    x_cap = len(others) if full else OTHERS_CAP
     return {
         # The resolved path, so a consumer can gate on "a store exists" and
         # see which one. An absent store answers `empty_summary()`, where this
@@ -543,7 +609,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         "repos": repo_rows(cfg),
         "unlisted_repo": unlisted_repo(store_dir, cfg),
         "open": open_counts,
-        "open_in_arcs": sum(r["open"] for r in rows),
+        "open_in_arcs": in_arcs,
         # Parked is quiet, not hidden: fresh agents found no sign one existed
         # until its date (2026-10-14). The user: a count is enough.
         "parked": sum(n.spec.parked and S.read_status(n) == "open" for n in notes),
@@ -575,6 +641,8 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None) -> dict:
         "untouched": [{**digest(n, HEAD_CHARS), "active_days": active_days(n)}
                       for n in untouched[:u_cap]],
         "untouched_elided": max(0, len(untouched) - u_cap),
+        "others": others[:x_cap],
+        "others_elided": max(0, len(others) - x_cap),
         # The kind that parks a status row, named in the untouched line's ways out.
         "park_kind": next((label for label, k in kinds.items() if k.status and k.parked), None),
         "uncommitted_notes": notes_n,
@@ -1003,14 +1071,18 @@ def _labelled(paint, r, first=None) -> str:
     return line
 
 
-def render_summary(d: dict, paint=plain) -> str:
+def render_summary(d: dict, paint=plain, person: bool = False) -> str:
+    """`person`: printed at a terminal, where each line says what it shows
+    and none tells an agent what to do (the user, 2026-10-26)."""
     counts = ", ".join(f"{paint(label, 'kind:' + label)} {n}" for label, n in d["open"].items())
     # `bug 0` beside a bug filed in an arc read as bug-free (2026-09-27).
     in_arcs = f"; {d['open_in_arcs']} open in arcs" if d.get("open_in_arcs") else ""
     in_arcs += f"; {d['parked']} parked" if d.get("parked") else ""
     named = f" {d['named_store']}" if d.get("named_store") else ""
     named += f" (for {d['reader']})" if d.get("reader") else ""
-    out = [f"symbion{named}: open outside arcs: "
+    # Session start's pull said these first: a failed fetch, or what it merged.
+    out = [*d.get("sync", ()),
+           f"symbion{named}: open outside arcs: "
            f"{counts or 'no status kinds declared'}{in_arcs}"]
     if d.get("repos"):
         out.append("  " + repos_line(d))
@@ -1073,10 +1145,12 @@ def render_summary(d: dict, paint=plain) -> str:
         out.append("  " + paint(
             f"{_count(n, 'open entry')} untouched for {UNTOUCHED_DAYS} or more active days "
             f"(days anyone wrote an entry here)"
-            f"{f', the oldest {shown} below' if 0 < shown < n else ''}: after the user's "
+            f"{f', the oldest {shown} below' if 0 < shown < n else ''}" + ("" if person else
+            f": after the user's "
             f"first request, check {'it' if one else 'each'} against the repo and the store, "
             f"then suggest a plan: resolve, citing what settled it; a question, for what only "
-            f"the user can decide{park}; or the work, if it still stands", "warn"))
+            f"the user can decide{park}; a date to come back to it, `symbion supersede ID "
+            f"--due DATE`; or the work, if it still stands"), "warn"))
     for r in d.get("untouched", ()):
         lead = paint(f"untouched {r['active_days']} active days", "meta")
         out.append(f"  {lead} " + _labelled(paint, r))
@@ -1111,7 +1185,8 @@ def render_summary(d: dict, paint=plain) -> str:
                                 f"hook's limit: `symbion summary` prints them", "meta"))
     if d.get("full") and not (d["arcs_elided"] or d["priority_elided"] or d.get("heads_elided")
                               or d.get("due_elided") or d.get("people_elided") or d.get("waiting_elided")
-                              or d.get("closed_elided") or d.get("untouched_elided")):
+                              or d.get("closed_elided") or d.get("untouched_elided")
+                              or d.get("others_elided")):
         # A --full that lifted nothing otherwise prints the default text
         # byte for byte, and the flag reads as dropped.
         out.append("  " + paint("(--full: nothing was elided)", "meta"))
@@ -1128,9 +1203,19 @@ def render_summary(d: dict, paint=plain) -> str:
                              for c in changed[:6])
             more = f"; +{len(changed) - 6} more (--json)" if len(changed) > 6 else ""
             out.append("    " + paint(f"since the wrap: {said}{more}", "warn"))
+    # A shared store: what each other side wrote since this side's handoff,
+    # with the command that lists it. None of its rows print here.
+    for o in d.get("others", ()):
+        did = " and ".join(_count(n, w) for n, w in ((o["rows"], "row"), (o["wraps"], "wrap")) if n)
+        cmd = " ".join(filter(None, ["symbion", d.get("named_store"), "list", "--side",
+                                     shlex.quote(o["side"]), o["since"] and "--since wrap"]))
+        out.append(f"  other side, {flatten(o['side'])}: {did} since "
+                   f"{'your last wrap' if o['since'] else 'the store began'}: {cmd}")
+    if d.get("others_elided"):
+        out.append("  " + paint(f"+{_count(d['others_elided'], 'more other side')} (--full)", "meta"))
     if d.get("gui"):
-        out.append(f"  symbion serve: {d['gui']}; when you point the user at an entry, "
-                   f"link it: {d['gui']}/notes?id=<id>")
+        out.append(f"  symbion serve: {d['gui']}" + ("" if person else
+                   f"; when you point the user at an entry, link it: {d['gui']}/notes?id=<id>"))
     if d.get("store") and d.get("rows") == 0:
         out.append("  " + FIRST_CONTACT)
     elif d.get("skill"):
@@ -1148,7 +1233,8 @@ def render_summary(d: dict, paint=plain) -> str:
 # JavaScript string counts, in UTF-16 units, with a margin under the cap.
 HOOK_CHARS = 9_800
 # The blocks `fit` trims, least needed first.
-_TRIM = ("heads", "untouched", "people", "arcs", "closed", "priority", "due", "waiting")
+_TRIM = ("heads", "untouched", "people", "arcs", "closed", "others", "priority", "due",
+         "waiting")
 
 
 def fit(d: dict, budget: int = HOOK_CHARS) -> dict:
@@ -1170,10 +1256,12 @@ def fit(d: dict, budget: int = HOOK_CHARS) -> dict:
     return d
 
 
-def one_line(d: dict) -> str:
+def one_line(d: dict, told=()) -> str:
     """The person's line at session start: the header, the soonest due date
-    and the GUI. The rest of the text is for the agent."""
-    line = render_summary(d).split("\n", 1)[0]
+    and the GUI, after the lines of the pull's the person reads too (`told`:
+    a changed symbion.toml names commands symbion runs). The rest of the
+    text is for the agent."""
+    line = render_summary({**d, "sync": []}).split("\n", 1)[0]
     n = len(d["due"]) + d["due_elided"]
     if n == 1:
         line += f"; 1 entry {d['due'][0]['phrase']}"
@@ -1181,7 +1269,7 @@ def one_line(d: dict) -> str:
         line += f"; {n} entries due, the first {d['due'][0]['phrase']}"
     if d.get("gui"):
         line += f" · {d['gui']}"
-    return line
+    return "\n".join([*told, line])
 
 
 def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -> dict:
@@ -1255,7 +1343,7 @@ def _bits(k: dict) -> str:
 
 def render_schema(d: dict, paint=plain) -> str:
     src = "symbion.toml [kinds]" if d["declared"] else "symbion.toml [kinds]; absent = these defaults"
-    out = [f"kinds  ({src})   entries"]
+    out = [f"kinds  ({src})   versions"]
     w = max((len(k["label"]) for k in d["kinds"]), default=4)
     for k in d["kinds"]:
         out.append(f"  {paint(k['label'].ljust(w), 'kind:' + k['label'])}  "

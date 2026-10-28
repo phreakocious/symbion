@@ -20,17 +20,22 @@ from collections import Counter
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
+import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields as dc_fields, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from time import monotonic, sleep
 
 from . import catalog  # for nfc() only -- catalog does not import store, so
                         # this does not invert the layering.
 
 from . import kinds as K
+from . import merge
+from .config import CONFIG_FILE
 
 # ---- constants ----
 STATUSES = {"open", "resolved"}
@@ -67,6 +72,7 @@ class Note:
     measurements: dict | None = None  # flat: finite float/int/str values only
     options: tuple | None = None      # question: its answers, the default first (check_fields)
     target_blob: str | None = None    # the target file's blob id when written (gitref.target_blob)
+    side: str | None = None           # shared store: the writing clone's git user.name
     extra: dict | None = None         # a newer symbion's fields, written back as read (_ROW_KEYS)
     spec: K.Kind = K.Kind()           # the kind's bits, set at read time; NEVER serialized
     # Its chain's first created_at, set at read time on a revision; NEVER
@@ -85,6 +91,7 @@ class Arc:
     author: str
     archived: bool = False
     archived_at: str | None = None
+    side: str | None = None            # a shared store: the side that created the arc
     extra: dict | None = None          # a newer symbion's fields, written back as read
 
 
@@ -323,7 +330,8 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
                              f"(`symbion schema` lists the status kinds)")
         canon_due(d["due"])
     if d.get("options") is not None and kind != "question":
-        raise ValueError(f"options on kind {kind!r}: only a question takes answers")
+        raise ValueError(f"options on kind {kind!r}: only a question takes answers. A "
+                         f"question changing kind drops them with `--option \"\"`")
 
 
 # ---- serialization ----
@@ -390,6 +398,7 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
         # In the order given: the first is the default (the user, 2026-10-16).
         options=tuple(o) if (o := d.get("options")) else None,
         target_blob=d.get("target_blob"),
+        side=d.get("side"),
         extra={k: v for k, v in d.items() if k not in _ROW_KEYS | _RETIRED_KEYS} or None,
         spec=kinds[d["kind"]],
     )
@@ -416,6 +425,7 @@ def note_to_dict(note: Note) -> dict:
         "measurements": note.measurements,
         "options": list(note.options) if note.options is not None else None,
         "target_blob": note.target_blob,
+        **({"side": note.side} if note.side is not None else {}),
         **(note.extra or {}),
     }
 
@@ -601,8 +611,28 @@ def read_only() -> bool:
     return bool(os.environ.get("SYMBION_READ_ONLY"))
 
 
+class Busy(Exception):
+    """Another command held the store's lock past a caller's deadline."""
+
+
+def _try_lock(fd) -> bool:
+    """One try at the store's lock that never waits: whether it was taken."""
+    try:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except BlockingIOError:
+        return False
+    except OSError as e:                     # Windows says a held byte with EACCES
+        if fcntl or e.errno not in (errno.EACCES, errno.EDEADLOCK):
+            raise
+        return False
+    return True
+
+
 @contextmanager
-def _lock(store, undoable: bool = True):
+def _lock(store, undoable: bool = True, until: float | None = None):
     """Exclusive lock over the whole store, held for one mutation.
 
     NEVER NEST — flock is per open-file-description, so a second LOCK_EX from
@@ -610,14 +640,21 @@ def _lock(store, undoable: bool = True):
     point, and after require_store so the directory exists.
 
     An `undoable` hold copies the files a write changes before it runs, and
-    keeps the copy as the one undo level if the write changed them (`undo`)."""
+    keeps the copy as the one undo level if the write changed them (`undo`).
+    With `until`, a time.monotonic() deadline, a lock still held at it
+    raises Busy instead of waiting on."""
     if read_only():
         raise ReadOnly()
     p = Path(store) / LOCK_FILE
     p.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        if fcntl:
+        if until is not None:
+            while not _try_lock(fd):
+                if monotonic() >= until:
+                    raise Busy("another symbion command holds the store")
+                sleep(0.05)
+        elif fcntl:
             fcntl.flock(fd, fcntl.LOCK_EX)
         else:
             # Byte 0, locked past EOF is allowed. LK_LOCK gives up after 10
@@ -643,14 +680,15 @@ def _lock(store, undoable: bool = True):
         os.close(fd)
 
 
-def _replace_atomically(path: Path, body: str) -> None:
-    """Write via temp + fsync + rename, so a crash leaves the old file whole."""
+def _replace_atomically(path: Path, body: str | bytes) -> None:
+    """Write via temp + fsync + rename, so a crash leaves the old file whole.
+    Bytes are written as given: a pull puts a file back byte for byte."""
     tmp = path.with_name(f".tmp.{os.getpid()}.{path.name}")
     try:
         # LF on every platform: Windows text mode writes CRLF, and a store
         # is shared by clones on all of them.
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            f.write(body)
+        with open(tmp, "wb") as f:
+            f.write(body.encode("utf-8") if isinstance(body, str) else body)
             f.flush()
             os.fsync(f.fileno())
         if path.exists():
@@ -672,6 +710,41 @@ def require_store(store) -> None:
     if not exists(store):
         raise ValueError(f"no store at {store}; run `symbion init`")
     ensure_store(store)
+
+
+class NoSide(ValueError):
+    """A write in a shared store from a clone with no git user.name."""
+
+
+def shared(store) -> bool:
+    """The store's symbion.toml sets `shared = true` (config.load refuses any
+    other value, so a read here asks only for the one)."""
+    p = Path(store) / CONFIG_FILE
+    return p.exists() and tomllib.loads(p.read_text(encoding="utf-8")).get("shared") is True
+
+
+def shared_side(store) -> str | None:
+    """None unless the store is shared; else this clone's side, its git
+    user.name, in NFC as every name the store keeps is: a clone typed on a
+    macOS and one on a Linux then compare equal. Never cached: a write asks
+    before its first line."""
+    if not shared(store):
+        return None
+    r = subprocess.run(["git", "-C", str(store), "config", "user.name"],
+                       capture_output=True, text=True, encoding="utf-8")
+    if not (name := r.stdout.strip()):
+        raise NoSide(f"this store is shared, and its clone has no git user.name: "
+                     f"git -C {shlex.quote(str(store))} config user.name NAME")
+    return catalog.nfc(name)
+
+
+def read_side(store) -> str | None:
+    """shared_side for a read: a clone with no user.name reads as no side,
+    since only a write refuses it by name."""
+    try:
+        return shared_side(store)
+    except NoSide:
+        return None
 
 
 UNDO_DIR = "symbion-undo"
@@ -984,6 +1057,7 @@ def add_many(store, rows, target_types=None, canonicalize=None, refuse_twins=Fal
                              f"{', '.join(kinds)} (declared under [kinds] in symbion.toml)")
         check_fields(fields["kind"], spec, fields)
     require_store(store)
+    side = shared_side(store)                # before the first line: a refusal writes nothing
     with _lock(store):                       # outer: covers canonicalize + mint + write
         # ponytail: lock held across canonicalize = rows x command_timeout worst
         # case; a per-row release would let a neighbour mint between rows, so
@@ -1001,6 +1075,8 @@ def add_many(store, rows, target_types=None, canonicalize=None, refuse_twins=Fal
             fields.setdefault("created_at", _now_iso())
             fields.setdefault("author", "unknown")
             fields.setdefault("body", "")
+            if side is not None:
+                fields["side"] = side
             if fields.get("due") is not None:
                 fields["due"] = canon_due(fields["due"])
             if "status" not in fields or fields["status"] is None:
@@ -1087,7 +1163,7 @@ def chain_tip(notes, note_id: str) -> Note:
 
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
-                        in_place=None, prepend_body: str | None = None,
+                        prepend_body: str | None = None,
                         add_measurements=None, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
@@ -1118,11 +1194,7 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     `append_body` adds to the TIP's body, read here under the caller's lock,
     so a revision that landed after the caller read the row is kept.
     `prepend_body` goes above it, the same way, as a new lead; a
-    pre-registration refuses it, since its registered text stays on top.
-
-    `in_place(tip) -> bool`, when given, may turn the append into a rewrite
-    of the tip's own line; `supersede` passes `rewritable`. A sweep passes
-    none and always appends."""
+    pre-registration refuses it, since its registered text stays on top."""
     for added in (append_body, prepend_body):
         if added is None:
             continue
@@ -1199,14 +1271,6 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         if key not in fields and base.get(key) in NULL_WORDS:
             base[key] = None
     check_fields(base["kind"], spec, base)
-    if in_place is not None and not dropped and base.get("status") == old.status \
-            and in_place(old):
-        # Keeps the id, the time and the row it revised: see `rewritable`.
-        # A status change never comes here: a resolve's time is when it closed.
-        # Nor a drop: the old row is then the only copy of what was dropped.
-        note = note_from_dict(base, kinds=kinds)
-        _rewrite_note_unlocked(store, note)
-        return note
     # The head keeps the id, and the version it replaces moves to a new one
     # (the user, 2026-10-11): a row went through three ids in one session,
     # and the cites, commit messages and chat that named it went stale.
@@ -1221,6 +1285,8 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     # correction, not by the person being corrected. The row gets a fresh
     # timestamp; a stale author beside it is incoherent.
     base["author"] = author or "unknown"
+    if (side := shared_side(store)) is not None:    # the edit is the editor's
+        base["side"] = side
     note = note_from_dict(base, kinds=kinds)
     _rewrite_note_unlocked(store, note, kept_id=kept.id)
     notes[notes.index(old)] = kept      # a sweep reads this list for its next row
@@ -1277,38 +1343,8 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
                 raise RefsDropped(gone)
         return _supersede_unlocked(store, notes, old_id, author=author,
                                    append_body=append_body, add_refs=add_refs,
-                                   prepend_body=prepend_body, in_place=lambda tip: rewritable(store, notes, tip, author),
+                                   prepend_body=prepend_body,
                                    add_measurements=add_measurements, **fields)
-
-
-def rewritable(store, notes, tip: Note, author: str | None) -> bool:
-    """Whether an edit by `author` rewrites `tip` in place instead of
-    appending a revision. A wording fix 54 s after the row left two rows
-    for one thought (2026-10-01): the window for an edit is the time before
-    `symbion commit`. Append-only keeps a conclusion's history, and a row
-    git never saw has none. So: git has not seen the row, its author is the
-    editor, no other row's body cites it, and it is no pre-registration,
-    whose registered text is the point. The caller also keeps the status:
-    a resolve's time is when the row closed."""
-    return not citing(notes, tip) and own_draft(store, tip, author)
-
-
-def own_draft(store, tip: Note, author: str | None) -> bool:
-    """Every condition of `rewritable` but the citations: `author` wrote
-    `tip` in this session (or both outside any), git has not seen it, and
-    it is no pre-registration."""
-    if not author or author != tip.author or (tip.spec.status and tip.spec.verdict):
-        return False
-    if sessions(store).get(tip.id) != session_key():
-        return False
-    committed = _committed_lines(store)
-    if committed is None:
-        return False
-    # By line, not by id: an edit keeps the row's id, so an id git has seen
-    # can hold an edit it has not.
-    lines = jsonl_lines(notes_path(store).read_text(encoding="utf-8"))
-    return not any(tip.id in raw and raw in committed and _line_id(raw) == tip.id
-                   for raw in lines)
 
 
 def _committed_floor(store, notes, tip: Note) -> str:
@@ -1332,17 +1368,9 @@ def _committed_floor(store, notes, tip: Note) -> str:
     return root.body or ""
 
 
-def citing(notes, tip: Note) -> list[str]:
-    """The ids of the other rows whose body cites `tip`, whole or by the
-    10-character tail SKILL.md says to cite."""
-    return [n.id for n in notes
-            if n.id != tip.id and n.body and (tip.id in n.body or tip.id[-10:] in n.body)]
-
-
 def _committed_lines(store) -> set | None:
     """The lines of notes.jsonl in the store's last commit: none before the
-    first one. None when git cannot say, so the edit keeps a version, as
-    every edit once did."""
+    first one. None when git cannot say."""
     git = ["git", "-C", str(store)]
     if subprocess.run([*git, "rev-parse", "-q", "--verify", "HEAD"],
                       capture_output=True).returncode:
@@ -1427,11 +1455,11 @@ def _forget_committed(store) -> None:
                         "".join(f"{i}\t{k}\n" for i, k in known.items() if i in live))
 
 
-def _rewrite_note_unlocked(store, note: Note, kept_id: str | None = None) -> None:
-    """Replace the line holding note.id, whole-file and atomically: a reader
-    without the lock sees the old file or the new one, never half. With
-    `kept_id`, that line stays as written but under `kept_id`, and the note
-    is appended: one write, so no crash leaves the id on neither line.
+def _rewrite_note_unlocked(store, note: Note, kept_id: str) -> None:
+    """Move the line holding note.id to `kept_id`, as written, and append
+    the note, whole-file and atomically: a reader without the lock sees the
+    old file or the new one, never half, and no crash leaves the id on
+    neither line.
     # ponytail: a sweep rewrites the file once per row; write a sweep's rows
     # in one pass if a rename over a large store gets slow."""
     path = notes_path(store)
@@ -1443,9 +1471,9 @@ def _rewrite_note_unlocked(store, note: Note, kept_id: str | None = None) -> Non
                          f"3 characters of one line's id to other hex digits, then write again")
     prior = sessions(store).get(note.id)
     line = _dumps(note_to_dict(note))
-    rows = [(line if kept_id is None else _dumps({**json.loads(raw), "id": kept_id}))
-            if _line_id(raw) == note.id else raw for raw in raws]
-    _replace_atomically(path, "\n".join(rows + ([line] if kept_id else [])) + "\n")
+    rows = [_dumps({**json.loads(raw), "id": kept_id}) if _line_id(raw) == note.id else raw
+            for raw in raws]
+    _replace_atomically(path, "\n".join(rows + [line]) + "\n")
     _record_session(store, note.id, kept_id, prior)
 
 
@@ -1741,12 +1769,14 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
     does not ignore are staged too. `wrap` names who ends a session
     with this commit: a `Wrap:` line in the one trailer block (a second
     `-m` would put `Rows:` outside it), and summary reads the newest. A
-    wrap commits even with nothing staged."""
+    wrap commits even with nothing staged. In a shared store the commit is
+    the clone's own (its git identity, so `git log` shows the side) and a wrap
+    adds a `Side:` line after `Wrap:`."""
     store = Path(store)
     require_store(store)
+    side = shared_side(store)          # a clone with no user.name is refused by name
     git = ["git", "-C", str(store)]
     with _lock(store, undoable=False):
-        _forget_undo(store)          # after a commit there is nothing to undo
         r = (subprocess.run([*git, "add", "-A"], capture_output=True, text=True, encoding="utf-8")
              if keep is None else _stage_kept(store, keep))
         if r.returncode == 0 and keep is not None and files:
@@ -1770,6 +1800,7 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
             # and a session that changed only the repo had none (2026-10-13).
             empty = r.returncode == 0             # nothing staged
             if empty and not wrap:
+                _forget_undo(store)      # what git holds already: undo would take it back
                 return False
             if r.returncode in (0, 1):
                 # A commit once named another agent's rows as its own work
@@ -1779,19 +1810,23 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
                                       capture_output=True, text=True, encoding="utf-8").stdout
                 rows = rows_by_author(added_rows(diff))
                 trailers = ([f"Rows: {rows}"] if rows else []) + ([f"Wrap: {wrap}"] if wrap else [])
+                if wrap and side:
+                    trailers.append(f"Side: {side}")
                 # In UTC by the one clock, as the rows are: git's own read the
                 # local zone, and ignored a stopped clock. A date the caller
                 # set in git's own variables still wins.
                 now = _now_iso()
                 r = subprocess.run(
-                    [*git, "-c", f"user.name={cfg.git_name}",
-                     "-c", f"user.email={cfg.git_email}", "commit", "-q",
+                    [*git, *([] if side else ["-c", f"user.name={cfg.git_name}",
+                                              "-c", f"user.email={cfg.git_email}"]),
+                     "commit", "-q",
                      *(["--allow-empty"] if empty else []), "-m", message,
                      *(["-m", "\n".join(trailers)] if trailers else [])],
                     capture_output=True, text=True, encoding="utf-8",
                     env={"GIT_AUTHOR_DATE": now, "GIT_COMMITTER_DATE": now, **os.environ})
                 if r.returncode == 0:
                     _forget_committed(store)
+                    _forget_undo(store)          # after a commit there is nothing to undo
     if r.returncode:
         said = (r.stderr + r.stdout).strip() or f"exit {r.returncode}, no output"
         raise RuntimeError(f"git refused the commit; the entries are on disk, "
@@ -1867,6 +1902,280 @@ def _stage_kept(store: Path, keep) -> subprocess.CompletedProcess:
     return r
 
 
+def _put(store: Path, texts: dict) -> None:
+    """Each file `texts` names written as its text; None removes the file."""
+    for name, body in texts.items():
+        if body is None:
+            (store / name).unlink(missing_ok=True)
+        else:
+            _replace_atomically(store / name, body)
+
+
+# ---- pull: the upstream merged around the pending rows ----
+PULLED = (NOTES_FILE, ARCS_FILE)
+PULL_ASIDE = "symbion-pull"
+
+
+def _git_said(store, *args, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(store), *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, **kw)
+
+
+def _git_paths(store, cmd, *args) -> set:
+    return set(filter(None, _git_said(store, cmd, "-z", *args).stdout.split("\0")))
+
+
+def _blob(store, rev: str, name: str) -> bytes | None:
+    r = subprocess.run(["git", "-C", str(store), "show", f"{rev}:{name}"], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _on_disk(store) -> dict:
+    return {f: (store / f).read_bytes() if (store / f).exists() else None for f in PULLED}
+
+
+def _body_lines(body) -> list[str]:            # CRLF reads as LF, as read_text reads it
+    return jsonl_lines(body.decode("utf-8").replace("\r\n", "\n")) if body else []
+
+
+def _pull_aside(store) -> Path | None:
+    """The git dir's copy of what a pull set aside, while it runs."""
+    r = _git_said(store, "rev-parse", "--git-path", PULL_ASIDE)
+    return Path(store, r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+
+
+def _pending_back(old: dict, now: dict, merged: dict, renames: dict, dropped: list) -> tuple:
+    """The files with the pending changes, `now` against `old` (lines by
+    file), put onto `merged`, and the splits, the merge's `renames` first."""
+    notes, splits = merge.reapply(old[NOTES_FILE], now[NOTES_FILE], merged[NOTES_FILE],
+                                  renames, dropped)
+    arcs, said = merge.merge_arcs(old[ARCS_FILE], now[ARCS_FILE], merged[ARCS_FILE])
+    dropped += said
+    return ({NOTES_FILE: "".join(ln + "\n" for ln in notes),
+             ARCS_FILE: "".join(ln + "\n" for ln in arcs)}, [*renames.items(), *splits])
+
+
+def _mid_merge(store) -> str:
+    here = f"git -C {shlex.quote(str(store))}"
+    return (f"the store is in the middle of a merge: finish it ({here} commit) or abort it "
+            f"({here} merge --abort), then pull")
+
+
+def _come_back(whose: str) -> str:
+    return f"the pending entries {whose} set aside come back at the next pull"
+
+
+def _drop_aside(aside: Path) -> None:
+    """Remove the copy by one rename, then delete it: a kill part way
+    through a delete of the copy itself left a part of it, read back as
+    rows the pending changes removed (a reviewer, 2026-10-26). A tombstone
+    a kill leaves is cleared when the next copy is made."""
+    if aside.exists():
+        os.replace(aside, gone := aside.with_name(PULL_ASIDE + ".gone"))
+        shutil.rmtree(gone, ignore_errors=True)
+
+
+def _read_aside(store, aside: Path) -> tuple:
+    """(old HEAD, saved files' bytes, splits) from a copy, refused unless
+    it is whole: its HEAD, its list of the files it holds, each of them, and
+    the commit HEAD names. A part of a copy applied as a whole one reads a
+    lost file as rows removed."""
+    try:
+        sha = (aside / "HEAD").read_text(encoding="utf-8").strip()
+        holds = (aside / "holds").read_text(encoding="utf-8").split()
+        saved = {f: (aside / f).read_bytes() if f in holds else None for f in PULLED}
+        splits = aside / "splits.json"
+        renames = json.loads(splits.read_text(encoding="utf-8")) if splits.exists() else {}
+        whole = isinstance(renames, dict) and _git_said(
+            store, "rev-parse", "-q", "--verify", f"{sha}^{{commit}}").returncode == 0
+    except (OSError, ValueError):
+        whole = False
+    if not whole:
+        raise RuntimeError(f"the copy a cut-off pull left in {aside} is not whole, so nothing "
+                           f"was put back from it: compare its files with notes.jsonl and "
+                           f"arcs.jsonl, then remove it")
+    return sha, saved, renames
+
+
+def _keep_sessions(store, old: dict, now: dict, splits: list) -> None:
+    """A pending head under a new id stays its session's, for its `commit`."""
+    known, path = sessions(store), _sessions_path(store)
+    held = {_line_id(ln) for ln in set(now[NOTES_FILE]) - set(old[NOTES_FILE])}
+    for was, new in splits:
+        if was in held and known.get(was) and path:
+            _append_line_unlocked(path, f"{new}\t{known[was]}")
+
+
+def _recover_unlocked(store) -> tuple:
+    """Put back what a pull that was killed set aside: its copy outlived
+    it. The pending changes go onto the files as they are now, which may
+    hold the merge and later rows, read through the splits the pull saved,
+    so rows it had already put back are not put back twice. A merge in
+    progress is left to whoever finishes it, a person perhaps: the rows wait
+    in the copy. Returns (one line or None, splits, dropped, the HEAD the
+    copy saved or None): a cut-off pull's merge is said from that HEAD."""
+    aside = _pull_aside(store)
+    if aside is None or not aside.exists():
+        return None, [], [], None
+    if _git_said(store, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        raise RuntimeError(f"{_mid_merge(store)}: {_come_back('a cut-off pull')}")
+    sha, saved, renames = _read_aside(store, aside)
+    old = {f: _body_lines(_blob(store, sha, f)) for f in PULLED}
+    now = {f: _body_lines(saved[f]) for f in PULLED}
+    dropped = []
+    texts, splits = _pending_back(old, now, {f: _body_lines(b) for f, b in _on_disk(store).items()},
+                                  renames, dropped)
+    _put(store, texts)
+    _keep_sessions(store, old, now, splits)
+    _drop_aside(aside)
+    _forget_undo(store)
+    return ("a pull was cut off before it put back the pending entries it had set aside: "
+            "they are back, still pending"), splits, dropped, sha
+
+
+def recover_pull(store, until: float | None = None) -> tuple:
+    """_recover_unlocked under the lock, taken only when a copy is left:
+    the pending rows go back even when no fetch can run. `until` is
+    _lock's."""
+    store = Path(store)
+    aside = _pull_aside(store)
+    if aside is None or not aside.exists():
+        return None, [], [], None
+    with _lock(store, undoable=False, until=until):
+        return _recover_unlocked(store)
+
+
+def merge_upstream(store, upstream: str, until: float | None = None) -> dict:
+    """`git merge` of `upstream` around the pending rows, for `symbion pull`,
+    under the lock. notes.jsonl and arcs.jsonl go back to HEAD for the merge,
+    the driver merges them, and their pending changes go back on after it
+    (merge.reapply, merge_arcs, against the old HEAD): still pending, and
+    still the session's that wrote them. Until they are back, a copy of them
+    sits in the git dir (PULL_ASIDE), and a pull a kill cut off is put back
+    first. A merge git refuses or stops changes nothing here, and the paths
+    it names go in `conflicts`, read from git's plumbing, since its words are
+    localized. Returns old_head (HEAD before the merge, or before the
+    cut-off pull it put back), merged (its commits), splits, dropped,
+    conflicts and recovered. `until` is _lock's."""
+    store = Path(store)
+    require_store(store)
+
+    def run(*args, **kw):
+        return _git_said(store, *args, **kw)
+
+    def head():
+        return run("rev-parse", "-q", "--verify", "HEAD").stdout.strip()
+
+    with _lock(store, undoable=False, until=until):
+        recovered, splits, dropped, was = _recover_unlocked(store)
+        if run("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+            # Undoing a failed pull runs `merge --abort`, which would take this one too.
+            raise RuntimeError(_mid_merge(store))
+        old_head = head()
+        n = run("rev-list", "--count", f"HEAD..{upstream}").stdout.strip()
+        out = {"old_head": was or old_head, "merged": int(n) if n.isdigit() else 0,
+               "splits": splits, "dropped": dropped, "conflicts": [], "recovered": recovered}
+        if not out["merged"]:
+            return out
+        # git refuses a merge over a change not committed to a file the merge
+        # writes, and a merge that is no fast-forward over any staged change.
+        # The two files here go back to HEAD first, so they never block it.
+        run("update-index", "-q", "--refresh")               # a touched file is no change
+        # --no-renames: a rename lists its old name too, which a local change may hold.
+        theirs = _git_paths(store, "diff", "--no-renames", "--name-only", f"HEAD...{upstream}")
+        local = _git_paths(store, "diff-index", "--name-only", "HEAD") | \
+            _git_paths(store, "ls-files", "--others", "--exclude-standard")
+        ff = run("merge-base", "--is-ancestor", "HEAD", upstream).returncode == 0
+        staged = set() if ff else _git_paths(store, "diff-index", "--cached", "--name-only",
+                                             "HEAD")
+        if blocked := sorted((local & theirs | staged) - set(PULLED)):
+            out.update(merged=0, conflicts=blocked)
+            return out
+        before, at_head = _on_disk(store), {f: _blob(store, "HEAD", f) for f in PULLED}
+        old, now = ({f: _body_lines(t[f]) for f in PULLED} for t in (at_head, before))
+        # The copy goes in whole or not at all: a kill while it is written
+        # leaves the files as they were and no copy to put back. `holds`
+        # lists the files it holds, so a part of it reads as damaged.
+        aside = _pull_aside(store)
+        if aside is None:
+            raise RuntimeError(f"git names no git dir for {store}, so nothing was merged")
+        new = aside.with_name(PULL_ASIDE + ".new")
+        for left in (new, aside.with_name(PULL_ASIDE + ".gone")):
+            shutil.rmtree(left, ignore_errors=True)
+        new.mkdir()
+        _put(new, before)
+        _replace_atomically(new / "holds", "".join(f"{f}\n" for f in PULLED if before[f] is not None))
+        _replace_atomically(new / "HEAD", old_head + "\n")
+        os.replace(new, aside)
+        merged, ok = {}, False
+        try:
+            run("reset", "-q", "--", *PULLED)
+            # git writes HEAD's copies and records their size. Bytes written
+            # here differ in size from a CRLF checkout (core.autocrlf, on by
+            # default in Git for Windows), and git then calls the file changed
+            # unread and refuses the merge (a Windows VM, 2026-10-28).
+            _put(store, {f: None for f in PULLED if at_head[f] is None})
+            if there := [f for f in PULLED if at_head[f] is not None]:
+                run("checkout-index", "-f", "-u", "--", *there)
+            stamp = _now_iso()           # in UTC by the one clock, as `commit` dates its own
+            r = run("merge", "--no-edit", upstream,
+                    env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp, **os.environ})
+            if r.returncode:
+                out["conflicts"] = sorted(_git_paths(store, "diff", "--name-only",
+                                                     "--diff-filter=U"))
+            else:
+                merged = _on_disk(store)
+                renames = {}
+                for said in r.stderr.split("\n"):            # the driver's lines
+                    if said.startswith("symbion: "):
+                        if m := merge.SAID_SPLIT.fullmatch(said.removeprefix("symbion: ")):
+                            renames[m[1]] = m[2]
+                        else:
+                            dropped.append(said.removeprefix("symbion: "))
+                texts, moved = _pending_back(old, now, {f: _body_lines(merged[f]) for f in PULLED},
+                                             renames, dropped)
+                # A kill from here on is put back through these, so a row
+                # already back under its new id is not put back again.
+                _replace_atomically(aside / "splits.json", json.dumps(dict(moved)))
+                _put(store, texts)
+                _keep_sessions(store, old, now, moved)
+                _drop_aside(aside)
+                splits += moved
+                _forget_undo(store)                  # a pull ends the undo level, as a commit does
+                ok = True
+        finally:
+            if not ok:
+                # Take back the merge, one git stopped or one it made, then
+                # the files as they were. `reset --merge` stops at a file
+                # changed since the merge, so those go back to the merge's
+                # first, and at one rewritten as it was until the index is
+                # refreshed ("not uptodate", measured 2026-10-26).
+                # A step git refuses leaves the files as git left them and
+                # the copy, which the next pull puts back.
+                if run("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0 and \
+                        (r2 := run("merge", "--abort")).returncode:
+                    raise RuntimeError(f"git could not abort the merge this pull began, so "
+                                       f"{_mid_merge(store)}: {_come_back('this pull')}. git "
+                                       f"said:\n{(r2.stderr + r2.stdout).strip()}")
+                if head() != old_head:
+                    _put(store, merged)
+                    run("update-index", "-q", "--refresh")
+                    if (r2 := run("reset", "-q", "--merge", old_head)).returncode:
+                        raise RuntimeError(f"git could not take back the merge this pull made, "
+                                           f"so the store keeps it, and "
+                                           f"{_come_back('this pull')}. git said:"
+                                           f"\n{(r2.stderr + r2.stdout).strip()}")
+                _put(store, before)
+                _drop_aside(aside)
+        if not ok:
+            if not out["conflicts"]:
+                said = (r.stderr + r.stdout).strip() or f"exit {r.returncode}, no output"
+                raise RuntimeError(f"git refused the merge, so nothing here changed. "
+                                   f"git said:\n{said}")
+            out["merged"] = 0
+        return out
+
+
 # ==========================================================================
 # Arc registry: serialization, mutators, membership/progress, seeding.
 #
@@ -1893,6 +2202,7 @@ def arc_from_dict(d: dict, legal_scopes=None) -> Arc:
         author=d.get("author", "unknown"),
         archived=bool(d.get("archived", False)),
         archived_at=d.get("archived_at"),
+        side=d.get("side"),
         extra={k: v for k, v in d.items() if k not in _ARC_KEYS} or None,
     )
 
@@ -1902,7 +2212,8 @@ def arc_to_dict(act: Arc) -> dict:
         "id": act.id, "name": act.name, "description": act.description,
         "target_scope": act.target_scope, "created_at": act.created_at,
         "author": act.author, "archived": act.archived,
-        "archived_at": act.archived_at, **(act.extra or {}),
+        "archived_at": act.archived_at,
+        **({"side": act.side} if act.side is not None else {}), **(act.extra or {}),
     }
 
 
@@ -1949,6 +2260,7 @@ def create_arc(store, name, description, target_scope, author="unknown",
     if legal_scopes is not None and target_scope not in legal_scopes:
         raise ValueError(f"unknown scope: {target_scope!r}")
     require_store(store)
+    side = shared_side(store)
     with _lock(store):                       # outer: load + mint slug + write
         acts = load_arcs(store)
         ids = {a.id for a in acts}
@@ -1960,7 +2272,7 @@ def create_arc(store, name, description, target_scope, author="unknown",
             n += 1
         act = Arc(id=slug, name=name, description=description,
                        target_scope=target_scope, created_at=_now_iso(),
-                       author=author, archived=False, archived_at=None)
+                       author=author, archived=False, archived_at=None, side=side)
         _write_arcs_unlocked(store, acts + [act])
     return act
 
@@ -2063,6 +2375,7 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
         raise ValueError(f"kind {kind!r} cannot be seeded: it has the verdict bit, "
                          f"and seed stamps no provenance and writes no falsifier")
     require_store(store)
+    side = shared_side(store)
     with _lock(store):                       # outer: load + mint + append
         notes = load(store)
         if canonicalize is not None:
@@ -2080,6 +2393,7 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
                 "target": {"type": target_type, "name": name},
                 "created_at": _now_iso(), "author": author, "body": "",
                 "status": "open", "arc_id": arc_id, "target_blob": blobs.get(name),
+                "side": side,
             }, kinds=kinds)
             _append_note_unlocked(store, note)
             created.append(note)

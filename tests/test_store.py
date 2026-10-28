@@ -549,10 +549,9 @@ def test_supersede_heals_a_legacy_row_carrying_a_field_its_kind_cannot_hold(tmp_
     assert store.heads(store.load(tmp_path)) == [new]
 
 
-def test_a_supersede_that_drops_a_field_never_edits_in_place(tmp_path):
-    """An uncommitted row's own author edits it in place (`rewritable`), so no
-    earlier version is kept. A dropped field would then be gone from disk, not
-    only from the head: the old row must stay as the copy that keeps it."""
+def test_a_supersede_that_drops_a_field_keeps_the_old_row(tmp_path):
+    """A dropped field is gone from the head, not from disk: the old row
+    stays as the copy that keeps it."""
     n = store.add(tmp_path, kind="decision", target={"type": "project", "name": None},
                   body="b", author="claude")
     path = store.notes_path(tmp_path)
@@ -808,36 +807,17 @@ def _commit(store_dir):
                     "commit", "-q", "-m", "c"], check=True)
 
 
-def test_an_edit_git_never_saw_rewrites_the_row_in_place(tmp_path):
-    """A wording fix 54 s after the row (2026-10-01) left two rows for one
-    thought. The edit window is the time before `symbion commit`: the row
-    keeps its id, its time and the row it revised; the text is the edit's."""
-    a = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
-                  body="v1", author="ann")
-    _commit(tmp_path)
-    b = store.supersede(tmp_path, a.id, author="ann", body="v2")         # a is in git
-    c = store.supersede(tmp_path, a.id, author="ann", body="v3", tags=["x"])
-    assert (c.id, c.created_at, c.supersedes) == (a.id, b.created_at, b.supersedes)
-    on_disk = store.load(tmp_path)
-    assert [(n.id, n.body, n.tags) for n in on_disk] == \
-        [(b.supersedes, "v1", ()), (a.id, "v3", ("x",))]
-
-
-@pytest.mark.parametrize("case", ["committed", "other author", "cited", "resolve",
+@pytest.mark.parametrize("case", ["uncommitted", "committed", "other author", "resolve",
                                   "pre-registration"])
-def test_an_edit_keeps_the_old_row_where_its_history_matters(tmp_path, case):
-    """A resolve's own time is when the row closed; a pre-registration's
-    registered text is the point; a cited row's text is what its citer read;
-    another author's row and a committed row are history."""
+def test_every_edit_keeps_the_version_it_replaces(tmp_path, case):
+    """An uncommitted edit by the row's own author rewrote its line until
+    2026-10-26: `show` gave an appended correction no date or author."""
     _declare(tmp_path, PREREG)
     kind = "prediction" if case == "pre-registration" else "task"
     a = store.add(tmp_path, kind=kind, target={"type": "project", "name": None},
                   body="v1", author="ann", checked="the run" if kind == "prediction" else None)
     if case == "committed":
         _commit(tmp_path)
-    if case == "cited":
-        store.add(tmp_path, kind="note", target={"type": "project", "name": None},
-                  body=f"see {a.id[-10:]}", author="bob")
     # A pre-registration's body may only extend its registered text.
     edit = ({"status": "resolved"} if case == "resolve"
             else {"body": "v1\n\nv2" if kind == "prediction" else "v2"})
@@ -862,28 +842,28 @@ def test_a_line_separator_in_a_body_reads_back_whole(tmp_path):
     assert (n.id, a.id) == (store.load(tmp_path)[0].id, store.load_arcs(tmp_path)[0].id)
 
 
-def test_an_in_place_edit_keeps_a_line_separator_row_whole(tmp_path):
+def test_an_edit_keeps_a_line_separator_row_whole(tmp_path):
     """The rewrite rebuilt the file from split lines joined by "\\n", so the
     separator became a real newline on disk."""
     project = {"type": "project", "name": None}
     a = store.add(tmp_path, kind="note", target=project, body=SEPARATORS, author="ann")
     b = store.add(tmp_path, kind="note", target=project, body="v1", author="ann")
-    assert store.supersede(tmp_path, b.id, author="ann", body="v2").id == b.id
-    assert [(n.id, n.body) for n in store.load(tmp_path)] == [(a.id, SEPARATORS), (b.id, "v2")]
+    new = store.supersede(tmp_path, b.id, author="ann", body="v2")
+    assert [(n.id, n.body) for n in store.load(tmp_path)] == \
+        [(a.id, SEPARATORS), (new.supersedes, "v1"), (b.id, "v2")]
 
 
 def test_a_committed_line_separator_row_reads_as_committed(tmp_path):
-    """A committed row split in two read as uncommitted, so its author's next
-    edit rewrote it in place, and the commit trailer counted it as `?`."""
+    """A committed row split in two read as uncommitted, and the commit
+    trailer counted it as `?`."""
     from types import SimpleNamespace
-    a = store.add(tmp_path, kind="note", target={"type": "project", "name": None},
-                  body=SEPARATORS, author="ann")
+    store.add(tmp_path, kind="note", target={"type": "project", "name": None},
+              body=SEPARATORS, author="ann")
     assert store.commit(tmp_path, "c", SimpleNamespace(git_name="t", git_email="t@t"))
     import subprocess
     msg = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%B"],
                          capture_output=True, text=True, encoding="utf-8").stdout
     assert "Rows: ann 1" in msg, msg
-    assert store.supersede(tmp_path, a.id, author="ann", body="v2").supersedes is not None
 
 
 def test_a_commit_with_keep_leaves_the_other_rows_pending(tmp_path):
@@ -972,10 +952,10 @@ def test_a_commit_forgets_the_sessions_of_the_rows_it_took(tmp_path, monkeypatch
     assert [r["id"] for r in store.pending_rows(tmp_path)] == [a.id]
 
 
-def test_another_sessions_draft_is_not_rewritten_in_place(tmp_path, monkeypatch):
-    """`own_draft` checked the author only, so one Claude session could
-    rewrite another's uncommitted `claude` row and leave no earlier version
-    of what that session may still be reading."""
+def test_each_version_is_pending_for_the_session_that_wrote_it(tmp_path, monkeypatch):
+    """One Claude session's edit of another's uncommitted `claude` row keeps
+    that session's version, and that version is still that session's to
+    commit."""
     project = {"type": "project", "name": None}
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
     a = store.add(tmp_path, kind="task", target=project, body="v1", author="claude")
@@ -1175,30 +1155,26 @@ def test_a_row_written_with_evidence_loads_and_drops_it(tmp_path):
     assert "evidence" not in store.note_to_dict(loaded[0])
 
 
-@pytest.mark.parametrize("committed", [False, True], ids=["in place", "new version"])
-def test_an_edit_keeps_a_field_a_newer_symbion_wrote(tmp_path, committed):
+def test_an_edit_keeps_a_field_a_newer_symbion_wrote(tmp_path):
     """A key this symbion does not know is a newer one's field, and an edit
     writes it back: the head dropped it (2026-10-16), so an older install's
     resolve took a question's options off it (the user, 2026-10-19)."""
-    from types import SimpleNamespace
     n = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
                   body="x", author="ann")
     path = store.notes_path(tmp_path)
     row = json.loads(path.read_text(encoding="utf-8"))
     path.write_text(json.dumps(row | {"later": {"a": [1, None]}}) + "\n", encoding="utf-8")
-    if committed:
-        assert store.commit(tmp_path, "c", SimpleNamespace(git_name="t", git_email="t@t"))
     store.supersede(tmp_path, n.id, author="ann", tags=("t",))
     head, = store.heads(store.load(tmp_path))
     assert head.tags == ("t",) and store.note_to_dict(head).get("later") == {"a": [1, None]}
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    assert [r.get("later") for r in rows] == [{"a": [1, None]}] * (2 if committed else 1)
+    assert [r.get("later") for r in rows] == [{"a": [1, None]}] * 2
 
 
 def test_undo_takes_back_the_last_write_whole(tmp_path, monkeypatch):
-    """One level: an add, an edit of a committed row, an in-place edit
-    (whose earlier text is on no disk), a batch and an arc each come back as
-    they were, sessions file included (the user, 2026-10-01)."""
+    """One level: an add, an edit of a committed row, an edit of an
+    uncommitted one, a batch and an arc each come back as they were,
+    sessions file included (the user, 2026-10-01)."""
     from types import SimpleNamespace
     cfg = SimpleNamespace(git_name="t", git_email="t@t")
     project = {"type": "project", "name": None}
@@ -1218,7 +1194,7 @@ def test_undo_takes_back_the_last_write_whole(tmp_path, monkeypatch):
 
     d = store.add(tmp_path, kind="note", target=project, body="draft1", author="claude")
     was, known = files(), store.sessions(tmp_path)
-    store.supersede(tmp_path, d.id, author="claude", body="draft2")      # in place
+    store.supersede(tmp_path, d.id, author="claude", body="draft2")
     assert store.undo(tmp_path, d.id, yes)["changed"] == [d.id]
     assert files() == was and store.sessions(tmp_path) == known
 
@@ -1231,6 +1207,41 @@ def test_undo_takes_back_the_last_write_whole(tmp_path, monkeypatch):
 
     arc = store.create_arc(tmp_path, "Arc", "", "item", author="claude")
     assert store.undo(tmp_path, arc.id, yes)["arcs"] == [arc.id] and files() == was
+
+
+@pytest.mark.parametrize("own", [False, True], ids=["everyone", "own rows"])
+def test_a_refused_commit_leaves_the_undo_level(tmp_path, refusing_hook, own):
+    """A secret scanner refuses the commit, and the secret is in the last
+    write: `undo` takes it back. The commit dropped the level before git
+    ran, so undo said nothing was written since the last commit
+    (2026-10-26)."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    store.add(tmp_path, kind="note", target=project, body="kept", author="ann")
+    assert store.commit(tmp_path, "c", cfg)
+    x = store.add(tmp_path, kind="note", target=project, body="token=hunter2", author="ann")
+    refusing_hook(tmp_path)
+    with pytest.raises(RuntimeError, match="secret found"):
+        store.commit(tmp_path, "refused", cfg, keep=store.own_rows(tmp_path, "ann") if own else None)
+    assert store.undo(tmp_path, x.id, lambda last, rows: True)["removed"] == [x.id]
+    assert "hunter2" not in store.notes_path(tmp_path).read_text(encoding="utf-8")
+
+
+def test_a_commit_with_nothing_to_take_ends_the_undo_level(tmp_path):
+    """A hand `git commit` took the last write: undo would take back a row
+    git holds. `symbion commit` finds nothing to stage and ends the level,
+    as a commit does."""
+    import subprocess
+    from types import SimpleNamespace
+    store.add(tmp_path, kind="note", target={"type": "project", "name": None}, body="b",
+              author="ann")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "by hand"], check=True)
+    assert store.undoable(tmp_path), "control: the level outlives a hand commit"
+    assert store.commit(tmp_path, "c", SimpleNamespace(git_name="t", git_email="t@t")) is False
+    assert not store.undoable(tmp_path)
 
 
 def test_undo_refuses_what_it_should_not_take_back(tmp_path):

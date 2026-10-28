@@ -22,9 +22,7 @@ _ARC_WRITES = {("arc", v) for v in ("create", "seed", "rename", "archive")}
 
 
 def _commit(store_dir, capsys):
-    """Commit the store, every writer's rows, so the edits after it append:
-    before a commit, an edit by the row's own author rewrites the row
-    (store.rewritable)."""
+    """Commit the store, every writer's rows."""
     assert run("commit", "--all", store_dir=store_dir) == 0
     capsys.readouterr()
 
@@ -350,6 +348,30 @@ def test_list_fixed_strings_names_a_regex_that_would_match(tmp_path, capsys):
     assert ids("--grep", "nowhere", "-F") == ([], ""), "no | in the pattern, no hint"
 
 
+def test_list_grep_names_a_grep_style_alternation(tmp_path, capsys):
+    """GNU grep's `a\\|b` is a literal pipe in a Python regex: it read 0 of N
+    with no hint while `a|b` matched (2026-10-26, twice). Quiet when the
+    pipe reading matches, or when `|` would match nothing either."""
+    run("add", "note", "--target", "project", "--body", "ruff and lint", store_dir=tmp_path)
+    run("add", "note", "--target", "project", "--body", "a|b stays literal", store_dir=tmp_path)
+    pipe = capsys.readouterr().out.strip().split("\n")[-1]
+
+    def ids(*argv):
+        run("list", *argv, "--json", store_dir=tmp_path)
+        c = capsys.readouterr()
+        return [r["id"] for r in json.loads(c.out)], c.err
+
+    got, err = ids("--grep", "ruff\\|mypy")
+    assert got == [] and "as 'ruff|mypy' it matches 1" in err, err
+    assert ids("--grep", "a\\|b") == ([pipe], ""), "a literal pipe that matches is quiet"
+    assert ids("--grep", "absent\\|gone") == ([], ""), "0 either way is a plain miss"
+    # A note quotes the pattern as the header does: repr doubled each backslash,
+    # and `'x\\|y'` pasted back is another pattern.
+    run("add", "note", "--target", "project", "--body", "pasted: x\\|y", store_dir=tmp_path)
+    capsys.readouterr()
+    assert "and 'x\\|y' holds operators" in ids("--grep", "x\\|y")[1]
+
+
 def test_list_grep_searches_refs(tmp_path, capsys):
     """SKILL.md sends the second object to `--ref` "instead of naming it in
     prose", then sends readers to `--grep` before they say the store holds
@@ -473,6 +495,11 @@ def test_a_write_whose_text_runs_past_500_chars_says_so(tmp_path, capsys, monkey
     assert said in err("supersede", nid, "--append", "--body", "z" * 600)
     assert said not in err("supersede", nid, "--append", "--body", "a short addition")
     assert said not in err("supersede", nid, "--add-tag", "t"), "no text, however long the body"
+    body = "word " * 200
+    assert said in err("supersede", nid, "--body", body), "a rewrite in new words"
+    fixed = body[:500] + "a fixed phrase " + body[500:]
+    assert said not in err("supersede", nid, "--body", fixed), \
+        "a phrase fixed inside a long body is a short write (2026-10-16: a 60-char fix read 1256)"
     run("add", "task", "--target", "item:c", "--body", "c", store_dir=tmp_path)
     task = capsys.readouterr().out.strip()
     assert said in err("resolve", task, "--body", "w" * 700)
@@ -582,6 +609,16 @@ def test_a_gotcha_no_hook_can_print_says_so(tmp_path, capsys):
     assert run("add", "note", "--target", "item:deploy", "--ref", "file:deploy.sh",
                "--tag", "gotcha", "--body", "t", store_dir=tmp_path) == 0
     assert never not in capsys.readouterr().err, "a file ref puts it in reach"
+
+
+def test_the_gotcha_hint_names_the_stores_own_types(tmp_path, capsys):
+    """In a store with no `file` type, the `--ref file:PATH` the hint named
+    was refused (2026-10-25). Any catalog type reaches the hook."""
+    _declare(tmp_path, '[catalogs]\ndevice = "echo d1"\n')
+    assert run("add", "note", "--target", "item:x", "--tag", "gotcha", "--body", "t",
+               store_dir=tmp_path) == 0
+    err = capsys.readouterr().err
+    assert "file:PATH" not in err and "of this store's catalogs (device, doc)" in err, err
 
 
 def test_list_shows_no_status_the_kind_no_longer_holds(tmp_path, capsys):
@@ -999,7 +1036,7 @@ def test_a_batch_on_a_resolver_type_names_no_misses(repo, tmp_path, capsys, monk
     # nothing would ever be a miss and the check could not fail.
     (tmp_path / "mint.py").write_text("import sys; print(sys.stdin.readline().strip())\n")
     _declare(tmp_path, f'[catalogs]\nnum = "printf 1.00"\n'
-                       f'[resolvers]\nnum = "{Path(sys.executable).as_posix()} '
+                       f'[resolvers]\nnum = "{shlex.quote(Path(sys.executable).as_posix())} '
                        f'{(tmp_path / "mint.py").as_posix()}"\n')
     rows = "".join(json.dumps({"kind": "note", "target": {"type": "num", "name": v},
                                "body": "b"}) + "\n" for v in ("5.00", "7.00"))
@@ -1053,6 +1090,18 @@ def test_a_closed_catalog_takes_only_the_names_it_lists(repo, tmp_path, capsys):
     c = capsys.readouterr()
     assert "host:edge " in c.out and "'edge' is a stored host name, read as typed; the " \
         "catalog resolves it to 'edge-three'" in c.err, c
+
+
+def test_an_empty_closed_catalog_says_it_listed_nothing(repo, tmp_path, capsys):
+    """A closed catalog whose command printed nothing at exit 0 refused each
+    name as a typo, "'alpha' matches nothing", and sent the reader to doubt a
+    real name (2026-10-25). A resolver can mint a first name; closed never does."""
+    _declare(tmp_path, '[catalogs]\nhost = "true"\n[resolvers]\nhost = "closed"\n')
+    rc = run("add", "note", "--target", "host:alpha", "--body", "x", store_dir=tmp_path)
+    err = capsys.readouterr().err
+    assert rc == 1 and "catalog 'host' produced no names, and it is closed, so it takes " \
+        "none: true" in err, err
+    assert "matches nothing" not in err
 
 
 def test_a_catalog_name_with_a_dot_segment_its_catalog_lacks_is_refused(repo, tmp_path,
@@ -1750,6 +1799,22 @@ def test_main_reports_a_clean_error_when_cwd_is_not_a_git_repo(tmp_path, monkeyp
     assert "Traceback" not in err
 
 
+def test_a_pointer_outside_a_git_repo_names_the_store_as_dir_does(tmp_path, monkeypatch, capsys):
+    """A folder in no repo with a `.symbion` refused every command as `not a
+    git repository` (the user, 2026-10-27). The nearest pointer above the
+    cwd names the store, and the summary names no `--dir`: this is the store
+    standing here reads."""
+    store.ensure_store(tmp_path / "notes")
+    (tmp_path / "folder" / "sub").mkdir(parents=True)
+    (tmp_path / "folder" / ".symbion").write_text("../notes\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path / "folder" / "sub")
+    assert cli.main(["add", "task", "--target", "project", "--body", "x"]) == 0
+    assert [r.body for r in store.load(tmp_path / "notes")] == ["x"]
+    capsys.readouterr()
+    assert cli.main(["summary"]) == 0
+    assert "--dir" not in capsys.readouterr().out
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows cannot remove a process's cwd")
 @pytest.mark.parametrize("argv", [["summary"], ["completion", "bash"]])
 def test_a_cwd_removed_under_the_shell_is_named_not_a_traceback(argv, tmp_path, monkeypatch,
@@ -2177,9 +2242,64 @@ def test_a_dirty_stamp_names_what_was_dirty(repo, tmp_path, capsys):
     run("add", "check", "--target", "project", "--checked", "x", "--result", "y",
         store_dir=store_dir)
     clean, dirty = [n.provenance for n in store.load(store_dir)]
-    assert set(clean) == {"sha", "dirty"} and clean["dirty"] is False
+    assert set(clean) == {"sha", "dirty", "author_date", "subject", "tree"}
+    assert clean["dirty"] is False
     assert dirty["dirty"] is True and dirty["dirty_count"] == 2
     assert sorted(dirty["dirty_paths"]) == ["CLAUDE.md", "scratch"], dirty
+
+
+def _amend_later(r):
+    """`commit --amend --no-edit` a minute on: within one second, an amend
+    that changes no file makes the same sha."""
+    ct = int(subprocess.run(["git", "-C", str(r), "show", "-s", "--format=%ct"],
+                            capture_output=True, text=True, check=True).stdout)
+    subprocess.run(["git", "-C", str(r), "commit", "-q", "--amend", "--no-edit"], check=True,
+                   capture_output=True, env={**os.environ, "GIT_COMMITTER_DATE": f"{ct + 60} +0000"})
+    return _head(r)
+
+
+def test_list_prints_a_rewritten_check_for_agents_and_json(repo, tmp_path, capsys):
+    """After a rewrite, agents typed old-to-new sha maps into their checks by
+    hand. The line names the new commit, its state and the tree test."""
+    s = tmp_path / "store"
+    run("add", "check", "--target", "project", "--checked", "x", "--result", "y", store_dir=s)
+    new = _amend_later(repo)
+    capsys.readouterr()
+    assert run("list", "--kind", "check", store_dir=s) == 0
+    out = capsys.readouterr().out
+    assert (f" state=rewritten distance=0 successor={new[:7]} successor_reads=current "
+            f"same_tree=yes") in out, out
+    assert out.count("state=") == 1, "a grep for state=current must miss this row"
+    assert run("list", "--kind", "check", "--json", store_dir=s) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert (row["state"], row["distance"], row["successor"], row["successor_state"],
+            row["same_tree"]) == ("rewritten", 0, new, "current", True)
+
+
+def test_a_successor_on_another_branch_prints_no_distance(repo, tmp_path, capsys):
+    s = tmp_path / "store"
+    (repo / "g").write_text("g")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "c1")
+    run("add", "check", "--target", "project", "--checked", "x", "--result", "y", store_dir=s)
+    new = _amend_later(repo)
+    _git(repo, "checkout", "-q", "-b", "side", "HEAD~1")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "side")
+    capsys.readouterr()
+    assert run("list", "--kind", "check", store_dir=s) == 0
+    out = capsys.readouterr().out
+    assert f" state=rewritten successor={new[:7]} successor_reads=diverged " in out, out
+    assert "distance=" not in out
+    assert run("list", "--kind", "check", "--json", store_dir=s) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert (row["state"], row["distance"], row["successor_state"]) == ("rewritten", None, "diverged")
+
+
+def test_term_words_a_rewritten_state():
+    from symbion import term
+    s = gitref.Successor("4e1a9c2" + "0" * 33, "behind", 3, False)
+    assert term._state(None, ("rewritten", 3), successor=s) == (
+        "rewritten as 4e1a9c2, tree differs, behind 3", term.WARN)
 
 
 def test_a_dirty_write_says_its_row_reads_unverifiable_for_good(repo, tmp_path, capsys):
@@ -2207,6 +2327,21 @@ def test_a_dirty_write_says_its_row_reads_unverifiable_for_good(repo, tmp_path, 
     assert "--external" not in err
     run("resolve", pid, "--body", "and more", store_dir=store_dir)
     assert "note: the tree has" not in capsys.readouterr().err
+
+
+def test_a_dirty_stamp_with_no_paths_says_the_tree_has_changes(repo, tmp_path, capsys):
+    """A `[provenance] command` written before the stamp named its paths
+    prints `dirty` alone, and the note said "0 uncommitted paths ()"
+    (2026-10-25)."""
+    store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
+    with open(store_dir / "symbion.toml", "a", encoding="utf-8") as f:
+        f.write("""[provenance]\ncommand = '''printf '{"sha": "%s", "dirty": true}' "$(git rev-parse HEAD)"'''\n""")
+    run("add", "check", "--target", "project", "--checked", "x", "--result", "y",
+        store_dir=store_dir)
+    err = capsys.readouterr().err
+    assert ("note: the tree has uncommitted changes, so this check entry reads "
+            "`unverifiable (dirty tree)` for good") in err, err
 
 
 
@@ -3435,7 +3570,7 @@ def test_prepend_puts_a_new_lead_above_the_body_but_never_a_pre_registrations(
     pid = capsys.readouterr().out.strip()
     assert run("supersede", pid, "--prepend", "--body", "lead", store_dir=tmp_path) == 1
     assert "pre-registration" in capsys.readouterr().err
-    assert len(store.load(tmp_path)) == 2
+    assert len(store.load(tmp_path)) == 3, "the task's two versions and the prediction"
 
 
 def test_a_pre_registrations_registered_text_and_run_take_no_rewrite(repo, tmp_path, capsys):
@@ -3489,17 +3624,13 @@ def test_a_fresh_store_keeps_a_predictions_registered_text(repo, tmp_path, capsy
     expected counts down before a run, an agent filed a `note` and appended
     the result before the first commit, which rewrote the row in place: the
     store could no longer show the prediction came first (2026-10-09). The
-    defaults carry `prediction`, and an edit never rewrites one."""
-    run("add", "note", "--target", "item:n", "--body", "x rises", store_dir=tmp_path)
-    nid = capsys.readouterr().out.strip()
+    defaults carry `prediction`, and an edit keeps its registered text."""
     run("add", "prediction", "--target", "item:p", "--checked", "run x",
         "--body", "x rises", store_dir=tmp_path)
     pid = capsys.readouterr().out.strip()
-    for rid in (nid, pid):
-        assert run("supersede", rid, "--append", "--body", "x rose", store_dir=tmp_path) == 0
+    assert run("supersede", pid, "--append", "--body", "x rose", store_dir=tmp_path) == 0
     rows = {n.id: n for n in store.load(tmp_path)}
-    assert rows[nid].body == "x rises\n\nx rose"        # a note's draft is rewritten
-    assert rows[rows[pid].supersedes].body == "x rises" and len(rows) == 3, \
+    assert rows[rows[pid].supersedes].body == "x rises" and len(rows) == 2, \
         "a prediction keeps its registered text"
 
 
@@ -3634,8 +3765,12 @@ def test_show_is_list_id(tmp_path, capsys):
     # a list filter read the row away: `no note found` for a row that exists
     assert run("show", nid, "--grep", "zzz", store_dir=tmp_path) == 2
     assert "symbion show: error: unrecognized arguments: --grep zzz" in capsys.readouterr().err
+    # list's --full, typed from habit, exited 2 (a trial, 2026-10-26)
+    assert run("show", nid, "--full", "--json", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out == want
     assert run("show", "-h", store_dir=tmp_path) == 0, "was `list --id -h`: an error"
-    assert capsys.readouterr().out.startswith("usage: symbion show [-h] [--json] [--all] id [id ...]")
+    assert capsys.readouterr().out.startswith(
+        "usage: symbion show [-h] [--json] [--all] [--full] id [id ...]")
 
 
 def test_show_takes_several_ids(tmp_path, capsys):
@@ -4091,6 +4226,29 @@ def test_a_body_that_cites_no_row_says_so(tmp_path, capsys):
     assert "matches 654321-fee" in err and "654321-fed" not in err, "only the new text"
 
 
+def test_a_row_a_sibling_store_holds_is_found_there(tmp_path, capsys, monkeypatch):
+    """Projects cite each other's rows, and a session looked up the rows it
+    had filed in another project's store: each `show` missed, and the next
+    call needed `--dir` (2026-10-25). A miss names the sibling `*-notes`
+    store that holds the one id, and a cite of its row is no miss."""
+    here, far = tmp_path / "here-notes", tmp_path / "far-notes"
+    run("add", "task", "--target", "project", "--body", "far away", store_dir=far)
+    there = capsys.readouterr().out.strip()
+    run("add", "task", "--target", "project", "--body", "x", store_dir=here)
+    capsys.readouterr()
+    monkeypatch.chdir(tmp_path)
+    for argv in (("show", there[-10:]), ("resolve", there)):
+        assert run(*argv, store_dir=here) == 1
+        err = capsys.readouterr().err
+        assert err.splitlines()[1:] == [f"  far-notes has it: symbion --dir far-notes show {there}"], \
+            (argv, err)
+    assert run("show", "123456-abc", store_dir=here) == 1
+    assert len(capsys.readouterr().err.splitlines()) == 1, "no store holds it: the miss alone"
+    assert run("add", "note", "--target", "project", "--body",
+               f"as {there[-10:]} says, not 123456-abc", store_dir=here) == 0
+    assert "matches 123456-abc (cited" in capsys.readouterr().err
+
+
 def test_a_ref_to_an_item_no_row_names_says_so(tmp_path, capsys):
     """A `--ref item:NAME` meant for an existing followup named
     nothing, and was stored with no word (dogfood, 2026-10-10): `item` has
@@ -4209,6 +4367,19 @@ def test_a_parked_row_with_no_due_says_its_writer_will_not_see_it(tmp_path, caps
         assert "no --due" not in capsys.readouterr().err, extra
 
 
+def test_a_due_date_already_past_at_the_write_says_so(tmp_path, capsys):
+    """A trial agent registered a prediction with the date the user gave,
+    after it: the row read overdue at once, and nothing said so
+    (2026-10-26). Quiet on a later date, and on a row written closed."""
+    assert run("add", "prediction", "--target", "project", "--body", "p", "--checked", "c",
+               "--due", "2000-01-01", store_dir=tmp_path) == 0
+    assert "note: --due 2000-01-01 has passed" in capsys.readouterr().err
+    for extra in (["--due", "2999-01-01"], ["--due", "2000-01-01", "--status", "resolved"]):
+        assert run("add", "task", "--target", "project", "--body", "x", *extra,
+                   store_dir=tmp_path) == 0
+        assert "has passed" not in capsys.readouterr().err, extra
+
+
 def test_a_write_names_what_others_wrote_since_the_writers_last(tmp_path, capsys, monkeypatch):
     """A user's reply through the GUI mid-session reached the agent only by
     commit's per-author count, four times (2026-10-10, 2026-10-11). A write
@@ -4230,7 +4401,7 @@ def test_a_write_names_what_others_wrote_since_the_writers_last(tmp_path, capsys
     run("add", "task", "--target", "project", "--body", "y", store_dir=tmp_path)
     err = capsys.readouterr().err
     assert f"  waits on you, from human [bug] item:x  x broke  {bug}" in err, err
-    assert f"  waits on you, last by human [question, +1 amendment] project:  ship it? why" in err, err
+    assert "  waits on you, last by human [question, +1 amendment] project:  ship it? why" in err, err
     assert "\n    human added " in err and ": yes, ship it\n" in err, err
     run("add", "task", "--target", "project", "--body", "z", store_dir=tmp_path)
     assert "previous write" not in capsys.readouterr().err, "said once"
@@ -4338,10 +4509,9 @@ def test_the_news_floor_is_the_writers_row_above_this_write(tmp_path, capsys, mo
     add("y broke", "--author", "human")
     out = add("mine to edit")
     assert "y broke" in out.err, out.err
-    run("supersede", out.out.strip(), "--body", "edited in place", store_dir=tmp_path)
-    err = capsys.readouterr().err
-    assert "in place" in err and "previous write" not in err, \
-        "an edit in place keeps its line and time: it is still the write after y"
+    run("supersede", out.out.strip(), "--body", "edited", store_dir=tmp_path)
+    assert "previous write" not in capsys.readouterr().err, \
+        "the version it replaced is the writer's row above it, after y"
     add("v broke", "--author", "human")
     run("supersede", bug, "--add-tag", "seen", store_dir=tmp_path)
     err = capsys.readouterr().err
@@ -5399,6 +5569,21 @@ def test_schema_text_and_json(tmp_path, capsys):
     assert d["declared"] is True and d["kinds"][0]["rows"] == 1
 
 
+def test_schema_counts_versions_and_says_so(tmp_path, capsys):
+    """The column counts every version, since a rename rewrites them all, and
+    its header said `entries`: one question and its superseded version read
+    as 2 questions (2026-10-26)."""
+    run("add", "--kind", "question", "--type", "project", "--body", "a", store_dir=tmp_path)
+    run("commit", store_dir=tmp_path)
+    nid = capsys.readouterr().out.split()[0]
+    run("supersede", nid, "--body", "b", store_dir=tmp_path)
+    capsys.readouterr()
+    run("schema", store_dir=tmp_path)
+    head, *rows = capsys.readouterr().out.splitlines()
+    assert head.endswith(" versions"), head
+    assert re.search(r"^  question .* 2  ", next(r for r in rows if "question" in r)), rows
+
+
 def test_schema_on_an_absent_store_names_it_in_text_and_prints_defaults_in_json(repo, tmp_path, capsys):
     """Silence was for the hook, which stopped running schema; after that it
     read as a store with no kinds."""
@@ -5886,6 +6071,26 @@ def test_commit_on_a_local_only_store_says_nothing_of_a_remote(tmp_path, capsys)
     assert run("push", store_dir=tmp_path) == 1
 
 
+def test_a_misspelled_toml_key_is_named_with_its_near_miss(tmp_path, capsys, monkeypatch):
+    """`local_onyl = true` read as unset in silence: rc 0, stderr empty, and
+    `commit` still said "no remote" (2026-10-25). The hook merges stderr into
+    its JSON stdout, so there the note joins the agent's text."""
+    run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=tmp_path)
+    (tmp_path / "symbion.toml").write_text("local_onyl = true\n")
+    capsys.readouterr()
+    assert run("schema", store_dir=tmp_path) == 0
+    err = capsys.readouterr().err
+    assert "symbion.toml sets local_onyl (local_only?), which this symbion does not read" in err, err
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"{}")))
+    run("summary", "--hook", store_dir=tmp_path)
+    out, err = capsys.readouterr()
+    assert "symbion.toml sets" not in err, err
+    assert "local_onyl (local_only?)" in json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    (tmp_path / "symbion.toml").write_text("local_only = true\n")
+    run("schema", store_dir=tmp_path)
+    assert "symbion.toml sets" not in capsys.readouterr().err
+
+
 def test_commit_a_hook_refuses_says_so_with_the_hooks_words(tmp_path, capsys,
                                                              refusing_hook):
     """It printed 'nothing to commit' and dropped the hook's output, so a
@@ -6057,7 +6262,7 @@ def test_supersede_takes_external_only_where_the_row_already_has_it(repo, tmp_pa
     assert "add --external" in capsys.readouterr().err
     rows = {n.id: n for n in store.load(tmp_path)}
     assert (rows[ext].result, rows[ext].provenance["external"]) == ("ok, re-read", True)
-    assert rows[sha].result == "ok" and len(rows) == 2
+    assert rows[sha].result == "ok" and len(rows) == 3, "ext's two versions and sha"
 
 
 def test_from_json_takes_external(tmp_path, capsys, monkeypatch):
@@ -6433,6 +6638,20 @@ def test_a_store_that_names_no_project_resolves_in_the_cwd(two_projects, tmp_pat
     assert "other_only.py" in out and err == ""
 
 
+def test_a_check_in_a_store_no_project_claims_says_whose_head_it_took(two_projects, tmp_path,
+                                                                      capsys):
+    """A trial agent wrote a check from another checkout into a store named
+    by SYMBION_DIR: it took that checkout's HEAD, and nothing said so
+    (2026-10-26). The stamp says so; a plain write stays quiet."""
+    scratch = tmp_path / "scratch"
+    store.ensure_store(scratch)
+    assert run("add", "note", "--target", "item:x", "--body", "x", store_dir=scratch) == 0
+    assert "no project claims" not in capsys.readouterr().err
+    assert run("add", "check", "--target", "project", "--checked", "c", "--result", "r",
+               store_dir=scratch) == 0
+    assert f"no project claims {scratch.resolve()}" in capsys.readouterr().err
+
+
 def test_init_with_a_foreign_store_installs_in_the_cwd_and_points_there(two_projects):
     """`--dir X init` is how a project is pointed at a store it shares, so
     init never follows the store to its owner."""
@@ -6491,6 +6710,32 @@ def test_a_renamed_repo_is_shown_the_store_no_project_names(repo, tmp_path, caps
     shutil.rmtree(tmp_path / "old-notes")
     assert cli.main(["list"]) == 1
     assert "note:" not in capsys.readouterr().err, "no orphan, no note"
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+def test_a_pointer_to_nowhere_says_to_put_the_store_there_before_init(repo, tmp_path, capsys,
+                                                                     tracked):
+    """A committed `.symbion` read from a clone in another layout names no
+    store, and `run symbion init` started a new, empty one there: a second
+    person's agent split a shared store with no warning (a shared-store trial,
+    2026-10-27).
+    A tracked pointer is every clone's, so editing it is no way out there."""
+    gone = tmp_path / "team-notes"
+    (repo / ".symbion").write_text("../team-notes\n")
+    if tracked:
+        _git(repo, "add", ".symbion")
+    assert cli.main(["list"]) == 1
+    err = capsys.readouterr().err
+    other_way = ("git tracks .symbion, so every clone reads that path" if tracked
+                 else "or write your store's path in .symbion")
+    assert err == (f"symbion: no store at {gone.resolve()}; run `symbion init`\n"
+                   f"note: {repo / '.symbion'} names it. Clone or move the store there"
+                   f"{': ' if tracked else ', '}{other_way}; init starts a new, empty store\n"), err
+    assert cli.main(["summary"]) == 0
+    assert "Clone or move the store there" in capsys.readouterr().out, "the session-start line too"
+    store.ensure_store(gone)
+    assert cli.main(["list"]) == 0
+    assert "note:" not in capsys.readouterr().err, "a store there, no note"
 
 
 @pytest.mark.parametrize("argv, code", [
@@ -7002,58 +7247,20 @@ def test_version_names_the_commit_only_of_a_tracked_checkout(tmp_path):
     assert "(git" not in cli._version(venv)
 
 
-def test_an_edit_before_a_commit_says_it_changed_the_row_itself(tmp_path, capsys):
-    """An edit by the row's author before `symbion commit` keeps the id
-    (store.rewritable), and the id alone on stdout read as a no-op. The
-    replace note looked up the superseded row, which an edit in place of a
-    first version does not have: StopIteration."""
-    run("add", "task", "--target", "project", "--body", "v1", "--tag", "a", store_dir=tmp_path)
-    nid = capsys.readouterr().out.strip()
-    assert run("supersede", nid, "--body", "v2", "--tag", "b", store_dir=tmp_path) == 0
-    out, err = capsys.readouterr()
-    assert out.strip() == nid
-    assert f"note: {nid} was not yet committed, so it was edited in place" in err
-    assert "(`symbion commit` before an edit keeps one)" in err
-    assert "--tag replaced the tags, dropping 'a'" in err
-    _commit(tmp_path, capsys)
-    assert run("supersede", nid, "--body", "v3", store_dir=tmp_path) == 0
+def test_an_edit_before_a_commit_keeps_the_earlier_version(tmp_path, capsys):
+    """An edit by the row's own author before `symbion commit` rewrote the
+    row in place: `show` gave an appended correction no date or author, and
+    trial agents asked to keep the first wording kept no version of it
+    (2026-10-26). Every edit keeps the version it replaces."""
+    nid = _add(tmp_path, capsys, "task", "--target", "project", "--body", "v1")
+    assert run("supersede", nid, "--append", "--body", "v2", store_dir=tmp_path) == 0
     out, err = capsys.readouterr()
     assert out.strip() == nid and "edited in place" not in err, err
-    kept = _earlier(tmp_path, capsys, nid)
-    assert run("show", kept, "--all", "--json", store_dir=tmp_path) == 0
-    assert json.loads(capsys.readouterr().out)[0]["body"] == "v2", "the committed version"
-    # Now only the newest version is uncommitted: named as the row, the note
-    # read as if the committed row never was (2026-10-12).
-    assert run("supersede", nid, "--append", "--body", "v4", store_dir=tmp_path) == 0
-    err = capsys.readouterr().err
-    assert (f"note: {nid}'s newest version, not yet committed, was edited in place; "
-            f"the version before it stays as {kept}") in err, err
-    assert "no earlier version" not in err and _earlier(tmp_path, capsys, nid) == kept
-
-
-def test_an_edit_a_citation_keeps_from_the_row_itself_says_why(tmp_path, capsys):
-    """An uncommitted edit of the caller's own row changes that row unless
-    another row cites it. The cited case printed a new id and nothing else,
-    so the caller, expecting the id given, could not tell why (2026-10-05)."""
-    mine = _add(tmp_path, capsys, "bug", "--target", "item:x", "--body", "v1")
-    theirs = _add(tmp_path, capsys, "bug", "--target", "item:z", "--body", "v1")
-    shut = _add(tmp_path, capsys, "bug", "--target", "item:w", "--body", "v1")
-    cite = _add(tmp_path, capsys, "note", "--target", "item:y",
-                "--body", f"see {mine[-10:]}, {theirs} and {shut}")
-    assert run("supersede", mine, "--body", "v2", store_dir=tmp_path) == 0
-    out, err = capsys.readouterr()
-    assert out.strip() == mine and "edited in place" not in err, err
-    assert run("show", _earlier(tmp_path, capsys, mine), "--all", "--json",
+    assert run("show", _earlier(tmp_path, capsys, nid), "--all", "--json",
                store_dir=tmp_path) == 0
-    assert json.loads(capsys.readouterr().out)[0]["body"] == "v1", "the version cited"
-    # Another author's edit, and a resolve, keep a version whether or not a row cites them.
-    assert run("supersede", theirs, "--body", "v2", "--author", "sam", store_dir=tmp_path) == 0
-    assert "edited in place" not in capsys.readouterr().err
-    assert run("resolve", shut, store_dir=tmp_path) == 0
-    assert "edited in place" not in capsys.readouterr().err
-    assert run("supersede", cite, "--body", "v2", store_dir=tmp_path) == 0
-    out, err = capsys.readouterr()
-    assert out.strip() == cite and "edited in place" in err
+    assert json.loads(capsys.readouterr().out)[0]["body"] == "v1"
+    assert run("show", nid, store_dir=tmp_path) == 0
+    assert "-- user added below, " in capsys.readouterr().out
 
 
 def test_a_serve_on_the_store_links_ids_at_a_terminal_and_summary_names_it(tmp_path, capsys,
@@ -7099,6 +7306,12 @@ def test_a_serve_on_the_store_links_ids_at_a_terminal_and_summary_names_it(tmp_p
         assert f";{page}\x1b\\{nid[-10:]}\x1b]8;;\x1b\\" in raw, (verb, raw)
         assert raw.count(page) == 1, ("the id alone, not its whole line", verb, raw)
         assert "127.0.0.1:2222" not in raw, (verb, raw)      # an id may hold 2222
+    # the summary's ids too, and a person reads the URL, not an agent's errand
+    # (the user, 2026-10-26)
+    assert run("summary", store_dir=store_dir) == 0
+    raw = _ANSI.sub("", capsys.readouterr().out)
+    assert f";{page}\x1b\\{nid}\x1b]8;;\x1b\\" in raw, raw
+    assert f"  symbion serve: {url}" in raw.splitlines() and "link it" not in raw, raw
 
 
 def test_a_row_on_a_file_counts_the_commits_that_changed_it_since(tmp_path, repo, capsys):
@@ -7317,13 +7530,11 @@ def test_a_catalogs_doc_entry_replaces_the_built_in(repo, tmp_path, capsys):
     assert "built in" not in capsys.readouterr().out.split("\n  doc", 1)[1].splitlines()[0]
 
 
-@pytest.mark.parametrize("in_place", [True, False])
-def test_a_body_rewrite_that_drops_added_below_text_says_so(tmp_path, capsys, in_place):
+def test_a_body_rewrite_that_drops_added_below_text_says_so(tmp_path, capsys):
     """`supersede --body`, meant to correct one sentence, replaced a resolved
     row's report and the resolution added below it, at exit 0 (dogfood,
     2026-10-15). A rewrite that loses an added-below section, as `show`
-    marks them, names the loss; one that keeps it with an edit says nothing.
-    Both as a new version and as an edit in place of an uncommitted one."""
+    marks them, names the loss; one that keeps it with an edit says nothing."""
     nid = _add(tmp_path, capsys, "bug", "--target", "project", "--author", "ada",
                "--body", "The parser drops the last line of every file it reads.")
     _commit(tmp_path, capsys)
@@ -7336,8 +7547,6 @@ def test_a_body_rewrite_that_drops_added_below_text_says_so(tmp_path, capsys, in
                "Fixed in the reader: the loop now flushes its buffer at end of file.",
                store_dir=tmp_path) == 0
     assert "added-below" not in capsys.readouterr().err
-    if not in_place:
-        _commit(tmp_path, capsys)
     assert run("supersede", nid, "--author", "bob", "--body",
                "The parser drops the final line of every file it reads.",
                store_dir=tmp_path) == 0
@@ -7419,6 +7628,16 @@ def test_option_refuses_a_fourth_and_any_kind_but_question(tmp_path, capsys):
     assert store.load(tmp_path) == []
 
 
+def test_add_help_gives_the_option_cap_the_write_enforces(tmp_path, capsys):
+    """An answer over 60 characters was refused at the write, and `add -h`
+    gave no limit (2026-10-26, a skill trial)."""
+    assert run("add", "-h", store_dir=tmp_path) == 0
+    assert "one line of at most 60 characters" in " ".join(capsys.readouterr().out.split())
+    assert run("add", "question", "--target", "project", "--body", "?", "--option", "a" * 61,
+               store_dir=tmp_path) == 1
+    assert "over 60 characters" in capsys.readouterr().err
+
+
 def test_a_long_options_line_clips_in_the_list_and_prints_whole_in_show(tmp_path, capsys):
     opts = [f"{c} " * 29 + c for c in "abc"]                 # three answers of 59 characters
     run("add", "question", "--target", "project", "--body", "?",
@@ -7469,6 +7688,18 @@ def test_supersede_option_replaces_clears_and_survives_add_tag(tmp_path, capsys)
     assert run("supersede", qid, "--option", "", "--option", "a", store_dir=tmp_path) == 1
     assert "option 1 is empty" in capsys.readouterr().err
     assert run("resolve", qid, "--option", "a", store_dir=tmp_path) == 2   # argparse: unrecognized
+
+
+def test_a_question_changing_kind_is_told_how_to_drop_its_answers(tmp_path, capsys):
+    """A park, question to idea, was refused over its answers, and the error
+    named no way past them (dogfood, 2026-10-26)."""
+    run("add", "question", "--target", "project", "--body", "?", "--option", "a",
+        store_dir=tmp_path)
+    qid = capsys.readouterr().out.strip()
+    assert run("supersede", qid, "--kind", "idea", store_dir=tmp_path) == 1
+    assert 'drops them with `--option ""`' in capsys.readouterr().err
+    assert run("supersede", qid, "--kind", "idea", "--option", "", store_dir=tmp_path) == 0
+    assert store.heads(store.load(tmp_path))[0].kind == "idea"
 
 
 def test_list_grep_reads_options(tmp_path, capsys):

@@ -39,8 +39,8 @@ A kind is a label on three bits, and the bits are all symbion knows:
   - `current`: HEAD has not moved.
   - `behind N`: N commits have landed since. `ahead N`: this checkout is N
     commits short of the stamp. `diverged`: the stamp is on another branch.
-  - `dangling` or `unverifiable`: no branch holds the stamp, or git has lost
-    it (an amend, a rebase, a squash).
+  - `rewritten as SHA`: an amend or a rebase moved the stamp to SHA, whose
+    state follows. `dangling`: no branch holds it. `unverifiable`: git lost it.
   - `unverifiable (dirty tree)`: the tree had uncommitted changes at the
     write. This never clears.
   - `external`, with its age: `--external` stamps a run on something outside
@@ -114,9 +114,9 @@ else: the user (as their `git config user.name`), other agents, a subagent you
 name. The session-start summary sets someone else's entries apart, and leaves
 your parked entries out until they come due.
 
-An entry in the user's words is theirs: `--author "$(git config user.name)"`. A
-subagent, or another model you hand work to, writes under its own name
-(`--author sonnet-review`).
+An entry in the user's words is theirs: `--author "$(git config user.name)"`.
+One you write is yours, even with their results in it. A subagent, or another
+model you hand work to, writes under its own name (`--author sonnet-review`).
 
 ## Saving
 
@@ -167,7 +167,7 @@ and its fix fit in them. One trap is one entry; a how-to is a plain note.
 
 A `check` reaches no open view, so a running job also needs a `task` due at
 its end, resolved with the result. A result the user reports from this tree
-is a `check` whose `--checked` names who ran it; one from another tree or day is a `note`
+is your `check`, and its `--checked` names who ran what; one from another tree or day is a `note`
 on its commit. A pre-registration whose window closes unrun takes a new
 `--due`, not a resolve.
 
@@ -179,9 +179,9 @@ it, act on the answer and resolve the question. `--ref` puts an object in reach
 of `context --target`, where prose does not. `priority` marks what the next
 session must act on.
 
-`--body` is markdown. Inside double quotes the shell runs each backtick span and
-expands each `$`, in any flag. Put such text in single quotes, or a body in
-`--body-file -` with a quoted heredoc (`<<'EOF'`) after the last flag.
+`--body` is markdown. In any flag, double quotes run each backtick span and
+expand each `$`, and an apostrophe ends single quotes. A body with any of them
+goes in `--body-file -` with a quoted heredoc (`<<'EOF'`) after the last flag.
 
 ## Arcs
 

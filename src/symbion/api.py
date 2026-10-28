@@ -15,6 +15,7 @@ import itertools
 import math
 import os
 import re
+import shlex
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -71,7 +72,8 @@ def resolve(dir_value=None, follow_owner=True) -> Ctx:
     Propagates `subprocess.CalledProcessError` when the process cwd is not
     inside a git repository AND nothing names the store -- the store is
     derived from the project, so there is nothing to open. cli.main() has a
-    clause for it; a GUI caller needs one too.
+    clause for it; a GUI caller needs one too. Outside a repo, a `.symbion`
+    in the cwd or above it names the store (config.loose_pointer).
 
     A store NAMED by `--dir` or SYMBION_DIR needs no project: with none in
     the cwd and none claiming the store, both roots are None, reads degrade (gitref answers as for a departed sha), a configured
@@ -92,12 +94,16 @@ def resolve(dir_value=None, follow_owner=True) -> Ctx:
     With no owner the store repo is still not a project, so both roots are
     None rather than a catalog listing the store's own files."""
     from_env = dir_value is None and bool(os.environ.get("SYMBION_DIR"))
+    pointed = None
     try:
         root = config.project_root()
         wroot = config.work_root()
     except subprocess.CalledProcessError:
         if dir_value is None and not from_env:
-            raise
+            # Outside a repo, a `.symbion` here or above names the store, as --dir does.
+            dir_value = pointed = config.loose_pointer(Path.cwd())
+            if pointed is None:
+                raise
         root = wroot = None
     in_store = (dir_value is None and not from_env and store.is_store(root))
     store_dir = (Path(dir_value).resolve() if dir_value is not None
@@ -106,7 +112,7 @@ def resolve(dir_value=None, follow_owner=True) -> Ctx:
     # caller can say "this is not the store you get by standing here". The
     # tree, not config.store_dir: SYMBION_DIR names a store too, and a reader
     # who cannot see the environment is exactly who the label is for.
-    tree_default = None if root is None else config.tree_store(root, wroot)
+    tree_default = pointed if root is None else config.tree_store(root, wroot)
     followed = False
     if (follow_owner and (dir_value is not None or from_env or in_store)
             and (root is None or tree_default != store_dir)):
@@ -392,12 +398,13 @@ _HEX6 = re.compile(r"^[0-9a-fA-F]{6}$")
 
 
 def harvest_hashtags(body: str):
-    """`("#gui do the thing", ...)` -> `(["gui"], "do the thing")`.
+    """`("#gui do the thing", ...)` -> `(["gui"], "do the thing")`, and
+    `("fix the #gui reload", ...)` -> `(["gui"], "fix the gui reload")`.
 
     Tags are a COLUMN, not prose: leaving `#gui` in the body would store the
-    same fact twice and let the two disagree, and a line-leading `#gui` is
-    eaten by markdown into an <h1> anyway -- the text renders without it
-    either way, so the stripped body is what was already being displayed.
+    same fact twice and let the two disagree. A tag with a word on each side
+    of it on its line is a word of the sentence, so its word stays, without
+    the `#`: dropped, it cut the sentence (the user, 2026-10-27).
 
     Code spans and fences are masked before scanning, so a `#include` or a
     `#!/bin/sh` inside backticks stays code.
@@ -407,7 +414,8 @@ def harvest_hashtags(body: str):
     harvest in an editable field, so a wrong one is visible and removable
     rather than silent; tighten only if that proves annoying in practice.
     """
-    return _harvest(body, _HASHTAG, lambda tag: None if _HEX6.match(tag) else tag)  # a colour
+    return _harvest(body, _HASHTAG, lambda tag: None if _HEX6.match(tag) else tag,  # a colour
+                    inline=True)
 
 
 # `!task` names the row's kind as `#gui` names a tag, with the same guards.
@@ -429,9 +437,14 @@ def harvest_kind(body: str, kinds):
     return (found[0] if found else None), out
 
 
-def _harvest(body, rx, name_of):
+# What may open a line before a leading tag: a list item's or a quote's mark.
+_LINE_MARK = re.compile(r"^\s*(?:[-*+>]|\d+[.)])\s")
+
+
+def _harvest(body, rx, name_of, inline: bool = False):
     """Each distinct name `rx` finds outside code that `name_of` maps to a
-    name (None skips it), and the body without them."""
+    name (None skips it), and the body without them. With `inline`, one with
+    a word on each side of it on its line keeps its word, less its mark."""
     masked = _CODE.sub(lambda m: " " * len(m.group(0)), body or "")
     spans, tags = [], []
     for m in rx.finditer(masked):
@@ -444,10 +457,23 @@ def _harvest(body, rx, name_of):
     out = body or ""
     if not spans:
         return tags, out
-    # A name goes with the space before it, so `do #gui it` reads `do it`.
+    blank = list(masked)
+    for start, end in spans:
+        blank[start:end] = " " * (end - start)
+    blank = "".join(blank)
+
+    def worded(start, end):
+        line_start = blank.rfind("\n", 0, start) + 1
+        line_end = len(blank) if (e := blank.find("\n", end)) < 0 else e
+        return bool(re.search(r"\w", _LINE_MARK.sub("", blank[line_start:start], count=1))
+                    and re.search(r"\w", blank[end:line_end]))
+    # A name goes with the space before it, so `#gui do it` reads `do it`.
     # The rest is the author's: a tidy over the whole body cut each run of
     # spaces in a fenced traceback to one.
     for start, end in reversed(spans):     # right-to-left keeps earlier spans valid
+        if inline and worded(start, end):
+            out = out[:start] + out[start + 1:]
+            continue
         if out[start - 1:start] in (" ", "\t"):
             start -= 1
         out = out[:start] + out[end:]
@@ -703,6 +729,15 @@ def why_unverifiable(prov) -> str:
     return "commit unavailable"
 
 
+def rewritten_words(s) -> str:
+    """What follows `rewritten` for a gitref.Successor: the commit the run's
+    became, the tree test, and that commit's own state. An unknown tree gets
+    no word, so it reads as neither answer (the rewritten-stamps design)."""
+    tree = {True: ", same tree", False: ", tree differs"}.get(s.same_tree, "")
+    rel = s.state if s.distance is None or s.state == "current" else f"{s.state} {s.distance}"
+    return f"as {s.sha[:7]}{tree}, {rel}"
+
+
 # The most a dropped file may weigh: NiceGUI's socket takes a message of up
 # to 1 MB (python-socketio's default, which NiceGUI keeps), and the file
 # viewer reads at most 500,000 characters (the drop design, 2026-10-15).
@@ -806,14 +841,6 @@ def free_doc_name(ctx: Ctx, name: str, text: str) -> str:
             raise ValueError(f"cannot save a doc as {cand!r}: it leads out of docs/")
         if not path.exists() or as_dropped(path) == text:
             return cand
-
-
-def rewritable(ctx: Ctx, note_id: str, *, author: str) -> bool:
-    """Whether `author`'s edit of note_id's chain changes its tip in place
-    (store.rewritable). Read outside the lock: for words shown before a
-    write, never to decide one."""
-    notes = store.load(ctx.store_dir)
-    return store.rewritable(ctx.store_dir, notes, store.chain_tip(notes, note_id), author)
 
 
 def retag(ctx: Ctx, note_id: str, *, add=(), rm=(), author) -> store.Note:
@@ -1051,14 +1078,141 @@ def commit(ctx: Ctx, message: str, *, author: str | None = None,
     return ok
 
 
-def push(ctx: Ctx, *, capture: bool = False) -> subprocess.CompletedProcess:
+def push(ctx: Ctx, *, capture: bool = False,
+         timeout: float | None = None) -> subprocess.CompletedProcess:
     """`git push` the store; a bare push needs an upstream, so it is set
     first. At a terminal git's progress, prompts and refusals are its own
     words. `capture` is for a caller with no terminal (the GUI): they come
-    back as text, and git may not prompt, which would wait forever."""
+    back as text, and git may not prompt, which would wait forever. A
+    `timeout` implies `capture`, and a push past it is stopped with every
+    process it started (gitref.run_timed): `subprocess.TimeoutExpired`."""
     if store.read_only():
         raise store.ReadOnly()
     gitref.set_upstream(ctx.store_dir)
+    if timeout is not None:
+        return gitref.run_timed(["git", "-C", str(ctx.store_dir), "push"], timeout)
     kw = dict(capture_output=True, text=True, encoding="utf-8", stdin=subprocess.DEVNULL,
               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}) if capture else {}
     return subprocess.run(["git", "-C", str(ctx.store_dir), "push"], **kw)
+
+
+@dataclass
+class Pulled:
+    """What `pull` did, a field for each line it says. `upstream` is the
+    branch it merged (origin/main), for the commands it names."""
+    error: str | None = None
+    merged: int = 0
+    splits: list = field(default_factory=list)       # (kept_id, new_id)
+    dropped: list = field(default_factory=list)
+    conflicts: list = field(default_factory=list)
+    toml_changed: str | None = None                  # "<sha> by <author>"
+    old_client: bool = False
+    upstream: str | None = None
+    recovered: str | None = None                     # a killed pull's rows, put back
+    old_head: str | None = None                      # HEAD before the merge, or a cut-off pull's
+
+    def notices(self, ctx: Ctx) -> list[str]:
+        """The lines of a pull the person reads too, not only the agent, at a
+        terminal and in the GUI alike: a changed symbion.toml names commands
+        symbion runs."""
+        s = shlex.quote(str(ctx.store_dir))
+        return [*([f"symbion.toml changed in {self.toml_changed}: it names commands symbion "
+                   f"runs, so read it:", f"  git -C {s} diff {self.old_head[:12]} HEAD -- "
+                   f"symbion.toml"] if self.toml_changed else []),
+                *([f"a clone runs an older symbion: it commits as {ctx.cfg.git_name}, and its "
+                   f"edits keep the side they replace; upgrade it"] if self.old_client else [])]
+
+
+def _merged_since(ctx: Ctx, p: Pulled) -> None:
+    """What the merges since p.old_head brought that a pull says: a change
+    to symbion.toml, which names commands symbion runs, and a commit an
+    older symbion made (authored `git_name`)."""
+    s, new = ctx.store_dir, f"{p.old_head}..HEAD"
+    if config.CONFIG_FILE in gitref._git(s, "diff", "--no-renames", "--name-only", "-z",
+                                         p.old_head, "HEAD").stdout.split("\0"):
+        p.toml_changed = gitref._git(s, "log", "-1", "--no-show-signature", "--format=%h by %an",
+                                     new, "--", config.CONFIG_FILE).stdout.strip() or "the merge"
+    p.old_client = ctx.cfg.git_name in gitref._git(
+        s, "log", "--no-show-signature", "--format=%an", new).stdout.split("\n")
+
+
+def pull(ctx: Ctx, *, timeout: float = 10, until: float | None = None) -> Pulled:
+    """Fetch the shared store's origin, outside the lock, then merge its
+    upstream around the pending rows (store.merge_upstream). What the merge
+    brought is said (_merged_since), and so is what a pull a kill cut off
+    after its merge brought. `until` is store._lock's: session start's pull
+    gives up on a store another command holds (store.Busy)."""
+    s = ctx.store_dir
+    store.require_store(s)
+    if not store.shared(s):
+        return Pulled(error="this store is not shared: pull merges a shared store's "
+                            "upstream (shared = true in symbion.toml)")
+    try:
+        store.shared_side(s)             # a clone with no user.name is refused by name
+    except store.NoSide as e:
+        return Pulled(error=str(e))
+    p = Pulled()
+    try:
+        # Before the fetch: a killed pull's rows go back offline, and when
+        # its merge left nothing to merge.
+        p.recovered, p.splits, p.dropped, p.old_head = store.recover_pull(s, until)
+    except RuntimeError as e:
+        p.error = str(e)
+        return p
+    if p.old_head:
+        _merged_since(ctx, p)
+    if "origin" not in gitref._git(s, "remote").stdout.split():
+        p.error = "no remote: this store exists on one disk"
+        return p
+    gitref.ensure_merge_driver(s)
+    gitref.set_upstream(s)
+    if why := gitref.fetch(s, timeout):
+        p.error = why
+        return p
+    ref = gitref._git(s, "rev-parse", "--symbolic-full-name", "@{u}").stdout.strip()
+    p.upstream = ref.removeprefix("refs/remotes/") or None
+    if not ref or not gitref.behind(s):
+        return p
+    try:
+        m = store.merge_upstream(s, ref, until)
+    except store.Busy:
+        if not p.old_head:               # nothing put back to say: the caller says it skipped
+            raise
+        p.error = "skipped the merge: another symbion command holds the store"
+        return p
+    except RuntimeError as e:
+        p.error = str(e)
+        return p
+    p.merged, p.conflicts = m["merged"], m["conflicts"]
+    p.old_head = p.old_head or m["old_head"]
+    p.splits += m["splits"]
+    p.dropped += m["dropped"]
+    p.recovered = p.recovered or m["recovered"]
+    if p.merged:
+        _merged_since(ctx, p)
+    return p
+
+
+@dataclass
+class Synced:
+    """What `sync` did: its pull, then its push, which a pull that stopped
+    holds (pushed None). `carried` is the commits not on origin before it."""
+    pulled: Pulled
+    pushed: subprocess.CompletedProcess | None = None
+    carried: int | None = None
+    timed_out: bool = False                          # the push ran past its timeout
+
+
+def sync(ctx: Ctx, *, timeout: float = 30) -> Synced:
+    """A shared store's commit, once made, at a terminal or in the GUI: pull,
+    then push, so what reaches origin has merged what origin held. A push
+    past `timeout` seconds is stopped (push)."""
+    s = Synced(pull(ctx))
+    if s.pulled.error or s.pulled.conflicts:
+        return s
+    s.carried = gitref.unpushed(ctx.store_dir)
+    try:
+        s.pushed = push(ctx, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        s.timed_out = True
+    return s

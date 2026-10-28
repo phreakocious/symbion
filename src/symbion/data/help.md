@@ -100,7 +100,8 @@ A **tag** groups entries by a theme that cuts across targets: `#gui`,
 `#perf`, `#release`. An entry can carry any number of tags. A tag has no
 type and no list: it is exactly the word typed, so `flaky-test` and
 `flaky-tests` are two tags. The Tags page counts each tag and points out
-pairs that look like one. Writing `#word` in an entry's text adds the tag.
+pairs that look like one. Writing `#word` in an entry's text adds the tag;
+between two words, the word stays in the text.
 
 To choose: if it is a thing that can be renamed, moved or finished, or you
 want one page that gathers everything about it, make it the target or a
@@ -147,8 +148,10 @@ chip says how that commit relates to the project now:
 - `behind 5`: five commits have landed since. The run may no longer
   describe the code.
 - `diverged`: the run was on another branch.
-- `dangling`: no branch holds the run's commit any more, as after an amend
-  or a rebase. Run the check again.
+- `rewritten as 4e1a9c2`: an amend or a rebase moved the run's commit, and
+  the chip goes on with the new commit's state. The new code may differ.
+- `dangling`: no branch holds the run's commit any more, and no rewrite
+  explains it, as after a squash. Run the check again.
 - `unverifiable`, with the reason, such as uncommitted changes when it ran.
   This never clears.
 - `external`, with its age: the run was on something outside the project,
@@ -193,7 +196,10 @@ arrow dims, and clicking it says which write holds the undo now.
 
 A page shows the store as it was when the page opened. When an entry is
 written or edited after that, by an agent, at a terminal or in another tab,
-a reload button with a count appears in the top bar. In the installed app,
+a button with a count appears in the top bar. It lists those entries beside
+the page, with **reload page** at the top. A reload redraws only what the
+page filters for, so on an arc or a search it may show none of them. Click
+an entry in the list to read it whole. In the installed app,
 the icon's badge counts the entries others wrote since you last opened a
 page; your own are not counted. The app's window has no status bar, so the
 address of the link under the pointer shows at its bottom left.

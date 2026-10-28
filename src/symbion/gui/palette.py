@@ -2,7 +2,8 @@
 as the person types (the user's design, 2026-10-16). Empty, it lists
 the places, the actions the top bar offers now and the other stores a serve
 runs on. Typed, it lists entries whose id ends so, here then in the other
-stores; places, arcs, targets and tags whose name holds every word; the
+stores; places, arcs, targets and tags whose name holds every word (after
+a type and a colon, `item:`, that type's targets whose name does); the
 entries here that say it, open first; and how many entries say it in each
 other store, each a link to that store's search.
 
@@ -22,9 +23,11 @@ from .chrome import _PLACES, git_state
 from .filters import href, id_hit, search_pattern
 from .notes import kind_class, marked, snippet, target_href
 
-# Rows a typed query shows: entries here, and each kind of place.
+# Rows a typed query shows: entries here, each kind of place, and the
+# targets of a type typed as `item:`.
 ENTRIES = 4
 EACH = 2
+TYPED = 20
 
 # What a row's text holds of an entry's body: one line, cut by the browser.
 _CHARS = 120
@@ -93,24 +96,37 @@ def rows(ctx, author: str, q: str) -> list[dict]:
 
     places = [{"icon": icon, "html": marked(label, words), "href": path}
               for label, path, icon in _PLACES if has(label)]
-    arcs = [{"icon": "linear_scale", "html": marked(a.name, words),
-             "meta": "arc · {}/{}".format(*S.arc_progress(here, a.id)),
-             "href": target_href("arc", a.id)}
-            for a in sorted(S.load_arcs(ctx.store_dir), key=lambda a: a.archived)
-            if has(f"{a.id} {a.name}")]
     # Targets as the Targets page counts them: every entry on one or citing it.
     on = Counter(t for n in S.newest_first(here)
                  for t in dict.fromkeys([(n.target.type, n.target.name),
                                          *((r.type, r.name) for r in n.refs)])
                  if t[1] and t[0] != "arc")
-    targets = [{"icon": "my_location", "html": marked(name, words), "mono": typ != "item",
+    # `item:` lists the items and `file:api` the files that hold "api": every
+    # item held `item:`, and the two most named were all it showed (2026-10-27).
+    # `arc:` the arcs, which no count above holds.
+    of, colon, rest = q.partition(":")
+    of = of.lower() if colon and of.lower() in {typ for typ, _ in on} | {"arc"} else ""
+    named = rest.split() if of else words
+
+    def aimed(typ: str, name: str) -> bool:
+        if of:
+            return typ == of and all(w.lower() in name.lower() for w in named)
+        return has(f"{typ}:{name}")
+
+    arcs = [{"icon": "linear_scale", "html": marked(a.name, named),
+             "meta": "arc · {}/{}".format(*S.arc_progress(here, a.id)),
+             "href": target_href("arc", a.id)}
+            for a in sorted(S.load_arcs(ctx.store_dir), key=lambda a: a.archived)
+            if aimed("arc", f"{a.id} {a.name}")]
+
+    targets = [{"icon": "my_location", "html": marked(name, named), "mono": typ != "item",
                 "meta": f"{typ} · {summ._count(c, 'entry')}", "href": target_href(typ, name)}
-               for (typ, name), c in on.most_common() if has(f"{typ}:{name}")]
+               for (typ, name), c in on.most_common() if aimed(typ, name)]
     tags = [{"icon": "tag", "html": marked(f"#{t}", words), "mono": True,
              "meta": f"tag · {summ._count(c, 'entry')}", "href": href(tag=t)}
             for t, c in Counter(t for n in here for t in n.tags).most_common() if has(f"#{t}")]
     found = places + arcs + targets + tags
-    shown = places + arcs[:EACH] + targets[:EACH] + tags[:EACH]
+    shown = places + arcs[:TYPED if of else EACH] + targets[:TYPED if of else EACH] + tags[:EACH]
     if shown:
         groups.append(_group("go to", shown, _of(len(shown), len(found))))
     if acts := _actions(ctx, author, has):

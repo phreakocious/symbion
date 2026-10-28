@@ -58,7 +58,8 @@ above the open entries.
    that list, in its words: "mostly held" stays "mostly held". `--wrap`
    commits the message even when no entry changed. The heredoc goes to `-m -`,
    never inside `-m "$( )"`, where bash 3.2 breaks on an apostrophe. The wrap
-   does not push unless the project's instructions say so.
+   does not push unless the project's instructions say so, or the store is
+   shared: there `commit` pulls, then pushes.
 
 4. **Report**, in a few lines: the entries added, superseded and resolved; the
    practices filed; the commit.

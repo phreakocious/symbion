@@ -232,8 +232,11 @@ def pool(cfg, target_type: str) -> list[str]:
     cause instead. Emptiness is judged only after `names` has ruled out a
     non-zero exit, so a failed producer keeps its own diagnosis."""
     out = names(cfg, target_type, allow_empty=True)
-    if out or target_type in cfg.resolvers:
+    if out or resolver(cfg, target_type):
         return out
+    if cfg.resolvers.get(target_type) == CLOSED:
+        raise CatalogError(f"catalog {target_type!r} produced no names, and it is closed, "
+                           f"so it takes none: {cfg.catalogs.get(target_type)}")
     if target_type == "doc" and cfg.catalogs.get("doc") == DOC_CATALOG:
         raise CatalogError(f"the store has no file under docs/ yet: write "
                            f"{Path(cfg.store or '.', 'docs', 'NAME').as_posix()} first, "

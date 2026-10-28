@@ -42,8 +42,8 @@ def test_flatten_collapses_newlines_and_tabs():
 
 def test_body_is_flattened_before_truncation(tmp_path):
     cfg = Config(project_root=tmp_path)
-    n = store.add(tmp_path, kind="bug", target={"type": "project", "name": None},
-                  body="x\n" * 500, tags=["priority"])
+    store.add(tmp_path, kind="bug", target={"type": "project", "name": None},
+              body="x\n" * 500, tags=["priority"])
     text = summary.render_summary(summary.summary(tmp_path, cfg))
     assert text.count("\n") < 30, "line cap bypassed by embedded newlines"
 
@@ -1102,11 +1102,9 @@ def test_calendar_days_without_a_write_do_not_age_an_entry(tmp_path):
 
 
 def test_a_touch_restarts_the_count(tmp_path, monkeypatch):
-    """A committed row's edit is a new version, stamped now. An uncommitted
-    row's edit rewrites it in place and keeps its stamp, so commit first."""
+    """An edit is a new version, stamped now."""
     cfg = Config(project_root=tmp_path)
     t = _untouched_store(tmp_path, summary.UNTOUCHED_DAYS)
-    assert store.commit(tmp_path, "rows", cfg)
     monkeypatch.setattr(store, "_now_iso", lambda: _day(30))
     store.supersede(tmp_path, t, author="claude", append_body="waits on the 8.0 release")
     assert summary.summary(tmp_path, cfg)["untouched"] == []
@@ -1131,6 +1129,21 @@ def test_untouched_leaves_out_what_another_block_or_the_date_covers(tmp_path):
         store.add(tmp_path, kind="note", target={"type": "item", "name": f"n{i}"}, body="x",
                   author="claude", created_at=_day(20 + i))
     assert summary.summary(tmp_path, cfg, reader="claude")["untouched"] == []
+
+
+def test_untouched_leaves_out_an_entry_an_open_question_cites(tmp_path, monkeypatch):
+    """The question carries the ask already: a triage question citing the
+    untouched entries stood beside this block's own ask to check each
+    (2026-10-25). Its resolve brings them back at once."""
+    cfg = Config(project_root=tmp_path)
+    t = _untouched_store(tmp_path, summary.UNTOUCHED_DAYS)
+    q = store.add(tmp_path, kind="question", target={"type": "project", "name": None},
+                  body=f"Close {t[-10:]}?", author="claude",
+                  created_at=_day(20 + summary.UNTOUCHED_DAYS - 1)).id
+    assert summary.summary(tmp_path, cfg)["untouched"] == []
+    monkeypatch.setattr(store, "_now_iso", lambda: _day(30))
+    store.supersede(tmp_path, q, author="claude", status="resolved")
+    assert [r["id"] for r in summary.summary(tmp_path, cfg)["untouched"]] == [t]
 
 
 def test_untouched_names_the_oldest_by_active_days_up_to_its_cap(tmp_path):
@@ -1161,7 +1174,16 @@ def test_untouched_renders_its_ways_out_with_the_stores_parked_kind(tmp_path):
            "here): after the user's first request, check it against the repo and the store, " \
            "then suggest a plan" in text, text
     assert "symbion supersede ID --kind idea --due DATE" in text
+    # still valid but waiting on something: a resolved "keep these" left them
+    # untouched, and the summary asked again each session (2026-10-26)
+    assert "a date to come back to it, `symbion supersede ID --due DATE`" in text
     assert f"  untouched {summary.UNTOUCHED_DAYS} active days [task] item:old  old work  {t}" in text
+    # a person at a terminal reads what it shows, not what an agent should do
+    person = summary.render_summary(summary.summary(tmp_path, cfg), person=True)
+    assert "  1 open entry untouched for 5 or more active days (days anyone wrote an entry " \
+           "here)\n" in person, person
+    assert f"  untouched {summary.UNTOUCHED_DAYS} active days [task] item:old  old work  {t}" \
+        in person
 
 
 def test_untouched_offers_no_park_in_a_store_with_no_parked_kind(tmp_path):
@@ -1189,3 +1211,37 @@ def test_every_block_with_an_elided_count_is_one_fit_can_trim():
     (until this test, only a note in the store said so)."""
     assert {k.removesuffix("_elided") for k in summary.empty_summary() if k.endswith("_elided")} \
         == set(summary._TRIM)
+
+
+def test_the_nudge_names_the_busiest_other_sides_and_counts_the_rest(tmp_path):
+    rows = [{"id": f"20260110-12000{i}-000000-ab{i}", "kind": "task",
+             "target": {"type": "project", "name": None}, "created_at": "2026-01-10T12:00:00+00:00",
+             "author": "claude", "body": "x", "status": "open", "side": s}
+            for i, s in enumerate("BCCDDDEEEE")]
+    (tmp_path / "notes.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows),
+                                          encoding="utf-8")
+    cfg = Config(project_root=tmp_path)
+    d = summary.summary(tmp_path, cfg, reader="claude", side="A")
+    assert [(o["side"], o["rows"]) for o in d["others"]] == [("E", 4), ("D", 3), ("C", 2)]
+    assert d["others_elided"] == 1 and d["heads"] == []
+    text = summary.render_summary(d).splitlines()
+    assert "  other side, E: 4 rows since the store began: symbion list --side E" in text
+    assert "  +1 more other side (--full)" in text
+    full = summary.summary(tmp_path, cfg, full=True, reader="claude", side="A")
+    assert len(full["others"]) == 4 and full["others_elided"] == 0
+
+
+@pytest.mark.parametrize("reader, writer, aged", [("A", "B", False), ("A", "A", True),
+                                                  ("A", None, True), (None, "B", True)],
+                         ids=["the-other-side", "the-readers-side", "no-side", "unshared"])
+def test_only_the_readers_side_and_sideless_writes_age_an_entry(tmp_path, reader, writer, aged):
+    """A partner writing daily must not age the reader's rows into the untouched block.
+    Unshared, a store switched back off counts every day, sides and all."""
+    cfg = Config(project_root=tmp_path)
+    t = store.add(tmp_path, kind="task", target={"type": "item", "name": "old"}, body="old work",
+                  author="claude", created_at=_day(0), side="A").id
+    for i in range(summary.UNTOUCHED_DAYS):
+        store.add(tmp_path, kind="note", target={"type": "item", "name": f"n{i}"}, body="x",
+                  author="claude", created_at=_day(20 + i), side=writer)
+    data = summary.summary(tmp_path, cfg, reader="claude", side=reader)
+    assert [r["id"] for r in data["untouched"]] == ([t] if aged else [])

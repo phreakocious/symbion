@@ -266,7 +266,8 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
         # writes rows with no authentication.
         ui.run(
             host=host, port=port, show=show, reload=reload,
-            uvicorn_reload_dirs=str(Path(__file__).resolve().parent),
+            # All of symbion: watching gui/ alone served an api.py edit stale.
+            uvicorn_reload_dirs=str(Path(__file__).resolve().parent.parent),
             uvicorn_reload_includes="*.py",
             title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON,
             reconnect_timeout=30.0,

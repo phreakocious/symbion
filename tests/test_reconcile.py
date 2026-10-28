@@ -105,6 +105,18 @@ def test_ambiguous_rename_is_dropped_not_guessed(tmp_path, monkeypatch):
     assert "a.py" not in m, "an ambiguous rename must fall through to stale"
 
 
+def test_a_renames_command_gives_tab_pairs_and_a_failure_gives_none(tmp_path):
+    """A `[renames]` value other than "git" is a command printing old<TAB>new
+    lines: chains resolve as git's do, and a line with no tab is skipped. A
+    nonzero exit reads as no renames, even with pairs printed: reconcile then
+    says stale, never a guess."""
+    def renames(cmd):
+        return catalog.rename_map(Config(project_root=tmp_path, renames={"file": cmd}), "file")
+    out = r"printf 'x.py\ty.py\nno tab here\ny.py\tz.py\n'"
+    assert renames(out) == {"x.py": "z.py", "y.py": "z.py"}
+    assert renames(out + "; exit 3") == {}
+
+
 PREREG = ('[kinds]\nprediction = { status = true, verdict = true }\n'
           'task = { status = true }\n')
 
