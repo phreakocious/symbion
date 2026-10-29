@@ -258,6 +258,17 @@ refused, and a shared store with no `origin` says `no remote`.
   `symbion.toml`, or a file under `docs/` or `archive/`. Then `pull` changes
   nothing. It names the files, prints the git commands that finish the merge,
   and exits 1. A store that is not shared refuses `pull`.
+- **`symbion trust`.** A pull that changes `symbion.toml` shuts a gate in the
+  clone: a marker in its git dir, never pushed, holding the HEAD before that pull.
+  While it is shut, every write refuses, and so does every configured command
+  (catalogs, resolvers, renames, the provenance override), on a read too. Every
+  other read works and ends with a `note:` that says so; session start puts that
+  line in both the agent's text and yours. `trust` prints the commits and the diff
+  since that HEAD, then asks for a yes on a terminal. With stdin from a pipe it
+  refuses, so `yes |` in an agent's shell does not accept. An agent that drives a
+  pseudo-terminal can: this stops an agent that obeys a pulled line, not one set on
+  getting past it, which runs as you do. A fresh clone is trusted, and so is
+  your own edit. A `git pull` run by hand in the store shuts no gate.
 - **The merge driver** is a hidden verb that git runs, `symbion merge-driver`. The
   first `pull` in a clone registers it in that clone's `.git/config` and
   `.git/info/attributes`. Nothing is committed, so a clone without symbion merges

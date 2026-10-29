@@ -82,12 +82,14 @@ def test_item_type_is_never_canonicalized(tmp_path):
     assert catalog.canonical(c, "item", "  anything typed ") == "  anything typed "
 
 
-def test_output_that_is_not_utf8_names_the_command(tmp_path):
+def test_a_line_that_is_not_utf8_is_skipped_and_named(tmp_path, capsys):
     """A catalog printing Latin-1 ended in `error: 'utf-8' codec can't
-    decode byte`, naming no command (2026-10-09 review)."""
-    c = cfg(tmp_path, thing="printf 'caf\\351\\n'")
-    with pytest.raises(catalog.CatalogError, match=r"not UTF-8 \(byte 3\): printf"):
-        catalog.names(c, "thing")
+    decode byte`, naming no command (2026-10-09 review). Then one Latin-1
+    file name, which git no longer quotes, refused every `file:` write
+    (audit 2026-10-28): the line is skipped, and the rest of the catalog reads."""
+    c = cfg(tmp_path, thing="printf 'ok\\ncaf\\351\\r\\nfine\\r\\n'")
+    assert catalog.names(c, "thing") == ["ok", "fine"]
+    assert "note: 1 line printed by printf 'ok" in capsys.readouterr().err
 
 
 def test_command_exceeding_timeout_raises_catalog_error(tmp_path):

@@ -53,7 +53,9 @@ try {
     }
     if (-not $env:SYMBION_AUTHOR) { $env:SYMBION_AUTHOR = 'codex' }
     # Native stderr must become plain stdout, which Codex passes to the agent.
-    & symbion summary 2>&1 | ForEach-Object { Write-Output "$_" }
+    # --hook pulls, marks the read and fits the text, as session_start.sh does;
+    # Codex reads its JSON's additionalContext, and gets no systemMessage.
+    & symbion summary --hook 2>&1 | ForEach-Object { Write-Output "$_" }
 } catch {
     Write-Output "error: symbion session start: $($_.Exception.Message)"
 }

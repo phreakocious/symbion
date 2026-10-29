@@ -54,7 +54,7 @@ isolates `HOME`, the cwd and the cache. One test runs faster without it.
 To try a change by hand, make a scratch store and name it with `--dir`:
 
 ```bash
-d=$(mktemp -d)
+d=$(mktemp -d)/s-notes      # a fresh parent: every command scans a store's siblings
 .venv/bin/python -c 'import sys; from symbion import store; store.ensure_store(sys.argv[1])' "$d"
 .venv/bin/symbion --dir "$d" …
 ```

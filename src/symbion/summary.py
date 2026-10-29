@@ -12,7 +12,7 @@ from difflib import SequenceMatcher
 from itertools import pairwise, zip_longest
 from pathlib import Path
 
-from . import catalog, config, gitref, kinds as K, store as S
+from . import api, catalog, config, gitref, kinds as K, store as S
 from .gui import servers
 
 ARC_CAP = 10
@@ -80,8 +80,12 @@ def clip(s, n: int) -> str:
 def age_days(created_at: str, now: datetime | None = None) -> int:
     """Whole days since an ISO stamp. A stamp without an offset (rows older
     than store._now_iso's offset) is read as local time, the same clock that
-    wrote it."""
-    created = datetime.fromisoformat(created_at)
+    wrote it. One that will not parse is 0, as store.written_at sorts it
+    oldest rather than stopping a read."""
+    try:
+        created = datetime.fromisoformat(created_at)
+    except (TypeError, ValueError):
+        return 0
     if created.tzinfo is None:
         created = created.astimezone()
     return max(0, ((now or S.now_shown()) - created).days)
@@ -93,8 +97,12 @@ _UNITS = ((3600, 60, "m"), (86400, 3600, "h"), (14 * 86400, 86400, "d"),
 
 def age(stamp: str, now: datetime | None = None) -> str:
     """How long ago, in one short unit: `now`, `40m`, `8h`, `3d`, `5w`,
-    `4mo`, `2y`. A stamp without an offset is local time, as in age_days."""
-    then = datetime.fromisoformat(stamp)
+    `4mo`, `2y`. A stamp without an offset is local time, as in age_days;
+    one that will not parse is `?`."""
+    try:
+        then = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return "?"
     if then.tzinfo is None:
         then = then.astimezone()
     s = max(0.0, ((now or S.now_shown()) - then).total_seconds())
@@ -498,7 +506,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None) -> di
     # open question's cite only: across stores, a newer cite from
     # any row was a passing mention as often as a triage (2026-10-27).
     one = cite_ids(by_id)
-    asked = {S.chain_tip(loaded, i).id for q in notes
+    asked = {_tip_id(loaded, i) for q in notes
              if q.kind == "question" and S.read_status(q) == "open"
              for t in _CITE.findall(q.body or "") if (i := one.get(t))}
     untouched = sorted((n for label, k in kinds.items() if k.status and not k.parked
@@ -867,6 +875,15 @@ def cite_ids(ids) -> dict:
     return one | {i: i for i in ids}
 
 
+def _tip_id(notes, i: str) -> str | None:
+    """The id of `i`'s chain tip; None for a chain that cycles (a hand edit),
+    which hid the whole session summary when a question cited it."""
+    try:
+        return S.chain_tip(notes, i).id
+    except (KeyError, ValueError):
+        return None
+
+
 def links(notes, n) -> list[str]:
     """A line for each row n's body cites, read through that row's head,
     then one for each head whose body cites any version of n, newest first.
@@ -897,7 +914,9 @@ def links(notes, n) -> list[str]:
     mine = {c.id for c in _chain(by_id, S.chain_tip(notes, n.id))}
     heads = {}
     for i, t in cited(n).items():
-        h = S.chain_tip(notes, i)
+        if (h := _tip_id(notes, i)) is None:
+            continue
+        h = by_id[h]
         if i not in mine and h.id not in heads:
             heads[h.id] = line(f"cites {t}" + (f" -> {h.id[-10:]}" if h.id != i else ""), h)
     by = [h for h in S.newest_first(S.heads(notes))
@@ -997,7 +1016,7 @@ def added_label(a) -> str:
     return f"{a['added_by']} {verb} {when_added(a['added_at'])}{since}:"
 
 
-def json_row(n, by_id, since) -> dict:
+def json_row(n, by_id, since, state=None) -> dict:
     """A row as `list`, `context` and `arc todo` print it in --json:
     `read_dict` plus what they compute. `raised_by` is the author of the
     chain's first row: `author` is the head's, so one `supersede --append` by
@@ -1005,10 +1024,12 @@ def json_row(n, by_id, since) -> dict:
     harness, 2026-10-07). `raised_at` is that row's time, for the same reason:
     by `created_at`, a row amended today read as filed today (2026-10-12).
     Both stamps in UTC: a consumer's string sort misordered an import's
-    local offsets (2026-10-22)."""
+    local offsets (2026-10-22). `state` is a verdict row's
+    `api.verdict_state` pair."""
     root = _root(by_id, n)
     return S.read_dict(n) | {"created_at": S.utc_stamp(n.created_at), "commits_since": since,
-                             "raised_by": root.author, "raised_at": S.utc_stamp(root.created_at)}
+                             "raised_by": root.author, "raised_at": S.utc_stamp(root.created_at)} \
+        | ({"state": state[0], "distance": state[1]} if state else {})
 
 
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -1250,6 +1271,14 @@ def fit(d: dict, budget: int = HOOK_CHARS) -> dict:
             d[block] = d[block][:-1]
             d[f"{block}_elided"] = d.get(f"{block}_elided", 0) + 1
             d["fitted"] += 1
+    # Last, the handoff: a long one dropped every row and still ran over.
+    if (w := d.get("wrap")) and size() > budget:
+        tail = (f" … (clipped; git -C {shlex.quote(str(d['store']))} log -1 --grep='^Wrap: ' "
+                f"prints it whole)")
+        body = w["body"]
+        while body and size() > budget:
+            body = body[:max(0, len(body) - (size() - budget) - len(tail))].rstrip()
+            d["wrap"] = {**w, "body": body + tail}
     d["fitted"] -= 1
     if not d["fitted"]:
         del d["fitted"]
@@ -1262,11 +1291,14 @@ def one_line(d: dict, told=()) -> str:
     a changed symbion.toml names commands symbion runs). The rest of the
     text is for the agent."""
     line = render_summary({**d, "sync": []}).split("\n", 1)[0]
-    n = len(d["due"]) + d["due_elided"]
+    # A due row that waits on the reader sits in `waiting`, not `due`.
+    due = sorted([*d["due"], *(r for r in d["waiting"] if r.get("phrase"))],
+                 key=lambda r: r["days"])
+    n = len(due) + d["due_elided"]
     if n == 1:
-        line += f"; 1 entry {d['due'][0]['phrase']}"
+        line += f"; 1 entry {due[0]['phrase']}"
     elif n:
-        line += f"; {n} entries due, the first {d['due'][0]['phrase']}"
+        line += f"; {n} entries due, the first {due[0]['phrase']}"
     if d.get("gui"):
         line += f" · {d['gui']}"
     return "\n".join([*told, line])
@@ -1311,7 +1343,14 @@ def context(store_dir, cfg, target=None, commit=None, branch=None, since=None) -
     by_id = {n.id: n for n in loaded}
     return {"store": str(store_dir) if S.exists(store_dir) else None,
             "gui": (r := servers.serving(store_dir)) and r["url"], **named,
-            "notes": [json_row(n, by_id, since[n.id]) for n in rows]}
+            "notes": [json_row(n, by_id, since[n.id], st) for n, st in verdict_states(cfg, rows)]}
+
+
+def verdict_states(cfg, rows) -> list:
+    """Each row with its `api.verdict_state` pair, None for a row of no
+    verdict kind, against one HEAD read."""
+    head = gitref.head_sha(cfg) if any(n.spec.verdict for n in rows) else None
+    return [(n, api.verdict_state(cfg, n, head) if n.spec.verdict else None) for n in rows]
 
 
 # ---- schema: the vocabulary, for the hook, the skill and a human ----

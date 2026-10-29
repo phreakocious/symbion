@@ -2,6 +2,8 @@
 fixture runs no client JS, so these fire the event `_DROP_JS` sends."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("nicegui")
@@ -63,6 +65,21 @@ async def test_with_the_composer_open_a_known_file_joins_refs(user: User, ctx):
     await user.open("/")
     user.find(marker="new-note").click()
     _one(user, "note-body").value = "draft"
+    _drop(user, "app.py", "print(1)\n")
+    assert _one(user, "note-refs").value == ["file:src/app.py"]
+    assert _one(user, "note-on-type").value == "project"
+    assert _one(user, "note-body").value == "draft"
+
+
+async def test_a_known_file_joins_the_refs_of_a_draft_kept_over_a_reload(user: User, ctx):
+    await user.open("/")
+    user.find(marker="new-note").click()
+    _one(user, "note-body").value = "draft"
+    _composer_dialog(user).close()
+    old = user.client
+    user.navigate.reload()
+    while user.client is old:
+        await asyncio.sleep(0.02)
     _drop(user, "app.py", "print(1)\n")
     assert _one(user, "note-refs").value == ["file:src/app.py"]
     assert _one(user, "note-on-type").value == "project"

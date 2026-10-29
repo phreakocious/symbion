@@ -27,6 +27,13 @@ from .theme import FAVICON, FONTS_DIR, FONTS_URL, PALETTE
 # elements and a check a few git calls, and all 312 of one store's rows took
 # 3.7s and a 1 MB page.
 PAGE_ROWS = 100
+# A read-only serve's visitors share one event loop: 30 rows render /notes
+# in about half the time of 100.
+DEMO_ROWS = 30
+
+
+def _page_rows() -> int:
+    return min(PAGE_ROWS, DEMO_ROWS) if S.read_only() else PAGE_ROWS
 
 # A "recent <kind>" board holds verdict rows this young, and older ones still
 # current at HEAD. It held the 25 newest of any age: suite runs from weeks
@@ -64,7 +71,9 @@ def _board(ctx, title, rows, author, *, aside: str = "", more: str = "", tip: st
                 .mark("board-title")
             ui.label(str(len(shown))).classes("sb-count").mark("board-count")
             if aside:
-                link = ui.link(aside, more).classes("sb-board-aside").mark("board-aside")
+                # A board with no page of its own: a link to "" reloaded this one.
+                link = (ui.link(aside, more) if more else ui.label(aside)) \
+                    .classes("sb-board-aside").mark("board-aside")
                 if tip:
                     link.tooltip(tip)
         since = since or {}
@@ -374,7 +383,8 @@ def build_page(ctx, *, author: str) -> None:
             if len(hits) > 1:
                 ui.label(f"{len(hits)} entries end in -{old}; open the one you mean") \
                     .classes("text-notable").mark("ambiguous-id")
-            shown = rows if params.get("all") else rows[:PAGE_ROWS]
+            # The demo is public: a page of every row held the loop for all.
+            shown = rows if params.get("all") and not S.read_only() else rows[:_page_rows()]
             # The cut is named at the top, not only in the link at the end.
             cut = f"; newest {len(shown)} shown" if len(shown) < len(rows) else ""
             if q:
@@ -402,7 +412,7 @@ def build_page(ctx, *, author: str) -> None:
                                 hit=q.split(), git_head=git_head, since=since[n.id],
                                 seams=summ.seams(by_id, n) if "id" in kwargs else (),
                                 seen=rd)
-            if len(shown) < len(rows):
+            if len(shown) < len(rows) and not S.read_only():
                 ui.link(f"+{len(rows) - len(shown)} older not shown — show all",
                         filters.href(**base, all="1")).classes("text-body").mark("show-all")
             if "id" in kwargs and len(rows) == 1:
@@ -410,7 +420,7 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/targets")
     @gitref.heads_once()           # each repo's HEAD once a page
-    def targets_page():
+    def targets_page(all: str = ""):
         shell(ctx, author, [("Targets", None)], here="/targets")
         git_head = gitref.head_sha(ctx.cfg)
         rd = reading(ctx)
@@ -437,7 +447,18 @@ def build_page(ctx, *, author: str) -> None:
         with ui.column().classes("sb-main gap-5"):
             ui.label(f"{summ._count(len(own), 'target')} with entries on them, open work first") \
                 .classes("sb-subtitle")
-            for t in sorted(own, key=lambda t: not live[t]):     # stable: newest within
+            # A page of cards, as /notes draws: a board per file of a seeded
+            # arc drew 1,500, on the loop every visitor shares.
+            budget = None if all and not S.read_only() else _page_rows()
+            order = sorted(own, key=lambda t: not live[t])     # stable: newest within
+            drawn = 0
+            for i, t in enumerate(order):
+                if budget is not None and drawn >= budget:
+                    if not S.read_only():
+                        ui.link(f"+{len(order) - i} more targets not shown — show all",
+                                "/targets?all=1").classes("text-body").mark("show-all")
+                    break
+                drawn += max(1, min(len(live[t]), BOARD_ROWS))
                 to = target_href(*t)
                 _board(ctx, title(*t), live[t], author,
                        to=to, aside=f"· {summ._count(len(on[t]), 'entry')}", more=to,

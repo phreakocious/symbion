@@ -99,6 +99,27 @@ def test_init_links_by_junction_where_windows_refuses_a_symlink(repo, tmp_path, 
     assert "kept" in out and "linked" not in out and "left alone" not in out, out
 
 
+def test_init_writes_the_repos_own_default_branch(repo, tmp_path):
+    """init wrote `default_branch = "main"` whatever the repo's was, and on
+    a `master` repo `context --branch topic` read `git cannot list
+    main..topic` (audit 2026-10-28). origin's HEAD first, else the branch
+    checked out."""
+    _git(repo, "branch", "-m", "master")
+    _git(repo, "checkout", "-q", "-b", "topic")       # adopting on a branch
+    assert run("init", "--yes", store_dir=tmp_path / "a") == 0
+    assert 'default_branch = "master"' in (tmp_path / "a" / "symbion.toml").read_text()
+    _git(repo, "checkout", "-q", "master")
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(repo), str(origin))
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/trunk")
+    _git(origin, "branch", "trunk", "master")
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "fetch", "-q", "origin")
+    _git(repo, "remote", "set-head", "origin", "-a")
+    assert run("init", "--yes", store_dir=tmp_path / "b") == 0
+    assert 'default_branch = "trunk"' in (tmp_path / "b" / "symbion.toml").read_text()
+
+
 def test_init_writes_a_store_readme_once(repo, tmp_path, capsys):
     """The user, 2026-10-05: a store should say what it is. A person who
     opens the store's repo, on a forge or a disk, met bare JSONL. A re-run
@@ -127,6 +148,21 @@ def test_init_leaves_a_foreign_skill_dir_alone(repo, tmp_path, capsys):
     assert run("init", "--yes", store_dir=tmp_path / "store") == 0
     assert (mine / "SKILL.md").read_text() == "mine" and not mine.is_symlink()
     assert "left alone" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a symlink needs Developer Mode on Windows")
+def test_init_relinks_a_dangling_skill_link(repo, tmp_path, capsys):
+    """After a reinstall moved the package, the link dangled: `exists()` is
+    False for it, so init named it "not a link" and left it, and the hook
+    failed at every session start (audit 2026-10-28)."""
+    link = _home() / ".claude/skills/symbion"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "gone", target_is_directory=True)
+    assert run("init", store_dir=tmp_path / "store") == 1      # a plan: changes pending
+    assert f"will relink {link} -> " in capsys.readouterr().out
+    assert run("init", "--yes", store_dir=tmp_path / "store") == 0
+    assert "left alone" not in capsys.readouterr().out
+    assert link.resolve() == Path(str(SKILL_DIR)).resolve()
 
 
 def test_init_prints_the_hook_block_instead_of_merging_user_settings(repo, tmp_path, capsys):

@@ -146,6 +146,21 @@ def stamp_cfg(cfg, prov):
     return cfg.repo(stamp_repo(cfg, prov))
 
 
+def repo_default_branch(cfg) -> str | None:
+    """The repo's own default branch: origin's HEAD, else a local main or
+    master (a branch can adopt symbion), else the branch checked out. None
+    outside a repo."""
+    if not getattr(cfg, "work_root", None):
+        return None
+    origin = _git(cfg, "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD").stdout.strip()
+    if origin:
+        return origin.removeprefix("origin/")
+    for b in ("main", "master"):
+        if _git(cfg, "rev-parse", "-q", "--verify", f"refs/heads/{b}").returncode == 0:
+            return b
+    return _git(cfg, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip() or None
+
+
 def only_on_default_branch(cfg, name) -> str | None:
     """`cfg.default_branch` when `name` is a path THERE and not in this
     worktree, else None.
@@ -884,7 +899,7 @@ def _cached_git(cfg, key, *args, input: str | None = None):
     return out
 
 
-def _file_history(cfg, paths, head: str) -> tuple[dict, float]:
+def _file_history(cfg, paths, head: str, timeout: float | None = None) -> tuple[dict, float]:
     """(path -> [(sha, committer time, blob after, position)], the position
     of the first merge), in one walk in topological order: a commit before
     its parents. A merge has no `--raw` record, so no path lists one; the
@@ -892,13 +907,22 @@ def _file_history(cfg, paths, head: str) -> tuple[dict, float]:
     `SHA TIME PARENTS`, then per changed path a `:modes blobs status` record
     and the path. No paths, no walk: an empty pathspec reads every commit.
     The revision and the pathspecs go on stdin, which git reads as it reads
-    them on argv, `:(literal)` included."""
+    them on argv, `:(literal)` included. Past `timeout` seconds the walk
+    stops and the history is None."""
     if not paths:
         return {}, math.inf
     spec = "".join(f":(literal){p}\n" for p in paths)
-    out = _cached_git(cfg, (head, "log", *paths), "log", "--stdin", "-z", "--topo-order",
-                      "--no-renames", "--raw", "--no-abbrev", "--format=%H %ct %P",
-                      input=f"{head or 'HEAD'}\n--\n{spec}")
+    args = ("log", "--stdin", "-z", "--topo-order", "--no-renames", "--raw", "--no-abbrev",
+            "--format=%H %ct %P")
+    stdin = f"{head or 'HEAD'}\n--\n{spec}"
+    if timeout is None:
+        out = _cached_git(cfg, (head, "log", *paths), *args, input=stdin)
+    else:
+        try:
+            r = run_timed(["git", "-C", str(_root(cfg)), *args], timeout, input=stdin)
+        except subprocess.TimeoutExpired:
+            return None, math.inf
+        out = r.stdout if r.returncode == 0 else None
     toks = out.split("\0") if out is not None else []
     hist, top, merge, i, pos = {}, None, None, 0, -1
     while i < len(toks):
@@ -917,7 +941,7 @@ def _file_history(cfg, paths, head: str) -> tuple[dict, float]:
     return hist, math.inf if merge is None else merge
 
 
-def changed_since(cfg, notes, head: str | None = None) -> dict:
+def changed_since(cfg, notes, head: str | None = None, timeout: float | None = None) -> dict:
     """id -> the commits, newest first, that changed the row's target file
     after the content the row saw; None when the target is no file in this
     checkout.
@@ -936,20 +960,23 @@ def changed_since(cfg, notes, head: str | None = None) -> dict:
 
     In a store with [repos], each row's file is asked of its own repo.
     `head` is the HEAD of the repo `cfg` stands in; another repo's is read
-    once per call."""
+    once per call. `timeout` is the whole call's: past it, the rows of each
+    repo still to walk read None."""
     if not getattr(cfg, "repos", None):
-        return _changed_since(cfg, notes, head)
+        return _changed_since(cfg, notes, head, timeout)
     groups = {}
     for n in notes:
         groups.setdefault(n.target.type if n.target.type in cfg.repos else None, []).append(n)
-    out = {}
+    out, end = {}, None if timeout is None else time.monotonic() + timeout
     for name, rows in groups.items():
         at = cfg if name is None else cfg.repo(name)
-        out |= _changed_since(at, rows, head if at.work_root == cfg.work_root else None)
+        left = None if end is None else end - time.monotonic()
+        out |= {n.id: None for n in rows} if left is not None and left <= 0 else \
+            _changed_since(at, rows, head if at.work_root == cfg.work_root else None, left)
     return out
 
 
-def _changed_since(cfg, notes, head: str | None = None) -> dict:
+def _changed_since(cfg, notes, head: str | None = None, timeout: float | None = None) -> dict:
     """changed_since in one repo: `cfg`'s roots, no routing."""
     files = {n.id: _file(cfg, n.target.type, n.target.name) for n in notes}
     now = _blobs(cfg, sorted({p for p in files.values() if p}))
@@ -957,7 +984,9 @@ def _changed_since(cfg, notes, head: str | None = None) -> dict:
                     and now.get(files[n.id]) != n.target_blob})
     if moved and head is None:
         head = head_sha(cfg)
-    hist, merge = _file_history(cfg, moved, head)
+    hist, merge = _file_history(cfg, moved, head, timeout)
+    if hist is None:                           # the walk ran past its timeout
+        return {n.id: None for n in notes}
     anchored, out = {}, {}
     for n in notes:
         path = files[n.id]
@@ -983,11 +1012,11 @@ def _changed_since(cfg, notes, head: str | None = None) -> dict:
     return out
 
 
-def commits_since(cfg, notes, head: str | None = None) -> dict:
+def commits_since(cfg, notes, head: str | None = None, timeout: float | None = None) -> dict:
     """id -> how many commits changed_since lists, None where it has none:
     the count every read prints."""
     return {k: None if v is None else len(v)
-            for k, v in changed_since(cfg, notes, head).items()}
+            for k, v in changed_since(cfg, notes, head, timeout).items()}
 
 
 def uncommitted(store_dir) -> tuple[int, bool]:
@@ -1164,21 +1193,22 @@ def ensure_merge_driver(store) -> bool:
     return changed
 
 
-def run_timed(argv, timeout: float) -> subprocess.CompletedProcess:
-    """Run `argv` with its output captured, stdin closed and git unable to
-    ask for a password. Past `timeout` seconds it is stopped and
+def run_timed(argv, timeout: float, input: str | None = None) -> subprocess.CompletedProcess:
+    """Run `argv` with its output captured, stdin closed (or `input` on it)
+    and git unable to ask for a password. Past `timeout` seconds it is stopped and
     `subprocess.TimeoutExpired` is raised. On POSIX it runs in a session of
     its own and the stop reaches every process it started: an ssh git ran
     has no terminal to prompt on, and none outlives it holding the pipe. On
     Windows taskkill stops its process tree: kill() stops git alone, and the
     wait for the pipe its child holds would outlast the timeout."""
     posix = os.name == "posix"
-    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
+                          stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
                           start_new_session=posix) as p:
         try:
-            out, err = p.communicate(timeout=timeout)
+            out, err = p.communicate(input, timeout=timeout)
         except subprocess.TimeoutExpired:
             if posix:
                 with suppress(ProcessLookupError):

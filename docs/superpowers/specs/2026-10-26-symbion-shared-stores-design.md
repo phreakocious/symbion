@@ -279,7 +279,11 @@ It warns and does not refuse.
   edit becomes its own entry.
 - An arc conflict takes the upstream's value and never stops a pull; only a
   conflict in `symbion.toml` or a doc needs git by hand.
-- A `symbion.toml` changed by a pull is a warning, not a refusal.
+- A `symbion.toml` changed by a pull is a warning, not a refusal. *Amended
+  2026-10-28: a refusal. A teammate's push could change a catalog command, and
+  the agent's next write ran it unread. Until the user runs `symbion trust` at a
+  terminal, writes and the toml's commands refuse and reads warn. The user chose
+  all or nothing, and a fresh clone trusted.*
 - In shared mode, store commits carry the clone's git identity, not `git_name`.
 - `pull` never merges over pending rows in place: it sets them aside and puts them
   back.

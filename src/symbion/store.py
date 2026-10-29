@@ -273,6 +273,11 @@ def stamp_sha(prov) -> str | None:
     return sha if isinstance(sha, str) and sha else None
 
 
+def control_char(s) -> str | None:
+    """The first C0 or DEL character in `s`, for a name or a tag."""
+    return next((c for c in s if c < " " or c == "\x7f"), None) if isinstance(s, str) else None
+
+
 def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
     """The write-side invariants, determined by the kind's bits and shared by
     `add_many`, `_supersede_unlocked` and `api.fields_from_row` -- a
@@ -314,6 +319,9 @@ def check_fields(kind: str, spec: K.Kind, d: dict) -> None:
                          f"would show the entry")
     if isinstance(d.get("tags"), str):
         raise ValueError(f"tags must be a list of strings, not the string {d['tags']!r}")
+    if bad := next((t for t in d.get("tags") or () if control_char(t)), None):
+        raise ValueError(f"tag {bad!r} holds a control character ({control_char(bad)!r}): "
+                         f"a newline split `list`'s one line per entry")
     if not spec.verdict and (d.get("checked") is not None or d.get("result") is not None):
         raise ValueError(f"--checked/--result are not valid for kind {kind!r}: "
                          f"it has no verdict bit; put the evidence in --body "
@@ -611,6 +619,21 @@ def read_only() -> bool:
     return bool(os.environ.get("SYMBION_READ_ONLY"))
 
 
+class Untrusted(ValueError):
+    """A write while a pull's change to symbion.toml waits on `symbion trust`."""
+
+    def __init__(self):
+        super().__init__(catalog.UNTRUSTED)
+
+
+def distrust(store, old_head: str) -> None:
+    """Shut the gate a pull's change to symbion.toml opens, at the HEAD
+    before it; one already shut keeps its earlier HEAD, so `trust` shows
+    every change since."""
+    if (p := catalog.untrusted_path(store)) is not None and not p.exists():
+        _replace_atomically(p, old_head + "\n")
+
+
 class Busy(Exception):
     """Another command held the store's lock past a caller's deadline."""
 
@@ -632,8 +655,10 @@ def _try_lock(fd) -> bool:
 
 
 @contextmanager
-def _lock(store, undoable: bool = True, until: float | None = None):
-    """Exclusive lock over the whole store, held for one mutation.
+def _lock(store, undoable: bool = True, until: float | None = None, gated: bool = True):
+    """Exclusive lock over the whole store, held for one mutation. A `gated`
+    hold refuses while a pulled symbion.toml waits on `symbion trust`
+    (catalog.untrusted); a pull is not gated.
 
     NEVER NEST — flock is per open-file-description, so a second LOCK_EX from
     this same process would deadlock. Acquire only at a top-level mutating entry
@@ -666,8 +691,12 @@ def _lock(store, undoable: bool = True, until: float | None = None):
                 except OSError as e:
                     if e.errno != errno.EDEADLOCK:
                         raise
-        snap = _snapshot(store) if undoable else None
+        snap = None
         try:
+            # Held: a pull this write waited on may have shut the gate.
+            if gated and catalog.untrusted(store):
+                raise Untrusted()
+            snap = _snapshot(store) if undoable else None
             yield
         finally:
             if snap:
@@ -978,13 +1007,24 @@ def _parse_jsonl(text: str, parse) -> tuple[list, list]:
     return good, bad
 
 
+def _read_utf8(file: Path) -> str:
+    """A store file's text. A byte that is not UTF-8 (a hand edit saved as
+    Latin-1) stopped every command naming no file: name the line."""
+    try:
+        return file.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        line = e.object[:e.start].count(b"\n") + 1
+        raise ValueError(f"{file} line {line} is not UTF-8 (byte {e.object[e.start]:#04x}); "
+                         f"every command reads this file: save that line as UTF-8") from None
+
+
 def _read_notes(file: Path, kinds):
     """(notes, [(lineno, raw, error)]). Each call gets its own lists:
     callers append."""
     file = Path(file)
     if not file.exists():
         return [], []
-    text = file.read_text(encoding="utf-8")
+    text = _read_utf8(file)
     hit = _PARSED.get(file)
     if hit and hit[0] == text and hit[1] == kinds:
         return list(hit[2]), list(hit[3])
@@ -1164,7 +1204,7 @@ def chain_tip(notes, note_id: str) -> Note:
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
                         prepend_body: str | None = None,
-                        add_measurements=None, **fields) -> Note:
+                        add_measurements=None, *, side, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
     multi-row aggregate (`rename_target`, `apply_reconciliation`) can hold
@@ -1185,7 +1225,8 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     obviously-absent attribution beats a plausible false one.
 
     `kinds` lets a sweep read the table once and pass it; a single-row caller
-    may omit it.
+    may omit it. `side` is `shared_side`'s, read once by the caller before its
+    lock: a sweep that asked per row ran one `git config` per row.
 
     A caller that will look up further ids in the same transaction must
     append the returned Note to its `notes` list itself -- this function
@@ -1285,7 +1326,7 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     # correction, not by the person being corrected. The row gets a fresh
     # timestamp; a stale author beside it is incoherent.
     base["author"] = author or "unknown"
-    if (side := shared_side(store)) is not None:    # the edit is the editor's
+    if side is not None:                    # the edit is the editor's
         base["side"] = side
     note = note_from_dict(base, kinds=kinds)
     _rewrite_note_unlocked(store, note, kept_id=kept.id)
@@ -1328,6 +1369,7 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
     the tip holds (RefsDropped), compared once the names resolve: a writer
     who meant to add a ref dropped the others (more than once by 2026-10-15)."""
     require_store(store)
+    side = shared_side(store)
     with _lock(store):
         notes = load(store)
         if canonicalize is not None:
@@ -1341,7 +1383,7 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
                    for r in fields["refs"]}
             if gone := [r for r in chain_tip(notes, old_id).refs if (r.type, r.name) not in now]:
                 raise RefsDropped(gone)
-        return _supersede_unlocked(store, notes, old_id, author=author,
+        return _supersede_unlocked(store, notes, old_id, author=author, side=side,
                                    append_body=append_body, add_refs=add_refs,
                                    prepend_body=prepend_body,
                                    add_measurements=add_measurements, **fields)
@@ -1403,10 +1445,19 @@ def session_key() -> str | None:
     return os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
 
 
+_SESSIONS_PATHS: dict = {}
+
+
 def _sessions_path(store) -> Path | None:
-    r = subprocess.run(["git", "-C", str(store), "rev-parse", "--git-path", SESSIONS_FILE],
-                       capture_output=True, text=True, encoding="utf-8")
-    return Path(store, r.stdout.strip()) if r.returncode == 0 else None
+    # Asked once per store: per row, it was most of a batch write's time
+    # under the lock. A miss is not kept: the store may be a repo by the next.
+    store = Path(store).absolute()
+    if (p := _SESSIONS_PATHS.get(store)) is None:
+        r = subprocess.run(["git", "-C", str(store), "rev-parse", "--git-path", SESSIONS_FILE],
+                           capture_output=True, text=True, encoding="utf-8")
+        if r.returncode == 0:
+            p = _SESSIONS_PATHS[store] = Path(store, r.stdout.strip())
+    return p
 
 
 def _record_session(store, note_id: str, kept_id: str | None = None,
@@ -1573,7 +1624,7 @@ nfc = catalog.nfc  # was defined identically here and in catalog.py; catalog
 
 
 def _rename_unlocked(store, notes, kinds, target_type, old, new, author,
-                     new_type=None) -> tuple[int, int]:
+                     new_type=None, *, side) -> tuple[int, int]:
     """Move every HEAD off (target_type, old): its target, and each ref naming
     it, onto (new_type, new), one supersede per row; `new_type` defaults to
     `target_type`. The other refs keep their place.
@@ -1602,7 +1653,7 @@ def _rename_unlocked(store, notes, kinds, target_type, old, new, author,
             fields["refs"] = [{"type": r.type, "name": r.name} for r in refs]
         if fields:
             notes.append(_supersede_unlocked(store, notes, note.id, author=author,
-                                             kinds=kinds, **fields))
+                                             kinds=kinds, side=side, **fields))
             moved += "target" in fields
             repointed += was in note.refs
     return moved, repointed
@@ -1641,6 +1692,7 @@ def rename_target(store, target_type, old, new, author=None,
     the type the rows move to."""
     check_types([{"type": new_type or target_type}], target_types)
     require_store(store)
+    side = shared_side(store)
     with _lock(store):
         if canonicalize is not None:
             new = canonicalize(new)
@@ -1648,7 +1700,7 @@ def rename_target(store, target_type, old, new, author=None,
         if target_type == "commit":
             old = _stored_commit(notes, old)
         return _rename_unlocked(store, notes, K.read_kinds(store),
-                                target_type, old, new, author, new_type)
+                                target_type, old, new, author, new_type, side=side)
 
 
 def _stored_commit(notes, old):
@@ -1676,6 +1728,7 @@ def retype(store, from_type, to_type, author=None, target_types=None) -> tuple[i
     one it is a unique substring of."""
     check_types([{"type": to_type}], target_types)
     require_store(store)
+    side = shared_side(store)
     with _lock(store):
         notes, kinds = load(store), K.read_kinds(store)
         names = sorted({o.name for n in heads(notes) for o in (n.target, *n.refs)
@@ -1686,7 +1739,8 @@ def retype(store, from_type, to_type, author=None, target_types=None) -> tuple[i
         # history reads noisy. Each sweep sees the last: _rename_unlocked
         # appends what it writes to `notes`.
         for name in names:
-            m, r = _rename_unlocked(store, notes, kinds, from_type, name, name, author, to_type)
+            m, r = _rename_unlocked(store, notes, kinds, from_type, name, name, author, to_type,
+                                    side=side)
             moved, repointed = moved + m, repointed + r
         return moved, repointed
 
@@ -2041,7 +2095,7 @@ def recover_pull(store, until: float | None = None) -> tuple:
     aside = _pull_aside(store)
     if aside is None or not aside.exists():
         return None, [], [], None
-    with _lock(store, undoable=False, until=until):
+    with _lock(store, undoable=False, until=until, gated=False):
         return _recover_unlocked(store)
 
 
@@ -2066,7 +2120,7 @@ def merge_upstream(store, upstream: str, until: float | None = None) -> dict:
     def head():
         return run("rev-parse", "-q", "--verify", "HEAD").stdout.strip()
 
-    with _lock(store, undoable=False, until=until):
+    with _lock(store, undoable=False, until=until, gated=False):
         recovered, splits, dropped, was = _recover_unlocked(store)
         if run("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
             # Undoing a failed pull runs `merge --abort`, which would take this one too.
@@ -2124,6 +2178,8 @@ def merge_upstream(store, upstream: str, until: float | None = None) -> dict:
                 out["conflicts"] = sorted(_git_paths(store, "diff", "--name-only",
                                                      "--diff-filter=U"))
             else:
+                if CONFIG_FILE in theirs:    # under the lock: no write runs its commands first
+                    distrust(store, old_head)
                 merged = _on_disk(store)
                 renames = {}
                 for said in r.stderr.split("\n"):            # the driver's lines
@@ -2222,7 +2278,7 @@ def _read_arcs(store) -> tuple[list, list]:
     file = arcs_path(store)
     if not file.exists():
         return [], []
-    return _parse_jsonl(file.read_text(encoding="utf-8"), arc_from_dict)
+    return _parse_jsonl(_read_utf8(file), arc_from_dict)
 
 
 def load_arcs(store):
@@ -2479,17 +2535,20 @@ def apply_reconciliation(store, rows, resolve_stale=False, author=None):
     retargeted = repointed = resolved = 0
     require_store(store)
     kinds = K.read_kinds(store)
+    side = shared_side(store)
     with _lock(store):
         notes = load(store)
         for r in rows:
             if r["status"] == "renamed":
                 moved, refs = _rename_unlocked(store, notes, kinds, r["target_type"],
-                                               r["target_name"], r["suggestion"], author)
+                                               r["target_name"], r["suggestion"], author,
+                                               side=side)
                 retargeted += moved
                 repointed += refs
             elif r["status"] == "stale" and resolve_stale and not r.get("needs_result"):
                 new_note = _supersede_unlocked(
-                    store, notes, r["id"], author=author, kinds=kinds, status="resolved",
+                    store, notes, r["id"], author=author, kinds=kinds, side=side,
+                    status="resolved",
                     append_body=f"reconcile: target {r['target_name']!r} disappeared "
                                 f"from the {r['target_type']} catalog; no rename evidence.")
                 notes.append(new_note)

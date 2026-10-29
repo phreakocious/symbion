@@ -6,6 +6,7 @@ except ImportError:                     # Windows
 import json
 import os
 import re
+import subprocess
 from datetime import datetime
 
 import pytest
@@ -934,6 +935,23 @@ def test_own_rows_are_the_sessions_and_with_none_the_authors(tmp_path, monkeypat
     assert own(None, "claude") == set()
     monkeypatch.setenv("CODEX_THREAD_ID", "s2")         # the innermost agent's key
     assert own("s1", "codex") == {theirs.id}
+
+
+def test_a_batch_in_a_session_asks_git_for_the_sessions_file_once(tmp_path, monkeypatch):
+    """`_sessions_path` ran `git rev-parse` per appended row, under the lock:
+    3.7 s of a 500-row seed's 4.0 s write (audit 2026-10-28)."""
+    store.ensure_store(tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    real, asked = subprocess.run, []
+
+    def run(argv, *a, **kw):
+        asked.extend(x for x in argv if x == store.SESSIONS_FILE)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    rows = store.add_many(tmp_path, [{"kind": "note", "target": {"type": "item", "name": str(i)}}
+                                     for i in range(5)])
+    assert len(asked) <= 1 and set(store.sessions(tmp_path)) == {n.id for n in rows}
 
 
 def test_a_commit_forgets_the_sessions_of_the_rows_it_took(tmp_path, monkeypatch):

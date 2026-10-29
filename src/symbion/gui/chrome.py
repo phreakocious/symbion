@@ -456,8 +456,12 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     # tabs of several stores share a window. "<store> · symbion" on every
     # page left the tabs of the installed app alike; its window is one store's
     # and names it, so there the tab is the page alone (the user, 2026-10-15).
+    # symbion last, where the strip cuts first: a shared link's preview read
+    # the store's name and no description (the user, 2026-10-28).
     page = crumbs[-1][0]
-    ui.page_title(f"{name} · {page}")
+    ui.page_title(f"{name} · {page} · symbion")
+    ui.add_head_html(f'<meta name="description" content="{ABOUT}">'
+                     f'<meta property="og:description" content="{ABOUT}">')
     js_page = json.dumps(page).replace("<", "\\u003c")   # a search is in it: no </script>
     ui.add_head_html('<script>if (matchMedia("(display-mode: tabbed)").matches) '
                      f'document.title = {js_page}</script>')
@@ -495,10 +499,16 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     # Scripts off, as a blocker leaves a page: nothing is drawn, and NiceGUI's
     # notice blames the browser's ES modules. This says what is missing. The
     # template styles that notice after this HTML: only !important hides it.
-    ui.add_body_html('<noscript><style>#esm-fallback{display:none!important}</style>'
-                     '<p style="margin:30vh auto 0;max-width:40em;padding:0 16px;'
-                     'text-align:center;color:var(--q-body)">symbion\'s GUI needs '
-                     'JavaScript. Allow scripts for this site, then reload.</p></noscript>')
+    # An agent's fetch runs no script and drops <noscript>, but reads text
+    # hidden by CSS: sb-about tells it what symbion is, and <noscript> shows it.
+    ui.add_body_html('<noscript><style>#esm-fallback{display:none!important}'
+                     '#sb-about{display:block!important}</style></noscript>'
+                     '<div id="sb-about" style="display:none"><div style="margin:30vh auto 0;'
+                     'max-width:40em;padding:0 16px;text-align:center;color:var(--q-body)">'
+                     '<p>symbion\'s GUI needs JavaScript. Allow scripts for this site, then '
+                     f'reload.</p><p>{ABOUT} An agent reads a store with the '
+                     '<code>symbion</code> command, not this page. Source, install and docs: '
+                     f'<a href="{SOURCE}">{SOURCE}</a></p></div></div>')
     heads = S.heads(S.load(ctx.store_dir))
     # value=None: open beside the page on a wide window, a slide-over behind
     # the menu button on a narrow one (open by default, it covered a phone).
@@ -634,6 +644,7 @@ def _peek_panel(ctx, author: str, drawer, heads):
 
 
 _PEEKED = "sb-peeked"
+_DRAFT = "sb-draft"
 _DRIFT = object()           # the peek's other content: `_drift_list`
 
 
@@ -675,7 +686,8 @@ def _dropped(ctx, a: dict, made: dict, open_form) -> None:
         made["form"].insert(flat if md else fenced(flat, name), cursor, block=not md)
 
     # Open, or closed with a draft: the drop adds to what is there.
-    busy = bool(made) and (made["dialog"].value or made["form"].busy())
+    busy = bool(made) and (made["dialog"].value or made["form"].busy()) \
+        or not made and _DRAFT in app.storage.tab       # kept over a reload, not yet built
     # ponytail: runs every catalog on the event loop, about 55 ms here
     # (2026-10-16), as the name field does; run.io_bound if one is slow.
     hits = api.known_files(ctx, name, text)
@@ -758,7 +770,18 @@ def _new_note_button(ctx, author: str, target_type, target_name, arc_id,
                                     lambda: ui.navigate.reload(), author=author,
                                     arc_id=arc_id, another=lambda: added.append(1),
                                     start_kind=kind)
-        dialog.on_value_change(lambda e: added and not e.value and ui.navigate.reload())
+            if draft := app.storage.tab.get(_DRAFT):     # in `slot`: the tab is the page's
+                made["form"].restore(draft)
+
+        def moved(e):
+            # A draft closed with Esc outlives the reload a card's write
+            # brings (audit, 2026-10-28); open, it is the form's again.
+            app.storage.tab.pop(_DRAFT, None)
+            if not e.value and made["form"].busy():
+                app.storage.tab[_DRAFT] = made["form"].state()
+            if added and not e.value:
+                ui.navigate.reload()
+        dialog.on_value_change(moved)
         made["dialog"] = dialog
         return dialog
 
@@ -818,6 +841,8 @@ def _help(ctx) -> None:
 
 
 SOURCE = "https://github.com/phreakocious/symbion"
+ABOUT = ("symbion is a notebook and ticket registry for one project, shared by you and your "
+         "coding agent.")
 
 # The sidebar's places: (label, path, Material icon).
 _PLACES = (("Summary", "/", "dashboard"), ("All entries", "/notes", "notes"),
@@ -933,7 +958,7 @@ def _other_stores(ctx) -> None:
     started from need not be the store's (`--dir`), and two read the same."""
     here = str(ctx.store_dir.resolve())
     others = {r["store"]: r for r in servers.running() if r["store"] != here}
-    if not others:
+    if not others or S.read_only():         # a read-only serve's visitors see no other store
         return
     with ui.element("div").classes("sb-nav"):
         ui.label("other stores").classes("sb-nav-head")

@@ -15,7 +15,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import CONFIG_FILE
+from .config import CONFIG_FILE, KNOWN_KEYS
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,10 @@ def parse_kinds(section) -> dict[str, Kind]:
         if not isinstance(label, str) or not _LABEL.match(label):
             raise ValueError(f"[kinds] {label!r}: a label is lowercase letters, digits, _ or -")
         if not isinstance(v, dict):
+            if label in KNOWN_KEYS:     # init's file ends inside [kinds]: a line appended lands here
+                raise ValueError(f"[kinds] {label!r}: `{label}` is a top-level key of "
+                                 f"{CONFIG_FILE}, not a kind; move it above the first [table] "
+                                 f"header")
             raise ValueError(f"[kinds] {label!r}: expected a table like {{ status = true }}")
         bad = sorted(set(v) - _KEYS)
         if bad:

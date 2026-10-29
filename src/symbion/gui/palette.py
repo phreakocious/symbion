@@ -67,8 +67,9 @@ def rows(ctx, author: str, q: str) -> list[dict]:
     q = q.strip()
     here = heads(ctx.store_dir)
     me = str(Path(ctx.store_dir).resolve())
-    others = sorted((r for r in servers.running() if r["store"] != me),
-                    key=lambda r: servers.name(r["store"]))
+    # A read-only serve names no other store a serve runs for its user.
+    others = [] if S.read_only() else sorted((r for r in servers.running() if r["store"] != me),
+                                             key=lambda r: servers.name(r["store"]))
     if not q:
         active = sum(not a.archived for a in S.load_arcs(ctx.store_dir))
         meta = {"/notes": str(len(here)), "/arcs": f"{active} active" if active else ""}
@@ -134,6 +135,8 @@ def rows(ctx, author: str, q: str) -> list[dict]:
 
     grep = search_pattern(q)
     hits = S.query(here, grep=grep)
+    say = [(r, len(S.query(heads(r["store"]), grep=grep))) for r in others]
+    say = sorted(((r, c) for r, c in say if c), key=lambda rc: -rc[1])
     if hits:
         # Open first, then entries with no status, then closed: newest first in each.
         rank = {"open": 0, None: 1}
@@ -145,8 +148,10 @@ def rows(ctx, author: str, q: str) -> list[dict]:
                                           f"that say “{q}”",
                 "meta": "All entries", "href": href(q=q)}],
             " · ".join(filter(None, (_of(min(len(hits), ENTRIES), len(hits)), "open first")))))
-    say = [(r, len(S.query(heads(r["store"]), grep=grep))) for r in others]
-    say = sorted(((r, c) for r, c in say if c), key=lambda rc: -rc[1])
+    elif say:
+        # Printed, not implied: "other stores · N of M say it" alone read as
+        # this store not searched (the user, 2026-10-28).
+        groups.append(_group("entries here", [], f"none say “{q}”"))
     # "none of N" beside the entries here that say it; beside an id found in
     # one of them it read as a contradiction, and alone the box says nothing
     # matched.

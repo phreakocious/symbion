@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from symbion import api, cli, gitref, merge, store, summary
+from symbion import api, catalog, cli, gitref, merge, store, summary
 from symbion.config import Config
 
 
@@ -443,6 +443,93 @@ def test_a_pull_flags_a_commit_by_an_older_symbion(sides, capsys):
     assert "older symbion" in capsys.readouterr().out
 
 
+def push_toml(a, text) -> None:
+    (a / "symbion.toml").write_text(f"shared = true\n{text}", encoding="utf-8")
+    git(a, "commit", "-qam", "toml from A")
+    git(a, "push", "-q")
+
+
+def test_a_pulled_toml_change_refuses_writes_and_reads_warn(sides, capsys):
+    """Each names the store's own `trust`: under `--dir`, the write's
+    `symbion trust` acted on the default store (2026-10-28)."""
+    a, b = sides
+    push_toml(a, "# from A\n")
+    assert sym(b, "pull") == 0
+    capsys.readouterr()
+    assert sym(b, "add", "--kind", "task", "--type", "project", "--body", "x") == 1
+    assert re.search(r"`symbion --dir \S+ trust` in a terminal", capsys.readouterr().err)
+    assert not (b / "notes.jsonl").read_text(encoding="utf-8")
+    with pytest.raises(store.Untrusted):            # the GUI's doc save takes no lock
+        api.save_doc(api.resolve(str(b)), "x.md", "x")
+    assert sym(b, "list") == 0
+    assert re.search(r"`symbion --dir \S+ trust` in a terminal", capsys.readouterr().err)
+
+
+def test_a_pulled_toml_change_refuses_its_commands_on_a_read(sides, capsys, tmp_path):
+    a, b = sides
+    pwned = tmp_path / "PWNED"
+    push_toml(a, f"[catalogs]\nthing = 'touch {pwned.as_posix()}; echo x'\n")
+    assert sym(b, "pull") == 0
+    capsys.readouterr()
+    rc = sym(b, "context", "--target", "thing:x")
+    assert not pwned.exists()
+    assert rc == 1 and re.search(r"`symbion --dir \S+ trust` in a terminal",
+                                 capsys.readouterr().err)
+
+
+def test_the_merge_shuts_the_gate_before_it_lets_go_of_the_lock(sides):
+    a, b = sides
+    push_toml(a, "# from A\n")
+    old = git(b, "rev-parse", "HEAD")
+    git(b, "fetch", "-q")
+    store.merge_upstream(b, git(b, "rev-parse", "--symbolic-full-name", "@{u}"))
+    assert catalog.untrusted(b) == old                # before api.pull's own lines run
+
+
+def test_a_local_toml_edit_never_shuts_the_gate(sides, capsys):
+    a, b = sides
+    (b / "symbion.toml").write_text("shared = true\n# from B\n", encoding="utf-8")
+    git(b, "commit", "-qam", "toml from B")
+    assert sym(b, "add", "--kind", "task", "--type", "project", "--body", "x") == 0
+    assert "trust` in a terminal" not in capsys.readouterr().err
+
+
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_trust_shows_every_pulled_change_and_needs_a_terminal(sides, capsys, monkeypatch):
+    a, b = sides
+    push_toml(a, "# one\n")
+    assert sym(b, "pull") == 0
+    push_toml(a, "# one\n# two\n")
+    assert sym(b, "pull") == 0                      # a second pull keeps the first's HEAD
+    capsys.readouterr()
+    assert sym(b, "trust") == 1                     # stdin is no terminal here
+    out, err = capsys.readouterr()
+    assert "+# one" in out and "+# two" in out and "terminal" in err, (out, err)
+    assert sym(b, "add", "--kind", "task", "--type", "project", "--body", "x") == 1
+    for no in ("n\n", ""):                          # "" is Ctrl-D
+        monkeypatch.setattr(sys, "stdin", Tty(no))
+        assert sym(b, "trust") == 1
+    monkeypatch.setattr(sys, "stdin", Tty("y\n"))
+    assert sym(b, "trust") == 0
+    assert "trusted:" in capsys.readouterr().out
+    assert sym(b, "add", "--kind", "task", "--type", "project", "--body", "x") == 0
+    assert "trust` in a terminal" not in capsys.readouterr().err
+    assert sym(b, "trust") == 0 and "nothing" in capsys.readouterr().out
+
+
+def test_session_start_says_the_gate_is_shut_until_trust(sides, capsys):
+    a, b = sides
+    push_toml(a, "# from A\n")
+    hook(b, capsys)                                 # the pull that shuts it
+    text, line = hook(b, capsys)                    # a later session: nothing new to pull
+    assert "trust` in a terminal" in text.splitlines()[0], text
+    assert "trust` in a terminal" in line.splitlines()[0], line
+
+
 def test_a_pull_says_each_value_it_dropped(sides, capsys):
     a, b = sides
     assert sym(a, "arc", "create", "--name", "x", "--scope", "item") == 0
@@ -707,12 +794,14 @@ def test_a_pull_killed_after_merging_a_changed_symbion_toml_still_names_it(sides
     git(a, "push", "-q")
     sha = git(a, "rev-parse", "--short", "HEAD")
     _killed_pull(b, "reapply")                         # merged, then killed before it said so
+    catalog.untrusted_path(b).unlink()                 # as a kill before the gate was shut leaves it
     if origin == "down":                               # the next fetch fails: said all the same
         git(b, "remote", "set-url", "origin", str(b.parent / "nowhere.git"))
     capsys.readouterr()
     assert sym(b, "pull") == (0 if origin == "up" else 1)
     out = capsys.readouterr().out
     assert "cut off" in out and f"symbion.toml changed in {sha} by A" in out, out
+    assert catalog.untrusted(b)
     (cmd,) = [ln.strip() for ln in out.splitlines() if ln.startswith("  ")]
     shown = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
     assert shown.returncode == 0 and "+# from A" in shown.stdout, cmd
@@ -1033,9 +1122,9 @@ def test_session_start_shows_the_person_a_changed_symbion_toml(sides, capsys):
     git(a, "push", "-q")
     sha = git(a, "rev-parse", "--short", "HEAD")
     text, line = hook(b, capsys)
-    told = [ln for ln in text.splitlines() if "symbion.toml" in ln]    # the notice, its command
-    assert len(told) == 2 and sha in told[0], text
-    assert line.splitlines()[:2] == told and line.splitlines()[2].startswith("symbion"), line
+    told = [ln for ln in text.splitlines() if "symbion.toml" in ln]    # the notice, its command, the gate
+    assert len(told) == 3 and sha in told[0] and "trust` in a terminal" in told[2], text
+    assert line.splitlines()[:3] == told and line.splitlines()[3].startswith("symbion"), line
 
 
 def test_session_start_shows_the_person_an_older_client(sides, capsys, monkeypatch):
@@ -1140,7 +1229,10 @@ def test_commit_with_a_conflicting_pull_commits_and_holds_the_push(sides, capsys
     assert rb not in held
 
 
-def test_a_write_says_when_origin_moved_and_never_merges(sides, capsys):
+@pytest.mark.parametrize("write", [("add", "--kind", "task", "--type", "project", "--body", "x"),
+                                   ("arc", "create", "--name", "x")])
+def test_a_write_says_when_origin_moved_and_never_merges(sides, capsys, write):
+    """An arc write too: it ended without the count (2026-10-28)."""
     a, b = sides
     assert gitref.fetch(b, timeout=10) is None
     fetch_head = b / ".git" / "FETCH_HEAD"
@@ -1149,7 +1241,7 @@ def test_a_write_says_when_origin_moved_and_never_merges(sides, capsys):
     publish(a, "from A")
     head = git(b, "rev-parse", "HEAD")
     capsys.readouterr()
-    add(b, "from B")
+    assert sym(b, *write) == 0
     err = capsys.readouterr().err
     assert f"origin has 1 new store commit: symbion --dir {b.as_posix()} pull\n" in err, err
     assert git(b, "rev-parse", "HEAD") == head
@@ -1742,3 +1834,19 @@ def test_the_nudges_command_lists_the_rows_it_counted(sides, capsys, monkeypatch
     capsys.readouterr()
     assert cli.main([*cmd[1:], "--json"]) == 0
     assert len(json.loads(capsys.readouterr().out)) == counted
+
+
+def test_a_sweep_reads_the_side_once(sides, monkeypatch):
+    """`_supersede_unlocked` asked `shared_side` per row: a 300-row rename ran
+    305 git processes and took 4.2 s against 1.7 s unshared (audit pass 2,
+    2026-10-28). The sweep's caller asks once; each row still carries it."""
+    a, _ = sides
+    for i in range(4):
+        assert sym(a, "add", "--kind", "task", "--target", "item:old", "--body", f"r{i}") == 0
+    asked = []
+    real = store.shared_side
+    monkeypatch.setattr(store, "shared_side", lambda s: asked.append(s) or real(s))
+    assert store.rename_target(a, "item", "old", "new", author="claude") == (4, 0)
+    assert len(asked) == 1
+    moved = [r for r in lines(a / "notes.jsonl") if r["target"]["name"] == "new"]
+    assert len(moved) == 4 and {r["side"] for r in moved} == {"A"}

@@ -235,3 +235,21 @@ async def test_a_box_carries_a_cards_star_due_date_and_tags(user: User, seeded):
     assert all("sb-resolvable" in r.classes for r in rows)
     starred = [r for r in rows if "sb-starred" in r.classes]
     assert [r.props["data-id"] for r in starred] == [one.id]
+
+
+async def test_a_box_id_is_one_prop_not_a_script(user: User, seeded):
+    """As a card's: `x :title=1` as an id added a `:`-prop, which nicegui.js
+    runs as JavaScript (audit 2026-10-28)."""
+    ctx, act = seeded
+    one = next(n for n in store.load(ctx.store_dir) if n.target.name == "one")
+    evil = f"{one.id} :title=1"
+    p = ctx.store_dir / "notes.jsonl"
+    p.write_text(p.read_text().replace(one.id, evil))
+
+    @ui.page("/t")
+    def page():
+        checklist(ctx, act.id, lambda: None, author="ada")
+
+    await user.open("/t")
+    (row,) = [r for r in user.find(marker="checklist-row").elements if one.id in r._props["data-id"]]
+    assert row._props["data-id"] == evil and ":title" not in row._props

@@ -325,6 +325,28 @@ async def test_an_id_cited_in_a_body_links_to_that_note(user: User, repo, tmp_pa
     assert f"<code>{cited.id}</code>" in html
 
 
+async def test_an_id_in_any_code_block_stays_text(user: User, repo, tmp_path):
+    """`link_ids` masked only backtick code: an id inside a `~~~` fence or an
+    indented code block rendered as link syntax (audit 2026-10-28)."""
+    ctx = api.resolve(str(tmp_path))
+    cited = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                          "body": "the cited entry"}, author="ada")
+    body = (f"settled by {cited.id}.\n\n~~~\nfenced {cited.id}\n~~~\n\n"
+            f"    indented {cited.id}\n\nand {cited.id} again")
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": body}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (md,) = user.find(ui.markdown).elements
+    html = md.props["innerHTML"]
+    assert html.count(f'href="/notes?id={cited.id}"') == 2, html
+    assert f"fenced {cited.id}" in html and f"indented {cited.id}" in html, html
+
+
 async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
     """The user, 2026-10-01: rows cite the 10-character tail, and only a
     full id linked. A tail links only to a row this store has: rows cite
@@ -1099,6 +1121,37 @@ async def test_the_edit_dialog_stars_a_row_in_the_same_write(user: User, repo, t
     head = await _append_in_dialog(user, ctx, n, "more", meanwhile=flip)
     assert (head.body, list(head.tags)) == ("first\n\nmore", ["ux", "priority"])
     assert len(store.load(tmp_path)) == 2     # one write: the row and its edit
+
+
+async def test_the_edit_dialog_harvests_only_the_tags_typed_in_it(user: User, repo, tmp_path):
+    """A save harvested #words from the whole body: a CLI body's "rule #main"
+    lost its `#` and gained a tag `main` on a one-typo fix, and a star-only
+    save added the tag too (audit 2026-10-28). A #tag new to the body is one."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "the CSS rule #main hides it"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, store.chain_tip(store.load(tmp_path), n.id), lambda: None, author="ada")
+
+    async def save(body=None):
+        await user.open("/t")
+        user.find(marker="note-edit").click()
+        await user.should_see(marker="edit-body")
+        if body is None:
+            user.find(marker="edit-priority").click()
+        else:
+            user.find(marker="edit-body").elements.pop().set_value(body)
+        user.find(marker="edit-save").click()
+        head = store.chain_tip(store.load(tmp_path), n.id)
+        return head.body, list(head.tags)
+
+    assert await save() == ("the CSS rule #main hides it", ["priority"])
+    assert await save("the CSS rule #main hides it.") == ("the CSS rule #main hides it.",
+                                                         ["priority"])
+    assert await save("the CSS rule #main hides it. #ux") == ("the CSS rule #main hides it.",
+                                                             ["priority", "ux"])
 
 
 async def test_the_edit_dialog_unstars_a_row(user: User, repo, tmp_path):

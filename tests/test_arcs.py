@@ -47,7 +47,7 @@ def test_rename_keeps_the_id_so_checkboxes_still_resolve(tmp_path):
 
 def test_slugify_bounds_the_arc_id_length(tmp_path):
     """The last hole in the width bound NAME_CHARS was added to close --
-    the arc id (slug) renders straight into the summary, unbounded."""
+    the arc id (slug) renders straight into the summary, uncapped."""
     act = store.create_arc(tmp_path, "n" * 500, "", "item")
     assert len(act.id) <= 48
 

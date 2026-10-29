@@ -172,7 +172,7 @@ def _pointer(root: Path, work: Path | None = None) -> Path | None:
     if work is not None and not (p.exists() or p.is_symlink()):
         p = work / POINTER_FILE
     try:
-        text = p.read_text(encoding="utf-8")
+        text = p.read_text(encoding="utf-8-sig")   # PowerShell 5.1 writes a BOM
     except OSError as e:
         if isinstance(e, FileNotFoundError) and not p.is_symlink():
             return None
@@ -195,7 +195,7 @@ def store_dir(root: Path, work: Path | None = None) -> Path:
     be overridden by a file in the tree."""
     env = os.environ.get("SYMBION_DIR")
     if env:
-        return Path(env).resolve()
+        return Path(env).expanduser().resolve()   # a settings file's env has no shell
     return tree_store(root, work)
 
 
@@ -232,7 +232,10 @@ def store_owner(store) -> Path | None:
     100 rows `unverifiable`, stderr empty. Two such repos: no owner.
 
     ponytail: only siblings are scanned; a pointer from a repo elsewhere
-    stays unowned until the store records its project."""
+    stays unowned until the store records its project. Each sibling costs a
+    stat, so a store straight in a crowded dir pays it per command: one in
+    $TMPDIR took about 2 s a command on a Mac (2026-10-28); a scratch store
+    goes in a fresh dir."""
     store = Path(store).resolve()
     if store.name.endswith("-notes"):
         root = _claims(store.parent / store.name[:-len("-notes")], store)
@@ -338,16 +341,26 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
     explicitly in the file, which always wins."""
     p = Path(store) / CONFIG_FILE
     d = tomllib.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    # A wrong type crashed every command, the hook included, far from its key.
+    for k in ("provenance", "catalogs", "resolvers", "renames"):
+        if k in d and not isinstance(d[k], dict):
+            raise ValueError(f"{k} in {p} is {d[k]!r}: write it as a [{k}] table"
+                             + (", its command under `command =`" if k == "provenance" else ""))
+    for k in ("project_root", "work_root", "default_branch", "git_name", "git_email",
+              "stale_target_noun"):
+        if k in d and not isinstance(d[k], str):
+            raise ValueError(f"{k} in {p} is {d[k]!r}: write it as a quoted string")
     prov = d.get("provenance") or {}
     explicit_root = d.get("project_root")
+    # Against the store, as [repos] paths are: the cwd varies by command.
     if explicit_root:
-        resolved_root = Path(explicit_root).resolve()
+        resolved_root = (Path(store) / Path(explicit_root).expanduser()).resolve()
     elif project_root is not None:
         resolved_root = Path(project_root).resolve()
     else:
         resolved_root = None
     if "work_root" in d:
-        resolved_work = Path(d["work_root"]).resolve()
+        resolved_work = (Path(store) / Path(d["work_root"]).expanduser()).resolve()
     elif explicit_root:
         resolved_work = resolved_root
     elif work_root is not None:

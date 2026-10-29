@@ -148,8 +148,24 @@ def test_other_running_stores_are_counted_and_link_to_their_own_search(repo, tmp
     assert (row["text"], row["meta"], row["href"]) == \
         ("far", "1 entry", "http://127.0.0.1:20001/notes?q=release")
     assert g["other stores"]["aside"] == "1 of 1 say it"
+    g = _groups(ctx, "far")                 # only elsewhere: this store's 0 is printed
+    assert g["entries here"] == {"head": "entries here", "aside": "none say “far”", "rows": []}
+    assert list(g) == ["entries here", "other stores"]
     assert _groups(ctx, "close")["other stores"]["aside"] == "none of 1 say it"
     # nothing anywhere: no groups, and the box says so
     assert _groups(ctx, "nowhere") == {}
     assert [(r["text"], r["meta"]) for r in _groups(ctx, "")["other stores"]["rows"]] == \
         [("far", "1 entry")]
+
+
+def test_a_read_only_serve_lists_no_other_store(repo, tmp_path, monkeypatch):
+    """Read-only, three hex digits read the rows of a store another serve
+    ran by id tail (audit 2026-10-28): a read-only serve names no other store."""
+    ctx = api.resolve(str(tmp_path))
+    far = tmp_path / "far-notes"
+    store.ensure_store(far)
+    tail = _add(api.resolve(str(far)), "note", "release far away")[-3:]
+    _serving(far, "http://127.0.0.1:20001/")
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    for q in ("", "release", tail):
+        assert "other stores" not in _groups(ctx, q) and "entries by id" not in _groups(ctx, q), q

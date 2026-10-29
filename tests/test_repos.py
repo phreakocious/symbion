@@ -3,6 +3,7 @@ design, 2026-10-13). Three sibling repos and one store whose name matches
 none of them; each repo's `.symbion` names it."""
 import json
 import subprocess
+import time
 from datetime import timedelta
 
 import pytest
@@ -860,3 +861,30 @@ def test_a_batch_footer_leaves_out_a_name_a_path_placed(ws, sym):
     rc, out, err = sym("add", "--from-json", str(rows))
     assert rc == 0 and "1 of 1 names not in their catalog, stored as typed: net:typo.tf\n" \
         in err, err
+
+
+def test_a_history_timeout_is_the_whole_calls_not_each_repos(ws, sym, monkeypatch):
+    """changed_since gave each repo the whole timeout, so the session-start
+    hook's gotcha count over N repos could take N times its share of the
+    hook's deadline (2026-10-28). A repo reached after the time is spent
+    asks git nothing, and its rows read None."""
+    for t in ("net:main.tf", "app:main.tf"):
+        assert sym("add", "note", "--target", t, "--body", "x")[0] == 0
+    for r in ("tf-net", "tf-app"):
+        (ws / r / "main.tf").write_text("changed\n")
+        _commit(ws / r, "edit")
+    asked = []
+
+    def slow(argv, timeout, input=None):
+        asked.append(timeout)
+        time.sleep(0.35)
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    monkeypatch.setattr(gitref, "run_timed", slow)
+    monkeypatch.chdir(ws / "tf-net")
+    ctx = api.resolve()
+    got = gitref.changed_since(ctx.cfg, _heads(ws), timeout=0.3)
+    assert len(asked) == 1 and set(got.values()) == {None}, (asked, got)
+    asked.clear()
+    gitref.changed_since(ctx.cfg, _heads(ws), timeout=1.0)
+    assert len(asked) == 2 and asked[1] <= 1.0 - 0.35, asked

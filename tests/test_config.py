@@ -124,6 +124,19 @@ def test_explicit_project_root_in_toml_also_pins_work_root(repo, tmp_path):
     assert cfg.work_root == repo, "explicit project_root must pin work_root"
 
 
+def test_a_relative_root_in_toml_is_read_from_the_store(repo, tmp_path, monkeypatch):
+    """`project_root = "../repo"` resolved against the cwd, so a command run
+    from the repo's subdirectory named a root that is not there; `[repos]`
+    paths resolve against the store (audit 2026-10-28)."""
+    store = tmp_path / "myproj-notes"
+    store.mkdir()
+    (store / "symbion.toml").write_text(f'project_root = "../{repo.name}"\n'
+                                        f'work_root = "../{repo.name}"\n')
+    monkeypatch.chdir(tmp_path.parent)
+    cfg = config.load(store, project_root=None)
+    assert (cfg.project_root, cfg.work_root) == (repo.resolve(), repo.resolve())
+
+
 def test_explicit_work_root_in_toml_overrides_the_pin(repo, tmp_path):
     """An explicit `work_root` in symbion.toml always wins, even over an
     explicit `project_root` pin -- someone who names both roots by hand
@@ -196,6 +209,19 @@ def test_shared_with_local_only_is_refused(tmp_store):
     with pytest.raises(ValueError) as e:
         config.load(tmp_store, project_root=tmp_store)
     assert "shared" in str(e.value) and "local_only" in str(e.value)
+
+
+@pytest.mark.parametrize("line", ['provenance = "python3 stamp.py"', 'renames = ["git"]',
+                                  'catalogs = "git ls-files"', 'resolvers = 1',
+                                  "project_root = 5", "work_root = true",
+                                  "default_branch = 1", "git_name = []"])
+def test_a_wrong_typed_key_is_named(tmp_store, line):
+    """`provenance = "python3 stamp.py"` crashed every command, the hook
+    included, on `'str' object has no attribute 'get'` (audit 2026-10-28)."""
+    (tmp_store / "symbion.toml").write_text(line + "\n")
+    key = line.split(" ")[0]
+    with pytest.raises(ValueError, match=f"^{key} in .* is "):
+        config.load(tmp_store, project_root=None)
 
 
 def test_shared_must_be_a_bool(tmp_store):
@@ -281,6 +307,21 @@ def test_pointer_expands_a_tilde(repo, monkeypatch):
     monkeypatch.delenv("SYMBION_DIR", raising=False)
     (repo / ".symbion").write_text("~/some-store\n")
     assert config.store_dir(repo) == (Path.home() / "some-store").resolve()
+
+
+def test_a_pointer_saved_with_a_bom_reads_as_its_path(repo, monkeypatch):
+    """PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM, and the
+    pointer read as a path starting U+FEFF: a missing store, whose message
+    advised `init` (audit 2026-10-28)."""
+    monkeypatch.delenv("SYMBION_DIR", raising=False)
+    (repo / ".symbion").write_bytes("\ufeff../elsewhere\r\n".encode("utf-8"))
+    assert config.store_dir(repo) == (repo.parent / "elsewhere").resolve()
+
+
+def test_symbion_dir_expands_a_tilde(repo, monkeypatch):
+    """An env value from a settings file gets no shell to expand it."""
+    monkeypatch.setenv("SYMBION_DIR", "~/env-store")
+    assert config.store_dir(repo) == (Path.home() / "env-store").resolve()
 
 
 def test_env_beats_the_pointer(repo, tmp_path, monkeypatch):

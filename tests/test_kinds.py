@@ -44,6 +44,14 @@ def test_a_bad_label_is_refused_by_name(label):
         K.parse_kinds({label: {}})
 
 
+def test_a_top_level_key_appended_under_kinds_is_named_as_misplaced():
+    """init's symbion.toml ends inside [kinds]: `echo 'shared = true' >>` read
+    as a broken kind (a scratch run, 2026-10-28)."""
+    section = tomllib.loads("[kinds]\nbug = { status = true }\nshared = true\n")["kinds"]
+    with pytest.raises(ValueError, match=r"top-level key.*above the first \[table\]"):
+        K.parse_kinds(section)
+
+
 def test_an_unknown_key_is_refused_by_name():
     with pytest.raises(ValueError, match="colour"):
         K.parse_kinds({"bug": {"status": True, "colour": "red"}})

@@ -997,6 +997,28 @@ def test_without_a_commit_holding_the_stamp_the_count_falls_back_to_dates(repo):
     assert _since(cfg, _file_row(cfg, "f1", "2030-01-03T00:00:00+00:00", stamp=False)) == 0
 
 
+def test_a_history_walk_past_its_timeout_reads_as_no_count(repo, monkeypatch):
+    """The session hook counts each gotcha file's commits with no limit: a
+    300k-commit history took 45.7 s, past Claude Code's 10 s for a hook
+    (audit 2026-10-28). With a timeout, a walk that runs past it gives no
+    count, and the hook drops that clause."""
+    cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})
+    row = _file_row(cfg, "f0", "2030-01-04T00:00:00+00:00")
+    (repo / "f0").write_text("later")
+    _commit_at(repo, "later", "2030-01-06T00:00:00+00:00")
+    gitref._HISTORY.clear()
+    asked = []
+
+    def slow(argv, timeout, input=None):
+        asked.append(timeout)
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    monkeypatch.setattr(gitref, "run_timed", slow)
+    assert gitref.commits_since(cfg, [row], timeout=0.5) == {row.id: None}
+    assert asked == [0.5]
+    assert _since(cfg, row) == 1, "no timeout: the walk as before"
+
+
 def test_commits_since_is_none_where_the_target_is_no_file_here(repo):
     from symbion import store
     cfg = Config(project_root=repo, catalogs={"file": "git ls-files"})

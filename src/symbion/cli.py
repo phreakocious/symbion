@@ -36,6 +36,10 @@ from . import summary as summ
 
 # ---- author resolution ----
 def _resolved_author(args) -> str:
+    # One rule for every write, as add's: resolve stored `unknown`, arc create "".
+    if args.author is not None and not args.author.strip():
+        raise SystemExit("error: author is required: --author names who writes it; "
+                         "leave the flag out for the default")
     return args.author if args.author is not None else api.author_default()
 
 
@@ -102,8 +106,8 @@ def _skill_dir() -> Path:
 
 # Each change init makes, printed in the past tense once made, and as
 # `will <verb>` in the list a run without --yes prints instead.
-_PAST = {"create": "created", "write": "wrote", "link": "linked", "set": "set", "keep": "kept",
-         "merge": "merged"}
+_PAST = {"create": "created", "write": "wrote", "link": "linked", "relink": "relinked",
+         "set": "set", "keep": "kept", "merge": "merged"}
 
 
 def _act(write: bool, verb: str, what: str) -> bool:
@@ -136,12 +140,16 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
     changed = False
     # resolve() follows a symlink or a junction, and a real directory resolves
     # to itself, never to the package.
+    # A reinstall moved the package: the link pointed nowhere, and was left.
+    dangling = link.is_symlink() and not link.exists()
     if link.exists() and link.resolve() == target.resolve():
         changed |= _act(write, "keep", f"{link} -> {target}")
-    elif os.path.lexists(link):             # a dangling junction too, which is no symlink
+    elif os.path.lexists(link) and not dangling:   # a dangling junction too, which is no symlink
         print(f"note: {link} exists and is not a link to {target}; left alone")
     else:
         if write:
+            if dangling:
+                link.unlink()
             link.parent.mkdir(parents=True, exist_ok=True)
             try:
                 link.symlink_to(target, target_is_directory=True)
@@ -152,7 +160,7 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
                 # junction needs neither.
                 import _winapi
                 _winapi.CreateJunction(str(target), str(link))
-        changed |= _act(write, "link", f"{link} -> {target}")
+        changed |= _act(write, "relink" if dangling else "link", f"{link} -> {target}")
     if agent == "hermes":
         # Hermes has no hook whose output reaches the model as a summary: its
         # on_session_start return is ignored, and pre_llm_call fires every turn
@@ -308,13 +316,25 @@ def _git_says(root: Path, path: Path) -> str:
 
 
 def _ignored_paths(store_dir, prefix: str) -> list[str]:
-    """Paths under `prefix` that `git add -A` skips. `--ignored=matching`
-    names each ignored FILE; the default collapses them to the directory."""
-    r = subprocess.run(["git", "-C", str(store_dir), "--no-optional-locks", "status",
-                        "--porcelain", "--ignored=matching"],
+    """Paths under `prefix` that `git add -A` skips by a `.gitignore` in the
+    store. `--ignored=matching` names each ignored FILE; the default collapses
+    them to the directory. -z: a quoted name failed the prefix test. A rule
+    from the user's own excludes file ignores their litter (`.DS_Store`), and
+    `add -f` would commit it."""
+    git = ["git", "-C", str(store_dir), "--no-optional-locks"]
+    r = subprocess.run([*git, "status", "--porcelain", "-z", "--ignored=matching"],
                        capture_output=True, text=True, encoding="utf-8")
-    return sorted(ln[3:] for ln in r.stdout.splitlines()
-                  if ln.startswith("!! ") and ln[3:].startswith(prefix + "/"))
+    paths = [e[3:] for e in r.stdout.split("\0")
+             if e.startswith("!! ") and e[3:].startswith(prefix + "/")]
+    if not paths:
+        return []
+    # -v -z: source, line, pattern, path, each ended by a NUL.
+    c = subprocess.run([*git, "check-ignore", "-v", "-z", "--stdin"], input="\0".join(paths),
+                       capture_output=True, text=True, encoding="utf-8")
+    f = c.stdout.split("\0")
+    return sorted(path for src, path in zip(f[0::4], f[3::4])
+                  if Path(src).name == ".gitignore" and not Path(src).is_absolute()
+                  and not src.startswith("~"))
 
 
 def _say_ignored_archive(store_dir, would=False) -> None:
@@ -522,7 +542,7 @@ def _write_starter_toml(p: Path, cfg) -> None:
 #                                        # resolve here, never against project_root, since those
 #                                        # are per-worktree and project_root is deliberately the
 #                                        # MAIN worktree so every linked worktree shares one store.
-default_branch = "{cfg.default_branch}"
+default_branch = "{gitref.repo_default_branch(cfg) or cfg.default_branch}"
 # local_only = true   # no remote on purpose: `commit` stops saying "no remote"
 # shared = true       # experimental: one store, a clone per person; session start pulls, `commit` pulls and pushes
 # git_name = "symbion-notes"          # the author of the store's own commits: set
@@ -625,7 +645,7 @@ def _session_cache() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "symbion" / "gotchas"
 
 
-def _list_gotchas(ctx, sid: str) -> None:
+def _list_gotchas(ctx, sid: str, deadline: float) -> None:
     """The list gotchas.sh reads on each tool call: per catalog name a
     #gotcha row is on or refers to, the row's id and the line the agent gets
     when a call names it. A trap on a file reached a session only through
@@ -637,8 +657,10 @@ def _list_gotchas(ctx, sid: str) -> None:
     d.mkdir(parents=True, exist_ok=True)
     week = time.time() - 7 * 86400
     for f in d.iterdir():                  # one per session: keep a week's
-        if f.stat().st_mtime < week:
-            f.unlink(missing_ok=True)
+        # Another session's sweep may take a file first; it costs that file only.
+        with contextlib.suppress(FileNotFoundError):
+            if f.stat().st_mtime < week:
+                f.unlink(missing_ok=True)
     for spent in ("seen", "edit"):              # what gotchas.sh has printed
         (d / f"{sid}.{spent}").unlink(missing_ok=True)
     lines = []
@@ -650,11 +672,14 @@ def _list_gotchas(ctx, sid: str) -> None:
     # user, 2026-10-14). A count cannot say stale: every file gotcha in one
     # store had changed since, by one commit to hundreds. The agent, in the file at
     # that moment, judges; the line gives it the age, the churn and the retire.
-    since = gitref.commits_since(ctx.cfg, rows)
+    left = min(HOOK_HISTORY_TIMEOUT, deadline - time.monotonic())
+    since = gitref.commits_since(ctx.cfg, rows, timeout=left) if left > 0 else {}
     for n in rows:
         tail = n.id[-10:]
         sym = " ".join(filter(None, ["symbion", _named_store(ctx)]))
-        age = f"written {summ.when_added(n.first_written or n.created_at)}"
+        at = n.first_written or n.created_at
+        # The line is cached for the session: `6m ago` still read so 45 minutes on.
+        age = f"written {store.shown(at) if summ.age_days(at) == 0 else summ.when_added(at)}"
         if _other_side(by_id, n, side):
             age += f" by {summ._root(by_id, n).author}"
         if since.get(n.id):
@@ -1082,7 +1107,10 @@ def _rows_from_json(path):
     object per line, blank lines skipped. Keys outside the input shape are
     refused by name -- an `id`, `created_at` or `provenance` in the input
     would otherwise be silently discarded, and a typo'd key silently dropped."""
-    text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    try:
+        text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    except OSError as e:                # as --body-file: a refusal, not a traceback
+        raise SystemExit(f"--from-json: {e}") from None
     rows, errors = [], []
     for i, line in enumerate(store.jsonl_lines(text), 1):
         if not line.strip():
@@ -1134,7 +1162,8 @@ def _extract_dir(argv):
             continue
         rest.append(a)
         i += 1
-    return value, rest
+    # The shell expands `--dir ~/x`, never `--dir=~/x`.
+    return value and os.path.expanduser(value), rest
 
 
 # ---- argparse ----
@@ -1739,6 +1768,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     sub.add_parser("push", help="git push the store to its remote; commit first")
     sub.add_parser("pull", help="fetch a shared store's origin and merge it; pending entries "
                                 "stay pending, each its session's")
+    sub.add_parser("trust", help="show what pulls changed in symbion.toml and accept it; "
+                                 "writes and its commands wait until then. The user's, at a "
+                                 "terminal")
     ud = sub.add_parser("undo", help="take back the store's last write, if it was yours "
                         "and not yet committed",
                         description="take back the store's last write, one level: an add, "
@@ -1837,9 +1869,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     "ticks a step; `arc todo ID` is what is left.")
     asub = act.add_subparsers(dest="acmd", required=True)
 
-    ac = asub.add_parser("create", help="start an arc; prints its id")
-    ac.add_argument("--name", required=True)
-    ac.add_argument("--desc", default="")
+    says = "start an arc; prints its id"
+    ac = asub.add_parser("create", help=says, description=says)
+    ac.add_argument("--name", required=True, help="the arc's name, as the summary prints it")
+    ac.add_argument("--desc", default="", help="what the arc is for; arc list prints it")
     ac.add_argument("--scope", default="mixed", metavar="SCOPE",
                     type=_catalog_choice(arc_scopes, "scope", store_dir),
                     help="what the arc's entries are about (default mixed): item, project, "
@@ -1855,8 +1888,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     ar.add_argument("id")
     ar.add_argument("new_name")
 
-    aa = asub.add_parser("archive", help="take an arc off the summary; its open entries "
-                                         "then list outside arcs")
+    says = "take an arc off the summary; its open entries then list outside arcs"
+    aa = asub.add_parser("archive", help=says, description=says)
     aa.add_argument("id")
 
     asd = asub.add_parser("seed", help="add one task per --name, or per entry of a "
@@ -2122,7 +2155,7 @@ _CITED = re.compile(r"(?<![\w-])(?:20\d{6}-[\dxa-f-]*[\dxa-f]|\d{6}-[\dxa-f]{3})
 _DASHED_ID = re.compile(r"-(?:\d+-)*[0-9a-f]{3}")
 
 
-def _name_unknown_ids(store_dir, texts) -> None:
+def _name_unknown_ids(store_dir, texts, where="the body") -> None:
     """Rows cited before they existed, as placeholders (`20990101-123xxx`, a
     full id of zeros), were found only by reading the row back. A cited row
     no id here starts with (or, for a tail, ends with) gets a note; never a
@@ -2133,10 +2166,10 @@ def _name_unknown_ids(store_dir, texts) -> None:
             if not re.fullmatch(r"20\d{6}-\d+", tok) and not _held(ids, tok)]
     if miss:
         # A row a sibling store holds is a cite of another project's: no note.
-        there = [[n.id for n in store.load(p)] for p in _siblings(store_dir)]
+        there = [ids for _, ids in _sibling_ids(store_dir)]
         miss = [tok for tok in miss if not any(_held(other, tok) for other in there)]
     if miss:      # one line: a retro citing another store's rows printed four (2026-10-11)
-        print(f"note: no entry in this store matches {', '.join(miss)} (cited in the body)",
+        print(f"note: no entry in this store matches {', '.join(miss)} (cited in {where})",
               file=sys.stderr)
 
 
@@ -2410,14 +2443,33 @@ def _no_arc(store_dir, arc_id: str) -> None:
     print(api.no_arc(store_dir, arc_id), file=sys.stderr)
 
 
+def _name_archived_arcs(store_dir, written) -> None:
+    """An open box filed in an archived arc lists outside arcs, and the arc
+    reads one short under `arc list --all`: the write said nothing (dogfood,
+    2026-10-28). check_arc lets it through: a closing note may go there."""
+    gone = {a.id for a in store.load_arcs(store_dir) if a.archived}
+    boxes = Counter(n.arc_id for n in written if n.arc_id in gone and n.spec.status
+                    and not n.spec.parked and store.read_status(n) == "open")
+    for arc, k in boxes.items():
+        what = "this open entry lists" if k == 1 else f"these {k} open entries list"
+        print(f"note: arc {arc} is archived: {what} outside arcs (list --arc {arc} --status open)",
+              file=sys.stderr)
+
+
 def _no_note(note_id: str, store_dir=None) -> None:
+    # The summary prints arc ids beside entry ids, and an agent held one as
+    # the other (dogfood, 2026-10-28).
+    if store_dir and any(a.id == note_id for a in store.load_arcs(store_dir)):
+        print(f"{note_id} is an arc, not an entry: arc todo {note_id} lists its open boxes, "
+              f"list --arc {note_id} every entry in it", file=sys.stderr)
+        return
     print(f"no entry found: {note_id} (an id, or its tail after a dash: 123456-a1b, a1b; "
           f"list --grep TEXT searches the entries)", file=sys.stderr)
     # A project's session looked up the rows it had filed in another
     # project's store, and each miss took a second call (2026-10-25).
     tok = store.id_tail(note_id)
-    for p in _siblings(store_dir) if store_dir else ():
-        if len(hits := _held([n.id for n in store.load(p)], tok)) == 1:
+    for p, ids in _sibling_ids(store_dir) if store_dir else ():
+        if len(hits := _held(ids, tok)) == 1:
             where = shlex.quote(_from_here(p))
             print(f"  {where} has it: symbion --dir {where} show {hits[0]}", file=sys.stderr)
 
@@ -2506,9 +2558,58 @@ def _say_pulled(ctx, p, quiet=False, cap=None) -> int:
     return 0
 
 
+def _untrusted_note(ctx) -> str | None:
+    """The line a read prints while a pulled symbion.toml waits on `trust`."""
+    if not catalog.untrusted(ctx.store_dir):
+        return None
+    return "note: " + _untrusted(ctx, catalog.UNTRUSTED)
+
+
+def _untrusted(ctx, e) -> str:
+    """A write's refusal or a read's note, naming the store's own `trust`:
+    under `--dir`, a bare `symbion trust` acts on the default store."""
+    if str(e) != catalog.UNTRUSTED or ctx is None:
+        return str(e)
+    me = " ".join(filter(None, ["symbion", _named_store(ctx)]))
+    return catalog.UNTRUSTED.replace("`symbion trust`", f"`{me} trust`")
+
+
+def _trust(ctx) -> int:
+    """`trust`: every change to symbion.toml since the first pull that shut
+    the gate, then a yes read from a terminal. stdin from a pipe refuses,
+    so an agent's shell cannot accept: it tells the user. Not a wall, as an
+    agent runs as the user does; it stops one that obeys a pulled row."""
+    s, old = ctx.store_dir, catalog.untrusted(ctx.store_dir)
+    if not old:
+        print("nothing to trust: no pull has changed symbion.toml since it was last trusted")
+        return 0
+    for args in (["log", "--no-show-signature", "--format=%h %an %s"], ["diff"]):
+        print(gitref._git(s, *args, f"{old}..HEAD", "--", config.CONFIG_FILE).stdout, end="")
+    sys.stdout.flush()                   # the change, above the words that name it
+    if not sys.stdin.isatty():
+        print("trust: the user accepts this at a terminal; an agent shows them the change "
+              "and asks them to run it", file=sys.stderr)
+        return 1
+    try:
+        said = input("Accept this symbion.toml? It names commands symbion runs. [y/N] ")
+    except EOFError:                     # Ctrl-D is a no
+        said = ""
+    if said.strip().lower() not in ("y", "yes"):
+        print("not trusted: writes and its commands still wait", file=sys.stderr)
+        return 1
+    catalog.untrusted_path(s).unlink()
+    print("trusted: writes and symbion.toml's commands run again")
+    return 0
+
+
 SYNC_CAP = 5                        # split and dropped lines of session start's pull the summary carries
 HOOK_FETCH_TIMEOUT = 4              # seconds session start waits on origin: HOOK_TIMEOUT stops the hook
+HOOK_HISTORY_TIMEOUT = 3            # seconds the gotcha list counts its files' commits; past it, no count
 HOOK_LOCK_WAIT = 2                  # seconds session start's pull waits on a store another command holds
+# Seconds from session start's read to the end of its gotcha count. Each
+# budget above fit alone, and together they ran 9.7 s against HOOK_TIMEOUT
+# (audit, 2026-10-28). The pull's two (6 s) fit in it; the count takes what is left.
+HOOK_DEADLINE = 8
 PUSH_TIMEOUT = 30                   # seconds `commit` waits on origin's push
 
 
@@ -2588,10 +2689,10 @@ def _say_pending(ctx) -> None:
     """`add` wrote two rows and said nothing of their being uncommitted: the
     session found them by `git status` in the store at its end (dogfood,
     2026-10-11). End a write as `commit` ends, with the command, and say
-    whose rows it takes and whose it leaves."""
+    whose rows it takes and whose it leaves. An arc write changes arcs.jsonl
+    alone, which every commit takes: `arc archive` printed the id and no
+    note (dogfood, 2026-10-28)."""
     rows = store.pending_rows(ctx.store_dir)
-    if not rows:
-        return
     keep = store.with_bases(rows, api.own_rows(ctx))
     mine, left = [r for r in rows if keep(r)], [r for r in rows if not keep(r)]
     cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit"]))
@@ -2600,10 +2701,15 @@ def _say_pending(ctx) -> None:
                 f"({store.rows_by_author(left)})" if left else "")
         print(f"note: {summ._count(len(store.entries(mine)), 'entry')} not committed "
               f"({store.rows_by_author(mine)}): {cmd}{more}", file=sys.stderr)
-    else:
+        return
+    arcs = gitref.registry_modified(ctx.store_dir)
+    if rows:
         print(f"note: {summ._count(len(store.entries(rows)), 'entry')} not committed "
-              f"({store.rows_by_author(rows)}), none of them yours: "
-              f"{cmd} --all takes them", file=sys.stderr)
+              f"({store.rows_by_author(rows)}), none of them yours: {cmd} --all takes them"
+              + (f"; arcs.jsonl changed too: {cmd} takes it" if arcs else ""),
+              file=sys.stderr)
+    elif arcs:
+        print(f"note: arcs.jsonl not committed: {cmd}", file=sys.stderr)
 
 
 def _say_news(ctx, wrote) -> None:
@@ -2735,6 +2841,17 @@ def _siblings(store_dir) -> list[Path]:
     # (2026-10-27); skip a store whose text lacks the id if a write feels it.
     here = Path(store_dir).resolve()
     return [p for p in sorted(here.parent.glob("*-notes")) if p != here and store.exists(p)]
+
+
+def _sibling_ids(store_dir):
+    """Each sibling store and its ids. One that does not load (a toml a
+    stopped pull left in conflict) is skipped: it raised after a write had
+    landed, and the exit 1 invited a retry that wrote the row twice."""
+    for p in _siblings(store_dir):
+        try:
+            yield p, [n.id for n in store.load(p)]
+        except (ValueError, OSError):        # TOMLDecodeError is a ValueError
+            continue
 
 
 def _from_here(path) -> str:
@@ -2937,6 +3054,7 @@ def _dispatch(args, ctx) -> int:
         _name_dirty(written)
         _name_undated(written)
         _name_past_due(written)
+        _name_archived_arcs(store_dir, written)
         if len(written) > 1:
             _name_catalog_misses(ctx.cfg, fields, written)
         _echo_clipped_heads(store_dir, written)
@@ -3132,12 +3250,10 @@ def _dispatch(args, ctx) -> int:
             rows = []
             raw = {n.id: n for n in stored}
             for n in notes:
-                d = summ.json_row(raw[n.id], raw, since[n.id])
-                if n.spec.verdict:
-                    state, distance = api.verdict_state(cfg, n, git_head)
-                    d["state"] = state
-                    d["distance"] = distance
-                    if state == "rewritten" and (s := gitref.successor(cfg, n.provenance,
+                st = api.verdict_state(cfg, n, git_head) if n.spec.verdict else None
+                d = summ.json_row(raw[n.id], raw, since[n.id], st)
+                if st:
+                    if st[0] == "rewritten" and (s := gitref.successor(cfg, n.provenance,
                                                                        git_head)):
                         d |= {"successor": s.sha, "successor_state": s.state,
                               "same_tree": s.same_tree}
@@ -3183,6 +3299,9 @@ def _dispatch(args, ctx) -> int:
             # The reader as summary has it: at a terminal the person, who
             # has no one else's line to be shown.
             reader = None if sys.stdout.isatty() else api.author_default()
+            # A superseded row's head carries its added lines, and a full body
+            # shows them: `added` walks the chain, k versions cost k² clips.
+            bare = args.full or bool(args.note_id)
             for n in notes:
                 state = api.verdict_state(cfg, n, git_head) if n.spec.verdict else None
                 subject = subjects.get(n.target.name) if n.target.type == "commit" else None
@@ -3191,7 +3310,8 @@ def _dispatch(args, ctx) -> int:
                 _print_note(n, state=state, subject=subject, successor=succ,
                             full=args.full or bool(args.note_id), head=heads_of.get(n.id),
                             gui=gui, since=since[n.id],
-                            added=summ.added(by_id, n, reader, summ.LIST_BODY_CHARS),
+                            added=None if bare or n.id in heads_of
+                            else summ.added(by_id, n, reader, summ.LIST_BODY_CHARS),
                             seams=summ.seams(by_id, n) if args.full or args.note_id else (),
                             links=summ.links(every, n) if args.note_id else (),
                             written=summ.written(by_id, n) if args.full or args.note_id else None,
@@ -3265,6 +3385,11 @@ def _dispatch(args, ctx) -> int:
             fields["due"] = args.due or None          # "" clears, as --arc-id "" detaches
         if args.target is not None:
             fields["target"] = args.target
+        if args.tags is not None and (args.add_tags or args.rm_tags):
+            print("supersede: --tag replaces the tags, so --add-tag and --rm-tag beside it "
+                  "would be dropped; nothing was written. Use --tag alone, or the other two",
+                  file=sys.stderr)
+            return 1
         if args.tags is not None:                      # --tag: replace
             fields["tags"] = args.tags
         elif (args.add_tags or args.rm_tags) and args.refs is None and not args.add_refs \
@@ -3325,6 +3450,8 @@ def _dispatch(args, ctx) -> int:
             return 1
         print(note.id)
         args.wrote.add(note.id)
+        if args.arc_id:
+            _name_archived_arcs(store_dir, [note])
         _name_unknown_ids(store_dir, [args.body])
         _name_near_tags(store_dir, [note])
         _name_new_items(store_dir, [note], tip.refs if tip else ())
@@ -3434,6 +3561,9 @@ def _dispatch(args, ctx) -> int:
     if args.cmd == "pull":
         return _say_pulled(ctx, api.pull(ctx))
 
+    if args.cmd == "trust":
+        return _trust(ctx)
+
     if args.cmd == "rename":
         # A type the store no longer declares still names its rows: rename
         # is how they leave it (the repos design, "Converting a store").
@@ -3521,8 +3651,11 @@ def _dispatch(args, ctx) -> int:
             return 0
         at_terminal = sys.stdout.isatty() and not (args.json or args.hook)
         read_at = store._now_iso() if args.hook else None
+        deadline = time.monotonic() + HOOK_DEADLINE
         reader = None if at_terminal else api.author_default()
         sync, told = _hook_pull(ctx) if args.hook else ([], [])   # before the summary reads it
+        if args.hook and (note := _untrusted_note(ctx)):          # each session until `trust`
+            sync, told = [*sync, note], [*told, note]
         side = store.read_side(store_dir)      # after the pull: it can bring `shared`
         data = summ.summary(store_dir, cfg, full=args.full, reader=reader, side=side)
         data["sync"] = sync
@@ -3546,7 +3679,7 @@ def _dispatch(args, ctx) -> int:
             sid = _hook_session()
             try:
                 if sid:
-                    _list_gotchas(ctx, sid)
+                    _list_gotchas(ctx, sid, deadline)
                     _mark_read(ctx, sid, read_at)
             except OSError:             # a cache it cannot write costs the hint, not the summary
                 pass
@@ -3590,6 +3723,14 @@ def _dispatch(args, ctx) -> int:
             side = store.read_side(store_dir)
             every = summ.seen_from(store.load(store_dir), side)
             by_id = {n.id: n for n in every}
+            if (data.get("target") or "").startswith("arc:"):
+                # A box is in an arc by its arc_id, not its target: `0 entries
+                # for arc:X` read as an empty arc (dogfood, 2026-10-28).
+                arc, shown = data["target"][4:], {d["id"] for d in data["notes"]}
+                k = sum(n.arc_id == arc and n.id not in shown for n in store.heads(every))
+                if k:
+                    head += (f"; +{summ._count(k, 'entry')} filed in the arc (list --arc {arc}; "
+                             f"arc todo {arc} lists its open boxes)")
             if not (args.target or args.commit or args.branch):
                 other = len(store.heads(every)) - len(data["notes"])
                 if other:
@@ -3600,6 +3741,7 @@ def _dispatch(args, ctx) -> int:
                 row = by_id.get(d["id"])
                 _print_note(store.note_from_dict(d, kinds=ctx.kinds), gui=gui,
                             since=d["commits_since"],
+                            state=(d["state"], d["distance"]) if "state" in d else None,
                             written=summ.written(by_id, row) if row else None,
                             side=_other_side(by_id, row, side) if row else None)
         return 0
@@ -3613,9 +3755,18 @@ def _dispatch(args, ctx) -> int:
 def _dispatch_arc(args, ctx) -> int:
     store_dir, cfg = ctx.store_dir, ctx.cfg
     if args.acmd == "create":
+        # A second arc by one name read as the first in the summary (dogfood, 2026-10-28).
+        twins = [a for a in store.load_arcs(store_dir) if a.name.casefold() == args.name.casefold()]
         act = api.create_arc(ctx, args.name, args.desc, args.scope,
                                   author=_resolved_author(args))
         print(act.id)
+        _name_unknown_ids(store_dir, [args.desc], "--desc")
+        notes = store.load(store_dir) if twins else ()
+        for a in twins:
+            done, total = store.arc_progress(notes, a.id)
+            print(f"note: arc {a.id} is named {a.name!r} too ({done}/{total}"
+                  f"{', archived' if a.archived else ''}); arc rename {act.id} NAME "
+                  f"tells them apart", file=sys.stderr)
         return 0
 
     if args.acmd == "list":
@@ -3626,8 +3777,8 @@ def _dispatch_arc(args, ctx) -> int:
                 hidden += 1
                 continue
             done, total = store.arc_progress(notes, a.id)
-            rows.append({"id": a.id, "name": a.name, "description": a.description,
-                         "done": done, "total": total, "archived": a.archived})
+            # The arc whole: --json dropped its dates, scope and author (2026-10-28).
+            rows.append(store.arc_to_dict(a) | {"done": done, "total": total})
         if args.json:
             print(json.dumps(rows))
         else:
@@ -3640,13 +3791,16 @@ def _dispatch_arc(args, ctx) -> int:
                 desc = paint(f"  -- {r['description']}", "meta") if r["description"] else ""
                 prog = paint(f"{r['done']}/{r['total']}",
                              "good" if r["done"] == r["total"] else "meta")
-                gone = paint("  (archived)", "meta") if r["archived"] else ""
+                when = f" {r['archived_at'][:10]}" if r.get("archived_at") else ""
+                gone = paint(f"  (archived{when})", "meta") if r["archived"] else ""
                 print(f"{paint(r['id'].ljust(w), 'text')} {prog}  "
                       f"{paint(r['name'], 'body')}{gone}{desc}")
             if hidden:
                 print(paint(f"+{hidden} archived (arc list --all)", "meta"))
         return 0
 
+    # The id prints either way; a no-op read as a change (dogfood, 2026-10-28).
+    was = next((a for a in store.load_arcs(store_dir) if a.id == getattr(args, "id", None)), None)
     if args.acmd == "rename":
         try:
             api.rename_arc(ctx, args.id, args.new_name)
@@ -3654,6 +3808,9 @@ def _dispatch_arc(args, ctx) -> int:
             _no_arc(store_dir, args.id)
             return 1
         print(args.id)                # every other write prints; silence read as "did nothing"
+        if was.name == args.new_name:
+            print(f"note: {args.id} is named {args.new_name!r} already; nothing changed",
+                  file=sys.stderr)
         return 0
 
     if args.acmd == "archive":
@@ -3663,6 +3820,10 @@ def _dispatch_arc(args, ctx) -> int:
             _no_arc(store_dir, args.id)
             return 1
         print(args.id)
+        if was.archived:
+            when = f" {store.shown(was.archived_at)}" if was.archived_at else ""
+            print(f"note: {args.id} was archived{when}; nothing changed", file=sys.stderr)
+            return 0
         done, total = store.arc_progress(store.load(store_dir), args.id)
         if total > done:
             print(f"note: {summ._count(total - done, 'open entry')} in {args.id}, now listed "
@@ -3710,7 +3871,9 @@ def _dispatch_arc(args, ctx) -> int:
                         author=_resolved_author(args), kind=args.kind)
         for n in made:                    # ids on stdout, as add prints them
             print(n.id)
+            args.wrote.add(n.id)
         print(f"seeded {len(made)} new {args.kind}(s)", file=sys.stderr)
+        _name_archived_arcs(store_dir, made)
         return 0
 
     if args.acmd == "todo":
@@ -3730,7 +3893,8 @@ def _dispatch_arc(args, ctx) -> int:
             # because its rows are a report, not notes.
             since = gitref.commits_since(cfg, rows)
             by_id = {n.id: n for n in notes}
-            print(json.dumps([summ.json_row(n, by_id, since[n.id]) for n in rows]))
+            print(json.dumps([summ.json_row(n, by_id, since[n.id], st)
+                              for n, st in summ.verdict_states(cfg, rows)]))
         else:
             # A finished arc printed nothing at exit 0, the same as one nobody
             # had started (2026-09-22). Count with denominator; the hidden set
@@ -3947,6 +4111,7 @@ def _main(argv) -> int:
                   "merge.symbion.driver in the clone's .git/config)", file=sys.stderr)
             return 2
         return merge.driver(Path(argv[1]), Path(argv[2]), Path(argv[3]), argv[4])
+    ctx = None
     try:
         dir_value, rest = _extract_dir(argv)
         if rest[:1] in (["-V"], ["--version"]):
@@ -4032,10 +4197,23 @@ def _main(argv) -> int:
                       f"stamped with the HEAD of {ctx.cfg.work_root}, where you stand; a "
                       f".symbion naming the store in its project's root claims it",
                       file=sys.stderr)
-        if rc == 0 and args.cmd in ("add", "resolve", "supersede"):
+        # News needs the ids a write made; origin's count needs none, and an
+        # arc write ended without it (dogfood, 2026-10-28).
+        row_write = args.cmd in ("add", "resolve", "supersede") or \
+            args.cmd == "arc" and args.acmd == "seed" and bool(args.wrote)
+        write = row_write or args.cmd == "rename" or args.cmd == "arc" and (
+            args.acmd in ("create", "rename", "archive")
+            or args.acmd == "reconcile" and (args.apply or args.resolve_stale))
+        if rc == 0 and write:
             _say_pending(ctx)
+        if rc == 0 and row_write:
             _say_news(ctx, args.wrote)
+        if rc == 0 and write:
             _say_upstream(ctx)
+        # A refused write said it already; summary --hook says it in its text.
+        if rc == 0 and args.cmd not in ("trust", "serve") and not getattr(args, "hook", False) \
+                and (note := _untrusted_note(ctx)):
+            print(note, file=sys.stderr)
         return rc
     except SystemExit as e:
         code = e.code
@@ -4067,6 +4245,9 @@ def _main(argv) -> int:
         # store_dir isn't bound in this frame when api.resolve() raises
         # before returning (config.load runs in ITS frame, not this one) --
         # api.resolve attaches it to the exception for exactly this handler.
+        if getattr(e, "store_dir", None) is None:     # not this store's toml
+            print(f"error: could not parse a {config.CONFIG_FILE}: {e}", file=sys.stderr)
+            return 1
         print(f"error: could not parse {e.store_dir / config.CONFIG_FILE}: {e}",
               file=sys.stderr)
         # A pull killed with git's merge stopped on this file leaves its
@@ -4083,7 +4264,7 @@ def _main(argv) -> int:
                   file=sys.stderr)
         return 1
     except (catalog.CatalogError, catalog.AmbiguousName) as e:
-        print(f"error: {e}", file=sys.stderr)
+        print(f"error: {_untrusted(ctx, e)}", file=sys.stderr)
         return 1
     except store.ReadOnly as e:
         print(f"error: {e} (SYMBION_READ_ONLY is set)", file=sys.stderr)
@@ -4092,7 +4273,7 @@ def _main(argv) -> int:
         print(f"error: {e}", file=sys.stderr)    # its own clause must come first
         return 1
     except ValueError as e:                      # AmbiguousName subclasses this;
-        print(f"error: {e}", file=sys.stderr)    # its own clause must come first
+        print(f"error: {_untrusted(ctx, e)}", file=sys.stderr)    # its own clause must come first
         return 1
 
 

@@ -511,7 +511,7 @@ async def test_tab_title_leads_with_the_project_name(user: User, ctx_with_notes)
     search's text in it ends no script. `_client`: see the first test."""
     await user.open("/notes?q=a</script>b")
     assert user.client.resolve_title() == \
-        f"{ctx_with_notes.cfg.project_root.name} · search: a</script>b"
+        f"{ctx_with_notes.cfg.project_root.name} · search: a</script>b · symbion"
     assert 'if (matchMedia("(display-mode: tabbed)").matches) ' \
         'document.title = "search: a\\u003c/script>b"</script>' in user._client.head_html
 
@@ -721,6 +721,77 @@ async def test_a_question_without_options_takes_typed_words_only(user: User, ctx
     user.find(marker="answer-field").type("8080").trigger("keydown.enter")
     assert _head(tmp_path, bare).body.rstrip().endswith("8080")
     assert _head(tmp_path, bare).author == "ada"
+
+
+async def _reloaded(user: User, by=None) -> None:
+    """A card's write reloads the page: `ui.navigate.reload()`, as the `user`
+    fixture runs it, opens the page anew in the same tab. `by` is the write."""
+    old = user.client
+    (by or user.navigate.reload)()
+    for _ in range(200):
+        if user.client is not old:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("the page did not reload")
+
+
+def _composer_closed(user: User) -> None:
+    (d,) = [d for d in user.find(ui.dialog).elements
+            if any("sb-new-card" in c.classes for c in d.default_slot.children)]
+    d.close()
+
+
+def _the(user: User, marker: str):
+    (e,) = user.find(marker=marker).elements
+    return e
+
+
+async def test_a_draft_closed_with_esc_outlives_a_reload(user: User, ctx_with_notes):
+    """A star, resolve or answer on any card reloads the page, and the
+    composer's draft came back empty (audit, 2026-10-28)."""
+    await user.open("/")
+    user.find(marker="new-note").click()
+    _the(user, "note-body").value = "half a thought #wip"
+    _the(user, "note-kind-select").value = "task"
+    _the(user, "note-due").value = "2026-12-01"
+    _composer_closed(user)
+    await _reloaded(user)
+    user.find(marker="new-note").click()
+    assert _the(user, "note-body").value == "half a thought #wip"
+    assert (_the(user, "note-kind-select").value, _the(user, "note-due").value) == \
+        ("task", "2026-12-01")
+    assert _the(user, "note-tags").value == "wip"
+
+
+async def test_a_draft_added_does_not_come_back(user: User, ctx_with_notes):
+    await user.open("/")
+    user.find(marker="new-note").click()
+    _the(user, "note-body").value = "kept, then added"
+    _composer_closed(user)
+    user.find(marker="new-note").click()
+    await _reloaded(user, user.find(marker="note-add").click)
+    assert "kept, then added" in [n.body for n in store.load(ctx_with_notes.store_dir)]
+    user.find(marker="new-note").click()
+    assert _the(user, "note-body").value == ""
+
+
+async def test_an_answer_typed_outlives_a_reload(user: User, ctx_with_notes):
+    _q(ctx_with_notes, "which port?")
+    await user.open("/")
+    user.find(marker="answer-field").type("8080")
+    await _reloaded(user)
+    await user.should_see(marker="answer-field")
+    assert _the(user, "answer-field").value == "8080"
+
+
+async def test_an_answer_sent_is_not_typed_again_at_its_next_turn(user: User, ctx_with_notes):
+    q = _q(ctx_with_notes, "which port?")
+    await user.open("/")
+    await _reloaded(user, lambda: user.find(marker="answer-field").type("8080")
+                    .trigger("keydown.enter"))
+    api.supersede(ctx_with_notes, q, author="sam", append_body="and the next one?")
+    await _reloaded(user)
+    assert _the(user, "answer-field").value == ""
 
 
 async def test_a_question_not_waiting_on_the_person_lists_its_options(user: User,
@@ -1192,6 +1263,54 @@ async def test_a_long_list_says_what_it_did_not_show(user: User, repo, tmp_path,
     await user.open(more.props["href"])
     await user.should_see("entry 0")
     await user.should_not_see(marker="show-all")
+
+
+
+async def test_targets_draws_a_page_of_cards_and_names_the_rest(user: User, repo, tmp_path,
+                                                                 monkeypatch):
+    """/targets capped each board and never the page: one board per file of
+    a seeded arc, 1,500 cards in 7.8 s, on the event loop every visitor
+    shares (audit 2026-10-28). A read-only serve ignores `all=1`, on /notes
+    too."""
+    monkeypatch.setitem(build_page.__globals__, "PAGE_ROWS", 3)
+    ctx = api.resolve(str(tmp_path))
+    for i in range(5):
+        api.add(ctx, {"kind": "task", "target": {"type": "item", "name": f"t{i}"},
+                      "body": f"entry {i}"}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/targets")
+    assert len(user.find(marker="board").elements) == 3
+    (more,) = user.find(marker="show-all").elements
+    assert (more.text, more.props["href"]) == ("+2 more targets not shown — show all",
+                                               "/targets?all=1")
+    await user.open("/targets?all=1")
+    assert len(user.find(marker="board").elements) == 5
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    await user.open("/targets?all=1")
+    assert len(user.find(marker="board").elements) == 3
+    await user.should_not_see(marker="show-all")
+    await user.open("/notes?all=1")
+    assert len(user.find(marker="note-row").elements) == 3
+    await user.should_not_see(marker="show-all")
+
+
+async def test_a_read_only_serve_draws_a_shorter_page(user: User, repo, tmp_path, monkeypatch):
+    """A read-only serve renders a 100-row /notes in about twice the time
+    of a 30-row one, and a visitor's tabs queue behind each other."""
+    monkeypatch.setitem(build_page.__globals__, "DEMO_ROWS", 2)
+    ctx = api.resolve(str(tmp_path))
+    for i in range(3):
+        api.add(ctx, {"kind": "task", "target": {"type": "item", "name": f"t{i}"},
+                      "body": f"entry {i}"}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    assert len(user.find(marker="note-row").elements) == 3
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    await user.open("/notes")
+    assert len(user.find(marker="note-row").elements) == 2
+    assert _count(user) == "3 entries; newest 2 shown"
+    await user.open("/targets")
+    assert len(user.find(marker="board").elements) == 2
 
 
 # ---- the card layout's gaps, measured in the browser 2026-10-01 ----
@@ -2011,7 +2130,9 @@ async def test_a_store_with_repos_names_the_store_not_the_repo_the_serve_stands_
     monkeypatch.chdir(r)
     build_page(api.resolve(), author="ada")
     await user.open("/")
-    assert user.client.resolve_title() == "work-notes · Summary"
+    assert user.client.resolve_title() == "work-notes · Summary · symbion"
+    from symbion.gui import chrome
+    assert f'<meta property="og:description" content="{chrome.ABOUT}">' in user._client.head_html
     (brand,) = user.find(marker="brand").elements
     assert brand.text == "work-notes"
 
@@ -2351,3 +2472,56 @@ async def test_a_page_reads_the_clones_side_once_however_many_questions_it_shows
     await user.open(page)
     await user.should_see("is it 2")
     assert len(calls) == 1, calls
+
+
+async def test_a_row_id_is_one_prop_not_a_script(user: User, ctx_with_notes):
+    """`.props(f"data-id={id}")` let an id like `x :title=1` add a `:`-prop,
+    which nicegui.js runs as JavaScript; a pushed row or a hand edit sets the
+    id, as store.load never checks its shape (audit 2026-10-28)."""
+    bug = next(n.id for n in store.heads(store.load(ctx_with_notes.store_dir)) if n.kind == "bug")
+    evil = f"{bug} :title=1"
+    p = ctx_with_notes.store_dir / "notes.jsonl"
+    p.write_text(p.read_text().replace(bug, evil))
+    await user.open("/notes")
+    (card,) = [e for e in user.find(marker="note-row").elements if bug in e._props.get("data-id", "")]
+    assert card._props["data-id"] == evil and ":title" not in card._props
+
+
+async def test_a_read_only_sidebar_names_no_other_store(user: User, repo, tmp_path, monkeypatch):
+    """Its tooltip gave another store's absolute path to a read-only
+    serve's visitors (audit 2026-10-28)."""
+    import json
+    import os
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    records = tmp_path / "cache" / "symbion" / "serve"
+    records.mkdir(parents=True)
+    (records / "elsewhere.json").write_text(json.dumps(
+        {"pid": os.getpid(), "url": "http://127.0.0.1:1111",
+         "store": str((tmp_path / "elsewhere-notes").resolve())}))
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    build_page(api.resolve(str(tmp_path)), author="ada")
+    await user.open("/")
+    await user.should_not_see(marker="store-item")
+
+
+async def test_a_cut_board_with_no_page_of_its_own_links_nowhere(user: User, repo, tmp_path,
+                                                                   monkeypatch):
+    """The "waiting on you" board's `· N more` linked to "" and reloaded the
+    page; an `arc:` ref chip went to /object, not the arc's page (audit
+    2026-10-28)."""
+    monkeypatch.setitem(build_page.__globals__, "BOARD_ROWS", 2)
+    ctx = api.resolve(str(tmp_path))
+    for i in range(3):
+        api.add(ctx, {"kind": "question", "target": {"type": "project", "name": None},
+                      "body": f"ask {i}"}, author="sam")
+    arc = api.create_arc(ctx, "camp", "d", "item", author="ada")
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}, "body": "x",
+                  "refs": [{"type": "arc", "name": arc.id}]}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    asides = [e for e in user.find(marker="board-aside").elements if "more" in e.text]
+    assert asides and all(e.props.get("href") for e in asides if "href" in e.props), \
+        [(e.text, e.props.get("href")) for e in asides]
+    await user.open("/notes")
+    (ref,) = user.find(marker="note-ref").elements
+    assert ref.props["href"] == f"/arc?id={arc.id}"

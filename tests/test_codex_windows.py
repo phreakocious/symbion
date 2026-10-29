@@ -8,6 +8,7 @@ import sysconfig
 
 import pytest
 from symbion import cli, store
+from test_shared import publish, sides  # noqa: F401
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="native Windows hook")
 HOOK = Path(__file__).resolve().parents[1] / "src/symbion/data/skill/session_start.ps1"
@@ -19,9 +20,22 @@ def default_codex_home(monkeypatch):
     monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
+def context(result) -> str:
+    """What the agent reads: the JSON's additionalContext, or the plain text
+    an error prints."""
+    try:
+        return json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    except ValueError:
+        return result.stdout
+
+
 def run_hook(repo, **overrides):
+    # Git for Windows' cmd/, as its installer puts on PATH: the ucrt64/bin/git.exe
+    # Git Bash finds first segfaults in a fetch with no usr/bin beside it.
+    git = Path(shutil.which("git"))
+    git_dir = next((p / "cmd" for p in git.parents if (p / "cmd" / "git.exe").is_file()), git.parent)
     env = {**os.environ, "PATH": os.pathsep.join([
-        str(Path(sysconfig.get_path("scripts"))), str(Path(shutil.which("git")).parent)]),
+        str(Path(sysconfig.get_path("scripts"))), str(git_dir)]),
         "SYMBION_DIR": "", "SYMBION_AUTHOR": "", **overrides}
     return subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive",
                            "-ExecutionPolicy", "Bypass", "-File", str(HOOK)],
@@ -60,7 +74,18 @@ def test_native_hook_adoption_and_errors(repo, tmp_path, mode):
     elif mode == "broken-config":
         assert "could not parse" in result.stdout
     else:
-        assert "user request: → λ" in result.stdout
+        assert "user request: → λ" in context(result)
+        assert "systemMessage" not in result.stdout     # Codex shows it as a warning
+
+
+def test_native_hook_pulls_a_shared_store(repo, sides):   # noqa: F811 (the fixture)
+    """The .ps1 ran `summary` without --hook: no pull, read mark or fit,
+    where session_start.sh pulled (audit 2026-10-28)."""
+    a, b = sides
+    publish(a, "from A")
+    result = run_hook(repo, SYMBION_DIR=str(b))
+    assert result.returncode == 0 and result.stderr == "", result
+    assert context(result).startswith("pulled 1 commit from origin/"), result
 
 
 def test_native_hook_names_missing_executable_only_in_adopted_projects(repo):
@@ -80,7 +105,7 @@ def test_native_hook_preserves_an_explicit_reader(repo):
                   author=author, body=f"parked by {author}", status="open")
     result = run_hook(repo, SYMBION_AUTHOR="human")
     assert result.returncode == 0 and result.stderr == ""
-    assert "parked by codex" in result.stdout and "parked by human" not in result.stdout
+    assert "parked by codex" in context(result) and "parked by human" not in context(result)
 
 
 def test_native_hook_shares_the_main_worktrees_store(repo, tmp_path):
@@ -95,7 +120,7 @@ def test_native_hook_shares_the_main_worktrees_store(repo, tmp_path):
     subdir.mkdir()
     result = run_hook(subdir)
     assert result.returncode == 0 and result.stderr == "", result
-    assert "shared worktree request" in result.stdout
+    assert "shared worktree request" in context(result)
 
 
 def test_native_only_registration_is_not_duplicated(tmp_path, capsys):

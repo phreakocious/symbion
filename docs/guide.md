@@ -147,7 +147,8 @@ command should be `symbion summary`.
 `additionalContext`, what the agent reads, and its `systemMessage` is what you
 see at session start: one line, and in a [shared store](#share-a-store) above it
 the pull's lines that say `symbion.toml` changed, with the command that shows
-the change, or that a clone runs an older symbion. The not-on-PATH line and the `error:` lines
+the change, or that a clone runs an older symbion, and, until you run
+`symbion trust`, the line that says writes wait on it. The not-on-PATH line and the `error:` lines
 print as plain text, and the PowerShell hook prints all of it that way.
 
 | output | meaning |
@@ -262,11 +263,14 @@ Shared stores are experimental. A later release may change them, or remove them.
 before shared stores gives an edit the wrong side.
 
 **2. Switch it on.** The store needs a remote, and the clone needs a `user.name`:
-that name is the side, so each person's must differ. In the first person's clone:
+that name is the side, so each person's must differ. The store commits as the
+clone's git identity, so the clone needs a `user.email` too, unless git has a
+global one. In the first person's clone:
 
 ```bash
 git -C ../<repo>-notes remote add origin <url>      # if the store has no remote yet
 git -C ../<repo>-notes config user.name "First Person"
+git -C ../<repo>-notes config user.email first@example.com
 ```
 
 Then add `shared = true` to `../<repo>-notes/symbion.toml`, at the top of the file,
@@ -291,6 +295,7 @@ where symbion looks for it (`../<repo>-notes`), and names their side in the clon
 ```bash
 git clone <url> ../<repo>-notes
 git -C ../<repo>-notes config user.name "Second Person"
+git -C ../<repo>-notes config user.email second@example.com
 git -C ../<repo>-notes fetch
 ```
 
@@ -304,6 +309,17 @@ From then on session start pulls, and `commit` pulls, then pushes. Run `pull` or
 new store commits: symbion pull`, and a `commit` that could not reach origin says
 to pull, then push. A pull that cannot finish (a conflict in `symbion.toml` or in
 a file under `docs/`) prints the git commands that end it.
+
+A pull that changes `symbion.toml` stops every write, and every command the file
+names, until you read the change and accept it at a terminal:
+
+```bash
+symbion trust
+```
+
+Reads go on, each with a line that says so, and so does session start. From an
+agent's shell `trust` refuses: the agent shows you the change and asks you to run
+it.
 [The reference](reference.md#shared-stores) has the rest.
 
 ## Browse it (optional)

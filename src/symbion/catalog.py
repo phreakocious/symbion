@@ -52,6 +52,38 @@ def posix_sh() -> str | None:
 # 2026-10-15). A [catalogs] `doc` entry replaces it.
 DOC_CATALOG = 'git -C "${SYMBION_DIR:?}/docs" ls-files --cached --others --exclude-standard'
 
+# A pull that changes symbion.toml leaves this in the clone's git dir, never
+# pushed, holding the HEAD before it; `symbion trust` removes it. A fresh
+# clone is trusted: cloning a store is trusting it (the user, 2026-10-28).
+# shortcut: a `git pull` run by hand in the store leaves none; a content hash
+# would catch it, and then trip on each local edit.
+UNTRUSTED_FILE = "symbion-untrusted"
+UNTRUSTED = ("a pull changed symbion.toml, which names commands symbion runs: writes and "
+             "those commands wait until the user reads the change and runs `symbion trust` "
+             "in a terminal")
+_UNTRUSTED_PATHS: dict = {}
+
+
+def untrusted_path(store) -> Path | None:
+    """The marker's path in `store`'s git dir; None outside a git repo.
+    Asked once per store, as store._sessions_path is."""
+    store = Path(store).absolute()
+    if (p := _UNTRUSTED_PATHS.get(store)) is None:
+        r = subprocess.run(["git", "-C", str(store), "rev-parse", "--git-path", UNTRUSTED_FILE],
+                           capture_output=True, text=True, encoding="utf-8")
+        if r.returncode == 0:
+            p = _UNTRUSTED_PATHS[store] = Path(store, r.stdout.strip())
+    return p
+
+
+def untrusted(store) -> str | None:
+    """The HEAD before the first pull that changed symbion.toml and is not
+    yet trusted, or None."""
+    p = untrusted_path(store)
+    with contextlib.suppress(FileNotFoundError):
+        return p.read_text(encoding="utf-8").strip() if p else None
+    return None
+
 
 def run_configured(cfg, cmd: str, input: str | None = None):
     """Run one configured shell command in the CURRENT worktree, bounded.
@@ -74,6 +106,8 @@ def run_configured(cfg, cmd: str, input: str | None = None):
     is argv and cannot be inherited, so without this a command run under
     `--dir` resolved the default store instead and answered confidently from
     the wrong names."""
+    if getattr(cfg, "store", None) is not None and untrusted(cfg.store):
+        raise CatalogError(UNTRUSTED)
     if getattr(cfg, "work_root", None) is None:
         if getattr(cfg, "repos", None):
             raise CatalogError(
@@ -132,14 +166,24 @@ def run_configured(cfg, cmd: str, input: str | None = None):
                 raise CatalogError(
                     f"command exceeded its timeout and was killed: {cmd}") from None
             raise
-    try:
-        # text=True's newlines: \r\n and a lone \r read as \n.
-        out, err = (b.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-                    for b in (out, err))
-    except UnicodeDecodeError as e:
-        raise CatalogError(f"command printed bytes that are not UTF-8 "
-                           f"(byte {e.start}): {cmd}") from None
+    # Per line: one Latin-1 file name, which git no longer quotes, refused
+    # the whole catalog and every `file:` write with it.
+    lines = out.splitlines(keepends=True)
+    good = [s for s in (_utf8(ln) for ln in lines) if s is not None]
+    if n := len(lines) - len(good):
+        print(f"note: {n} {'line' if n == 1 else 'lines'} printed by {cmd} "
+              f"{'is' if n == 1 else 'are'} not UTF-8, skipped", file=sys.stderr)
+    # text=True's newlines: \r\n and a lone \r read as \n.
+    out, err = ("".join(good), err.decode("utf-8", "replace"))
+    out, err = (s.replace("\r\n", "\n").replace("\r", "\n") for s in (out, err))
     return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+
+def _utf8(b: bytes) -> str | None:
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _lines(stdout: str) -> list[str]:
@@ -350,11 +394,13 @@ def did_you_mean(query: str, candidates) -> str:
     return f"; did you mean {', '.join(map(repr, near))}?" if near else ""
 
 
-def canonical(cfg, target_type: str, name, pending=(), candidates=None):
+def canonical(cfg, target_type: str, name, pending=(), candidates=None, earlier=None):
     """`candidates` lets a write that runs the catalog once pass the pool in;
     `pending` is the names that write has already resolved, unioned with the
     catalog/candidates (order kept, no duplicates — a duplicate would make a
-    repeated query read as ambiguous)."""
+    repeated query read as ambiguous). A caller that keeps that union itself
+    passes it as `candidates`, and `earlier` the names in it no catalog
+    listed."""
     if name is None or target_type in NON_CANONICAL_TYPES:
         return name
     if target_type == "doc":             # as git prints it, from the store's root
@@ -362,9 +408,10 @@ def canonical(cfg, target_type: str, name, pending=(), candidates=None):
     if target_type not in cfg.catalogs:
         return nfc(name)
     base = pool(cfg, target_type) if candidates is None else candidates
-    cands = list(dict.fromkeys([*base, *pending]))
-    return match(cfg, target_type, name, cands,
-                 earlier=set(pending).difference(base) if pending else ())
+    cands = dict.fromkeys([*base, *pending]) if pending else base
+    if earlier is None:
+        earlier = set(pending).difference(base) if pending else ()
+    return match(cfg, target_type, name, cands, earlier=earlier)
 
 
 def across(query, pools) -> list[tuple[str, str]]:

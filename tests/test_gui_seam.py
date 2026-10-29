@@ -42,6 +42,7 @@ ALLOWED_STORE_READS = {
     "undoable", "note_from_dict",                # the undo button's read, and its dialog's rows
     "now_shown",                                 # the clock, which SYMBION_NOW can stop
     "read_only", "ReadOnly",                     # serve --read-only, and its refusal
+    "Untrusted",                                 # a pulled symbion.toml's refusal
     "read_side", "NoSide",                       # a shared store's reader, and a write's refusal
     "shared",                                    # a shared store's buttons pull, then push
 }
@@ -118,6 +119,7 @@ def test_the_audit_skips_comments_but_not_code_after_a_hash_in_a_string():
 CLI_FILE = GUI_DIR.parent / "cli.py"
 CLI_STORE_CALLS = ALLOWED_STORE_READS | {
     "note_from_dict", "read_dict", "reconcile_arc",      # reads
+    "arc_to_dict",                                        # read: arc list --json's row
     "stored_names",                                       # read: list --name's stored form
     "jsonl_lines",                                        # a text helper
     "_replace_atomically",                                # a file helper: --merge-hook's settings

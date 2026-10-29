@@ -161,8 +161,14 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     # cannot fetch.
     assert 'href="/favicon.ico"' in page, page[:2000]
     # A browser with scripts blocked is told so, not that it lacks ES modules.
-    assert "<noscript><style>#esm-fallback{display:none!important}</style>" in page
+    assert "<noscript><style>#esm-fallback{display:none!important}" in page
     assert "GUI needs JavaScript" in page
+    # An agent's fetch runs no script, and its converter drops <noscript>
+    # (Claude Code's WebFetch did, 2026-10-28) but not text hidden by CSS: it
+    # reads what symbion is from an element a browser running scripts never draws.
+    seen = re.sub(r"(?s)<(script|noscript|style)\b.*?</\1>", "", page)
+    assert "ticket registry" in seen and "https://github.com/phreakocious/symbion" in seen
+    assert '<div id="sb-about" style="display:none">' in page
     assert icon == ("image/svg+xml", FAVICON.read_bytes()), icon
     # The manifest makes the GUI an installable app, its pages tabs in one
     # window; its icons are PNGs, which an SVG alone did not give, and opaque:

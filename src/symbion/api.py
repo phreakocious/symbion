@@ -206,6 +206,9 @@ def check_name(typ: str, name) -> None:
                              f"a named subject is item:{name}")
     elif not isinstance(name, str) or not name.strip():
         raise ValueError(f"target type {typ!r} needs a name: {typ}:NAME")
+    elif c := store.control_char(name):
+        raise ValueError(f"{typ}:{name!r} holds a control character ({c!r}): a newline "
+                         f"split `list`'s one line per entry")
     elif typ == "commit" and name.startswith("-"):
         # A commit name reaches git among its arguments (2026-10-09).
         raise ValueError(f"commit:{name} starts with '-', which git reads as an option; "
@@ -279,8 +282,11 @@ def _canonicalizer(ctx: Ctx):
     """One write's name rule: `gitref.canon_name` (commit peeled, built-ins
     NFC) plus, for a catalog type, the catalog ONCE per write and a `pending`
     list of the names this write has already resolved for that type, unioned
-    with the catalog so a repeated query never sees a duplicate candidate."""
-    pools: dict[str, list[str]] = {}
+    with the catalog so a repeated query never sees a duplicate candidate.
+    The union is kept, not rebuilt per name: a dict, so `in` is O(1). 1,000
+    names against a 50k-name catalog took 5 s under the lock."""
+    pools: dict[str, dict] = {}                # the catalog's names, then this write's
+    added: dict[str, set] = {}                 # this write's that no catalog listed
     pending: dict[str, list[str]] = {}
     listed: dict[str, list[str]] = {}          # file_target's: each repo's names, once
 
@@ -302,19 +308,21 @@ def _canonicalizer(ctx: Ctx):
         if name is None or typ in catalog.NON_CANONICAL_TYPES or typ not in ctx.cfg.catalogs:
             return {"type": typ, "name": gitref.canon_name(ctx.cfg, typ, name)}
         if typ not in pools:
-            pools[typ] = catalog.pool(ctx.cfg, typ)
-        got = catalog.canonical(ctx.cfg, typ, name,
-                                pending=pending.get(typ, ()), candidates=pools[typ])
+            pools[typ], added[typ] = dict.fromkeys(catalog.pool(ctx.cfg, typ)), set()
+        cands = pools[typ]
+        got = catalog.canonical(ctx.cfg, typ, name, candidates=cands, earlier=added[typ])
         # No name a catalog lists has a `.` or `..` segment, unless it says
         # so (a `file:` one is a path, above): `--ref doc:../x.py` stored a
         # junk target at exit 0 (the user, 2026-10-19).
-        if got not in pools[typ] and \
+        if got not in cands and \
                 (seg := next((s for s in got.split("/") if s in (".", "..")), None)):
             raise catalog.CatalogError(
                 f"{typ}:{got} has a '{seg}' segment, which no name the {typ} catalog lists "
                 f"has" + ("; a doc: name is its path within the store's docs/"
                           if typ == "doc" else ""))
-        pending.setdefault(typ, []).append(got)
+        if got not in cands:
+            cands[got] = None
+            added[typ].add(got)
         return {"type": typ, "name": got}
     return one
 
@@ -397,7 +405,7 @@ _CODE = re.compile(r"```.*?```|`[^`\n]+`", re.S)
 _HEX6 = re.compile(r"^[0-9a-fA-F]{6}$")
 
 
-def harvest_hashtags(body: str):
+def harvest_hashtags(body: str, known=()):
     """`("#gui do the thing", ...)` -> `(["gui"], "do the thing")`, and
     `("fix the #gui reload", ...)` -> `(["gui"], "fix the gui reload")`.
 
@@ -413,8 +421,11 @@ def harvest_hashtags(body: str):
     #deadbeef and other long hexes still read as tags. The GUI shows the
     harvest in an editable field, so a wrong one is visible and removable
     rather than silent; tighten only if that proves annoying in practice.
+
+    A name in `known` stays as written: an edit passes the old body's.
     """
-    return _harvest(body, _HASHTAG, lambda tag: None if _HEX6.match(tag) else tag,  # a colour
+    return _harvest(body, _HASHTAG,
+                    lambda tag: None if _HEX6.match(tag) or tag in known else tag,  # a colour
                     inline=True)
 
 
@@ -539,12 +550,15 @@ def no_arc(store_dir, arc_id: str) -> str:
     """A bare miss stopped at the miss (2026-09-22). A near miss gets its
     candidates, otherwise the legal values, and always the verb that lists
     them. One helper, so every site agrees."""
-    ids = [a.id for a in store.load_arcs(store_dir)]
+    arcs = store.load_arcs(store_dir)
+    ids = [a.id for a in arcs]
+    gone = {a.id for a in arcs if a.archived}
+    named = lambda i: f"{i} (archived)" if i in gone else i      # noqa: E731
     near = difflib.get_close_matches(arc_id, ids, n=3, cutoff=0.65)
     if near:
-        what = f"did you mean {', '.join(near)}?"
+        what = f"did you mean {', '.join(map(named, near))}?"
     elif ids:
-        shown = ", ".join(ids[:_HINT_CAP])
+        shown = ", ".join(map(named, ids[:_HINT_CAP]))
         more = f", +{len(ids) - _HINT_CAP} more" if len(ids) > _HINT_CAP else ""
         what = f"arcs: {shown}{more}"
     else:
@@ -812,6 +826,8 @@ def save_doc(ctx: Ctx, name: str, text: str) -> str:
     one name."""
     if store.read_only():
         raise store.ReadOnly()
+    if catalog.untrusted(ctx.store_dir):
+        raise store.Untrusted()
     name = _doc_name(name)
     path = object_path(ctx, "doc", name)
     if path is None:                    # a symlink in docs/ that leads out
@@ -882,7 +898,7 @@ def add_fields(ctx: Ctx, fields) -> list:
     author and a plausible-looking row on disk -- `store.add_many` defaults a
     missing one to "unknown" rather than raising."""
     for i, f in enumerate(fields, 1):
-        if not f.get("author"):
+        if not (f.get("author") or "").strip():
             raise ValueError(f"{_entry(i, len(fields))}author is required")
     return store.add_many(ctx.store_dir, fields, target_types=ctx.target_types,
                           canonicalize=lambda rows: _stamped(ctx, canonicalize_rows(ctx, rows)),
@@ -1132,6 +1148,7 @@ def _merged_since(ctx: Ctx, p: Pulled) -> None:
                                          p.old_head, "HEAD").stdout.split("\0"):
         p.toml_changed = gitref._git(s, "log", "-1", "--no-show-signature", "--format=%h by %an",
                                      new, "--", config.CONFIG_FILE).stdout.strip() or "the merge"
+        store.distrust(s, p.old_head)        # a pull a kill cut off before merge_upstream did
     p.old_client = ctx.cfg.git_name in gitref._git(
         s, "log", "--no-show-signature", "--format=%an", new).stdout.split("\n")
 

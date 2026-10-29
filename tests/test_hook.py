@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sysconfig
@@ -572,11 +573,12 @@ def test_a_gotcha_line_says_its_age_its_files_churn_and_how_to_retire_it(git_rep
                             "tool_input": {"file_path": f"{git_repo}/{f}"}})
 
     said = line("serve.py")
-    assert "is on file:serve.py (written just now; the file has changed in 1 commit since): " \
-           "serve.py trap" in said, said
+    # A stamp, not `just now`: the line is cached for the session, and an age froze.
+    assert re.search(r"is on file:serve\.py \(written \d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ; the file "
+                     r"has changed in 1 commit since\): serve\.py trap", said), said
     assert said.endswith(f" (if it no longer holds: `symbion supersede {tails['serve.py']} "
                          "--add-tag retired`)"), "a gotcha that fits has no more to show"
     said = line("other.py")
-    assert "is on file:other.py (written just now): other.py trap" in said, said
+    assert re.search(r"is on file:other\.py \(written [-\d]+ [:\d]+Z\): other\.py trap", said), said
     assert f"(`symbion show {tails['other.py']}` prints all of it; if it no longer holds: " \
            f"`symbion supersede {tails['other.py']} --add-tag retired`)" in said, said

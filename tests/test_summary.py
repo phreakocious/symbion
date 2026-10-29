@@ -201,7 +201,7 @@ def test_name_and_target_are_truncated_not_just_flattened(tmp_path):
     uniform run of letters, specifically so the derived arc id
     (create_arc's slugify collapses one contiguous run of non-alnum
     characters to a single dash) stays short. That isolates this test to
-    the name-truncation fix under review; the separately unbounded
+    the name-truncation fix under review; the separately uncapped
     slugify-length behavior in store.py is not in scope here."""
     cfg = Config(project_root=tmp_path)
     long_name = "n" + " " * 9998 + "n"           # 10,000 chars; slug -> "n-n"
@@ -875,6 +875,20 @@ def test_the_persons_line_is_the_header_the_soonest_due_row_and_the_gui(tmp_path
         f"; 2 entries due, the first {data['due'][0]['phrase']} · http://127.0.0.1:1")
 
 
+def test_the_persons_line_counts_a_due_row_that_waits_on_the_reader(tmp_path):
+    """A due row that waits on the reader sits in `waiting`, not `due`: the
+    user's task 3 days overdue beside the agent's due in 5 read "1 entry due
+    in 5d" (audit 2026-10-28)."""
+    cfg = Config(project_root=tmp_path)
+    t = {"type": "item", "name": "x"}
+    day = lambda n: (datetime.now(timezone.utc).date() + timedelta(days=n)).isoformat()  # noqa: E731
+    store.add(tmp_path, kind="task", target=t, author="human", due=day(-3))
+    store.add(tmp_path, kind="task", target=t, author="claude", due=day(5))
+    data = summary.summary(tmp_path, cfg, reader="claude")
+    assert [r.get("phrase") for r in data["waiting"]] == ["overdue 3d"]
+    assert summary.one_line(data).endswith("; 2 entries due, the first overdue 3d")
+
+
 def test_the_due_block_is_capped_and_says_how_many_it_hid(tmp_path):
     cfg = Config(project_root=tmp_path)
     for i in range(summary.DUE_CAP + 3):
@@ -1245,3 +1259,19 @@ def test_only_the_readers_side_and_sideless_writes_age_an_entry(tmp_path, reader
                   author="claude", created_at=_day(20 + i), side=writer)
     data = summary.summary(tmp_path, cfg, reader="claude", side=reader)
     assert [r["id"] for r in data["untouched"]] == ([t] if aged else [])
+
+
+def test_a_cycled_chain_cited_by_an_open_question_keeps_the_summary(tmp_path):
+    """Two rows that supersede each other (a hand edit) raised out of the
+    summary's set of rows an open question asks about, and the session-start
+    summary was gone (audit 2026-10-28); `show` of the question too."""
+    cfg = Config(project_root=tmp_path)
+    project = {"type": "project", "name": None}
+    store.add(tmp_path, id="20261028-000000-000001-aaa", kind="note", target=project,
+              supersedes="20261028-000000-000002-bbb")
+    store.add(tmp_path, id="20261028-000000-000002-bbb", kind="note", target=project,
+              supersedes="20261028-000000-000001-aaa")
+    q = store.add(tmp_path, kind="question", target=project, body="what of 000001-aaa?",
+                  status="open")
+    assert "question" in summary.summary(tmp_path, cfg)["open"]
+    assert summary.links(store.load(tmp_path), q) == []

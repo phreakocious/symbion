@@ -73,6 +73,9 @@ and the lines that pull printed come above the first item, in this order:
 - Each arc value or in-place rewrite the merge dropped.
 - `pulled N commits from …`.
 - A changed `symbion.toml`. Read it: it names commands symbion runs.
+- While a pulled `symbion.toml` waits on `symbion trust`, a `note:` that says so,
+  at each session start. Writes refuse until then. `trust` is the user's, at a
+  terminal: show them the change and ask them to run it.
 - A clone that runs an older symbion.
 
 Past 5 of the split and dropped lines, `+N more not shown` ends them. The other
@@ -189,7 +192,8 @@ parked entry of yours with no `--due`. In an agent session, it lists a
 target's open entries at your first add there and gives only their count after
 that, until the next session start. `add`, `resolve` and `supersede` say when
 the text they write runs past 500 characters. Each write ends with the count
-of entries not yet committed.
+of entries not yet committed; an arc write with none pending says
+`arcs.jsonl not committed`.
 
 In a shared store, `add`, `resolve` and `supersede` also say `origin has N new
 store commits: symbion pull` when origin holds commits this clone lacks. They fetch

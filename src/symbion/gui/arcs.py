@@ -73,7 +73,8 @@ def checklist(ctx, arc_id: str, refresh, *, author: str, seen=None) -> None:
                                        + (" sb-starred" if "priority" in fu.tags else "")
                                        + (" sb-done" if done else "")
                                        + (" sb-box" if bare(fu) else "")) \
-                .props(f"data-id={fu.id}").mark("checklist-row"):
+                .mark("checklist-row") as row:
+            row._props["data-id"] = fu.id   # one prop: .props() would parse the id
             with ui.element("div").classes("sb-note-main"):
                 if not bare(fu):
                     # The text is the link to the whole note, as a clipped

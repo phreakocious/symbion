@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import functools
 import html
+import itertools
 import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from datetime import datetime
 from difflib import SequenceMatcher
 from types import SimpleNamespace
@@ -210,6 +211,8 @@ class NoteMarkdown(ui.markdown):
 # no way to follow one but pasting it into the search.
 _NOTE_ID = re.compile(r"(?<![/=[])" + summ._CITE.pattern)
 _CODE = re.compile(r"(```.*?```|`[^`\n]*`)", re.S)
+# Only a body that may hold a block _CODE misses pays for a parse.
+_MAYBE_BLOCK = re.compile(r"~~~|^(?: {4}|\t)", re.M)
 
 
 @functools.lru_cache(maxsize=8)
@@ -255,8 +258,18 @@ def link_ids(body: str, store_dir) -> str:
     def tails():
         return _tails(str(store_dir), stamp())
 
-    return "".join(p if i % 2 else _NOTE_ID.sub(link, p)
-                   for i, p in enumerate(_CODE.split(body)))
+    def prose(text):
+        return "".join(p if i % 2 else _NOTE_ID.sub(link, p)
+                       for i, p in enumerate(_CODE.split(text)))
+    # A code block by the renderer's own reading: a `~~~` fence or an
+    # indented block printed the link's brackets.
+    lines = body.split("\n")
+    code = {i for tok in _BODY_MD.parse(body) if tok.type in ("fence", "code_block") and tok.map
+            for i in range(*tok.map)} if _MAYBE_BLOCK.search(body) else set()
+    runs = itertools.groupby(range(len(lines)), key=lambda i: i in code)
+    return "\n".join("\n".join(lines[i] for i in ix) if is_code
+                     else prose("\n".join(lines[i] for i in ix))
+                     for is_code, ix in ((k, list(g)) for k, g in runs))
 
 
 def kind_class(kind: str) -> str:
@@ -616,9 +629,12 @@ def reading(ctx) -> Reading:
 
 def read_only_refused(e: Exception) -> None:
     """`app.on_exception`: a write refused under `serve --read-only` that no
-    handler named still answers the click."""
+    handler named still answers the click; so does one a pulled
+    symbion.toml holds until `symbion trust`."""
     if isinstance(e, S.ReadOnly):
         ui.notify("Read-only demo: nothing here writes.")
+    elif isinstance(e, S.Untrusted):
+        ui.notify(str(e), type="negative")
 
 
 def _reveal_cmd(path) -> list[str] | None:
@@ -798,9 +814,11 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     cls = f"sb-note w-full {kind_class(n.kind)}"
     if actions:
         cls += " sb-has-actions" + (" sb-starred" if has_pri else "")
-    # data-id: the page filter matches a pasted id the card does not print
+    # data-id: the page filter matches a pasted id the card does not print.
+    # Set as one prop: .props() parses its string, and a `:`-prop runs as JS.
     with ui.element("div").classes(cls + (" sb-resolvable" if resolvable else "")) \
-            .props(f"data-id={n.id}").mark("note-row"):
+            .mark("note-row") as card:
+        card._props["data-id"] = n.id
         with ui.element("div").classes("sb-note-main"):
             _note_content(ctx, n, compact, hit, show_target, seams, diff_to)
             if answering:
@@ -873,6 +891,7 @@ def _answer_row(ctx, n, author: str, refresh) -> None:
         except ValueError as e:
             ui.notify(str(e), type="negative")
             return
+        app.storage.tab.get(_ANSWERS, {}).pop(n.id, None)    # sent: not typed for its next turn
         refresh()
 
     tip = f"added below the question, as {author}"
@@ -886,6 +905,7 @@ def _answer_row(ctx, n, author: str, refresh) -> None:
             .props('outlined dense aria-label="answer this question"') \
             .classes("sb-answer-field").mark("answer-field")
         field.on("keydown.enter", lambda: answer(field.value or ""))
+        _kept_answer(field, n.id)
 
 
 def _options_row(n) -> None:
@@ -984,8 +1004,7 @@ def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) 
                 .classes("sb-chip sb-target").mark("note-arc")
         for r in n.refs:
             with ui.element("span").classes("sb-pair"):
-                ui.link(f"↗ {summ.ref_label(r)}",
-                        f"/object?type={quote(r.type)}&name={quote(r.name or '', safe='')}") \
+                ui.link(f"↗ {summ.ref_label(r)}", target_href(r.type, r.name)) \
                     .classes("sb-chip sb-ref").mark("note-ref")
                 view_button(ctx, r.name, ttype=r.type)
         for t in n.tags:
@@ -1042,6 +1061,29 @@ def say_after_reload(text: str, failed: bool = False) -> None:
     died with the page, so `committed …` never showed (2026-10-13). A
     `failed` one stays until dismissed, as a refusal does."""
     app.storage.tab[_SAID] = [text, failed]
+
+
+_ANSWERS = "sb-answers"
+
+
+def _kept_answer(field, nid: str) -> None:
+    """Words typed in an answer field outlive the reload another card's write
+    brings (audit, 2026-10-28): kept per tab, put back once the page connects."""
+    client = ui.context.client
+
+    def keep(e) -> None:
+        kept = app.storage.tab.setdefault(_ANSWERS, {})
+        if e.value:
+            kept[nid] = e.value
+        else:
+            kept.pop(nid, None)
+
+    def back() -> None:
+        with client:
+            if text := app.storage.tab.get(_ANSWERS, {}).get(nid):
+                field.value = text
+    field.on_value_change(keep)
+    client.on_connect(back)
 
 
 def show_said() -> None:
@@ -1198,7 +1240,11 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                 was = {ref_key(r) for r in n.refs}
                 on["refs"] = [k for k in map(ref_key, tip.refs) if k in mine or k not in was] + \
                     [k for k in mine if k not in was and k not in map(ref_key, tip.refs)]
-            harvested, cleaned = api.harvest_hashtags(body.value or "")
+            # Only a #tag typed here: a CLI body keeps its #words, and a
+            # harvest of the whole body rewrote them on every save.
+            harvested, cleaned = api.harvest_hashtags(
+                body.value or "", known=api.harvest_hashtags(n.body)[0]) \
+                if edited else ([], body.value)
             more_tags, added = api.harvest_hashtags(more.value or "")
             if not added.strip():
                 text = {"body": cleaned} if edited else {}
@@ -1582,5 +1628,22 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
         if key not in (refs.value or []):
             refs.set_options({**refs.options, key: key}, value=[*(refs.value or []), key])
 
+    # The body first: its harvest sets the kind and tags, which the draft's own then replace.
+    fields = {"body": body, "kind": kind, "arc": arc, "checked": checked, "result": result,
+              "due": due, "tags": tags}
+
+    def _state() -> dict:
+        return {**{k: f.value for k, f in fields.items()},
+                "target": [on_type.value, on_name.value], "refs": list(refs.value or ())}
+
+    def _restore(d: dict) -> None:
+        _set_target(*d["target"])
+        for k, f in fields.items():
+            with suppress(ValueError):   # a kind or arc gone since: the rest still comes back
+                f.value = d[k]
+        for key in d["refs"]:
+            _add_ref(key)
+
     return SimpleNamespace(busy=lambda: bool((body.value or "").strip() or refs.value),
-                           set_target=_set_target, insert=_insert, add_ref=_add_ref)
+                           set_target=_set_target, insert=_insert, add_ref=_add_ref,
+                           state=_state, restore=_restore)
