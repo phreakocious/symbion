@@ -21,7 +21,8 @@ from typing import NamedTuple
 from . import catalog, config, store
 
 
-def _git(cfg_or_path, *args, input: str | None = None, errors: str = "strict"):
+def _git(cfg_or_path, *args, input: str | None = None, errors: str = "strict",
+         keep: bool = True):
     """HEAD, branches and dirtiness are per-worktree, so this must run
     against `work_root` (the CURRENT checkout), never `project_root` (which
     is deliberately the MAIN checkout -- see config.project_root). A bare
@@ -32,14 +33,15 @@ def _git(cfg_or_path, *args, input: str | None = None, errors: str = "strict"):
     command line holds at most 32,767 characters, and past it the call
     raises WinError 206 (a store's paths ran well past it, 2026-10-16).
     `errors="replace"` for text from any commit: an imported history holds
-    bytes that are not UTF-8, and a strict decode raised (2026-10-26)."""
+    bytes that are not UTF-8, and a strict decode raised (2026-10-26).
+    `keep=False` for an answer too large to keep for good: a diff."""
     root = _root(cfg_or_path)
     if root is None:
         # A store named from outside any repository (api.resolve): every git
         # question answers as it does for a departed sha -- a failed run --
         # so a check reads `unverifiable`, a subject falls back to its sha.
         return subprocess.CompletedProcess(["git", *args], 128, "", "not a git repository")
-    if store.read_only():
+    if store.read_only() and keep:
         # A read-only serve shows a frozen snapshot, so each distinct question
         # has one answer a process. The public demo asked about 60 a render,
         # 59 distinct over 5 renders: 5 s a page on its box, 2 s answered once
@@ -767,6 +769,132 @@ def branch_commits(cfg, ref: str, since: str | None = None) -> set:
 
 
 SHA_BATCH = 500                 # full shas per git call, well under 32,767 characters
+
+
+_HEX = re.compile(r"[0-9a-f]{4,64}")
+
+
+def commit_cfg(cfg, sha):
+    """The config of the repo that holds commit `sha`: in a store with
+    [repos], the listed repo whose history holds it; else `cfg`."""
+    return cfg.repo(name) if (name := holder(cfg, sha)) else cfg
+
+
+# A merge reads against its first parent: what it brought onto its branch.
+# git's own default, a combined diff, is empty for a clean merge. The second
+# form is for git before 2.31; a `log.diffMerges = combined` empties it.
+_FIRST_PARENT = (("--diff-merges=first-parent",), ("-m", "--first-parent"))
+# Fixed prefixes: `diff.noprefix` or `diff.mnemonicPrefix` would change the
+# names the viewer reads, and an external diff tool the whole text.
+_DIFF = ("--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/")
+
+
+def commit_show(cfg, sha, patch: bool = True) -> tuple | None:
+    """(author, ISO date, parents, message, patch) of commit `sha`, or None
+    when this checkout has no such commit. A name that is not hex runs no
+    git: a target name is typed text. A merge's patch is against its first
+    parent. `patch=False` reads none: a page that shows only the message."""
+    if not _HEX.fullmatch(sha or ""):
+        return None
+    for merges in _FIRST_PARENT:
+        r = _git(cfg, "show", *_DIFF, "--no-show-signature",
+                 "--patch" if patch else "--no-patch", *merges,
+                 "--format=%an%x00%aI%x00%P%x00%B%x00", "--end-of-options", sha,
+                 errors="replace", keep=False)
+        if r.returncode == 0:
+            break
+    else:
+        return None
+    author, date, parents, message, diff = r.stdout.split("\0", 4)
+    return author, date, parents.split(), message.strip("\n"), diff.lstrip("\n")
+
+
+def commit_files(cfg, sha) -> list[tuple]:
+    """(path, lines added, lines deleted) for each file commit `sha` changed,
+    a merge's against its first parent: None counts for a binary file, a
+    rename's new path. [] when git cannot say."""
+    if not _HEX.fullmatch(sha or ""):
+        return []
+    for merges in _FIRST_PARENT:
+        r = _git(cfg, "show", "-z", "--numstat", "--no-show-signature", *merges,
+                 "--format=", "--end-of-options", sha, errors="replace")
+        if r.returncode == 0:
+            break
+    else:
+        return []
+    # `ADDED\tDELETED\tPATH`, or for a rename `ADDED\tDELETED\t` and then its two paths
+    toks, out, i = r.stdout.split("\0"), [], 0
+    while i < len(toks):
+        t = toks[i].lstrip("\n")
+        if t.count("\t") == 2:
+            added, deleted, path = t.split("\t")
+            if not path and i + 2 < len(toks):
+                path, i = toks[i + 2], i + 2
+            out.append((path, None if added == "-" else int(added),
+                        None if deleted == "-" else int(deleted)))
+        i += 1
+    return out
+
+
+def commit_rows(cfg, revs, n: int, walk: bool = True) -> list[tuple]:
+    """(sha, committer ISO date, subject), at most `n`: the commits of the
+    range `revs`, newest first, or with `walk` false the commits `revs`
+    names, in its order. [] when git cannot read them."""
+    how = (f"-n{n}",) if walk else ("--no-walk=unsorted", "--ignore-missing")
+    r = _git(cfg, "log", "--no-show-signature", "--format=%H%x00%cI%x00%s", *how,
+             "--end-of-options", *(revs if walk else revs[:n]), errors="replace")
+    if r.returncode:
+        return []
+    return [tuple(ln.split("\0", 2)) for ln in r.stdout.split("\n") if ln.count("\0") == 2]
+
+
+def since_base(cfg, path, oldest, blob) -> tuple[str, bool]:
+    """What a row on `path` saw, before the commits changed_since lists for
+    it, `oldest` the oldest of them: (the commit to read `path` at, whether
+    `path` there is `blob`, the content the row saw). The commit is
+    `oldest`'s parent, or for a root commit the empty tree. False for a row
+    that saw edits no commit holds, or that has no blob (written before
+    stamping): the commit is then the nearest there is."""
+    r = _git(cfg, "rev-parse", "--verify", "-q", f"{oldest}^")
+    if r.returncode == 0:
+        base = r.stdout.strip()
+    else:
+        base = _git(cfg, "hash-object", "-t", "tree", "--stdin", input="").stdout.strip()
+    at = _git(cfg, "rev-parse", "--verify", "-q", f"{base}:{path}")
+    return base, bool(blob) and at.returncode == 0 and at.stdout.strip() == blob
+
+
+def diff_text(cfg, *args) -> str | None:
+    """`git diff ARGS`, None when git fails: a commit against the work tree
+    (`BASE -- PATH`), or two commits."""
+    r = _git(cfg, "diff", *_DIFF, *args, errors="replace", keep=False)
+    return r.stdout if r.returncode == 0 else None
+
+
+# host -> (the commit's page, the pull requests holding it), formatted with base and sha
+FORGES = {"github.com": ("{base}/commit/{sha}", "{base}/pulls?q=is%3Apr+{sha}"),
+          "gitlab.com": ("{base}/-/commit/{sha}", None),
+          "codeberg.org": ("{base}/commit/{sha}", None),
+          "bitbucket.org": ("{base}/commits/{sha}", None),
+          "git.sr.ht": ("{base}/commit/{sha}", None)}
+
+
+def forge_links(cfg, sha) -> dict:
+    """{"host", "commit", "prs"?}: the forge's pages for a commit that a
+    remote branch holds, from origin's URL; empty for a host not in FORGES,
+    or a commit no remote branch holds, whose page would 404."""
+    if not _HEX.fullmatch(sha or ""):
+        return {}
+    url = _git(cfg, "remote", "get-url", "origin").stdout.strip()
+    # the scp form (git@host:owner/repo) or a URL; a user or token never reaches the link
+    m = re.fullmatch(r"(?:[a-z+]+://)?(?:[^@/]*@)?([^/:]+)(?::\d+(?=/))?[:/](.+?)(?:\.git)?/?", url)
+    if not m or m[1] not in FORGES:
+        return {}
+    if not _git(cfg, "for-each-ref", "--count=1", "--contains", sha, "refs/remotes").stdout.strip():
+        return {}
+    base, (page, prs) = f"https://{m[1]}/{m[2]}", FORGES[m[1]]
+    return {"host": m[1], "commit": page.format(base=base, sha=sha)} | \
+        ({"prs": prs.format(base=base, sha=sha)} if prs else {})
 
 
 def subjects(cfg, shas) -> dict:

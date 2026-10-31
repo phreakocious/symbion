@@ -260,6 +260,61 @@ body[data-sb-drop]::after { content: attr(data-sb-drop); position: fixed; inset:
 /* it takes the focus so the page keys scroll it (notes.viewer): no ring round
    the whole dialog, as Quasar's own node, focused before, had none */
 .sb-md-card:focus { outline: none; }
+/* a diff (notes.diff_dialog): room for two sides of about 80 columns. Side by
+   side, the unified drawing comes too, and a window too narrow for two sides
+   shows it instead, with no toggle. */
+.sb-diff-card { width: min(1400px, 96vw); }
+.sb-diff-mode { flex: none; }
+.sb-diff-mode .q-btn { white-space: nowrap; }
+.sb-diff-narrow { display: none; }
+@media (max-width: 1099px) {
+  .sb-diff-wide, .sb-diff-mode { display: none !important; }
+  .sb-diff-narrow { display: block; }
+}
+.sb-diff { display: flex; flex-direction: column; gap: 14px; width: 100%; }
+.sb-diff-files { display: grid; grid-template-columns: minmax(0, max-content) auto;
+                 column-gap: 14px; row-gap: 2px; font-family: var(--mono); font-size: 12.5px; }
+.sb-diff-files a { color: var(--q-emph); text-decoration: none; overflow-wrap: anywhere; }
+.sb-diff-files a:hover { color: var(--q-primary); }
+.sb-diff-n { font-family: var(--mono); font-size: 12px; color: var(--q-muted); white-space: nowrap; }
+.sb-plus { color: var(--q-good); }
+.sb-minus { color: var(--q-bad); }
+.sb-diff-file { display: flex; flex-direction: column; gap: 4px; scroll-margin-top: 8px; }
+.sb-diff-fh { display: flex; gap: 14px; align-items: baseline; font-family: var(--mono);
+              font-size: 12.5px; color: var(--q-emph); overflow-wrap: anywhere; }
+.sb-diff-note { font-family: var(--mono); font-size: 12px; color: var(--q-muted); }
+.sb-diff-grid { display: grid; font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+                background: var(--q-raise); border-radius: 6px; overflow: hidden; }
+.sb-diff-unified { grid-template-columns: auto auto minmax(0, 1fr); }
+.sb-diff-split { grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr); }
+/* a long line wraps: a diff that scrolled sideways hid what changed */
+.sb-diff-grid > span { padding: 0 10px; white-space: pre-wrap; overflow-wrap: anywhere;
+                       min-height: 1.55em; color: var(--q-emph); }
+.sb-diff-grid > .ln { color: var(--q-muted); text-align: right; padding: 0 8px; user-select: none; }
+.sb-diff-grid > .hk, .sb-diff-grid > .nl { grid-column: 1 / -1; color: var(--q-muted); }
+.sb-diff-grid > .hk { background: var(--q-panel); padding: 2px 10px; }
+.sb-diff-grid > .del { background: color-mix(in srgb, var(--q-bad) 7%, transparent); }
+.sb-diff-grid > .ins { background: color-mix(in srgb, var(--q-good) 7%, transparent); }
+.sb-diff-grid > .none { background: color-mix(in srgb, var(--q-panel) 55%, transparent); }
+.sb-diff-unified > .del::before { content: "− "; color: var(--q-bad); }
+.sb-diff-unified > .ins::before { content: "+ "; color: var(--q-good); }
+.sb-diff-unified > .ctx::before { content: "  "; }
+.sb-dx { border-radius: 2px; }
+.del > .sb-dx { background: color-mix(in srgb, var(--q-bad) 30%, transparent); }
+.ins > .sb-dx { background: color-mix(in srgb, var(--q-good) 30%, transparent); }
+/* commits to click (notes.commit_list): sha, age, subject, read button */
+.sb-commits { display: grid; grid-template-columns: auto auto minmax(0, 1fr) 32px;
+              align-items: center; column-gap: 12px; row-gap: 2px; font-size: 13px; }
+a.sb-commits-sha { font-family: var(--mono); font-size: 12px; color: var(--q-body);
+                   text-decoration: none; }
+a.sb-commits-sha:hover { color: var(--q-primary); }
+.sb-commits-age { font-family: var(--mono); font-size: 12px; color: var(--q-muted); }
+.sb-commits-sub { color: var(--q-emph); white-space: nowrap; overflow: hidden;
+                  text-overflow: ellipsis; }
+/* a commit's page leads with it (pages._commit_card) */
+.sb-commit-card { display: flex; flex-direction: column; gap: 8px; }
+.sb-commit-subject { font-size: 16px; font-weight: 600; color: var(--q-emph); }
+.sb-docs.sb-commit-files { grid-template-columns: 20px minmax(0, 1fr) auto auto 32px; }
 /* the card's width, not its widest code line's: a long line scrolls in its block */
 .sb-md-card .nicegui-markdown { color: var(--q-emph); font-size: 14.5px; line-height: 1.6;
                                 width: 100%; min-width: 0; overflow-wrap: anywhere; }
@@ -297,7 +352,8 @@ a.sb-board-aside:hover { color: var(--q-primary); }
 /* the Docs page: a markdown file a row, its entries, its read button */
 .sb-docs { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto 32px;
            align-items: center; column-gap: 12px; row-gap: 2px; font-size: 13px; }
-.sb-docs > .q-icon { font-size: 18px; color: var(--q-dim); }
+.sb-docs-row { display: contents; }
+.sb-docs-row > .q-icon { font-size: 18px; color: var(--q-dim); }
 a.sb-docs-name { font-family: var(--mono); color: var(--q-emph); text-decoration: none;
                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 a.sb-docs-name:hover { color: var(--q-primary); }
@@ -305,6 +361,17 @@ a.sb-docs-name:hover { color: var(--q-primary); }
              font-size: 12px; color: var(--q-muted); }
 a.sb-docs-more { grid-column: 2 / -1; font-family: var(--mono); font-size: 12px;
                  color: var(--q-body); text-decoration: none; }
+/* the Map page: the chart, then a tile's entries, a row each */
+.sb-map    { height: 70vh; min-height: 420px; }
+.sb-map-rows { display: grid; grid-template-columns: auto auto minmax(0, 16rem) minmax(0, 1fr);
+               column-gap: 12px; row-gap: 2px; font-size: 13px; margin-top: 8px; }
+a.sb-map-row { display: contents; color: var(--q-body); text-decoration: none; }
+a.sb-map-row > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+a.sb-map-row:hover > * { color: var(--q-primary); }
+/* `display: contents` draws no focus ring: the row's cells show it */
+a.sb-map-row:focus-visible > * { color: var(--q-primary); text-decoration: underline; }
+.sb-map-kind { font-family: var(--mono); color: var(--kind); }
+.sb-map-meta { font-family: var(--mono); font-size: 12px; color: var(--q-muted); }
 /* an arc on the index: its name as the person wrote it (no capital forced) */
 .sb-arc    { display: flex; flex-direction: column; gap: 10px; }
 a.sb-arc-name { font-size: 16px; font-weight: 600; color: var(--q-emph); }
@@ -331,6 +398,9 @@ a.sb-arc-name:hover { color: var(--q-primary); }
            border: 1px solid var(--q-border); color: var(--q-body); }
 /* Links only: a label chip lit up on hover and a click did nothing. */
 a.sb-chip:hover   { border-color: var(--q-primary); color: var(--q-primary); }
+/* a chip that opens the viewer (card.js): a button, before the state colours */
+.sb-chip-opens    { background-color: transparent; cursor: pointer; }
+.sb-chip-opens:hover { border-color: var(--q-primary); color: var(--q-primary); }
 .sb-chip-open     { color: var(--q-notable); }
 .sb-chip-resolved { color: var(--q-good); }
 .sb-chip-good     { color: var(--q-good); }
@@ -449,6 +519,8 @@ a.sb-note-open { display: block; }
 a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 /* a card the search box's text filters out, and a board left with none */
 .sb-filtered { display: none !important; }
+/* a row past a board's first few, drawn for the filter, shown only by it */
+body:not(.sb-sifting) .sb-past, body.sb-sifting .sb-docs-more { display: none; }
 
 /* resolve: an empty box, a tick on hover; the 7px radius every .q-btn takes
    below. A card's is at its right and the toolbar sits beside it, an arc's
@@ -561,6 +633,12 @@ a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
              border: 1px solid var(--q-border); font-family: var(--mono); font-size: 11px;
              white-space: pre-line; overflow-wrap: anywhere;
              max-width: min(80ch, calc(100vw - 32px)) !important; }
+/* a card's tooltip (chrome._TIPS_JS): one element, styled as the others */
+.sb-tip { position: fixed; z-index: 9000; pointer-events: none; padding: 6px 10px;
+          border-radius: 4px; background: var(--q-panel); color: var(--q-emph);
+          border: 1px solid var(--q-border); font-family: var(--mono); font-size: 11px;
+          white-space: pre-line; overflow-wrap: anywhere;
+          max-width: min(80ch, calc(100vw - 32px)); }
 /* a sidebar kind's: its name and properties over what it is for (chrome._kind_item) */
 .q-tooltip.sb-kindtip { max-width: 320px !important; padding: 10px 12px; border-radius: 6px;
                         border-color: var(--q-border-hi); color: var(--q-body) !important;
@@ -742,3 +820,34 @@ def kind_css(kinds) -> str:
     `sb-kind-own` and over a default kind's colour alike."""
     return "".join(f".sb-kind-{k} {{ --kind: {T.kind_hex(k, s)}; }}\n"
                    for k, s in kinds.items() if s.color)
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    return "#" + "".join(f"{round(int(a[i:i + 2], 16) * (1 - t) + int(b[i:i + 2], 16) * t):02x}"
+                         for i in (1, 3, 5))
+
+
+def _contrast(a: str, b: str) -> float:
+    """WCAG 2 contrast ratio of two #rrggbb colours."""
+    def lum(h):
+        c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _ramp(lo: str, hi: str, text: str, steps: int = 5) -> tuple[str, ...]:
+    """Steps from lo to hi, from the first mix `text` reads on at 4.5:1."""
+    t0 = next(i / 100 for i in range(101) if _contrast(_mix(lo, hi, i / 100), text) >= 4.5)
+    return tuple(_mix(lo, hi, t0 + (1 - t0) * k / (steps - 1)) for k in range(steps))
+
+
+# The map's tiles (the spec, 2026-10-29). A tile with nothing to show takes
+# the surface colour and light text; the rest, steps toward a hue and dark
+# text. A straight ramp from the surface colour passes a band where neither
+# text colour reads at 4.5:1, so each ramp starts past it.
+MAP_EMPTY = PALETTE.border
+MAP_TEXT = PALETTE.bg_page
+MAP_OPEN = _ramp(PALETTE.border_hi, PALETTE.notable, MAP_TEXT)
+MAP_NEW = _ramp(PALETTE.border, PALETTE.good, MAP_TEXT)

@@ -18,7 +18,7 @@ from symbion import summary as summ
 
 
 _WRITES = {"add", "resolve", "supersede", "commit", "rename"}
-_ARC_WRITES = {("arc", v) for v in ("create", "seed", "rename", "archive")}
+_ARC_WRITES = {("arc", v) for v in ("create", "seed", "rename", "archive", "unarchive", "describe")}
 
 
 def _commit(store_dir, capsys):
@@ -374,6 +374,25 @@ def test_list_grep_names_a_grep_style_alternation(tmp_path, capsys):
     assert "and 'x\\|y' holds operators" in ids("--grep", "x\\|y")[1]
 
 
+def test_list_grep_names_the_arcs_it_matches(tmp_path, capsys):
+    """`list` lists entries, so a search for an arc's words read as nothing
+    filed on them (the user chose a note, 2026-10-29). Its name, its
+    description, and an archived one marked."""
+    run("arc", "create", "--name", "Treemap view", "--scope", "item", store_dir=tmp_path)
+    run("arc", "create", "--name", "Other", "--desc", "the treemap's colours", "--scope", "item",
+        store_dir=tmp_path)
+    run("arc", "create", "--name", "Unrelated", "--scope", "item", store_dir=tmp_path)
+    run("arc", "archive", "other", store_dir=tmp_path)
+    run("add", "note", "--target", "project", "--body", "no match", store_dir=tmp_path)
+    capsys.readouterr()
+    run("list", "--grep", "TREEMAP", store_dir=tmp_path)
+    err = capsys.readouterr().err
+    assert ("note: 2 arcs match too: treemap-view (Treemap view), other (Other, archived) "
+            "(list --arc ID lists its entries)") in err, err
+    run("list", "--grep", "nothing", "--json", store_dir=tmp_path)
+    assert "arcs match" not in capsys.readouterr().err
+
+
 def test_list_grep_searches_refs(tmp_path, capsys):
     """SKILL.md sends the second object to `--ref` "instead of naming it in
     prose", then sends readers to `--grep` before they say the store holds
@@ -482,6 +501,46 @@ def test_the_clip_note_comes_once_a_session_then_for_a_dated_opening(tmp_path, c
     assert "check that they carry" in err(plain, "item:d"), "another session hears it"
 
 
+@pytest.mark.parametrize("session_env", ["CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"])
+def test_a_compaction_lets_the_once_a_session_notes_speak_again(
+        tmp_path, capsys, monkeypatch, session_env):
+    """A note a session hears once leaves its context at a compaction, and
+    "listed at this session's first add there" then points at text the agent
+    no longer holds (the user, 2026-10-30). Session start clears those marks
+    under the session id used by either harness's CLI commands."""
+    monkeypatch.setenv(session_env, "s1")
+    n = iter(range(9))
+
+    def err(*args):
+        assert run(*args, store_dir=tmp_path) == 0
+        return capsys.readouterr().err
+
+    def add():
+        return err("add", "task", "--target", "item:a", "--body",
+                   f"Cut cache {next(n)}. " + "context " * 20)
+
+    clip, listed, short = ("first 100 chars", "if this entry settles or revises one",
+                           "listed at this session's first add there")
+    alt = "read `list --open` as `list --status open`"
+    long = "an entry, or an addition to one, is about 500"
+    assert clip in add()
+    said = add()
+    assert clip not in said and listed in said, said
+    assert short in add()
+    assert alt in err("list", "--open") and alt not in err("list", "--open")
+    assert long in err("add", "note", "--target", "item:b", "--body", "x" * 600)
+    assert long not in err("add", "note", "--target", "item:b", "--body", "y" * 600), \
+        "a session that heard it on every long write read past it"
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(
+        b'{"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"}')))
+    run("summary", "--hook", store_dir=tmp_path)
+    capsys.readouterr()
+    said = add()
+    assert clip in said and listed in said and short not in said, said
+    assert alt in err("list", "--open")
+    assert long in err("add", "note", "--target", "item:b", "--body", "z" * 600)
+
+
 def test_a_write_whose_text_runs_past_500_chars_says_so(tmp_path, capsys, monkeypatch):
     """SKILL.md asks each write to an entry, a new one or an addition, for
     about 500 characters; per write, not per entry (the user, 2026-10-14)."""
@@ -494,6 +553,9 @@ def test_a_write_whose_text_runs_past_500_chars_says_so(tmp_path, capsys, monkey
         "add", "note", "--target", "item:a", "--body", long)
     nid = store.load(tmp_path)[0].id
     assert said not in err("add", "note", "--target", "item:b", "--body", short)
+    assert said not in err("add", "prediction", "--target", "item:p", "--checked", "the run",
+                           "--body", "p" * 900), \
+        "a registration's body is the contract its resolve is scored on: it cannot move to docs/"
     assert said in err("supersede", nid, "--append", "--body", "z" * 600)
     assert said not in err("supersede", nid, "--append", "--body", "a short addition")
     assert said not in err("supersede", nid, "--add-tag", "t"), "no text, however long the body"
@@ -2315,8 +2377,8 @@ def test_a_dirty_write_says_its_row_reads_unverifiable_for_good(repo, tmp_path, 
     """A check written on a dirty tree reads `unverifiable (dirty tree)`
     from then on, and the write said nothing (2026-10-14). The write names
     the paths; a clean one stays quiet. A pre-registration's resolve is
-    stamped anew, so it says so too, without --external, which resolve does
-    not take; a resolve of a resolved row restamps nothing."""
+    stamped anew, so it says so too, and names --external as add does; a
+    resolve of a resolved row restamps nothing."""
     store_dir = tmp_path / "store"
     run("add", "check", "--target", "project", "--checked", "x", "--result", "y",
         store_dir=store_dir)
@@ -2333,9 +2395,33 @@ def test_a_dirty_write_says_its_row_reads_unverifiable_for_good(repo, tmp_path, 
     run("resolve", pid, "--result", "rose", store_dir=store_dir)
     err = capsys.readouterr().err
     assert "so this prediction entry reads `unverifiable (dirty tree)`" in err, err
-    assert "--external" not in err
+    assert "--external" in err
     run("resolve", pid, "--body", "and more", store_dir=store_dir)
     assert "note: the tree has" not in capsys.readouterr().err
+
+
+def test_resolve_external_stamps_a_pre_registration_judged_outside_the_repo(
+        repo, tmp_path, capsys):
+    """A prediction on a host's log, registered at HEAD and resolved beside an
+    unrelated uncommitted file, read `unverifiable (dirty tree)` for good: a
+    pre-registration's resolve is stamped anew, and took no --external
+    (2026-10-31). With it, the resolve is stamped with its time, as add
+    --external is, and the registration keeps its commit. On an entry that
+    is no open pre-registration it refuses, already resolved included."""
+    store_dir = tmp_path / "store"
+    pid = _add(store_dir, capsys, "prediction", "--target", "item:p",
+               "--checked", "a host's log", "--body", "x rises")
+    (repo / "scratch").write_text("uncommitted")
+    assert run("resolve", pid, "--result", "rose", "--external", store_dir=store_dir) == 0
+    assert "note: the tree has" not in capsys.readouterr().err
+    rows = [r for r in store.load(store_dir) if r.kind == "prediction"]
+    assert "sha" in rows[0].provenance, "the registration keeps its commit"
+    assert rows[-1].provenance["external"] is True and "sha" not in rows[-1].provenance
+    for nid in (pid, _add(store_dir, capsys, "task", "--target", "item:t", "--body", "do")):
+        assert run("resolve", nid, "--external", store_dir=store_dir) == 1
+        assert "error: --external stamps the resolve of an open pre-registration" in \
+            capsys.readouterr().err
+    assert len(store.load(store_dir)) == len(rows) + 1, "neither refusal wrote"
 
 
 def test_a_dirty_stamp_with_no_paths_says_the_tree_has_changes(repo, tmp_path, capsys):
@@ -4057,6 +4143,56 @@ def test_list_takes_an_obvious_status_flag_as_the_status(alias, status, tmp_path
     assert capsys.readouterr().out == want
 
 
+@pytest.mark.parametrize("guess, form", [
+    (["search", "drawer", "design"], ["list", "--grep", "drawer design"]),
+    (["search", "drawer", "--full"], ["list", "--grep", "drawer", "--full"]),
+    (["list", "--search", "drawer"], ["list", "--grep", "drawer"]),
+    (["list", "--text", "drawer"], ["list", "--grep", "drawer"]),
+    (["list", "--body", "drawer"], ["list", "--grep", "drawer"]),
+    (["list", "--by", "ada"], ["list", "--author", "ada"]),
+    (["list", "--type", "task"], ["list", "--kind", "task"]),
+    (["list", "--open"], ["list", "--status", "open"]),
+    (["list", "-n", "1"], ["list", "--limit", "1"]),           # head's habit (dogfood, 2026-10-30)
+    (["list", "--grep", "-i", "DRAWER"], ["list", "--grep", "drawer"]),
+    (["list", "--grep", "-F", "x.y"], ["list", "--grep", "x.y", "-F"]),
+])
+def test_a_read_guess_runs_as_its_form_and_says_so_once_a_session(guess, form, tmp_path, capsys,
+                                                                   monkeypatch):
+    """A read's guess that is unambiguous and seen in the field runs
+    (2026-10-01). Its note names the form symbion documents, once an agent
+    session and again after session start (the user, 2026-10-30); with no
+    session key, every time."""
+    run("add", "task", "--target", "item:a", "--body", "drawer design, x.y", store_dir=tmp_path)
+    run("add", "note", "--target", "item:b", "--body", "xzy", "--author", "ada",
+        store_dir=tmp_path)
+    capsys.readouterr()
+    assert run(*form, "--json", store_dir=tmp_path) == 0
+    want = capsys.readouterr()
+    assert json.loads(want.out) and "note: read" not in want.err
+
+    def notes():
+        assert run(*guess, "--json", store_dir=tmp_path) == 0
+        got = capsys.readouterr()
+        assert got.out == want.out
+        return got.err.count("note: read `")
+    assert [notes(), notes()] == [1, 1], "no session: each time"
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    assert [notes(), notes()] == [1, 0]
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"session_id": "s1"}')))
+    run("summary", "--hook", store_dir=tmp_path)
+    capsys.readouterr()
+    assert notes() == 1, "a compacted session has lost it"
+
+
+def test_a_guess_that_still_fails_names_no_form_it_ran_as(tmp_path, capsys):
+    """The note says what ran: a guess the parser then refuses ran nothing."""
+    assert run("list", "--by", store_dir=tmp_path) == 2
+    assert "note: read" not in capsys.readouterr().err
+    assert run("list", "--by", "ada", "--bogus", store_dir=tmp_path) == 2
+    err = capsys.readouterr().err
+    assert "--bogus" in err and "note: read" not in err, err
+
+
 def test_the_status_aliases_stay_out_of_list_help(tmp_path, capsys):
     """`-h` is what agents read: it teaches one form, `--status`."""
     run("list", "-h", store_dir=tmp_path)
@@ -4096,7 +4232,7 @@ def test_supersede_takes_append_file_and_prepend_file(tmp_path, capsys, monkeypa
     (["edit", "x"], "`supersede ID --body"),
     (["append", "x"], "`supersede ID --append --body"),   # dogfood, 2026-10-01
     (["close", "x"], "`resolve ID`"),
-    (["search", "x"], "`list --grep TEXT`"),
+    (["search"], "`list --grep TEXT`"),       # `search TEXT` runs as it
     (["due", "--help"], "`list --overdue`"),         # an adopter's agent, 2026-09-25
     (["add", "bug", "--target", "item:x", "login times out"], 'text goes in --body "…"'),
     # three runs taught three rules (dogfood, 2026-10-09): one names them all
@@ -4123,6 +4259,11 @@ def test_supersede_takes_append_file_and_prepend_file(tmp_path, capsys, monkeypa
     (["add", "--target", "item:login", "page", "timeout"],
      'a value with spaces needs quotes: --target "item:a b"'),
     (["add", "bgu", "--target", "item:x"], "invalid kind 'bgu' (choose from"),
+    # SKILL.md speaks of adding a gotcha; the summary counts `parked` (2026-10-30)
+    (["add", "gotcha", "--target", "item:x"],
+     "'gotcha' is a tag, not a kind: --tag gotcha (a new trap: `add note --tag gotcha"),
+    (["list", "--status", "parked"],
+     "'parked' is a kind bit, not a status: `list --kind idea --status open`"),
     # said only that --name is required (dogfood, 2026-10-09)
     (["arc", "create", "Adoption"],
      "required: --name; 'Adoption' went unused: it goes in --name \"Adoption\""),
@@ -4133,12 +4274,12 @@ def test_supersede_takes_append_file_and_prepend_file(tmp_path, capsys, monkeypa
     (["--init"], "--init is no flag; did you mean `symbion init`?"),
     (["arc", "--create"], "--create is no flag; did you mean `symbion arc create`?"),
     # each named a flag the verb lacks, or none (dogfood, 2026-10-14)
-    (["list", "--text", "x"], "--text: use --grep"),
-    (["list", "--body", "x"], "--body: use --grep"),
     (["add", "note", "--target", "project", "-F", "x"], "-F: use --body-file"),
     (["commit", "-F", "msg.txt"], '-F: use -m "$(cat FILE)"'),
+    # a filter list lacks; another verb answers it (dogfood, 2026-10-30)
+    (["list", "--cites", "x"],
+     "--cites: use `show ID`, which lists the entries that cite ID, or `list --grep ID`"),
     (["add", "--type", "bug", "--body", "x"], "'bug' is a kind: `add bug --target TYPE:NAME`"),
-    (["list", "--type", "task"], "'task' is a kind: `list --kind task`"),
     (["add", "bug", "--target", "login page"], "--target 'item:login page'"),
     # a mode flag read as taking the text (fresh agents, 2026-10-14: four in a day)
     (["supersede", "x", "--append", "more", "text"],
@@ -4656,7 +4797,8 @@ def test_text_a_human_reads_says_what_it_means(tmp_path, capsys, monkeypatch):
     p = cli._build_parser(frozenset({"item"}), frozenset(), frozenset(), tmp_path,
                           K.DEFAULT_KINDS)
     init = p._subparsers._group_actions[0].choices["init"]
-    assert init.description and "~/.claude" in init.description
+    assert init.description and "~/.agents/skills" in init.description
+    assert "the symbion plugin carries both" in init.description
 
 
 def test_a_checklist_takes_one_try(tmp_path, capsys):
@@ -5820,6 +5962,31 @@ def test_arc_archive_and_rename_print_the_id(tmp_path, capsys):
     assert "no arc 'nope'" in capsys.readouterr().err
 
 
+def test_arc_unarchive_and_describe_change_an_arc_after_a_commit(tmp_path, capsys):
+    """After a commit no verb took an archive back, and none changed an arc's
+    description (the user, 2026-10-30: two verbs, as rename and archive are)."""
+    def said(*a):
+        capsys.readouterr()
+        assert run(*a, store_dir=tmp_path) == 0
+        return capsys.readouterr()
+
+    run("arc", "create", "--name", "x", "--desc", "first", store_dir=tmp_path)
+    aid = capsys.readouterr().out.strip()
+    run("add", "task", "--target", "item:a", "--body", "one", "--arc-id", aid, store_dir=tmp_path)
+    assert f"arc unarchive {aid} undoes the archive" in said("arc", "archive", aid).err
+    _commit(tmp_path, capsys)
+    assert said("arc", "unarchive", aid).out.strip() == aid
+    (a,) = store.load_arcs(tmp_path)
+    assert not a.archived and a.archived_at is None
+    assert f"note: {aid} is not archived; nothing changed" in said("arc", "unarchive", aid).err
+    assert said("arc", "describe", aid, "second").out.strip() == aid
+    assert store.load_arcs(tmp_path)[0].description == "second"
+    assert "nothing changed" in said("arc", "describe", aid, "second").err
+    for verb in (["unarchive", "nope"], ["describe", "nope", "x"]):
+        assert run("arc", *verb, store_dir=tmp_path) == 1
+        assert "no arc 'nope'" in capsys.readouterr().err
+
+
 def test_arc_writes_say_what_their_id_alone_hides(tmp_path, capsys):
     """Each seen 2026-10-28: a second arc by one name, a no-op rename or
     archive, a box filed in an archived arc, `context --target arc:` and
@@ -5954,17 +6121,23 @@ def test_commit_reports_the_unpushed_count_when_the_store_has_a_remote(tmp_path,
 def test_push_sends_the_store_to_origin_and_names_what_it_leaves(tmp_path, capfd):
     """commit's hint was `git -C <store> push`: a path to paste, where the
     store is one symbion already resolves. A note written after the commit
-    is not in that push, so push names it."""
+    is not in that push, so push names it, and whose it is. Its line began
+    `not pushed:`, as a failed push's does, and read as a refusal of the
+    push it followed (2026-10-31): push says what it sent first, in an
+    agent's shell too, where one pipe takes both streams."""
     store_dir = _store_with_origin(tmp_path)
     run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=store_dir)
     run("commit", store_dir=store_dir)
     run("add", "--kind", "note", "--type", "project", "--body", "y", store_dir=store_dir)
+    r = subprocess.run([sys.executable, "-m", "symbion", "--dir", str(store_dir), "push"],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert r.returncode == 0 and gitref.unpushed(store_dir) == 0, r.stdout
+    assert re.search(r"\npushed 1 commit to origin\nnot in this push: 1 entry \(user 1\) not yet "
+                     r"in the store's git \(symbion --dir \S+ commit\)\n\Z", r.stdout), r.stdout
+    assert "not pushed" not in r.stdout, r.stdout
     capfd.readouterr()
     assert run("push", store_dir=store_dir) == 0
-    err = capfd.readouterr().err
-    assert gitref.unpushed(store_dir) == 0
-    assert re.search(r"not pushed: 1 entry not yet in the store's git \(symbion --dir \S+ commit\)\n",
-                     err), err
+    assert "pushed" not in capfd.readouterr().out, "nothing new went"
 
 
 def test_push_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capfd):
@@ -6283,19 +6456,38 @@ def test_commit_names_the_archive_paths_git_ignores(tmp_path, capsys):
     assert "gitignored" not in capsys.readouterr().err
 
 
+def test_the_archive_note_quotes_the_store_path(tmp_path, capsys):
+    """The note's `git -C` hint is pasted into a shell: a store path with a
+    space split into two words there (2026-10-29)."""
+    store_dir = tmp_path / "my notes"
+    run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=store_dir)
+    scratch = store_dir / "archive" / "sdd"
+    scratch.mkdir(parents=True)
+    (scratch / ".gitignore").write_text("*\n")
+    capsys.readouterr()
+    assert run("commit", store_dir=store_dir) == 0
+    assert f"(git -C '{store_dir}' add -f archive)" in capsys.readouterr().err
+
+
 
 def test_the_archive_note_names_quoted_paths_and_not_the_users_own_ignores(tmp_path):
     """git C-quotes a name with a space or a non-ASCII byte in `--porcelain`,
     and the quoted line failed `startswith("archive/")`: 2 of 4 ignored files
     were named (audit 2026-10-28). And a `.DS_Store` the user's global
     excludes file ignores is their litter, not a copied tree's `.gitignore`:
-    the note offered `add -f archive` for them (2026-10-28)."""
+    the note offered `add -f archive` for them (2026-10-28). Nor is a byproduct
+    the store's own `.gitignore` hides, a `__pycache__/` (2026-10-30)."""
     run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=tmp_path)
     scratch = tmp_path / "archive" / "sdd"
     scratch.mkdir(parents=True)
     (scratch / ".gitignore").write_text("*\n")
     for name in ("plan.md", "a b.md", "café.md"):
         (scratch / name).write_text("x\n")
+    with open(tmp_path / ".gitignore", "a") as f:
+        f.write("__pycache__/\n")
+    cache = tmp_path / "archive" / "tools" / "__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "mod.cpython-311.pyc").write_bytes(b"x")
     excludes = tmp_path.parent / "global-ignore"
     excludes.write_text(".DS_Store\n")
     subprocess.run(["git", "-C", str(tmp_path), "config", "core.excludesFile", str(excludes)],
@@ -6450,21 +6642,21 @@ def test_init_says_whether_the_session_start_hook_is_registered(capsys):
     file, which a command under another event key -- or the path quoted in a
     note -- satisfies. Three states, each asserted: registered, not
     registered, and unknown because the file is not readable JSON."""
-    settings = Path(os.environ["HOME"]) / ".claude" / "settings.json"
+    settings = Path(os.environ["HOME"]) / ".codex" / "hooks.json"
     settings.parent.mkdir(parents=True, exist_ok=True)
-    entry = cli._hook_entry(cli._HOOK_COMMAND)
+    entry = cli._codex_hook_entry(Path(os.environ["HOME"]) / ".agents/skills/symbion")
     settings.write_text(json.dumps({"hooks": {"SessionStart": [entry]}}))
-    cli._link_user_skill()
+    cli._link_user_skill(agent="codex")
     out = capsys.readouterr().out
     assert f"kept hook in {settings}" in out, out
-    elsewhere = {"hooks": {"PreToolUse": [entry]}}
+    elsewhere = {"hooks": {"Stop": [entry]}}
     settings.write_text(json.dumps(elsewhere))
-    cli._link_user_skill()
+    cli._link_user_skill(agent="codex")
     out = capsys.readouterr().out
     assert "does not register the symbion SessionStart hook" in out, out
     assert "kept hook" not in out, "the command is there, the SessionStart hook is not"
     settings.write_text("{ not json")
-    cli._link_user_skill()
+    cli._link_user_skill(agent="codex")
     out = capsys.readouterr().out
     assert "unknown" in out and "cannot be read" in out, out
     assert "does not register" not in out, "unreadable is not the negative case"
@@ -6475,18 +6667,18 @@ def test_the_printed_hook_entry_appends_beside_other_session_start_hooks(capsys)
     into a file that already has SessionStart hooks, it replaces them or is
     not JSON. Do what the message says, and the hook is registered and the
     other hook kept."""
-    settings = Path(os.environ["HOME"]) / ".claude" / "settings.json"
+    settings = Path(os.environ["HOME"]) / ".codex" / "hooks.json"
     settings.parent.mkdir(parents=True, exist_ok=True)
     other = {"matcher": "startup", "hooks": [{"type": "command", "command": "other-status"}]}
     settings.write_text(json.dumps({"hooks": {"SessionStart": [other]}}))
-    cli._link_user_skill()
+    cli._link_user_skill(agent="codex")
     out = capsys.readouterr().out
     assert "append" in out and "SessionStart" in out, out
     entry, _ = json.JSONDecoder().raw_decode(out, out.index("{"))
     data = json.loads(settings.read_text())
     data["hooks"]["SessionStart"].append(entry)
     settings.write_text(json.dumps(data))
-    cli._link_user_skill()
+    cli._link_user_skill(agent="codex")
     assert f"kept hook in {settings}" in capsys.readouterr().out
     assert json.loads(settings.read_text())["hooks"]["SessionStart"][0] == other
 
@@ -7292,8 +7484,9 @@ def _doc_flags(text):
     that runs `symbion list --json` names its flag. A span whose quotes do
     not pair is split on spaces."""
     verbs = {"init", "add", "list", "show", "resolve", "supersede", "commit", "rename",
-             "tags", "summary", "schema", "context", "arc"}
-    arcverbs = {"create", "seed", "list", "todo", "rename", "archive", "reconcile"}
+             "tags", "summary", "schema", "context", "arc", "skill"}
+    arcverbs = {"create", "seed", "list", "todo", "rename", "archive", "unarchive", "describe",
+                "reconcile"}
     lines = [ln for f in re.findall(r"```.*?```", text, re.S) for ln in f.strip("`").splitlines()]
     for para in re.split(r"\n\s*\n", re.sub(r"```.*?```", "\n\n", text, flags=re.S)):
         rows = [ln for ln in para.splitlines() if ln.lstrip().startswith("|")]

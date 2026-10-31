@@ -68,6 +68,12 @@ it, open work first. The Targets page lists every target that has entries.
 The Docs page lists every markdown file an entry is on or points at, the
 project's and the store's `docs/`, the most named first, each with a
 button that opens it.
+The Map page draws the entries as tiles, grouped on up to three of target,
+tag, kind, status, author, arc and the week written. A tile's area is its
+entries, its colour its open ones. A click on a tile lists its entries below
+the map. A click on a group also fills the map with it, and the bar under the
+map or the browser's back steps back out. Enter in the search box maps only the entries that
+hold every word typed.
 
 A target has a type and a name:
 
@@ -76,7 +82,8 @@ A target has a type and a name:
   button beside the chip opens the file, from the default branch when the
   branch checked out lacks it. The card counts the commits that changed the
   file since the entry was written: a high count means the entry may be out
-  of date.
+  of date. Click the count to see those commits and what they changed in
+  the file, and to read the file as the entry saw it.
 - `doc: recipe.md` is a file in the store's own `docs/` folder, where an
   entry's long detail goes. The name is its path inside `docs/`. The button
   beside the chip opens it, as it does a file.
@@ -84,7 +91,15 @@ A target has a type and a name:
   host, a test. The exact name is the key, so `login flow` and `login-flow`
   are two items. The name field suggests the names already in use.
 - `commit: 3f2a1c9` is one of the project's commits. The name field offers
-  the newest commits first, each with its subject.
+  the newest commits first, each with its subject. The commit's page shows
+  its message, and each file it changed with the entries on that file. The
+  button beside the chip, and the one on the page, show its diff. A merge's
+  diff is what it brought onto its branch. Once a remote branch holds the
+  commit, its page and that dialog link to it on GitHub, GitLab, Codeberg,
+  Bitbucket or sourcehut, and on GitHub to the pull requests that hold it.
+
+A diff reads unified or side by side: the switch at its top picks, and this
+browser keeps the pick. A window too narrow for two sides reads unified.
 - `project` is the project as a whole, for an entry with nothing narrower
   to be about.
 
@@ -159,6 +174,8 @@ chip says how that commit relates to the project now:
 - `pending`: a prediction not yet judged.
 
 Hover a state chip to see the commit, and for `behind`, the commits since.
+Click `behind` to see those commits and what they changed, and `ahead` to see
+the commits.
 
 ## Nothing committed is deleted
 
@@ -214,7 +231,7 @@ made here carries it.
 ## More
 
 - [README](https://github.com/phreakocious/symbion#readme): what symbion
-  does, install and a quick start.
+  does, and how to install it.
 - [Guide](https://github.com/phreakocious/symbion/blob/main/docs/guide.md):
   install in full, and adopting symbion in a project.
 - [Reference](https://github.com/phreakocious/symbion/blob/main/docs/reference.md):

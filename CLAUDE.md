@@ -30,9 +30,13 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
   every other command, `--help` and the GUI print in), `gui/` (`symbion serve`;
   `gui/theme.py` adds only its surfaces to that palette).
 - `src/symbion/data/skill/`: `SKILL.md`, `adoption.md`, `catalogs.md` and
-  `session_start.sh`, the agent surface. They ship in the package; `symbion init` links
-  `~/.claude/skills/symbion` to the installed copy.
-- `README.md`: what symbion does, install and a quick start. `docs/guide.md`: install
+  `session_start.sh`, the agent surface. They ship in the package; the Claude Code
+  plugin reaches the installed copy through `symbion skill`, and `symbion init --agent
+  codex` or `--agent hermes` links it.
+- `plugin/`: the Claude Code plugin, which holds no copy of the skill: a stub skill,
+  `/symbion:setup`, `/symbion:wrap` and two `sh` hooks that run the package's scripts.
+  `.claude-plugin/marketplace.json` makes the repo its marketplace.
+- `README.md`: what symbion does and how to install it. `docs/guide.md`: install
   in full and adopting symbion in a project. `docs/reference.md`: how it behaves, and
   development.
 - `docs/superpowers/specs/`: the designs, dated.
@@ -62,18 +66,18 @@ d=$(mktemp -d)/s-notes      # a fresh parent: every command scans a store's sibl
 SKILL.md's rule to run the installed `symbion` is for using symbion, not for
 developing it. A write refuses a store `init` never made, and without `--dir` a
 command uses `../<repo>-notes` beside the current repo. Run `.venv/bin/symbion init
---yes` only when the user asks: it creates that store, it can point the user-wide skill
-and hook at this checkout (`docs/guide.md`, "Adopt in a fresh repo"), and with `--dir`
-it can write a `.symbion` pointer into the checkout. Without `--yes` it only lists them.
-A scratch `init --yes` in a test sets `HOME` (on Windows, `USERPROFILE` too) to a
-scratch dir on the same command line; without it, init acts on your real skill link
-and hook.
+--yes` only when the user asks: it creates that store, with `--agent codex` or
+`--agent hermes` it can point that agent's user-wide skill and hook at this checkout
+(`docs/guide.md`, "Adopt in a fresh repo"), and with `--dir` it can write a `.symbion`
+pointer into the checkout. Without `--yes` it only lists them. A scratch `init --yes`
+in a test sets `HOME` (on Windows, `USERPROFILE` too) to a scratch dir on the same
+command line; without it, init acts on your real skill links and hooks.
 
 ## If this checkout is your installed symbion
 
-When the `symbion` on PATH is this checkout's editable install and
-`~/.claude/skills/symbion` links into it, every `symbion` call runs this `src/`, and
-every Claude Code session on the machine reads its skill and hook from
+When the `symbion` on PATH is this checkout's editable install and the symbion plugin
+is installed, every `symbion` call and the plugin's hooks run this `src/`, and every
+Claude Code session on the machine reads its skill and hooks from
 `src/symbion/data/skill/`. A broken save then prints a traceback at the start of every
 session, in every project. Keep each save runnable: edit bottom-up (store, api, cli),
 and do not edit `src/` while a `symbion` command runs in another session. A scripted

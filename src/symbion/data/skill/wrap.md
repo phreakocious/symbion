@@ -1,4 +1,4 @@
-# `/symbion wrap`: the session end
+# `/symbion:wrap`: the session end
 
 A wrap is the session's last use of its context: what it knows that no entry
 holds goes into the store now. It leaves the store true and one commit whose
@@ -31,10 +31,12 @@ above the open entries.
    before each commit, a tool to prefer) is a `task` for the user, tagged
    `practice`, on the instruction file it belongs in, or on `project` when
    `add` refuses the file, only when it names a failure this session hit that
-   the practice would have prevented. The wrap never edits an instruction
-   file. A number git or symbion prints goes nowhere. State nothing prints
-   (what a test host holds, which release is public) is a plain entry on its
-   item.
+   the practice would have prevented. Its body says what happened and what
+   would have prevented it, names the cheapest place a fix could live (the
+   environment, a hook, a file's gotcha, then an instruction), and drafts
+   no rule text. The wrap never edits an instruction file. A number git or
+   symbion prints goes nowhere. State nothing prints (what a test host holds,
+   which release is public) is a plain entry on its item.
 
 3. **Commit.** `symbion commit --dry-run`, in a call of its own, shows what
    goes in, and `symbion list --since wrap --limit 0` what was written since

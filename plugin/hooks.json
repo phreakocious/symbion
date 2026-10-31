@@ -1,0 +1,7 @@
+{
+  "symbion": {
+    "SessionStart": [
+      {"type": "command", "command": "sh hooks/session_start.sh antigravity", "timeout": 10}
+    ]
+  }
+}

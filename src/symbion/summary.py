@@ -315,7 +315,7 @@ def starred(notes):
 # it prints while the store holds zero rows and never again, so it is bounded
 # by store state, not by a session the tool does not keep.
 FIRST_CONTACT = ('no entries yet: symbion add task --target project --body "..."  '
-                 '(before a write, an agent loads the symbion skill, SKILL.md)')
+                 '(before a write, an agent loads the symbion skill)')
 
 
 def empty_summary() -> dict:
@@ -396,7 +396,7 @@ def row_digest(by_id, n, chars, reader, active=frozenset(), now=None) -> dict:
 
 def repo_rows(cfg) -> list[dict]:
     """`summary --json`'s `repos`: each listed repo, its path from the cwd,
-    and whether the cwd stands in it. The path from the cwd is how an agent
+    whether the cwd stands in it, and whether no repo is there. The path from the cwd is how an agent
     opens a row's file (`app:main.tf` is `../terraform-app/main.tf` from
     here), so it never keeps the map itself."""
     def from_cwd(p):
@@ -404,8 +404,8 @@ def repo_rows(cfg) -> list[dict]:
             return Path(os.path.relpath(p, Path.cwd())).as_posix()
         except ValueError:                   # Windows: another drive
             return p.as_posix()
-    return [{"name": n, "path": str(p), "from_cwd": from_cwd(p), "here": n == cfg.here}
-            for n, p in cfg.repos.items()]
+    return [{"name": n, "path": str(p), "from_cwd": from_cwd(p), "here": n == cfg.here,
+             "missing": not p.is_dir()} for n, p in cfg.repos.items()]
 
 
 def unlisted_repo(store_dir, cfg) -> dict | None:
@@ -427,8 +427,9 @@ def repos_line(d: dict) -> str:
     the header the same in every repo, so this line is where a session sees
     which store it reads and where it stands, and each other repo's path
     from the cwd."""
+    # A missing repo read as there until a write to it said otherwise (2026-10-27).
     names = [r["name"] + (" (here)" if r["here"] else f" {r['from_cwd']}")
-             for r in d["repos"]]
+             + (" (not on this machine)" if r.get("missing") else "") for r in d["repos"]]
     line = f"repos in {Path(d['store']).name}: {', '.join(names)}"
     if u := d.get("unlisted_repo"):
         return (f"{line}; this repo, {u['name']}, names the store and is not listed: add "

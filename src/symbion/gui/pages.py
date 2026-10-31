@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import timedelta
 from urllib.parse import urlsplit, urlunsplit
 
@@ -14,14 +15,17 @@ from nicegui import Client, app, ui
 from starlette.exceptions import HTTPException
 
 from .. import api, gitref
+from .. import term as T
 from .. import store as S
 from .. import summary as summ
-from . import arcs, filters, palette, servers
+from . import arcs, diffview, filters, palette, servers, treemap
 from .chrome import shell, store_name
-from .notes import (NoteMarkdown, ago, demo_says, file_buttons, history, link_ids,
-                    read_only_refused, reading, refusal_shown, render_note, target_href,
-                    view_button)
-from .theme import FAVICON, FONTS_DIR, FONTS_URL, PALETTE
+from .notes import (NoteMarkdown, ago, commit_meta, demo_says, file_buttons, forge_buttons,
+                    history, link_ids,
+                    kind_class, read_only_refused, reading, refusal_shown, render_note,
+                    target_href, view_button)
+from .theme import (FAVICON, FONTS_DIR, FONTS_URL, MAP_EMPTY, MAP_NEW, MAP_OPEN, MAP_TEXT,
+                    PALETTE)
 
 # /notes renders this many rows before "show all": every row is a few dozen
 # elements and a check a few git calls, and all 312 of one store's rows took
@@ -45,6 +49,48 @@ RECENT_DAYS = 14
 # busy store and as much again in the browser (the user, 2026-10-09). The
 # rest are a count in the heading, linked to the view that lists them all.
 BOARD_ROWS = 10
+
+# The map's panel lists this many of a tile's entries, then links to a page
+# that lists them all, where one does.
+PANEL_ROWS = 60
+
+# Each focus of the map is an entry in the tab's history, so back undoes it
+# (the user, 2026-10-30); the URL stays the view's, as the map spec keeps the
+# zoom out of it. An entry holds the focus as its labels from the top, not a
+# tile id: back to the map from an entry it listed draws the page anew, and
+# finds the group by them if it is still there. `sbMapChart` is set beside it.
+_MAP_JS = """<script>
+function sbMapTree(c) { return c.getModel().getSeriesByIndex(0).getData().tree; }
+function sbMapClick(e) {
+  const c = getElement(sbMapChart).chart, tree = sbMapTree(c);
+  let node;
+  if (e.data && e.data.children) {
+    c.dispatchAction({type: 'treemapRootToNode', targetNodeId: String(e.data.id)});
+    node = tree.getNodeById(String(e.data.id));
+  } else if (e.selfType === 'breadcrumb') node = tree.getNodeByDataIndex(e.nodeData.dataIndex);
+  else return;
+  const to = [];
+  for (; node.parentNode; node = node.parentNode) to.unshift(node.name);
+  const at = (history.state && history.state.sbMap) || [];
+  if (JSON.stringify(to) !== JSON.stringify(at)) history.pushState({sbMap: to}, '');
+}
+function sbMapShow() {
+  const c = getElement(sbMapChart).chart, tree = sbMapTree(c);
+  let node = tree.root;
+  for (const name of (history.state && history.state.sbMap) || [])
+    node = (node && node.children.find(n => n.name === name)) || null;
+  node = node || tree.root;
+  c.dispatchAction({type: 'treemapRootToNode', targetNode: node});
+  emitEvent('sbMapBack', node.parentNode ? Number(node.getId()) : null);
+}
+let sbMapDrawn = false;
+function sbMapLoad() {
+  if (sbMapDrawn) return;
+  sbMapDrawn = true;
+  if (history.state && history.state.sbMap && history.state.sbMap.length) sbMapShow();
+}
+addEventListener('popstate', sbMapShow);
+</script>"""
 
 
 def _board(ctx, title, rows, author, *, aside: str = "", more: str = "", tip: str = "",
@@ -90,18 +136,61 @@ def _naming(notes) -> dict[tuple, list]:
     as /object counts a target's rows."""
     on: dict[tuple, list] = {}
     for n in notes:
-        for t in dict.fromkeys([(n.target.type, n.target.name),
-                                *((r.type, r.name) for r in n.refs)]):
+        for t in treemap.objects(n):
             on.setdefault(t, []).append(n)
     return on
+
+
+def _commit_card(ctx, sha: str, loaded) -> None:
+    """A commit's page leads with the commit: its subject, who and when, its
+    message, its buttons, and each file it changed with its counts and the
+    entries on it, as the Docs page lists a file's (the diff viewer design,
+    2026-10-30)."""
+    cfg = gitref.commit_cfg(ctx.cfg, sha)
+    got = gitref.commit_show(cfg, sha, patch=False)
+    if got is None:
+        ui.label("not a commit in this checkout").classes("sb-subtitle").mark("commit-none")
+        return
+    author, date, parents, message, _ = got
+    subject, _, body = message.partition("\n")
+    files = gitref.commit_files(cfg, sha)
+    ftype = gitref.holder(ctx.cfg, sha) or "file"     # over several repos, the repo's type
+    on = _naming(S.heads(loaded))
+    with ui.card().classes("bg-panel w-full sb-commit-card").mark("commit-card"):
+        ui.label(subject).classes("sb-commit-subject")
+        commit_meta(sha, author, date, parents, body)
+        with ui.row().classes("items-center gap-1"):
+            view_button(ctx, sha, "read the diff", ttype="commit")
+            forge_buttons(cfg, sha)
+            ui.button(icon="content_copy",
+                      on_click=lambda: (ui.clipboard.write(sha), ui.notify(f"copied {sha}"))) \
+                .props('flat dense round size=sm color=muted aria-label="copy the full sha"') \
+                .tooltip(f"copy {sha}")
+        plus, minus = (sum(f[i] or 0 for f in files) for i in (1, 2))
+        ui.label(f"{summ._count(len(files), 'file')} · +{plus} −{minus} · the entries on each") \
+            .classes("sb-subtitle").mark("commit-stat")
+        with ui.element("div").classes("sb-docs sb-commit-files"):
+            for path, added, deleted in files:
+                rows = on.get((ftype, path), [])
+                n_open = sum(map(treemap.live, rows))
+                with ui.element("div").classes("sb-docs-row").mark("commit-file"):
+                    ui.icon("description")
+                    ui.link(path, target_href(ftype, path)).classes("sb-docs-name")
+                    ui.html(diffview.counts(added, deleted), sanitize=False)
+                    with ui.element("span").classes("sb-docs-n").mark("commit-file-entries"):
+                        if rows:
+                            ui.label(f"{len(rows)} ·" if n_open else summ._count(len(rows), "entry"))
+                        if n_open:
+                            ui.label(f"{n_open} open").classes("text-notable")
+                    view_button(ctx, path, ttype=ftype) or ui.element("span")
 
 
 def _docs_board(ctx, title: str, docs, on, mark: str, all: str, aside: str = "") -> None:
     """A board of the Docs page: a row a file, with its entries and the open
     ones among them, and a read button where the viewer can show it. Past
-    BOARD_ROWS, a link shows them all."""
+    BOARD_ROWS, a link shows them all. Those rows are drawn hidden, for the
+    search box's filter to find (chrome.py, `sbFilter`)."""
     docs = sorted(docs, key=lambda t: (-len(on[t]), t[1]))
-    shown = docs if all else docs[:BOARD_ROWS]
     with ui.element("section").classes("sb-board" + ("" if docs else " sb-board-empty")) \
             .mark(mark):
         with ui.element("div").classes("sb-board-head"):
@@ -110,19 +199,24 @@ def _docs_board(ctx, title: str, docs, on, mark: str, all: str, aside: str = "")
             if aside:
                 ui.label(aside).classes("sb-board-aside")
         with ui.element("div").classes("sb-docs"):
-            for typ, name in shown:
+            # shortcut: draws every row, about six elements each; a repo of
+            # thousands of markdown files wants the filter on the server.
+            for i, (typ, name) in enumerate(docs):
                 rows = on[(typ, name)]
                 n_open = sum(S.read_status(n) == "open" and not n.spec.parked for n in rows)
-                ui.icon("article")
-                ui.link(name if typ in ("file", "doc") else f"{typ}: {name}",
-                        target_href(typ, name)).classes("sb-docs-name").mark("doc-link")
-                with ui.element("span").classes("sb-docs-n").mark("doc-count"):
-                    ui.label(f"{len(rows)} ·" if n_open else summ._count(len(rows), "entry"))
-                    if n_open:
-                        ui.label(f"{n_open} open").classes("text-notable")
-                view_button(ctx, name, ttype=typ) or ui.element("span")
-            if len(shown) < len(docs):
-                ui.link(f"+{len(docs) - len(shown)} more", "/docs?all=1") \
+                past = not all and i >= BOARD_ROWS
+                with ui.element("div").classes("sb-docs-row sb-filterable" +
+                                               (" sb-past" if past else "")).mark("doc-row"):
+                    ui.icon("article")
+                    ui.link(name if typ in ("file", "doc") else f"{typ}: {name}",
+                            target_href(typ, name)).classes("sb-docs-name").mark("doc-link")
+                    with ui.element("span").classes("sb-docs-n").mark("doc-count"):
+                        ui.label(f"{len(rows)} ·" if n_open else summ._count(len(rows), "entry"))
+                        if n_open:
+                            ui.label(f"{n_open} open").classes("text-notable")
+                    view_button(ctx, name, ttype=typ) or ui.element("span")
+            if not all and len(docs) > BOARD_ROWS:
+                ui.link(f"+{len(docs) - BOARD_ROWS} more", "/docs?all=1") \
                     .classes("sb-docs-more").mark("docs-more")
 
 
@@ -167,7 +261,8 @@ def _error_pages(ctx, author: str) -> None:
     """NiceGUI's own error pages: its sad-face art, and no header to get
     back from. These keep symbion's chrome and say what went wrong."""
     def body(code: int, what: str) -> None:
-        shell(ctx, author, [("No such page" if code == 404 else "This page failed", None)])
+        shell(ctx, author, [("No such page" if code == 404 else "This page failed", None)],
+              cards=False)
         with ui.column().classes("sb-main gap-2"):
             ui.label(what).classes("sb-subtitle text-bad").mark("error-detail")
             ui.link("back to the notebook", "/").classes("text-body")
@@ -466,7 +561,7 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/tags")
     def tags_page():
-        shell(ctx, author, [("Tags", None)], here="/tags")
+        shell(ctx, author, [("Tags", None)], here="/tags", cards=False)
         counts = S.tag_counts(S.load(ctx.store_dir))
         with ui.column().classes("sb-main gap-2"):
             ui.label(f"{len(counts)} in use — near-synonyms are drift, not vocabulary") \
@@ -475,18 +570,19 @@ def build_page(ctx, *, author: str) -> None:
             # so each group splits one subject (summ.tag_key).
             for group in summ.near_tags(counts):
                 ui.label(" · ".join(f"{t} ({counts[t]})" for t in group)) \
-                    .classes("sb-chip sb-chip-notable").mark("tag-near")
+                    .classes("sb-chip sb-chip-notable sb-filterable").mark("tag-near")
             # A wrapped row, not one tag per line: 79 tags were a long scroll.
             with ui.row().classes("items-center gap-2 flex-wrap"):
                 for tag, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-                    ui.link(f"#{tag} {n}", filters.href(tag=tag)).classes("sb-chip")
+                    ui.link(f"#{tag} {n}", filters.href(tag=tag)) \
+                        .classes("sb-chip sb-filterable").mark("tag-chip")
 
     @ui.page("/docs")
     def docs_page(all: str = ""):
         """The user, 2026-10-16: "add Docs below Arcs in the sidebar and show
         all the documents we know about". Every markdown file a row is on or
         cites, the repo's, then the store's docs/, the most named first."""
-        shell(ctx, author, [("Docs", None)], here="/docs")
+        shell(ctx, author, [("Docs", None)], here="/docs", cards=False)
         on = {t: rows for t, rows in _naming(S.heads(S.load(ctx.store_dir))).items()
               if t[1] and t[1].lower().endswith(".md")}
         named = len(on)
@@ -511,6 +607,105 @@ def build_page(ctx, *, author: str) -> None:
             _docs_board(ctx, "in the store", [t for t in on if t[0] == "doc"], on, "docs-store",
                         all, aside=f"· {where}")
 
+    @ui.page("/map")
+    def map_page(by: str = "", show: str = "", color: str = "", q: str = ""):
+        """The spec, 2026-10-29: the store's entries as a treemap, to see "where
+        the work and history pile up, at a glance". Each control is a link
+        to another view, as a filter chip on /notes is, and so is a search:
+        the box's Enter maps only the entries it finds (the user, 2026-10-29)."""
+        view = treemap.view_from({"by": by, "show": show, "color": color, "q": q})
+        whole = treemap.href(replace(view, q=""))
+        shell(ctx, author, [("Map", whole), (filters.describe({}, view.q), None)] if view.q
+              else [("Map", None)], q=view.q, here="/map",
+              search=lambda text: treemap.href(replace(view, q=text or "")))
+        # as `reading` gives every page: another side's agent is someone else
+        root = treemap.build(reading(ctx).loaded, view,
+                             arcs={a.id: a.name for a in S.load_arcs(ctx.store_dir)},
+                             path_types=frozenset({"file", "doc", *ctx.cfg.repos}))
+
+        def axis(i: int, value: str) -> None:
+            by = [*view.by, *[""] * treemap.MAX_AXES][:treemap.MAX_AXES]
+            by[i] = value or ""
+            ui.navigate.to(treemap.href(replace(view, by=tuple(dict.fromkeys(a for a in by if a)))))
+
+        with ui.column().classes("sb-main gap-3"):
+            with ui.row().classes("items-center gap-3 flex-wrap"):
+                for i, label in enumerate(("group by", "then", "then")):
+                    ui.select({**({} if i == 0 else {"": "—"}), **treemap.AXES},
+                              value=view.by[i] if i < len(view.by) else "", label=label,
+                              on_change=lambda e, i=i: axis(i, e.value)) \
+                        .props("dense outlined options-dense").classes("min-w-[150px]") \
+                        .mark(f"map-by-{i + 1}")
+                ui.select(treemap.SHOWS, value=view.show, label="show",
+                          on_change=lambda e: ui.navigate.to(treemap.href(replace(view, show=e.value)))) \
+                    .props("dense outlined options-dense").classes("min-w-[190px]").mark("map-show")
+                ui.select(treemap.COLOURS, value=view.color, label="colour",
+                          on_change=lambda e: ui.navigate.to(treemap.href(replace(view, color=e.value)))) \
+                    .props("dense outlined options-dense").classes("min-w-[150px]").mark("map-color")
+            twice = [w for a, w in (("target", "on each object it is on or cites"),
+                                    ("tag", "under each of its tags")) if a in view.by]
+            if twice:
+                ui.label("An entry counts once " + " and once ".join(twice) +
+                         ", so the tiles add up to more than the store.") \
+                    .classes("sb-subtitle").mark("map-multi")
+            if not treemap.count(root):
+                ui.label("no entries in this view").classes("sb-subtitle").mark("map-empty")
+                return
+            opts, tiles = treemap.options(
+                root, view, kind_hex=lambda k: T.kind_hex(k, ctx.kinds.get(k)), palette=PALETTE,
+                ramps=(MAP_EMPTY, MAP_TEXT, MAP_OPEN, MAP_NEW), now=S.now_shown())
+            chart = ui.echart(opts).classes("w-full sb-map").mark("map-chart")
+            ui.add_head_html(f"<script>const sbMapChart = {chart.id}</script>{_MAP_JS}")
+
+            @ui.refreshable
+            def panel(tile=None) -> None:
+                if tile is None:
+                    ui.label("A click on a tile lists its entries here; a click on a group "
+                             "also fills the map with it.") \
+                        .classes("sb-subtitle")
+                    return
+                rows = treemap.entries(tile)
+                ui.label(f"{' › '.join(s[2] for s in tile.steps)}: "
+                         f"{summ._count(len(rows), 'entry')}, open first").classes("sb-board-title")
+                with ui.element("div").classes("sb-map-rows"):
+                    for n in rows[:PANEL_ROWS]:
+                        with ui.link(target=filters.href(id=n.id)).classes("sb-map-row").mark("map-row"):
+                            ui.label(n.kind).classes(f"sb-map-kind {kind_class(n.kind)}")
+                            ui.label(treemap.status(n)).classes("sb-map-meta")
+                            ui.label(f"{n.target.type}: {n.target.name}" if n.target.name
+                                     else n.target.type).classes("sb-map-meta")
+                            ui.label(summ.clip(" ".join(n.body.split()), 140))
+                if len(rows) > PANEL_ROWS:
+                    to = treemap.see_all(tile, view)
+                    if to is None:
+                        how = "click a tile in it" if tile.kids else "search or pick another axis"
+                        ui.label(f"+{len(rows) - PANEL_ROWS} more: {how} to narrow it") \
+                            .classes("sb-subtitle").mark("map-zoom")
+                    else:
+                        kind, q = to
+                        ui.link(f"all {len(rows)} on their page",
+                                target_href(q["type"], q["name"]) if kind == "object"
+                                else filters.href(**q)).classes("text-body").mark("map-all")
+
+            def tile(i):
+                # the breadcrumb, the whole map and a stale key (a page drawn
+                # before a reload) send no tile
+                return tiles[i] if isinstance(i, int) and 0 <= i < len(tiles) else None
+
+            def pick(e) -> None:
+                if (t := tile(e.args)) is not None:
+                    panel.refresh(t)
+
+            # a group fills the map; a tile without one stays put, since the map
+            # filled with one tile shows nothing the panel does not
+            chart.on("componentClick", pick,
+                     js_handler="(e) => { sbMapClick(e); emit(e.data ? e.data.id : null) }")
+            chart.on("chart:finished", js_handler="() => sbMapLoad()")
+            # back: the focus it returns to lists its entries, as its click did
+            ui.on("sbMapBack", lambda e: panel.refresh(tile(e.args)))
+            with ui.element("section").classes("sb-board w-full").mark("map-panel"):
+                panel()
+
     @ui.page("/object")
     @gitref.heads_once()           # each repo's HEAD once a page
     def object_page(type: str = "", name: str = ""):
@@ -519,22 +714,31 @@ def build_page(ctx, *, author: str) -> None:
         if not type or not name:
             ui.navigate.to("/notes")
             return
+        rd = reading(ctx)
+        # A typed or pasted name reads as `context --target` reads it: a short
+        # sha finds the full one rows store. A stored name, which every link
+        # here carries, skips the catalog run.
+        if name not in S.stored_names(rd.loaded, type):
+            with refusal_shown():
+                type, name = gitref.read_target(ctx.cfg, type, name, rd.loaded)
         shell(ctx, author, [(f"{type}: {name}", None)],
               new=(type, name, None))
         # Open work first, then the newest; a resolved row is history and
         # reads clipped (one file's page held 50 rows in full, 2026-09-27).
-        rd = reading(ctx)
         rows = S.heads_for(ctx.store_dir, type, name, loaded=rd.loaded)
         live = lambda n: S.read_status(n) == "open" and not n.spec.parked   # noqa: E731
         rows.sort(key=lambda n: not live(n))      # stable: newest within each
         git_head = gitref.head_sha(ctx.cfg)
         with ui.column().classes("sb-main gap-4"):
+            if type == "commit":
+                _commit_card(ctx, name, rd.loaded)
             with ui.row().classes("items-center gap-3"):
                 ui.label(f"{summ._count(len(rows), 'entry')} on or referencing this object") \
                     .classes("sb-subtitle")
-                view_button(ctx, name, "read the file", ttype=type)
-                if (path := api.object_path(ctx, type, name)) and path.is_file():
-                    file_buttons(path)
+                if type != "commit":
+                    view_button(ctx, name, "read the file", ttype=type)
+                    if (path := api.object_path(ctx, type, name)) and path.is_file():
+                        file_buttons(path)
             since = gitref.commits_since(ctx.cfg, rows, git_head)
             for n in rows:
                 # The page names the object: a row only referring to it names its own.
@@ -545,7 +749,7 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/arcs")
     def arcs_page():
-        shell(ctx, author, [("Arcs", None)], here="/arcs")
+        shell(ctx, author, [("Arcs", None)], here="/arcs", cards=False)
         with ui.column().classes("sb-main gap-4"):
             arcs.index(ctx, author=author)
 
@@ -589,6 +793,18 @@ def build_page(ctx, *, author: str) -> None:
                                 ui.navigate.reload()        # the name is in the top bar
 
                     ui.button("Save", on_click=_rename).props("flat dense").mark("arc-rename")
+                    desc = ui.input("description", value=a.description) \
+                        .props("dense outlined").classes("col").style("min-width:160px") \
+                        .mark("arc-description")
+
+                    def _describe():
+                        if demo_says("describes the arc"):
+                            return
+                        with refusal_shown():
+                            api.describe_arc(ctx, id, desc.value or "")
+                            body.refresh()
+
+                    ui.button("Save", on_click=_describe).props("flat dense").mark("arc-describe")
                     ui.space()
 
                     def _archive():
@@ -598,8 +814,17 @@ def build_page(ctx, *, author: str) -> None:
                             api.archive_arc(ctx, id)
                             ui.navigate.to("/arcs")
 
+                    def _unarchive():
+                        if demo_says("unarchives the arc"):
+                            return
+                        with refusal_shown():
+                            api.unarchive_arc(ctx, id)
+                            body.refresh()
+
                     if a.archived:
                         ui.label(f"archived {S.shown(a.archived_at) if a.archived_at else ''}").classes("sb-chip")
+                        ui.button("Unarchive", icon="unarchive", on_click=_unarchive) \
+                            .props("flat dense").mark("arc-unarchive")
                     else:
                         ui.button("Archive", icon="archive", on_click=_archive) \
                             .props("flat dense color=warning").mark("arc-archive")

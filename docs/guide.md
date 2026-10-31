@@ -6,17 +6,60 @@ says how symbion behaves.
 
 ## Install
 
+### In Claude Code
+
+From the project, in Claude Code:
+
+```
+/plugin install symbion --marketplace phreakocious/symbion
+/symbion:setup
+```
+
+The first line adds the repo as a marketplace (Claude Code asks `y` to add it,
+then a scope) and installs the plugin, live in the same session. The plugin holds
+a setup command, a stub skill and two small hooks. The stub runs `symbion skill`,
+and the hooks run the installed package's own `session_start.sh` and
+`gotchas.sh`, so the skill and the hooks always match the CLI.
+
+`/symbion:setup` then asks before each write, usually twice:
+
+1. It checks for the CLI and the repo. Outside a git repository it stops. It
+   lists what it would write: the CLI (`uv tool install --python '>=3.11'
+   'symbion[gui]'`, or `pipx install 'symbion[gui]'`, or an upgrade), the store
+   `../<repo>-notes` with its `symbion.toml` and `README.md`, and one line in
+   `CLAUDE.md`. On your yes, it installs, runs `symbion init --yes` and writes
+   the line.
+2. It follows `adoption.md`: it reads the project's TODO files, handoff notes,
+   Claude Code memory and git log, and shows a table of the entries it would make
+   and the sources it would retire. On your yes, it writes them and commits the
+   store. A retired file's `rm` is yours to run. A store that already has
+   entries, from symbion installed before the plugin, say, gets asked first
+   whether to look for what it lacks.
+
+It ends by starting `symbion serve` and giving you the address. A project with
+nothing to bring in gets the [live demo](https://symbion.nullphase.net/)'s link,
+to see a store weeks in.
+
+### Codex, Antigravity, Hermes Agent, or the CLI alone
+
 Python 3.11+ and git. On Windows, use Git for Windows: catalogs and
 resolvers run in its `sh`, which symbion finds beside git even when only
-Git's `cmd` directory is on PATH. Claude Code runs the session-start hook in
-Git's bash; without Git for Windows it fails with `'sh' is not recognized`.
+Git's `cmd` directory is on PATH. Claude Code runs the plugin's hooks in
+Git's bash; without Git for Windows they fail with `'sh' is not recognized`.
 Codex's hook runs in Windows PowerShell.
 
 ```bash
-pipx install 'symbion[gui]'     # or: uv tool install 'symbion[gui]'
+pipx install 'symbion[gui]'     # or: uv tool install --python '>=3.11' 'symbion[gui]'
 # [gui] adds the web UI (symbion serve); drop it for the core alone.
 # Unreleased main: pipx install 'symbion[gui] @ git+https://github.com/phreakocious/symbion'
 ```
+
+uv picks its default Python unless told otherwise. On macOS that may be the
+system's 3.9, which symbion's install refuses; `--python '>=3.11'` uses one
+3.11 or later, and downloads one into uv's own directory if none is found.
+pipx installs on its own Python, and on one older than 3.11 finds no symbion
+("Requires-Python >=3.11"): `pipx environment --value PIPX_DEFAULT_PYTHON`
+names it, and `--python PATH` installs on another.
 
 The core's four dependencies serve a person at a terminal: `rich` and
 `rich-argparse` colour and align the output (a pipe gets plain text),
@@ -49,34 +92,39 @@ the store.
 
 From the repo's root:
 
-**1. Create the store and link the agent files.**
+**1. Create the store and link the agent files.** In Claude Code,
+`/symbion:setup` runs this step and the bootstrap for you. By hand:
 
 ```bash
-symbion init          # lists each change and makes none (exit 1 if there are any)
-symbion init --yes    # makes them
+symbion init --agent codex          # lists each change and makes none (exit 1 if there are any)
+symbion init --agent codex --yes    # makes them
 ```
 
-That sets up Claude Code; `--agent codex` sets up Codex instead,
-`--agent both` sets up both, and `--agent hermes` sets up Hermes Agent.
+`--agent hermes` sets up Hermes Agent, and `--agent both` is Codex and Claude
+Code. On Claude Code the plugin carries the skill and the hooks, so `init` (its
+default agent) makes only the store there. `--agent antigravity` makes only the
+store too, and prints the plugin's install line until `agy` has the plugin:
+
+```bash
+agy plugin install https://github.com/phreakocious/symbion/tree/main/plugin
+```
+
+agy copies the plugin into `~/.gemini/config/plugins/symbion` and finds it at its
+next start. The copy holds the stub skill and the session-start hook. agy loads
+no plugin commands, so it has no `/symbion:setup` or `/symbion:wrap`, and no
+gotcha hook. The hook runs in `sh`; on Windows that is untested. It names a `~/.claude/skills/symbion`
+link or a symbion hook in `~/.claude/settings.json` left from an install before
+the plugin: with both, each session gets the skill, the summary and each gotcha
+twice. It says how to remove each, and removes neither.
 
 This creates `../<repo>-notes`, a git repo with no remote, holding a commented
 `symbion.toml` whose every value has a default and a README.md that says what
 the store is. Out of the box an entry goes on a commit, an item, the project or
 an arc. For entries on files, uncomment `file =` under `[catalogs]` and `file =
 "git"` under `[renames]`; a file target refused before then names both lines,
-by number. For Claude Code, the first
-`init` on a machine also links `~/.claude/skills/symbion` to the skill directory in the installed
-package (SKILL.md, adoption.md, catalogs.md and the hook scripts), so an upgrade
-reaches every project. It registers its hooks in `~/.claude/settings.json` when
-that file does not exist: the session-start hook, and the gotcha hook below on
-two events. When it does, `init` says each hook is already there, or prints the
-entry to append to `hooks.SessionStart`, `hooks.PostToolUse` or
-`hooks.PostToolUseFailure`, or says the file is not valid JSON.
-`init --merge-hook` appends each missing entry and keeps the rest of the file.
-It refuses a file that is not valid JSON. Without `--yes` it merges only once the
-skill link is in place, since the hook runs its script through that link. If your
-agent's own edit of the file is denied, as Claude Code's auto mode may deny it, run
-the flag yourself: type `! symbion init --merge-hook` at the agent's prompt. At each
+by number.
+
+In Claude Code the plugin's hooks run the installed package's scripts. At each
 session start the hook gives the agent `symbion summary` and shows you one line of it: the open counts, the soonest due
 entry and, while `symbion serve` runs, its address. The gotcha hook runs
 `gotchas.sh` after each Read, Edit, Write, NotebookEdit and Bash call, failed
@@ -87,14 +135,14 @@ gets that entry's lead, its age, how many commits have changed the file since,
 and the command that retires it: a gotcha has no status, and the agent in
 the file is the one placed to judge whether it still holds. It reads a list
 the session-start hook writes under
-`~/.cache/symbion/gotchas/`, so it costs a few milliseconds and never runs
-`symbion`. A `~/.claude/skills/symbion` that is not the
-link is left alone and named. On Windows the link is a directory junction
-when the account cannot make a symlink, so neither Developer Mode nor an
-elevated terminal is needed.
+`~/.cache/symbion/gotchas/`, and the package's directory from
+`~/.cache/symbion/skill_dir`, which the plugin's session-start hook writes from
+`symbion skill --path` when it is missing or stale. So it costs a few
+milliseconds and never runs `symbion`. The plugin's skill is `symbion:symbion`: its stub runs `symbion
+skill`, which prints the installed skill with this store's kinds in it.
 
 For Codex, `init --agent codex` links `~/.agents/skills/symbion` to the same
-skill directory and registers the hook in `$CODEX_HOME/hooks.json`
+skill directory and registers SessionStart and PreToolUse hooks in `$CODEX_HOME/hooks.json`
 (default `~/.codex/hooks.json`), on the same terms: it writes that file only
 when it is absent or under `--merge-hook`, and counts a registration inline in
 `config.toml`. Codex skips a new hook until you trust it in `/hooks`. See the
@@ -103,6 +151,16 @@ Linux the command runs `session_start.sh`. On Windows, init adds a
 `commandWindows` override running `session_start.ps1` with Windows PowerShell,
 without loading a profile. WSL is not required. Both commands read the
 session's cwd and use `codex` as the reader unless `SYMBION_AUTHOR` overrides it.
+The PreToolUse hook runs `codex_gotchas.py` with the Python interpreter that
+installed symbion, on all platforms. It reads the same session cache and shows
+gotchas before a tool call first names their file, and again before its first
+edit. For `apply_patch`, it checks only file headers, including move destinations.
+Existing installations can add it with `symbion init --agent codex --merge-hook`,
+then review it in `/hooks`. With hooks inline in `config.toml`, init prints the
+TOML to append there instead. A `~/.agents/skills/symbion` that is not the link
+is left alone and named. On Windows the link is a directory junction when the
+account cannot make a symlink, so neither Developer Mode nor an elevated
+terminal is needed.
 
 **Give Codex access to the store.** Codex's sandbox writes only inside the
 project, and the store sits beside it. Launch `codex --add-dir
@@ -130,8 +188,8 @@ The hook runs in every project and says nothing where there is no store.
 **2. Check the read side.** Start a session, or run the hook by hand:
 
 ```bash
-CLAUDE_PROJECT_DIR=$PWD sh ~/.claude/skills/symbion/session_start.sh
-sh ~/.agents/skills/symbion/session_start.sh     # the same, with only Codex set up
+CLAUDE_PROJECT_DIR=$PWD sh "$(symbion skill --path)/session_start.sh"   # what the plugin's hook runs
+sh ~/.agents/skills/symbion/session_start.sh     # the same, through Codex's link
 ```
 
 For Codex on Windows, run this from the project in PowerShell:
@@ -139,6 +197,17 @@ For Codex on Windows, run this from the project in PowerShell:
 ```powershell
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$HOME\.agents\skills\symbion\session_start.ps1"
 ```
+
+agy runs its hook in the plugin's directory and names the project on stdin.
+By hand, from the project:
+
+```bash
+printf '{"workspacePaths":["%s"]}' "$PWD" | ANTIGRAVITY_CONVERSATION_ID=by-hand \
+  sh ~/.gemini/config/plugins/symbion/hooks/session_start.sh antigravity
+```
+
+It prints `{"injectSteps": [{"systemMessage": {"systemMessage": …}}]}`, and the
+text in the table below is that inner `systemMessage`, which the model reads.
 
 Hermes Agent has no hook to run: start a session after step 3, and its first
 command should be `symbion summary`.
@@ -155,15 +224,16 @@ print as plain text, and the PowerShell hook prints all of it that way.
 |---|---|
 | `symbion: open outside arcs: bug 0, task 0, question 0, prediction 0` (`; N open in arcs` when arcs hold any, `; N parked` when any open entry is parked), then a line per arc and the open entries | working |
 | `symbion --dir ../other-notes: open outside arcs: …` | working, on a store this repo's tree does not name (`--dir`, `SYMBION_DIR`, or a cwd inside a store); the header names it, so two summaries in one session can be told apart |
-| either, then `  N entries not yet in the store's git (symbion commit)` | working; `/symbion wrap` at session end commits them |
+| either, then `  N entries not yet in the store's git (symbion commit)` | working; `/symbion:wrap` at session end commits them |
 | either, then `… (symbion commit --all once their session has ended)` | the entries are another session's, and `symbion commit` takes only yours: `--all` takes them once that session has ended |
 | `symbion: cannot read store at … because 'symbion' is not on PATH` | see [Install](#install) |
+| `symbion: this project has a symbion store, but the symbion CLI is not installed or does not run: run /symbion:setup.` | the plugin's hook, with no `symbion` that runs: `/symbion:setup` installs it. In Antigravity the line ends `see Install at https://github.com/phreakocious/symbion` |
 | `symbion: no store at …; run \`symbion init\`` | no store yet, or `.symbion`/`SYMBION_DIR` names a missing path |
 | `error: …/.symbion is a link to …` or `error: cannot read …/.symbion` | `.symbion` is there but is not a file symbion can read; the message gives the fix |
-| nothing | no store, no `.symbion` and no `SYMBION_DIR`, or the hook is not registered (or not trusted in Codex) |
+| nothing | no store, no `.symbion` and no `SYMBION_DIR`, or the plugin is not installed (Claude Code, Antigravity), or the hook is not registered or not trusted (Codex) |
 
 **3. Tell the agent.** One line in `CLAUDE.md` (Claude Code) or `AGENTS.md`
-(Codex, Hermes Agent):
+(Codex, Antigravity, Hermes Agent):
 
 ```
 - We use symbion for durable notes and tickets.
@@ -219,7 +289,7 @@ symbion arc list                    # done/total per arc
 symbion list --arc "$aid" --json    # every item, resolved included
 ```
 
-**End a session with `/symbion wrap`.** Writes never commit, so a git failure
+**End a session with `/symbion:wrap`.** Writes never commit, so a git failure
 never blocks an entry; `symbion summary` shows the uncommitted count until a
 commit. The wrap (`wrap.md` in the skill) files an open `question` for each ask
 the user left unanswered, writes entries for what the session learned, changed
@@ -345,16 +415,30 @@ to an entry stays good (`serve` prints it, and `--port` picks another). It has:
   own words. The answer goes below the question, as you, and the question
   stays open for its asker to act on;
 - boards by target on the targets page;
+- a commit's page: its message, and each file it changed with the entries
+  on that file;
+- a commit's diff, unified or side by side, from its page or the button
+  beside its chip, and, once a remote branch holds it, links to it on
+  GitHub, GitLab, Codeberg, Bitbucket or sourcehut, and on GitHub to its
+  pull requests;
+- the commits behind a card's `N commits since` or `behind N`, and what they
+  changed, a click away;
 - a Docs page: every markdown file an entry is on or points at, the
   project's and the store's `docs/`, the most named first, each with its
   entries, the open ones among them, and a button that opens it;
+- a Map page: the store's entries as a treemap, grouped on up to three axes
+  (target, tag, kind, status, author, arc, week written). A tile's area is its
+  entries, its colour its open ones; a click lists a tile's entries, a click on
+  a group fills the map with it and back undoes that, and every
+  choice is in the URL. Enter in the search box maps only the entries the
+  words find;
 - the sidebar's kinds, each with what it is for when hovered: the `when`
   the store's `symbion.toml` gives it;
 - an entry list where every tag, kind, author and target is a filter link;
 - a search box (`/`): its text filters the page as you type, and Enter
   searches the whole store (every word, literally, in any case, a phrase in
   double quotes as one word, or a pasted entry id), as a pause in the typing
-  does once nothing on the page matches;
+  does on a page of entries once none of them matches;
 - a palette (`⌘K`, or `Ctrl K`): the places, the top bar's actions, and
   entries by words or by an id's tail, here first, then a count and a link
   for every other store a `serve` runs on. Enter peeks at an entry here, and

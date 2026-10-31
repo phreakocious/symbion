@@ -69,6 +69,21 @@ def test_a_hermes_shell_writes_as_hermes_and_its_gui_as_the_person(monkeypatch):
     assert api.gui_author() == "ada"
 
 
+def test_an_agy_shell_writes_as_antigravity_and_its_gui_as_the_person(monkeypatch):
+    """agy gives its shell commands ANTIGRAVITY_AGENT and
+    ANTIGRAVITY_CONVERSATION_ID, and its hooks only the second (agy 1.4.12,
+    2026-10-30). An agy launched from a Claude Code session carries
+    CLAUDECODE and Claude's session id too."""
+    monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", "c1")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+
+    assert api.author_default() == "antigravity"
+    assert api.gui_author() == "ada"
+    assert store.session_key() == "c1"
+
+
 def test_symbion_author_wins_for_both(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("SYMBION_AUTHOR", "sam")
@@ -300,6 +315,8 @@ _NON_WRITERS = {
                     # test_add_fields_demands_an_author_per_row
     "rename_arc",   # writes, but to the arc record -- no note row
     "archive_arc",  # ditto
+    "unarchive_arc",  # ditto
+    "describe_arc",   # ditto
     "commit",            # writes git, not a note
     "own_rows",          # a read: which pending rows `commit` would take
     "push",              # ditto
@@ -1255,7 +1272,8 @@ def test_supersede_judges_a_given_options_list(repo, tmp_path):
 
 # Every api function that writes. test_gui_seam imports it.
 WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
-          "rename_arc", "archive_arc", "undo", "commit", "push", "pull", "sync",
+          "rename_arc", "archive_arc", "unarchive_arc", "describe_arc", "undo", "commit",
+          "push", "pull", "sync",
           "rename_target", "retype"}
 
 
@@ -1299,6 +1317,8 @@ def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
         "create_arc": lambda: api.create_arc(ctx, "b", "", "item", author="ada"),
         "rename_arc": lambda: api.rename_arc(ctx, arc.id, "c"),
         "archive_arc": lambda: api.archive_arc(ctx, arc.id),
+        "unarchive_arc": lambda: api.unarchive_arc(ctx, arc.id),
+        "describe_arc": lambda: api.describe_arc(ctx, arc.id, "e"),
         "undo": lambda: api.undo(ctx, None, author="ada", apply=False),
         "commit": lambda: api.commit(ctx, "m"),
         "push": lambda: api.push(ctx, capture=True),

@@ -357,6 +357,7 @@ def test_a_serve_writes_in_no_agent_session(tmp_path, monkeypatch):
     monkeypatch.setattr(serve.ui, "run", lambda **kw: None)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
     monkeypatch.setenv("CODEX_THREAD_ID", "t1")
+    monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", "a1")
     store.ensure_store(tmp_path / "s")
     serve.main(api.resolve(str(tmp_path / "s")), author="t", port=1111, show=False)
     assert store.session_key() is None

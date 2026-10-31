@@ -24,9 +24,14 @@ from .theme import (DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, kind_css, quasar_col
 # From anywhere but a field being typed in or an open dialog: `/` focuses the
 # search box, `n` and `?` press the buttons they name. What is typed in the
 # box hides the cards on the page that lack a word of it (`sbFilter`): every
-# word, in any case, in the card's text or its id. When it hides them all, a
-# pause in the typing searches the store, as Enter does: a superseded id, or a
-# row on no card of this page, read as gone (the user, 2026-10-05).
+# word, in any case, in the card's text or its id. A page of docs, tags or
+# arcs marks its rows `sb-filterable`: with no cards, a word read as hiding
+# them all and opened the store's search (the user, 2026-10-29). When it
+# hides them all on a page of entry cards, a pause in the typing searches the
+# store, as Enter does: a superseded id, or a row on no card of this page,
+# read as gone (the user, 2026-10-05). Elsewhere it does not (2026-10-29),
+# and the map, which narrows itself, filters nothing. While the box has words, `sb-sifting` on the body shows the
+# rows a board drew past its first few (`sb-past`): the filter reaches them all.
 _KEYS_JS = """<script>
 let sbExpandTimer;
 const sbKeys = {'/': '.sb-search input', 'n': '.sb-new', '?': '.sb-keys'};
@@ -43,16 +48,18 @@ function sbFilter(text, expand) {
   // A "quoted phrase" is one word, as filters.search_pattern reads the box.
   const words = [...(text || '').toLowerCase().matchAll(/"([^"]*)"?|([^\\s"]+)/g)]
     .map(m => (m[1] ?? m[2]).trim().split(/\\s+/).join(' ')).filter(Boolean);
-  for (const card of document.querySelectorAll('.sb-main .sb-note')) {
+  const units = ':is(.sb-note, .sb-filterable)';
+  for (const card of document.querySelectorAll('.sb-main ' + units)) {
     const hay = (card.textContent + ' ' + (card.dataset.id || ''))
       .toLowerCase().replace(/\\s+/g, ' ');
     card.classList.toggle('sb-filtered', !words.every(w => hay.includes(w)));
   }
   for (const board of document.querySelectorAll('.sb-board'))
     board.classList.toggle('sb-filtered',
-      words.length > 0 && !board.querySelector('.sb-note:not(.sb-filtered)'));
+      words.length > 0 && !board.querySelector(units + ':not(.sb-filtered)'));
+  document.body.classList.toggle('sb-sifting', words.length > 0);
   clearTimeout(sbExpandTimer);
-  if (words.length && !document.querySelector('.sb-main .sb-note:not(.sb-filtered)'))
+  if (expand && words.length && !document.querySelector('.sb-main ' + units + ':not(.sb-filtered)'))
     sbExpandTimer = setTimeout(() => expand(text), 700);
 }
 </script>"""
@@ -153,6 +160,39 @@ if (matchMedia('(display-mode: standalone), (display-mode: tabbed)').matches) {
 # browser's own new tab, on every card alike (the user, 2026-10-15). The other
 # keys press the peek's own buttons, so each does what its button does. Open
 # is read from where the drawer sits: it slides off the right edge when closed.
+# A card's tooltips (notes.Card, card.js): a `data-tip` attribute, shown in
+# one shared element under the pointer's target, or above it near the
+# window's foot, and kept inside the window as Quasar's are. A q-tooltip each
+# was a server element and a Vue component a chip. A tip filled from the
+# server on the first hover (`data-tip-key`) shows when its text arrives.
+_TIPS_JS = """<script>
+const sbTip = Object.assign(document.createElement('div'), {className: 'sb-tip', hidden: true});
+let sbTipAt = null, sbTipWatch = null;
+function sbTipPlace() {
+  const text = sbTipAt && sbTipAt.dataset.tip;
+  if (!text) { sbTip.hidden = true; return; }
+  if (!sbTip.isConnected) document.body.append(sbTip);
+  sbTip.textContent = text;
+  sbTip.hidden = false;
+  const r = sbTipAt.getBoundingClientRect(), w = sbTip.offsetWidth, h = sbTip.offsetHeight;
+  sbTip.style.left = Math.max(8, Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - 8)) + 'px';
+  sbTip.style.top = (r.bottom + 8 + h > innerHeight ? r.top - 8 - h : r.bottom + 8) + 'px';
+}
+function sbTipTo(el) {
+  if (el === sbTipAt) return;
+  sbTipAt = el;
+  if (sbTipWatch) sbTipWatch.disconnect();
+  sbTipWatch = el && new MutationObserver(sbTipPlace);
+  if (el) sbTipWatch.observe(el, {attributes: true, attributeFilter: ['data-tip']});
+  sbTipPlace();
+}
+document.addEventListener('mouseover', e =>
+  sbTipTo(e.target.closest ? e.target.closest('[data-tip], [data-tip-key]') : null));
+document.addEventListener('mouseout', e => { if (!e.relatedTarget) sbTipTo(null); });
+for (const ev of ['scroll', 'mousedown', 'keydown'])
+  document.addEventListener(ev, () => sbTipTo(null), true);
+</script>"""
+
 _PEEK_JS = """<script>
 function sbCards() {
   return [...document.querySelectorAll('.sb-main .sb-note[data-id]')]
@@ -440,7 +480,8 @@ def store_name(ctx) -> str:
 
 
 def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
-          here: str = "", new=("project", None, None), kind: str | None = None) -> None:
+          here: str = "", new=("project", None, None), kind: str | None = None,
+          cards: bool = True, search=None) -> None:
     """`crumbs` end in the page's title, which the top bar shows: a title of
     its own under the bar left a band of nothing above it (the user,
     2026-10-01). A parent comes before it only on a page one level down (an
@@ -449,7 +490,9 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     search keeps: on /notes a search narrows the list in view, elsewhere it
     starts one. `here` is the sidebar place this page is (`/`, `/notes`,
     `/tags`, `/arcs`), `new` the (type, name, arc) a new note starts on, and
-    `kind` the kind it starts as."""
+    `kind` the kind it starts as. `cards` is False on a page with no entry
+    cards, and `search` maps a page that narrows itself to the URL of the
+    words searched: see `_search_box`."""
     ui.dark_mode().enable()
     name = store_name(ctx)
     # The project, then the page: the tab strip truncates from the right, and
@@ -493,6 +536,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     ui.add_head_html(_LINKS_JS)
     ui.add_head_html(_APP_JS)
     ui.add_head_html(_BADGE_JS)
+    ui.add_head_html(_TIPS_JS)
     ui.add_head_html(_PEEK_JS)
     ui.add_head_html(_PALETTE_JS)
     ui.add_head_html(_ESM_JS)
@@ -541,7 +585,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
             # the peek is made below; a click on the stale button comes later
             _git_buttons(ctx, author, heads, lambda: show_drift())
             _new_note_button(ctx, author, *new, kind=kind)
-            _search_box(q, keep or {})
+            _search_box(q, keep or {}, cards=cards, to=search)
             with ui.element("div").classes("sb-who-top sb-narrow") \
                     .tooltip(f"viewing as {author}: a read-only demo, which writes nothing"
                              if S.read_only() else
@@ -847,7 +891,8 @@ ABOUT = ("symbion is a notebook and ticket registry for one project, shared by y
 # The sidebar's places: (label, path, Material icon).
 _PLACES = (("Summary", "/", "dashboard"), ("All entries", "/notes", "notes"),
            ("Targets", "/targets", "my_location"), ("Tags", "/tags", "tag"),
-           ("Arcs", "/arcs", "linear_scale"), ("Docs", "/docs", "description"))
+           ("Arcs", "/arcs", "linear_scale"), ("Docs", "/docs", "description"),
+           ("Map", "/map", "view_quilt"))
 
 
 def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
@@ -969,11 +1014,16 @@ def _other_stores(ctx) -> None:
                 ui.label(servers.name(path))
 
 
-def _search_box(q: str, keep: dict) -> None:
+def _search_box(q: str, keep: dict, *, cards: bool = True, to=None) -> None:
     """Typing filters the cards on this page, in the browser; Enter searches
     the whole store (the user, 2026-10-01), and so does a pause once the
-    filter hides every card (2026-10-05)."""
-    box = ui.input(placeholder="Filter · Enter searches all", value=q) \
+    filter hides every card (2026-10-05), on a page of entry cards only
+    (2026-10-29). `to` maps the words to the URL of a page that narrows
+    itself by them, as the map does: there typing filters nothing."""
+    narrows = to is not None
+    to = to or (lambda text: href(**{**keep, "q": text}))
+    box = ui.input(placeholder="Search · Enter narrows the page" if narrows
+                   else "Filter · Enter searches all", value=q) \
         .props('dense outlined clearable aria-label="search"').classes("sb-search") \
         .mark("search")
     with box.add_slot("prepend"):
@@ -984,7 +1034,7 @@ def _search_box(q: str, keep: dict) -> None:
     def _go(e):
         # The field's own text: the key can reach the server before the value.
         text = e.args if isinstance(e.args, str) else box.value
-        ui.navigate.to(href(**{**keep, "q": (text or "").strip() or None}))
+        ui.navigate.to(to((text or "").strip() or None))
 
     def _expand(e):
         # The page that shows this search can hide all its cards: an id hit's
@@ -992,12 +1042,17 @@ def _search_box(q: str, keep: dict) -> None:
         if (e.args if isinstance(e.args, str) else "").split() != q.split():
             _go(e)
 
-    box.on("update:value", _expand, js_handler="(v) => sbFilter(v, emit)")
+    if cards and not narrows:
+        box.on("update:value", _expand, js_handler="(v) => sbFilter(v, emit)")
+    elif not narrows:
+        box.on("update:value", js_handler="(v) => sbFilter(v)")
     box.on("keydown.enter", _go, js_handler="(e) => emit(e.target.value)")
-    box.tooltip("typing filters this page, and searches the store when nothing here "
-                "matches; Enter searches the store: every word, in any case, in body, "
-                'target, checked, result, refs or tags; a "quoted phrase" as one word; '
-                "or an entry id")
+    words = ('every word, in any case, in body, target, checked, result, refs or tags; '
+             'a "quoted phrase" as one word')
+    box.tooltip(f"Enter narrows this page to the entries that hold {words}" if narrows else
+                "typing filters this page" +
+                (", and searches the store when nothing here matches" if cards else "") +
+                f"; Enter searches the store: {words}; or an entry id")
 
 
 # Seconds between reads of the store's git state for the two buttons.

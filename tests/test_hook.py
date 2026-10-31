@@ -582,3 +582,46 @@ def test_a_gotcha_line_says_its_age_its_files_churn_and_how_to_retire_it(git_rep
     assert re.search(r"is on file:other\.py \(written [-\d]+ [:\d]+Z\): other\.py trap", said), said
     assert f"(`symbion show {tails['other.py']}` prints all of it; if it no longer holds: " \
            f"`symbion supersede {tails['other.py']} --add-tag retired`)" in said, said
+
+
+def test_a_gotcha_line_fired_by_a_ref_names_the_ref_and_counts_its_file(git_repo, tmp_path):
+    """A call that named a row's ref got "is on <target>" and the target's
+    churn, so the line read as misfiled (dogfood, 2026-10-30). A ref keeps no
+    blob, so its count starts at the row's first write."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    (s / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n')
+    for f in ("serve.py", "other.py"):
+        (git_repo / f).write_text("v1\n")
+    past = {**os.environ, "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
+            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z"}
+    _git(git_repo, "add", "-A")
+    subprocess.run(["git", "-C", str(git_repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "files"], check=True, capture_output=True, env=past)
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
+    r = subprocess.run([str(Path(SYMBION_BIN) / "symbion"), "add", "note", "--target",
+                        "file:serve.py", "--ref", "file:other.py", "--tag", "gotcha",
+                        "--body", "shared trap"], cwd=git_repo, capture_output=True, text=True,
+                       env={**env, "SYMBION_NOW": "2026-01-10T00:00:00+00:00"})
+    assert r.returncode == 0, r
+    for v in ("v2\n", "v3\n"):
+        (git_repo / "other.py").write_text(v)
+        _git(git_repo, "add", "-A")
+        _git(git_repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", v)
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env,
+                       input=json.dumps({"session_id": "s1", "hook_event_name": "SessionStart"}))
+    assert r.returncode == 0, r
+
+    def line(f, sid):
+        return _touch(env, {"session_id": sid, "tool_name": "Read",
+                            "tool_input": {"file_path": f"{git_repo}/{f}"}})
+
+    said = line("other.py", "s1")
+    assert re.search(r"is on file:serve\.py and refers to file:other\.py \(written [^;)]+; "
+                     r"other\.py has changed in 2 commits since\): shared trap", said), said
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env,
+                       input=json.dumps({"session_id": "s2", "hook_event_name": "SessionStart"}))
+    assert r.returncode == 0, r
+    said = line("serve.py", "s2")
+    assert re.search(r"is on file:serve\.py \(written [^;)]+\): shared trap", said), \
+        "the target's own line: no ref named, and serve.py has not changed"

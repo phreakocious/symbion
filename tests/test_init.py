@@ -51,20 +51,84 @@ def _summary(tmp_path, capsys):
     return text, json.loads(capsys.readouterr().out)
 
 
-def test_init_links_the_user_skill_and_writes_nothing_into_the_project(repo, tmp_path, capsys):
-    """Per-project copies re-staled every adopter on every SKILL.md edit
-    (2026-09-23/24). init links the package's skill dir once per user, and a
-    link into the install is current by construction."""
+def test_init_on_claude_code_links_and_registers_nothing(repo, tmp_path, capsys):
+    """On Claude Code the plugin carries the skill and the hooks (spec
+    2026-10-30), so init makes the store and wires nothing by hand: no skill
+    link, no settings.json, and nothing in the project."""
     assert run("init", "--yes", store_dir=tmp_path / "store") == 0
-    link = _home() / ".claude/skills/symbion"
-    assert link.resolve() == Path(str(SKILL_DIR)).resolve()  # Windows may use a junction
-    assert (link / "SKILL.md").read_text() == (SKILL_DIR / "SKILL.md").read_text()
+    assert not (_home() / ".claude").exists()
     assert not (repo / ".claude").exists() and not (repo / "hooks").exists()
-    settings = json.loads((_home() / ".claude/settings.json").read_text())
-    cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-    assert cmd == 'sh "$HOME/.claude/skills/symbion/session_start.sh"'
+    assert cli.PLUGIN_INSTALL == "/plugin install symbion --marketplace phreakocious/symbion"
     out = capsys.readouterr().out
-    assert f"linked {link}" in out and f"wrote {_home() / '.claude/settings.json'}" in out
+    assert (f"note: on Claude Code the symbion plugin carries the skill and the hooks: "
+            f"{cli.PLUGIN_INSTALL}, then /symbion:setup") in out, out
+
+
+def test_init_leaves_out_the_install_note_where_the_plugin_is_enabled(repo, tmp_path, capsys):
+    """A machine with the plugin enabled was told to install it (2026-10-30).
+    The user's settings.json enables it as `symbion@<marketplace>`."""
+    settings = _home() / ".claude/settings.json"
+    settings.parent.mkdir(parents=True)
+    for on, told in ((True, False), (False, True)):
+        settings.write_text(json.dumps({"enabledPlugins": {"symbion@symbion": on}}))
+        assert run("init", "--yes", store_dir=tmp_path / "store") == 0
+        assert (cli.PLUGIN_INSTALL in capsys.readouterr().out) is told, (on, told)
+
+
+OLD_START ={"matcher": "startup|resume|clear|compact", "hooks": [
+    {"type": "command", "command": 'sh "$HOME/.claude/skills/symbion/session_start.sh"'}]}
+OLD_GOTCHA = {"matcher": "Read|Edit|Write|NotebookEdit|Bash", "hooks": [
+    {"type": "command", "command": 'sh "$HOME/.claude/skills/symbion/gotchas.sh"'}]}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a symlink needs Developer Mode on Windows")
+def test_init_names_an_old_claude_link_and_hook_beside_the_plugin(repo, tmp_path, capsys):
+    """An install from before the plugin keeps working beside it, doubled: two
+    skills, two summaries, two lines per gotcha. init names each old piece and
+    how to remove it, and removes none: settings.json is the user's."""
+    link = _home() / ".claude/skills/symbion"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(Path(str(SKILL_DIR)), target_is_directory=True)
+    settings = _home() / ".claude/settings.json"
+    text = json.dumps({"hooks": {"SessionStart": [OLD_START], "PostToolUse": [OLD_GOTCHA],
+                                 "PostToolUseFailure": [OLD_GOTCHA]}})
+    settings.write_text(text)
+    assert run("init", "--yes", store_dir=tmp_path / "store") == 0
+    out = capsys.readouterr().out
+    assert (f"note: the plugin replaces {link}; with both, the agent gets the skill twice: "
+            f"remove the link with `rm {link}`") in out, out
+    assert (f"note: the plugin replaces the symbion SessionStart hook in {settings}; with "
+            f"both, each session shows the summary twice: delete that entry from "
+            f"hooks.SessionStart") in out, out
+    for event in ("PostToolUse", "PostToolUseFailure"):
+        assert (f"note: the plugin replaces the symbion {event} hook in {settings}; with "
+                f"both, each session shows each gotcha twice: delete that entry from "
+                f"hooks.{event}") in out, out
+    assert link.is_symlink() and settings.read_text() == text
+
+
+def test_init_names_a_skill_dir_that_is_not_its_link(repo, tmp_path, capsys):
+    mine = _home() / ".claude/skills/symbion"
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text("mine")
+    assert run("init", "--yes", store_dir=tmp_path / "store") == 0
+    assert (mine / "SKILL.md").read_text() == "mine" and not mine.is_symlink()
+    assert (f"note: the plugin replaces {mine}; with both, the agent gets the skill twice: "
+            f"it is a directory, not symbion's link, so move it aside if it holds an old "
+            f"copy of the skill") in capsys.readouterr().out
+
+
+def test_merge_hook_merges_nothing_for_claude_code(repo, tmp_path, capsys):
+    settings = _home() / ".claude/settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{}")
+    store_dir = tmp_path / "store"
+    assert run("init", "--yes", store_dir=store_dir) == 0
+    capsys.readouterr()
+    assert run("init", "--merge-hook", store_dir=store_dir) == 0
+    assert ("note: --merge-hook merges nothing for Claude Code, whose hooks come with the "
+            "plugin") in capsys.readouterr().out
+    assert settings.read_text() == "{}"
 
 
 def test_init_rerun_keeps_the_link_the_registration_and_the_toml(repo, tmp_path, capsys):
@@ -89,12 +153,12 @@ def test_init_links_by_junction_where_windows_refuses_a_symlink(repo, tmp_path, 
         raise OSError(22, "A required privilege is not held by the client", None, 1314)
     monkeypatch.setattr(Path, "symlink_to", refuse)
     store = tmp_path / "store"
-    assert run("init", "--yes", store_dir=store) == 0
-    link = _home() / ".claude/skills/symbion"
+    assert run("init", "--yes", "--agent", "codex", store_dir=store) == 0
+    link = _home() / ".agents/skills/symbion"
     assert not link.is_symlink() and link.resolve() == Path(str(SKILL_DIR)).resolve()
     assert (link / "SKILL.md").read_text() == (SKILL_DIR / "SKILL.md").read_text()
     capsys.readouterr()
-    assert run("init", "--yes", store_dir=store) == 0
+    assert run("init", "--yes", "--agent", "codex", store_dir=store) == 0
     out = capsys.readouterr().out
     assert "kept" in out and "linked" not in out and "left alone" not in out, out
 
@@ -141,39 +205,30 @@ def test_init_writes_a_store_readme_once(repo, tmp_path, capsys):
     assert f"wrote {s / 'README.md'}" not in capsys.readouterr().out
 
 
-def test_init_leaves_a_foreign_skill_dir_alone(repo, tmp_path, capsys):
-    mine = _home() / ".claude/skills/symbion"
-    mine.mkdir(parents=True)
-    (mine / "SKILL.md").write_text("mine")
-    assert run("init", "--yes", store_dir=tmp_path / "store") == 0
-    assert (mine / "SKILL.md").read_text() == "mine" and not mine.is_symlink()
-    assert "left alone" in capsys.readouterr().out
-
-
 @pytest.mark.skipif(os.name == "nt", reason="a symlink needs Developer Mode on Windows")
 def test_init_relinks_a_dangling_skill_link(repo, tmp_path, capsys):
     """After a reinstall moved the package, the link dangled: `exists()` is
     False for it, so init named it "not a link" and left it, and the hook
     failed at every session start (audit 2026-10-28)."""
-    link = _home() / ".claude/skills/symbion"
+    link = _home() / ".agents/skills/symbion"
     link.parent.mkdir(parents=True)
     link.symlink_to(tmp_path / "gone", target_is_directory=True)
-    assert run("init", store_dir=tmp_path / "store") == 1      # a plan: changes pending
+    assert run("init", "--agent", "codex", store_dir=tmp_path / "store") == 1   # changes pending
     assert f"will relink {link} -> " in capsys.readouterr().out
-    assert run("init", "--yes", store_dir=tmp_path / "store") == 0
+    assert run("init", "--yes", "--agent", "codex", store_dir=tmp_path / "store") == 0
     assert "left alone" not in capsys.readouterr().out
     assert link.resolve() == Path(str(SKILL_DIR)).resolve()
 
 
 def test_init_prints_the_hook_block_instead_of_merging_user_settings(repo, tmp_path, capsys):
-    settings = _home() / ".claude/settings.json"
+    settings = _home() / ".codex/hooks.json"
     settings.parent.mkdir(parents=True)
     settings.write_text('{"permissions": {"allow": []}}\n')
-    assert run("init", "--yes", store_dir=tmp_path / "store") == 0
+    assert run("init", "--yes", "--agent", "codex", store_dir=tmp_path / "store") == 0
     assert settings.read_text() == '{"permissions": {"allow": []}}\n'
     out = capsys.readouterr().out
     assert "SessionStart" in out and "session_start.sh" in out
-    assert "by typing `! symbion init --merge-hook` at the prompt" in out, out
+    assert "by typing `! symbion init --merge-hook --agent codex` at the prompt" in out, out
 
 
 OTHER = {"matcher": "startup", "hooks": [{"type": "command", "command": "other-status"}]}
@@ -189,17 +244,18 @@ def test_merge_hook_appends_the_entry_and_keeps_the_rest(repo, tmp_path, capsys,
     in the next (2026-10-10). The person types --merge-hook instead: it merges
     without --yes, since the flag asks for that one change."""
     store_dir = tmp_path / "store"
-    assert run("init", "--yes", store_dir=store_dir) == 0      # everything but the hook
-    settings = _home() / ".claude/settings.json"
+    codex = ("--agent", "codex")
+    assert run("init", "--yes", *codex, store_dir=store_dir) == 0      # everything but the hook
+    settings = _home() / ".codex/hooks.json"
     settings.write_text(json.dumps(before, ensure_ascii=False), encoding="utf-8")
     settings.chmod(0o600)
     capsys.readouterr()
-    assert run("init", "--merge-hook", store_dir=store_dir) == 0
+    assert run("init", "--merge-hook", *codex, store_dir=store_dir) == 0
     out = capsys.readouterr().out
     assert f"merged the symbion SessionStart hook into {settings}" in out
     assert out.splitlines()[-1] == "nothing else to change", out
     after = json.loads(settings.read_text(encoding="utf-8"))
-    assert after["hooks"]["SessionStart"][-1] == cli._hook_entry(cli._HOOK_COMMAND)
+    assert after["hooks"]["SessionStart"][-1] == cli._codex_hook_entry(_home() / ".agents/skills/symbion")
     assert {k: v for k, v in after.items() if k != "hooks"} == \
         {k: v for k, v in before.items() if k != "hooks"}
     assert after["hooks"]["SessionStart"][:-1] == ((before.get("hooks") or {})
@@ -207,53 +263,17 @@ def test_merge_hook_appends_the_entry_and_keeps_the_rest(repo, tmp_path, capsys,
     if os.name != "nt":
         assert settings.stat().st_mode & 0o777 == 0o600
     raw = settings.read_bytes()
-    assert run("init", "--merge-hook", store_dir=store_dir) == 0
+    assert run("init", "--merge-hook", *codex, store_dir=store_dir) == 0
     assert f"kept hook in {settings}" in capsys.readouterr().out
     assert settings.read_bytes() == raw, "registered already: written again"
 
 
-def test_init_registers_the_gotcha_hook_beside_the_session_hook(repo, tmp_path, capsys):
-    """A trap on a file reaches a session through a hook after each tool call
-    that can name the file (gotchas.sh), and after each that fails, which
-    PostToolUse never sees (2026-10-13). A new settings file gets all three
-    hooks. One that lacks a gotcha hook, as every install before it does,
-    hears which is missing, and --merge-hook adds it."""
-    store_dir = tmp_path / "store"
-    assert run("init", "--yes", store_dir=store_dir) == 0
-    settings = _home() / ".claude/settings.json"
-    hooks = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
-    assert hooks["PostToolUse"] == hooks["PostToolUseFailure"] == [cli._gotcha_entry()]
-    assert (resources.files("symbion") / "data" / "skill" / "gotchas.sh").is_file()
-    settings.write_text(json.dumps({"theme": "dark"}))
-    capsys.readouterr()
-    assert run("init", "--yes", store_dir=store_dir) == 0
-    out = capsys.readouterr().out
-    assert out.count("does not register") == 3 and out.count("An agent whose edit") == 1, out
-    settings.write_text(json.dumps({"hooks": {k: hooks[k] for k in ("SessionStart",
-                                                                    "PostToolUse")}}))
-    assert run("init", "--yes", store_dir=store_dir) == 0
-    out = capsys.readouterr().out
-    assert f"kept hook in {settings}" in out and f"kept PostToolUse hook in {settings}" in out
-    assert out.count("does not register") == 1, out
-    assert "does not register the symbion PostToolUseFailure hook" in out, out
-    # Its last line read `nothing to change`, and an upgrade stopped there
-    # with the hook unregistered (2026-10-12).
-    assert run("init", store_dir=store_dir) == 1
-    assert capsys.readouterr().out.splitlines()[-1] == (
-        "the symbion PostToolUseFailure hook is not registered: run `symbion init --merge-hook`")
-    assert run("init", "--merge-hook", store_dir=store_dir) == 0
-    assert f"merged the symbion PostToolUseFailure hook into {settings}" in capsys.readouterr().out
-    assert json.loads(settings.read_text(encoding="utf-8"))["hooks"] == hooks
-    assert run("init", "--merge-hook", store_dir=store_dir) == 0
-    assert f"kept PostToolUseFailure hook in {settings}" in capsys.readouterr().out
-
-
 @pytest.mark.parametrize("text", ["{ not json", '{"hooks": {"SessionStart": {}}}'])
 def test_merge_hook_refuses_a_file_it_cannot_read_and_leaves_it(repo, tmp_path, capsys, text):
-    settings = _home() / ".claude/settings.json"
+    settings = _home() / ".codex/hooks.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(text)
-    assert run("init", "--merge-hook", store_dir=tmp_path / "store") == 1
+    assert run("init", "--merge-hook", "--agent", "codex", store_dir=tmp_path / "store") == 1
     err = capsys.readouterr().err
     assert f"{settings} cannot be read" in err and "left it unchanged" in err, err
     assert settings.read_text() == text
@@ -262,14 +282,14 @@ def test_merge_hook_refuses_a_file_it_cannot_read_and_leaves_it(repo, tmp_path, 
 def test_merge_hook_waits_for_the_skill_link_the_hook_runs(repo, tmp_path, capsys):
     """The hook runs session_start.sh through the skill link: merged before
     the link exists, it fails at every session start in every project."""
-    settings = _home() / ".claude/settings.json"
+    settings = _home() / ".codex/hooks.json"
     settings.parent.mkdir(parents=True)
     settings.write_text("{}")
     store_dir = tmp_path / "store"
-    assert run("init", "--merge-hook", store_dir=store_dir) == 1
-    assert "run `symbion init --yes --merge-hook`" in capsys.readouterr().err
+    assert run("init", "--merge-hook", "--agent", "codex", store_dir=store_dir) == 1
+    assert "run `symbion init --yes --merge-hook --agent codex`" in capsys.readouterr().err
     assert settings.read_text() == "{}"
-    assert run("init", "--yes", "--merge-hook", store_dir=store_dir) == 0
+    assert run("init", "--yes", "--merge-hook", "--agent", "codex", store_dir=store_dir) == 0
     assert cli._hook_registered(settings)
 
 
@@ -290,22 +310,44 @@ def test_init_labels_the_pointer_by_what_git_will_take(repo, tmp_path, capsys):
     assert "keep it out of git" not in out
 
 
-def test_summary_points_at_the_user_skill_before_a_write(repo, tmp_path, capsys):
+def test_summary_points_at_the_user_skill_before_a_write(repo, tmp_path, capsys, monkeypatch):
     """After bootstrap, agents learned symbion from `--help` and guesses:
     later sessions rarely loaded SKILL.md or ran `schema` (2026-09-24). The
-    hook prints summary, so the pointer
-    reaches every session; it names the skill only where it is linked."""
+    hook prints summary, so the pointer reaches every session. Under the
+    plugin's hook (CLAUDE_PLUGIN_ROOT, measured in its environment by the
+    spike) it names the plugin's skill, which fills the schema in; else a
+    linked skill; with neither, nothing."""
     store.ensure_store(tmp_path / "store")
     run("add", "note", "--target", "project", store_dir=tmp_path / "store")
     text, d = _summary(tmp_path, capsys)        # an empty store has FIRST_CONTACT instead
     assert "SKILL.md" not in text and d["skill"] is None
-    run("init", "--yes", store_dir=tmp_path / "store")
+    run("init", "--yes", "--agent", "codex", store_dir=tmp_path / "store")
     capsys.readouterr()
     text, d = _summary(tmp_path, capsys)
-    assert d["skill"] == "~/.claude/skills/symbion/SKILL.md"
+    assert d["skill"] == "~/.agents/skills/symbion/SKILL.md"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path / "plugin"))
+    text, d = _summary(tmp_path, capsys)
+    assert d["skill"] == "symbion:symbion"
     assert text.splitlines()[-1] == ("  before a write: load the symbion skill "
-                                     "(~/.claude/skills/symbion/SKILL.md); "
+                                     "(symbion:symbion); "
                                      "`symbion schema` lists this store's kinds"), text
+
+
+def test_summary_in_a_claude_shell_names_the_plugin_skill(repo, tmp_path, capsys, monkeypatch):
+    """With the plugin on and the old link gone, a bare `summary` in Claude
+    Code's shell named the Codex link, the first link that exists (2026-10-30)."""
+    store.ensure_store(tmp_path / "store")
+    run("add", "note", "--target", "project", store_dir=tmp_path / "store")
+    run("init", "--yes", "--agent", "codex", store_dir=tmp_path / "store")
+    settings = _home() / ".claude/settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"enabledPlugins": {"symbion@symbion": True}}))
+    monkeypatch.setenv("CLAUDECODE", "1")
+    capsys.readouterr()
+    assert _summary(tmp_path, capsys)[1]["skill"] == "symbion:symbion"
+    # Codex's hook names its reader; a Codex started from Claude Code inherits CLAUDECODE.
+    monkeypatch.setenv("SYMBION_AUTHOR", "codex")
+    assert _summary(tmp_path, capsys)[1]["skill"] == "~/.agents/skills/symbion/SKILL.md"
 
 
 import tomllib
@@ -537,10 +579,8 @@ def test_init_without_yes_lists_each_change_and_makes_none(repo, tmp_path, capsy
     s = repo.parent / "other-notes"
     assert run("init", store_dir=s) == 1
     out = capsys.readouterr().out
-    link, settings = _home() / ".claude/skills/symbion", _home() / ".claude/settings.json"
     for line in (f"will create {s}", f"will write {s / 'symbion.toml'}",
                  f"will write {s / 'README.md'}",
-                 f"will link {link} -> ", f"will write {settings}",
                  f"will write {repo / '.symbion'} -> ../other-notes"):
         assert line in out, out
     assert out.splitlines()[-1] == "nothing written: re-run with --yes to make these changes"

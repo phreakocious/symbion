@@ -49,9 +49,9 @@ A kind is a label on three bits, and the bits are all symbion knows:
   A supersede keeps the stamp: it corrects the record of that run, and a new
   run is a new entry.
 - **`status` + `verdict`**: a pre-registration. It reads `pending` until
-  `resolve --result` closes it, stamped at the commit it was judged at. Its
-  body and `--checked` as registered are fixed: a supersede may only add
-  below them.
+  `resolve --result` closes it, stamped at the commit it was judged at, or
+  with `--external` at the time. Its body and `--checked` as registered are
+  fixed: a supersede may only add below them.
 - No bits: a plain entry. `symbion context` with no target lists every plain
   entry; `supersede <id> --add-tag retired` takes one out of it, and out of the
   gotcha hook.
@@ -160,10 +160,10 @@ under the store's `docs/`; the entry names it by its path there
 --grep` finds an entry before you write its twin.
 
 A trap, such as a test that passes alone and fails in its file's run or a step
-that must come before an edit, goes on its file tagged `gotcha`: in Claude Code,
-the first call in each session or subagent that names the file prints its first
-200 characters, and its first edit of the file prints them again, so the trap
-and its fix fit in them. One trap is one entry; a how-to is a plain note.
+that must come before an edit, goes on its file tagged `gotcha`: in Claude Code
+and Codex, the first call in each session or subagent that names the file prints
+its first 200 characters, and its first edit of the file prints them again, so
+the trap and its fix fit in them. One trap is one entry; a how-to is a plain note.
 
 A `check` reaches no open view, so a running job also needs a `task` due at
 its end, resolved with the result. A result the user reports from this tree
@@ -197,7 +197,7 @@ beside this file.
 
 The store is the project's one open list. A session ends when the user says
 so, or, in a run the user left to you, when you judge the work done. Its wrap
-(`/symbion wrap`, or any tool's wrap) follows `wrap.md`, beside this file.
+(`/symbion:wrap`, or any tool's wrap) follows `wrap.md`, beside this file.
 
 ## Bugs in symbion
 

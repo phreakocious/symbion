@@ -41,7 +41,7 @@ def test_at_rest_the_actions_are_the_ones_the_top_bar_would_show(repo, tmp_path)
     ctx = api.resolve(str(tmp_path))
     g = _groups(ctx, "")
     assert [r["text"] for r in g["go to"]["rows"]] == \
-        ["Summary", "All entries", "Targets", "Tags", "Arcs", "Docs"]
+        ["Summary", "All entries", "Targets", "Tags", "Arcs", "Docs", "Map"]
     assert [(r["text"], r["click"]) for r in g["do"]["rows"]] == \
         [("New entry", ".sb-new"), ("Keyboard shortcuts", ".sb-keys"),
          ("How symbion works", ".sb-help")]

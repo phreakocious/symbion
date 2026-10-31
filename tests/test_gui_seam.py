@@ -35,12 +35,14 @@ ALLOWED_STORE_READS = {
     "exists", "newest_first", "written_at", "shown", "appended", "stamp_sha", "unholdable",
     "notes_path", "arcs_path", "id_tail", "pending_rows", "with_bases", "entries", "Note", "Arc",
     "Target",
+    "stored_names",                              # /object reads a stored name as typed
     "STATUSES", "BUILTIN_TARGET_TYPES",
     "UndoRefused", "undo_words",                 # api.undo's refusal, and its words
     "RefsDropped",                               # api.supersede's refusal under keep_refs
     "Twin",                                      # api.add's refusal of an uncommitted twin
     "undoable", "note_from_dict",                # the undo button's read, and its dialog's rows
     "now_shown",                                 # the clock, which SYMBION_NOW can stop
+    "zone",                                      # the zone `shown` prints in: the map's weeks
     "read_only", "ReadOnly",                     # serve --read-only, and its refusal
     "Untrusted",                                 # a pulled symbion.toml's refusal
     "read_side", "NoSide",                       # a shared store's reader, and a write's refusal

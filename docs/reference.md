@@ -164,7 +164,8 @@ where two separate adds would store both.
   and a check on no repo's object, or a catalog type that is no repo's, is
   refused there. The
   summary's `repos in <store>:` line names the store, marks where you stand,
-  and gives each other repo's path from the cwd. `file:PATH` is read from
+  gives each other repo's path from the cwd, and marks a repo not on this
+  machine. `file:PATH` is read from
   where you stand; `REPO:PATH` from that repo's root.
 - **Files:** `notes.jsonl` (the entries and their versions), `arcs.jsonl`,
   `symbion.toml`, and the
@@ -319,6 +320,13 @@ variable, or an undefined name, fails it. `.venv/bin/python -m ruff check src
 tests` runs the same check, and `--fix` clears what it can. ruff has no OpenBSD
 wheel, so `[test]` leaves it out there and the test skips.
 
+The GUI's tests drive its pages with NiceGUI's `user` fixture, which runs no
+browser script. An entry's card is one element (`notes.Card`), which
+`src/symbion/gui/card.js` draws from its `card` prop, so the fixture finds no
+chip or button inside it. `tests/_cards.py` reads them from the prop, by the
+marker each part carries, and presses them through the card's `act` event. What
+the browser draws, and its tooltips, need a check in a browser.
+
 To make the clone the `symbion` on PATH, link the venv's script into any
 directory on PATH, `ln -s "$PWD/.venv/bin/symbion" ~/.local/bin/symbion`, or
 install it with `pipx install -e /path/to/symbion` (or `uv tool install -e`).
@@ -327,7 +335,13 @@ The specs in `docs/superpowers/specs/` are dated design records: why each
 decision was made. `SKILL.md` (in `src/symbion/data/skill/`, beside
 `adoption.md` and the hook) is what an agent reads; keep it short and its
 footgun list honest. If this clone is your installed symbion (an editable
-install, then `symbion init --yes`), `~/.claude/skills/symbion` and, with
-`--agent codex`, `~/.agents/skills/symbion` or, with `--agent hermes`,
-`~/.hermes/skills/symbion` link to that directory, so an edit there reaches every session on the machine at once, as
-an edit to `src/` reaches every `symbion` call.
+install), the plugin's stub and hooks, in Claude Code and in Antigravity, reach
+that directory through `symbion skill`, and with `symbion init --yes --agent
+codex` or `--agent hermes`, `~/.agents/skills/symbion` or
+`~/.hermes/skills/symbion` link to it. So an edit there reaches every session on
+the machine at once, as an edit to `src/` reaches every `symbion` call. To try a
+change to `plugin/` itself, install it from the clone: `/plugin install symbion
+--marketplace /path/to/symbion`. A path source runs the plugin in place. agy
+copies it instead (`agy plugin install /path/to/symbion/plugin`), so install
+again after each change. `plugin/hooks.json` is agy's, in agy's format, and
+`plugin/hooks/hooks.json` is Claude Code's: each reads only its own.

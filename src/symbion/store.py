@@ -1440,9 +1440,11 @@ SESSIONS_FILE = "symbion-sessions"
 
 def session_key() -> str | None:
     """The agent session this process runs in, when its runtime names one.
-    Codex first: one launched from Claude Code inherits both keys, and the
-    innermost agent is the one writing (as in api.author_default)."""
-    return os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    Codex and Antigravity before Claude Code: one launched from Claude Code
+    inherits its key, and the innermost agent is the one writing (as in
+    api.author_default)."""
+    return (os.environ.get("CODEX_THREAD_ID") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+            or os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
 
 
 _SESSIONS_PATHS: dict = {}
@@ -2358,6 +2360,15 @@ def archive_arc(store, id, _clock=None) -> Arc:
     clock = _clock or _utcnow
     return _edit_arc(store, id, lambda a: a if a.archived else replace(
         a, archived=True, archived_at=clock().isoformat(timespec="seconds")))
+
+
+def unarchive_arc(store, id) -> Arc:
+    """Back on the summary: `undo` takes an archive back only before a commit."""
+    return _edit_arc(store, id, lambda a: replace(a, archived=False, archived_at=None))
+
+
+def describe_arc(store, id, description) -> Arc:
+    return _edit_arc(store, id, lambda a: replace(a, description=description))
 
 
 # ---- arc membership, progress, seeding ----

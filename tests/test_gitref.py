@@ -41,6 +41,69 @@ def test_a_tree_id_is_rejected_not_stored_as_a_commit(repo):
     assert gitref.canonical_commit(cfg, "HEAD^{tree}") == "HEAD^{tree}"
 
 
+def test_a_commit_shows_as_author_date_parents_message_and_diff(repo, monkeypatch):
+    """The viewer's parts. A name that is not hex runs no git: a target name
+    is typed text, and `--output=PATH` among a log's revisions wrote a file."""
+    cfg = Config(project_root=repo)
+    (repo / "g").write_text("y\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "--author=Ada <ada@example.com>", "-m", "add g\n\nwhy g")
+    author, date, parents, message, diff = gitref.commit_show(
+        cfg, _run(repo, "rev-parse", "HEAD"))
+    assert (author, message) == ("Ada", "add g\n\nwhy g")
+    assert parents == [_run(repo, "rev-parse", "HEAD~1")]
+    assert date[:4].isdigit() and "T" in date
+    assert diff.startswith("diff --git a/g b/g")
+    assert gitref.commit_show(cfg, _run(repo, "rev-parse", "HEAD"), patch=False)[4] == ""
+    assert gitref.commit_show(cfg, "deadbeef") is None
+    calls = []
+    monkeypatch.setattr(gitref, "_git", lambda *a, **k: calls.append(a))
+    assert gitref.commit_show(cfg, "--output=x") is None
+    assert gitref.forge_links(cfg, "--output=x") == {}
+    assert calls == []
+
+
+@pytest.mark.parametrize("url, page, prs", [
+    ("git@github.com:o/r.git", "https://github.com/o/r/commit/S",
+     "https://github.com/o/r/pulls?q=is%3Apr+S"),
+    ("ssh://git@gitlab.com:2222/g/sub/r.git", "https://gitlab.com/g/sub/r/-/commit/S", None),
+    ("https://codeberg.org/o/r/", "https://codeberg.org/o/r/commit/S", None),
+    ("git@bitbucket.org:o/r.git", "https://bitbucket.org/o/r/commits/S", None),
+    ("git@git.sr.ht:~o/r", "https://git.sr.ht/~o/r/commit/S", None),
+    ("git@example.com:o/r.git", None, None),
+])
+def test_a_forge_link_is_built_from_origin(repo, url, page, prs):
+    cfg = Config(project_root=repo)
+    sha = _run(repo, "rev-parse", "HEAD")
+    _run(repo, "remote", "add", "origin", url)
+    _run(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    links = gitref.forge_links(cfg, sha)
+    assert links.get("commit") == (page and page.replace("S", sha))
+    assert links.get("prs") == (prs and prs.replace("S", sha))
+
+
+def test_a_forge_link_never_carries_the_remotes_user_or_token(repo, monkeypatch):
+    cfg = Config(project_root=repo)
+    sha = _run(repo, "rev-parse", "HEAD")
+    monkeypatch.setitem(gitref.FORGES, "example.com", ("{base}/commit/{sha}", None))
+    _run(repo, "remote", "add", "origin", "https://user:token@example.com/o/r.git")
+    _run(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    assert gitref.forge_links(cfg, sha) == {"host": "example.com",
+                                            "commit": f"https://example.com/o/r/commit/{sha}"}
+
+
+def test_a_commit_no_remote_branch_holds_has_no_forge_link(repo):
+    """Its page would 404: a commit not pushed yet, or with no origin."""
+    cfg = Config(project_root=repo)
+    first, head = _run(repo, "rev-parse", "HEAD~1"), _run(repo, "rev-parse", "HEAD")
+    assert gitref.forge_links(cfg, head) == {}
+    _run(repo, "remote", "add", "origin", "git@github.com:o/r.git")
+    _run(repo, "update-ref", "refs/remotes/origin/main", first)
+    assert gitref.forge_links(cfg, head) == {}
+    assert gitref.forge_links(cfg, first)["commit"].endswith(first)
+    assert gitref.forge_links(cfg, "--contains") == {}
+
+
 def test_clean_check_at_head_is_current(repo):
     cfg = Config(project_root=repo)
     prov = gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])

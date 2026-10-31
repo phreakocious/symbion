@@ -8,21 +8,24 @@ touches a deleted client (RuntimeError 'client has been deleted').
 from __future__ import annotations
 
 import functools
+import hashlib
 import html
 import itertools
 import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from difflib import SequenceMatcher
 from types import SimpleNamespace
 from typing import NamedTuple
 from urllib.parse import quote
 
+from fastapi.responses import PlainTextResponse
 from markdown_it.token import Token
 from nicegui import app, run, ui
+from nicegui.element import Element
 from nicegui.elements.mixins.value_element import ValueElement
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
@@ -32,6 +35,7 @@ from pygments.util import ClassNotFound
 from .. import api, catalog, gitref, term
 from .. import summary as summ
 from .. import store as S
+from . import diffview
 from .filters import href
 
 # A checkout's markdown file, in the viewer, is read by ui.markdown (markdown2).
@@ -290,21 +294,6 @@ def target_href(type: str, name: str | None) -> str:
     return f"/object?type={quote(type)}&name={quote(name, safe='')}"
 
 
-def target_link(n) -> None:
-    """Where this note points. Arcs go to their checklist; everything
-    else to the ref-aware object view."""
-    if n.target.type == "project" or not n.target.name:
-        # `project` has no object page -- /object redirects when name is empty --
-        # so this is the one row whose target cannot stand in for the note. It
-        # links to the note itself, which is also the only way into a project
-        # note filed under an arc: the checklist shows nothing else.
-        ui.link("project", href(id=n.id)).classes("sb-chip sb-target") \
-            .mark("note-target")
-        return
-    ui.link(f"{n.target.type}: {n.target.name}", target_href(n.target.type, n.target.name)) \
-        .classes("sb-chip sb-target").mark("note-target")
-
-
 def bare(n) -> bool:
     """A row with nothing to say, no body and no verdict: a seeded box. What
     it targets is its whole content, so that leads instead of a blank line."""
@@ -315,32 +304,6 @@ def bare(n) -> bool:
 def _arc_names(store_dir: str, _stamp) -> dict:
     """Arc id -> name. `_stamp` is arcs.jsonl's mtime and size, as `_tails`'s."""
     return {a.id: a.name for a in S.load_arcs(store_dir)}
-
-
-def _headline(url: str, kind: str, text: str, *marks) -> None:
-    with ui.link(target=url).classes("sb-note-open").mark("note-headline", *marks):
-        ui.html(f'<span class="sb-headline-type">{html.escape(kind)}</span>'
-                f'{html.escape(text)}', sanitize=False).classes("sb-note-text")
-
-
-def target_headline(n) -> None:
-    """A bare row's target as its text: the name bright, the type dim before
-    it. It stands in for `target_link`'s chip, so it carries that marker."""
-    if n.target.type == "project" or not n.target.name:
-        _headline(href(id=n.id), "", "project", "note-target")
-    else:
-        _headline(target_href(n.target.type, n.target.name), n.target.type,
-                  n.target.name, "note-target")
-
-
-def arc_headline(ctx, n) -> None:
-    """A bare row on its own object's page: the target is the page, so the
-    arc is what is left to say, by its name."""
-    p = S.arcs_path(ctx.store_dir)
-    st = p.stat() if p.exists() else None
-    name = _arc_names(str(ctx.store_dir), st and (st.st_mtime_ns, st.st_size)) \
-        .get(n.arc_id, n.arc_id)
-    _headline(f"/arc?id={quote(n.arc_id)}", "arc", name)
 
 
 TIP_COMMITS = 8
@@ -378,7 +341,9 @@ def check_tip(cfg, prov, state, distance, at=None) -> str:
     return f"{at}; {since}:\n" + "\n".join(lines) + more
 
 
-def _check_badge(ctx, n, git_head=None) -> None:
+def _check_chip(ctx, n, git_head=None) -> tuple[dict, object, object]:
+    """A check's state chip, what fills its tip on the first hover, and what
+    a click opens: each None where there is none."""
     state, distance = api.verdict_state(ctx.cfg, n, git_head)
     text = f"{state} {distance}" if state in ("behind", "ahead") else state
     # An age with no tip read as vague (the user, 2026-10-07): say what it dates.
@@ -406,23 +371,24 @@ def _check_badge(ctx, n, git_head=None) -> None:
            "ahead": "sb-chip-notable",
            "diverged": "sb-chip-notable", "dangling": "sb-chip-bad",
            "unverifiable": "sb-chip-bad"}[state]
-    chip = ui.label(text).classes(f"sb-chip {cls}").mark("check-state")
+    chip = {"t": text, "c": f"sb-chip {cls}".strip(), "m": "check-state"}
     if fixed_tip:
-        with chip:
-            ui.tooltip(fixed_tip)
-        return
+        return chip | {"tip": fixed_tip}, None, None
     if not S.stamp_sha(n.provenance) or state == "pending":
-        return
+        return chip, None, None
     # Filled on first hover: a `git log` per badge at render time doubled
     # the cost of a board of checks (45 badges: 1.5s to 2.9s).
-    with chip:
-        tip = ui.tooltip("")
+    if state not in ("behind", "ahead"):
+        return chip | {"tip": "", "key": "check"}, \
+            lambda: check_tip(ctx.cfg, n.provenance, state, distance), None
+    return chip | {"tip": "", "key": "check", "open": True}, \
+        lambda: check_tip(ctx.cfg, n.provenance, state, distance) + f"\n{_CLICK[state]}", \
+        lambda: check_dialog(ctx, n, state, distance)
 
-    def _fill():
-        if not tip.text:
-            tip.text = check_tip(ctx.cfg, n.provenance, state, distance)
 
-    chip.on("mouseenter", _fill)
+_CLICK = {"behind": "click: the commits, and what they changed",
+          "ahead": "click: the commits",
+          "since": "click: the commits, and what they changed in the file"}
 
 
 def since_tip(cfg, n) -> str:
@@ -437,31 +403,21 @@ def since_tip(cfg, n) -> str:
             + "\n".join(f"{s[:7]} {subj.get(s, '')}" for s in shas[:TIP_COMMITS]) + more)
 
 
-def _since_chip(ctx, n, since: int) -> None:
-    """Neutral, not a warning: on a busy file nearly every row has one."""
-    chip = ui.label(f"{summ._count(since, 'commit')} since").classes("sb-chip") \
-        .mark("note-since")
-    with chip:
-        tip = ui.tooltip("")
-
-    def _fill():                    # on hover, as the check badge's: a walk per card
-        if not tip.text:
-            tip.text = since_tip(ctx.cfg, n)
-
-    chip.on("mouseenter", _fill)
+def commit_tip(cfg, name) -> str:
+    """A commit chip's tip: the commit's subject, or that this checkout has
+    no such commit."""
+    return next(iter(gitref.subjects(cfg, [name]).values()), "not a commit in this checkout")
 
 
-def due_chip(n, status) -> None:
+def _due(n, status) -> tuple[str, str, str | None]:
     """Words while the row can still fire, the bare date once it cannot: a
-    resolved row is never late."""
+    resolved row is never late. (text, class, tip)."""
     state = S.due_state(n.due) if status == "open" else None
     if state is None:
-        ui.label(f"due {S.shown(n.due)}").classes("sb-chip").mark("note-due")
-        return
+        return f"due {S.shown(n.due)}", "sb-chip", None
     past, days = state
     cls = "sb-chip-bad" if past else "sb-chip-notable" if days <= summ.DUE_DAYS else ""
-    ui.label(summ.due_phrase(state)).classes(f"sb-chip {cls}").tooltip(S.shown(n.due)) \
-        .mark("note-due")
+    return summ.due_phrase(state), f"sb-chip {cls}".strip(), S.shown(n.due)
 
 
 def snippet(body: str, words, n: int = summ.BODY_CHARS) -> str:
@@ -516,21 +472,6 @@ def short_id(note_id: str) -> str:
     """The id's last two parts, as rows cite one another (`735180-a9c`): the
     date and time are already the row's age."""
     return "-".join(note_id.split("-")[-2:])
-
-
-def id_link(n) -> None:
-    """The id's tail, a link to the note alone, and a button that copies the
-    whole id: an agent is told about a row by pasting its id."""
-    ui.link(short_id(n.id), href(id=n.id)).classes("sb-note-meta sb-id") \
-        .mark("note-id").tooltip(f"{n.id}\nthis entry alone")
-
-    def _copy():
-        ui.clipboard.write(n.id)
-        ui.notify(f"copied {n.id}")
-
-    ui.button(icon="content_copy", on_click=_copy, color=None) \
-        .props('flat dense round size=xs aria-label="copy id"').classes("sb-copy") \
-        .tooltip("copy the full id").mark("note-copy-id")
 
 
 # Endings pygments names no lexer for, though one fits (the user, 2026-10-15).
@@ -685,6 +626,26 @@ def file_buttons(path) -> None:
         .tooltip("open in VS Code").mark("file-editor")
 
 
+def forge_buttons(cfg, sha) -> None:
+    """Links to the commit `sha` on its forge, and to the pull requests that
+    hold it (the user, 2026-10-30: "the diff, then jump to it, or its MR/PR");
+    none for a commit no remote branch holds."""
+    links = gitref.forge_links(cfg, sha)
+    # Read-only, a link would name the serving repo's remote, which may be private.
+    ro = S.read_only()
+    for key, icon, tip in (("commit", "public", "the commit on {}"),
+                           ("prs", "call_merge", "pull requests holding it on {}")):
+        if key in links:
+            tip = tip.format(links["host"])
+            b = ui.button(icon=icon, on_click=(lambda t=tip: demo_says(f"opens {t}")) if ro
+                          else None) \
+                .props("flat dense round size=sm color=muted").tooltip(tip).mark(f"forge-{key}")
+            # set, not parsed: the path comes from the remote's URL
+            b._props.update({"aria-label": tip} |
+                            ({} if ro else {"href": links[key], "target": "_blank",
+                                            "rel": "noopener"}))
+
+
 async def _reveal(cmd: list[str]) -> None:
     if demo_says("shows the file on the machine that serves this page"):
         return
@@ -699,34 +660,40 @@ async def _reveal(cmd: list[str]) -> None:
                   type="warning")
 
 
-def viewer(title: str, fill, *, mono: bool = False, reveal=None) -> None:
+def viewer(title: str, fill, *, mono: bool = False, reveal=None, head=None,
+           wide: bool = False) -> None:
     """The file viewer's dialog, opened: `title` and a close button over
     what `fill()` renders. The help opens in it too. `reveal`, a file on
     disk, adds `file_buttons` (the user, 2026-10-16: "is open in finder
-    even a possibility?")."""
+    even a possibility?"). `wide` for a diff, which may read side by side."""
     # The card is what scrolls, so it takes the focus: Quasar's dialog focuses
     # its first [autofocus][tabindex], else its own node, the card's parent,
     # where Page Up/Down scrolled nothing (the user, 2026-10-16).
     with ui.dialog() as dialog, \
-            ui.card().classes("bg-panel sb-md-card").props("autofocus tabindex=-1"):
+            ui.card().classes("bg-panel sb-md-card" + (" sb-diff-card" if wide else "")) \
+                .props("autofocus tabindex=-1"):
         with ui.row(wrap=False).classes("items-center w-full"):
             ui.label(title).classes("sb-subtitle" + (" sb-mono" if mono else ""))
             ui.space()
             if reveal:
                 file_buttons(reveal)
+            if head:
+                head()
             ui.button(icon="close", on_click=dialog.close) \
                 .props('flat dense round size=sm aria-label="close"')
         fill()
     dialog.open()
 
 
-def view_button(ctx, name, label: str = "", ttype=None):
-    """A button that shows the file `name` in a dialog: markdown rendered
-    (the user, 2026-10-02), anything else pygments knows coloured, code
-    most of all (the user, 2026-10-11). None when the viewer cannot show
-    it. Read on the click, so the dialog shows the file as it is then. A
-    shift-click shows a file on disk in the file manager instead (the
-    user, 2026-10-16)."""
+def viewable(ctx, name, ttype=None):
+    """What a button that shows the file `name` in a dialog needs: (icon, tip,
+    click(shift)), or None when the viewer cannot show it. Markdown is
+    rendered (the user, 2026-10-02), anything else pygments knows coloured,
+    code most of all (the user, 2026-10-11). Read on the click, so the dialog
+    shows the file as it is then. A shift-click shows a file on disk in the
+    file manager instead (the user, 2026-10-16)."""
+    if ttype == "commit":
+        return _commit_viewable(ctx, name)
     src = view_path(ctx, name, ttype)
     if src is None:
         return None
@@ -734,9 +701,9 @@ def view_button(ctx, name, label: str = "", ttype=None):
     md = (src[0].name if src[0] else name).lower().endswith(".md")
     revealable = src[0] is not None and _reveal_cmd(src[0]) is not None
 
-    def _click(e):
+    def click(shift: bool):
         path = (view_path(ctx, name, ttype) or (None,))[0]
-        cmd = path and (e.args or {}).get("shiftKey") and _reveal_cmd(path)
+        cmd = path and shift and _reveal_cmd(path)
         return _reveal(cmd) if cmd else _open()
 
     def _open():
@@ -762,12 +729,200 @@ def view_button(ctx, name, label: str = "", ttype=None):
         # a path: its case is its name
         viewer(f"{name}, as on {branch}" if branch else name, fill, mono=True, reveal=path)
 
-    return ui.button(label, icon="article" if md else "code") \
-        .on("click", _click, ["shiftKey"]) \
+    tip = (f"read {name}" + (f", as on {branch}" if branch else "")
+           + (f" · shift-click: {_reveal_label()}" if revealable else ""))
+    return ("article" if md else "code"), tip, click
+
+
+def _commit_viewable(ctx, sha):
+    """`viewable` for a commit: its message and diff in the viewer, and its
+    forge links in the dialog's head. The message wraps. Read on the click,
+    as a file is: a chip renders with no git."""
+    if not sha:
+        return None
+
+    def click(shift: bool):
+        cfg = gitref.commit_cfg(ctx.cfg, sha)
+        got = gitref.commit_show(cfg, sha)
+        if got is None:
+            ui.notify(f"no commit {sha[:12]} in this checkout", type="warning")
+            return
+        author, date, parents, message, diff = got
+        subject, _, body = message.partition("\n")
+
+        def lead():
+            commit_meta(sha, author, date, parents, body)
+        diff_dialog(subject or f"commit {sha[:12]}", diff, lead=lead,
+                    head=lambda: forge_buttons(cfg, sha), mono=False)
+
+    return "difference", f"read commit {sha[:7]}", click
+
+
+def commit_meta(sha, author, date, parents, body) -> None:
+    """Under a commit's subject: who and when, what a merge's diff is
+    against, and the message's body."""
+    # the name only: an email on a page is one more thing a demo publishes
+    ui.label(f"{sha[:12]} · {author} · {S.shown(date)}") \
+        .classes("sb-subtitle sb-mono").mark("commit-meta")
+    if len(parents) > 1:
+        ui.label(f"a merge: the changes it brought onto {parents[0][:7]}, its first parent") \
+            .classes("sb-subtitle").mark("commit-merge")
+    if body.strip("\n"):
+        ui.label(body.strip("\n")).classes("whitespace-pre-wrap").mark("commit-body")
+
+
+# The reader's pick of how a diff reads. The serve sets no storage_secret, so
+# NiceGUI keeps nothing per browser: the toggle sets a cookie, which the next
+# page's request carries, and this page keeps the pick in its client.
+DIFF_COOKIE = "sb-diff"
+_DIFF_IDS = itertools.count()
+
+
+def diff_mode() -> str:
+    """This page's last pick, else the browser's, else unified, as git prints."""
+    client = ui.context.client
+    try:
+        kept = client.request.cookies.get(DIFF_COOKIE)
+    except RuntimeError:            # a client built with no request
+        kept = None
+    mode = client.storage.get(DIFF_COOKIE, kept)
+    return mode if mode in diffview.MODES else "unified"
+
+
+def diff_dialog(title: str, text: str, *, lead=None, head=None, mono: bool = True) -> None:
+    """The viewer, wide, on the diff `text`, with the unified / side-by-side
+    toggle in its head: `lead()` draws what goes above the diff, `head()`
+    buttons beside the toggle. Side by side, the unified drawing comes too:
+    a window too narrow for two sides shows it instead (theme.py)."""
+    files = diffview.parse(text[:VIEW_CHARS])
+    uid = f"sb-d{next(_DIFF_IDS)}"
+    held = {}
+
+    def drawn(mode: str) -> str:
+        if mode != "split":
+            return diffview.render(files, mode, uid)
+        return (f'<div class="sb-diff-wide">{diffview.render(files, mode, uid)}</div>'
+                f'<div class="sb-diff-narrow">{diffview.render(files, "unified", uid + "n")}</div>')
+
+    def pick(e) -> None:
+        ui.context.client.storage[DIFF_COOKIE] = e.value
+        ui.run_javascript(f'document.cookie = "{DIFF_COOKIE}={e.value}; path=/; '
+                          f'max-age=31536000; samesite=lax"')
+        if view := held.get("view"):
+            view.set_content(drawn(e.value))
+
+    def heads() -> None:
+        if files:
+            ui.toggle(diffview.MODES, value=diff_mode(), on_change=pick) \
+                .props("dense no-caps unelevated toggle-color=primary") \
+                .classes("sb-diff-mode").mark("diff-mode")
+        if head:
+            head()
+
+    def fill() -> None:
+        if lead:
+            lead()
+        if not files:
+            ui.label("no changes").classes("sb-subtitle").mark("diff-none")
+            return
+        held["view"] = ui.html(drawn(diff_mode()), sanitize=False) \
+            .classes("w-full").mark("diff-view")
+        if len(text) > VIEW_CHARS:
+            ui.label(f"cut at {VIEW_CHARS:,} characters").classes("sb-subtitle")
+    viewer(title, fill, mono=mono, head=heads, wide=True)
+
+
+LIST_COMMITS = 50
+
+
+def commit_list(ctx, cfg, rows, total: int) -> None:
+    """Commits to click, newest first: each sha a link to its page, its age,
+    its subject on one line, and a button that opens it in the viewer."""
+    with ui.element("div").classes("sb-commits").mark("commit-list"):
+        for sha, date, subject in rows:
+            ui.link(sha[:7], target_href("commit", sha)).classes("sb-commits-sha") \
+                .mark("commit-row")
+            ui.label(ago(date)).classes("sb-commits-age").tooltip(S.shown(date))
+            ui.label(subject).classes("sb-commits-sub").tooltip(subject)
+            view_button(ctx, sha, ttype="commit") or ui.element("span")
+    if total > len(rows):
+        ui.label(f"+{total - len(rows)} more").classes("sb-subtitle").mark("commit-more")
+
+
+def since_dialog(ctx, n) -> None:
+    """A file entry's `N commits since`, opened: the commits, then the file's
+    diff from what the entry saw to the file now, uncommitted edits
+    included, which is what the count compares (gitref.changed_since)."""
+    shas = gitref.changed_since(ctx.cfg, [n])[n.id] or []
+    if not shas:
+        ui.notify(f"no commit has changed {n.target.name} since this entry")
+        return
+    cfg, path = ctx.cfg.for_type(n.target.type), n.target.name
+    base, exact = gitref.since_base(cfg, path, shas[-1], n.target_blob)
+    saw = "as this entry saw it" if exact else \
+        f"as of {base[:7]}, the nearest commit: the entry saw edits no commit holds"
+
+    def lead() -> None:
+        ui.label(f"changed in {summ._count(len(shas), 'commit')} since this entry, "
+                 f"newest first").classes("sb-subtitle")
+        commit_list(ctx, cfg, gitref.commit_rows(cfg, shas, LIST_COMMITS, walk=False), len(shas))
+        ui.label(f"{path}, {saw}, against the file now").classes("sb-subtitle") \
+            .mark("since-base")
+
+    def was() -> None:
+        text = gitref.blob_text(cfg, base, path)
+        if text is None:
+            ui.notify(f"cannot read {path} at {base[:7]}", type="warning")
+            return
+
+        def fill():
+            if path.lower().endswith(".md"):
+                ui.markdown(dark_mermaid(text[:VIEW_CHARS]), extras=FILE_MD_EXTRAS) \
+                    .mark("file-view")
+            else:
+                NoteMarkdown(fenced(text[:VIEW_CHARS], path)).mark("file-view")
+        viewer(f"{path}, {saw}", fill, mono=True)
+
+    def head() -> None:
+        ui.button(icon="history", on_click=was) \
+            .props(f'flat dense round size=sm color=muted aria-label="read {path} {saw}"') \
+            .tooltip(f"read {path} {saw}").mark("since-was")
+    diff_dialog(f"{path} since this entry", gitref.diff_text(cfg, base, "--", f":(literal){path}")
+                or "", lead=lead, head=head)
+
+
+def check_dialog(ctx, n, state: str, distance: int) -> None:
+    """A check's `behind N` or `ahead N`, opened: the commits between its
+    stamp and HEAD, and for `behind`, what they changed, the whole tree."""
+    sha = S.stamp_sha(n.provenance)
+    cfg = gitref.stamp_cfg(ctx.cfg, n.provenance)
+    rows = gitref.commit_rows(cfg, [f"{sha}..HEAD" if state == "behind" else f"HEAD..{sha}"],
+                              LIST_COMMITS)
+
+    def lead() -> None:
+        ui.label(f"stamped at {sha[:7]}; " +
+                 (f"HEAD is {summ._count(distance, 'commit')} past it, newest first"
+                  if state == "behind" else
+                  f"it is {summ._count(distance, 'commit')} past HEAD, newest first")) \
+            .classes("sb-subtitle")
+        commit_list(ctx, cfg, rows, distance)
+    if state == "ahead":
+        viewer(f"commits since HEAD, to {sha[:7]}", lead, mono=True)
+        return
+    diff_dialog(f"since this run, at {sha[:7]}", gitref.diff_text(cfg, sha, "HEAD") or "",
+                lead=lead)
+
+
+def view_button(ctx, name, label: str = "", ttype=None):
+    """`viewable`'s button, or None."""
+    if (v := viewable(ctx, name, ttype)) is None:
+        return None
+    icon, tip, click = v
+    return ui.button(label, icon=icon) \
+        .on("click", lambda e: click(bool((e.args or {}).get("shiftKey"))), ["shiftKey"]) \
         .props("flat dense no-caps color=muted aria-label=read"
                + ("" if label else " round size=xs")) \
-        .tooltip(f"read {name}" + (f", as on {branch}" if branch else "")
-                 + (f" · shift-click: {_reveal_label()}" if revealable else "")).mark("file-open")
+        .tooltip(tip).mark("file-open")
 
 
 def _waits_on_you(n, author, rd: Reading) -> bool:
@@ -775,6 +930,40 @@ def _waits_on_you(n, author, rd: Reading) -> bool:
     other side's question waits on that side's person."""
     return summ.on_side(rd.by_id, n, rd.side) and (n.supersedes is None
                                                    or summ.asks(author, rd.by_id, n))
+
+
+class Card(Element, component="card.js"):
+    """One entry's card, drawn in the browser from one prop (card.js): a
+    card of server elements was about 32 of them, most of a page's cost
+    (measured 2026-10-29). `sources` is the markdown its body pieces were
+    made from: with the prop's words and tips, what `should_see` and the
+    other content filters read, as they read the old card's elements."""
+
+    def __init__(self, card: dict, sources: list) -> None:
+        super().__init__()
+        self._props["card"] = card
+        self._sources = sources
+        if any(p["k"] == "md" and "codehilite" in p["html"] for p in card["main"]):
+            # ponytail: ui.markdown's own sheet by its private method; if it
+            # moves, code in a body loses its colours (the name is its own)
+            css = ui.markdown._generate_codehilite_css()
+            self._props["resource-name"] = \
+                f"codehilite_{hashlib.sha256(css.encode()).hexdigest()[:32]}.css"
+            self.add_dynamic_resource(self._props["resource-name"],
+                                      lambda: PlainTextResponse(css, media_type="text/css"))
+
+    def _displayed_contents(self, *, only_visible: bool) -> list:
+        c = self._props["card"]
+        parts = [*c["main"], *c["foot"], *(v for f in c["foot"] if (v := f.get("view"))),
+                 *(o for p in c["main"] for o in p.get("options", ())),
+                 *(p for p in (c["by"], c["age"]) if p), c["sid"]]
+        return [*self._sources, *(p.get(k) for p in parts for k in ("t", "tip", "html")),
+                *(x for p in c["main"] for x in p.get("items", ()))]
+
+
+def _head(url: str, kind: str, text: str, *marks) -> dict:
+    """A bare row's headline: its target, or on that target's own page, its arc."""
+    return {"k": "head", "m": ["note-headline", *marks], "h": url, "type": kind, "t": text}
 
 
 def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
@@ -797,7 +986,8 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     superseded this one: the card says what it changed, marks the words of a
     changed checked or result, and shows a rewritten body as a diff. `seen` is
     the page's reading of the store, made once: a card makes its own when the
-    page gives none."""
+    page gives none. The card is one `Card`, drawn by card.js from the data
+    built here (the user, 2026-10-29)."""
     def narrow(**kv):
         return href(**{**(base or {}), **kv})
 
@@ -814,75 +1004,50 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     cls = f"sb-note w-full {kind_class(n.kind)}"
     if actions:
         cls += " sb-has-actions" + (" sb-starred" if has_pri else "")
+    main, sources = _card_main(ctx, n, compact, hit, show_target, seams, diff_to)
+    if answering:
+        tip = f"added below the question, as {author}"
+        main.append({"k": "answer", "m": "answer-row", "options": [
+            {"t": o, "m": "answer-option", "icon": "check" if i == 0 else None,
+             "tip": f"“{o}”{', the default' if i == 0 else ''}, {tip}"}
+            for i, o in enumerate(n.options or ())]})
+    elif n.options:
+        # One line, the CLI's: three phrases parted by gaps alone read as one run
+        # of words in a browser shot (2026-10-17).
+        main.append({"k": "options", "m": "options",
+                     "t": f"options: {summ.options_line(n.options)}"})
+    foot, hover, views = _card_foot(ctx, n, status, narrow, show_target, git_head, since)
+    card = {"main": main, "foot": foot, "by": {"t": n.author, "h": narrow(author=n.author)},
+            "age": {"t": ago(n.created_at), "tip": S.shown(n.created_at)},
+            "sid": {"t": short_id(n.id), "h": href(id=n.id), "tip": f"{n.id}\nthis entry alone"},
+            # On the right, after the text: on the left it pushed an open row's
+            # text in past a closed row's (the user, 2026-10-01).
+            "resolve": bool(resolvable), "star": has_pri if actions else None}
     # data-id: the page filter matches a pasted id the card does not print.
-    # Set as one prop: .props() parses its string, and a `:`-prop runs as JS.
-    with ui.element("div").classes(cls + (" sb-resolvable" if resolvable else "")) \
-            .mark("note-row") as card:
-        card._props["data-id"] = n.id
-        with ui.element("div").classes("sb-note-main"):
-            _note_content(ctx, n, compact, hit, show_target, seams, diff_to)
-            if answering:
-                _answer_row(ctx, n, author, refresh)
-            elif n.options:
-                _options_row(n)
-            _note_foot(ctx, n, status, narrow, show_target, git_head, since)
-        # On the right, after the text: on the left it pushed an open row's
-        # text in past a closed row's (the user, 2026-10-01).
-        if resolvable:
-            if n.spec.verdict:
-                # A pre-registration closes with its verdict: the store
-                # refuses a bare resolve, so the button opens the dialog
-                # with the result field rather than showing the refusal.
-                on_resolve = lambda n=n: edit_dialog(ctx, n, refresh, author=author,
-                                                     resolving=True)
-            else:
-                def on_resolve(n=n):
-                    if demo_says("resolves the entry"):
-                        return
-                    with refusal_shown():
-                        api.supersede(ctx, n.id, author=author, status="resolved")
-                        refresh()
-            ui.button(icon="check", on_click=on_resolve) \
-                .props('flat round dense aria-label="resolve"').classes("sb-resolve") \
-                .tooltip("resolve").mark("note-resolve")
-        if actions:
-            actions_bar(ctx, n, refresh, author=author)
+    el = Card(card, sources).classes(cls + (" sb-resolvable" if resolvable else "")) \
+        .mark("note-row")
+    el._props["data-id"] = n.id
+    # the prop is NiceGUI's observable copy: a tip or a kept answer goes in it
+    card = el._props["card"]
+    foot = card["foot"]
 
+    def resolve():
+        if n.spec.verdict:
+            # A pre-registration closes with its verdict: the store refuses a
+            # bare resolve, so the button opens the dialog with the result
+            # field rather than showing the refusal.
+            edit_dialog(ctx, n, refresh, author=author, resolving=True)
+            return
+        if demo_says("resolves the entry"):
+            return
+        with refusal_shown():
+            api.supersede(ctx, n.id, author=author, status="resolved")
+            refresh()
 
-def actions_bar(ctx, n, refresh, *, author: str) -> None:
-    """Star and edit over a card's corner; a row that has it carries
-    `sb-has-actions`, and `sb-starred` when tagged priority."""
-    has_pri = "priority" in n.tags
-    with ui.element("div").classes("sb-actions"):
-        def _star():
-            if demo_says("unstars the entry" if has_pri else "stars the entry"):
-                return
-            with refusal_shown():
-                api.retag(ctx, n.id, add=() if has_pri else ("priority",),
-                          rm=("priority",) if has_pri else (), author=author)
-                refresh()
-
-        ui.button(icon="star" if has_pri else "star_outline", color=None,
-                  on_click=_star) \
-            .props("flat dense round size=sm" + (" color=warning" if has_pri else "")
-                   + ' aria-label="toggle priority"') \
-            .classes("sb-star").tooltip("toggle #priority").mark("note-star")
-        ui.button(icon="edit", color=None,
-                  on_click=lambda: edit_dialog(ctx, n, refresh, author=author)) \
-            .props('flat dense round size=sm aria-label="edit"').classes("sb-edit") \
-            .tooltip("supersede / edit").mark("note-edit")
-
-
-def _answer_row(ctx, n, author: str, refresh) -> None:
-    """One-click answers to a question someone else wrote last: a button per
-    option its asker gave (`--option`, the default first, marked), and the
-    person's own words. The answer goes below the question, as the person;
-    its asker acts on it and resolves it. Answers took the edit dialog, and
-    most open questions had none from the person (2026-10-16). The buttons
-    were parsed out of `Default: … Flip: say "…"` prose for a day, until the
-    user called that a fragile contract and the entries it bred robotic."""
-    def answer(text: str) -> None:
-        if not (text := text.strip()):
+    def answer(text) -> None:
+        # The answer goes below the question, as the person; its asker acts
+        # on it and resolves it (the options design, 2026-10-16).
+        if not isinstance(text, str) or not (text := text.strip()):
             return
         if demo_says("adds your answer below the question"):
             return
@@ -894,126 +1059,203 @@ def _answer_row(ctx, n, author: str, refresh) -> None:
         app.storage.tab.get(_ANSWERS, {}).pop(n.id, None)    # sent: not typed for its next turn
         refresh()
 
-    tip = f"added below the question, as {author}"
-    with ui.element("div").classes("sb-answer").mark("answer-row"):
-        for i, o in enumerate(n.options or ()):
-            ui.button(o, icon="check" if i == 0 else None, color=None,
-                      on_click=lambda o=o: answer(o)) \
-                .props("outline dense no-caps").classes("px-2").mark("answer-option") \
-                .tooltip(f"“{o}”{', the default' if i == 0 else ''}, {tip}")
-        field = ui.input(placeholder="or answer in your words · Enter") \
-            .props('outlined dense aria-label="answer this question"') \
-            .classes("sb-answer-field").mark("answer-field")
-        field.on("keydown.enter", lambda: answer(field.value or ""))
-        _kept_answer(field, n.id)
+    def keep(text) -> None:
+        # Words typed in an answer outlive the reload another card's write
+        # brings (audit, 2026-10-28): kept per tab, put back once the page connects.
+        kept = app.storage.tab.setdefault(_ANSWERS, {})
+        if isinstance(text, str) and text:
+            kept[n.id] = text
+        else:
+            kept.pop(n.id, None)
+
+    def copy() -> None:
+        ui.clipboard.write(n.id)
+        ui.notify(f"copied {n.id}")
+
+    def tip(i) -> None:
+        # once per chip: a `git log` per badge at render time doubled the
+        # cost of a board of checks
+        if i in hover and not foot[i]["tip"]:
+            foot[i]["tip"] = hover.pop(i)() or ""
+            el.update()
+
+    def act(e) -> None:
+        # The browser names what was pressed; a name or index it should
+        # not send, or one this card does not offer, does nothing.
+        args = e.args if isinstance(e.args, list) else [e.args]
+        what, rest = args[0] if args else None, args[1:]
+        first = rest[0] if rest else None
+        if what == "star" and actions:
+            toggle_star(ctx, n, refresh, author=author)
+        elif what == "edit" and actions:
+            edit_dialog(ctx, n, refresh, author=author)
+        elif what == "resolve" and resolvable:
+            resolve()
+        elif what == "copy":
+            copy()
+        elif what == "answer" and answering:
+            answer(first)
+        elif what == "typed" and answering:
+            keep(first)
+        elif what == "view" and isinstance(first, int) and first in views:
+            return views[first](len(rest) > 1 and bool(rest[1]))   # a reveal is async
+        elif what == "tip" and isinstance(first, int):
+            tip(first)
+
+    el.on("act", act)
+    if answering:
+        client = ui.context.client
+
+        def back() -> None:
+            with client:
+                if text := app.storage.tab.get(_ANSWERS, {}).get(n.id):
+                    card["typed"] = text
+                    el.update()
+        client.on_connect(back)
 
 
-def _options_row(n) -> None:
-    """A question's options where no buttons draw (the asker's own, one
-    answered, one resolved): as measurements show, so the answer below reads
-    against its alternatives, and the card shows what `show` prints."""
-    # One line, the CLI's: three phrases parted by gaps alone read as one run
-    # of words in a browser shot (2026-10-17).
-    ui.label(f"options: {summ.options_line(n.options)}").classes("sb-note-meta").mark("options")
+def toggle_star(ctx, n, refresh, *, author: str) -> None:
+    has_pri = "priority" in n.tags
+    if demo_says("unstars the entry" if has_pri else "stars the entry"):
+        return
+    with refusal_shown():
+        api.retag(ctx, n.id, add=() if has_pri else ("priority",),
+                  rm=("priority",) if has_pri else (), author=author)
+        refresh()
 
 
-def _note_content(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
-                  diff_to=None) -> None:
-    """The body, the verdict and measurements: what the row says.
-    A bare row says its target, or on that target's own page, its arc."""
+def _card_main(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
+               diff_to=None) -> list:
+    """The body, the verdict and measurements: what the row says, and the
+    markdown each body piece was made from. A bare row says its target, or
+    on that target's own page, its arc."""
+    main, sources = [], []
+
+    def md(text: str, **part) -> None:
+        sources.append(text := link_ids(text, ctx.store_dir))
+        main.append({"k": "md", "html": _body_html(text), **part})
+
     if diff_to:
         what = changes(n, diff_to)
-        ui.label(f"{diff_to.author} edited this {summ.when_added(diff_to.created_at)}"
-                 + (f": {', '.join(what)}" if what else "")) \
-            .classes("sb-note-meta").tooltip(diff_to.created_at).mark("changes")
+        main.append({"k": "changes", "m": "changes", "tip": diff_to.created_at,
+                     "t": f"{diff_to.author} edited this {summ.when_added(diff_to.created_at)}"
+                          + (f": {', '.join(what)}" if what else "")})
     if bare(n):
         if show_target:
-            target_headline(n)
+            t = n.target
+            main.append(_head(href(id=n.id), "", "project", "note-target")
+                        if t.type == "project" or not t.name else
+                        _head(target_href(t.type, t.name), t.type, t.name, "note-target"))
         elif n.arc_id:
-            arc_headline(ctx, n)
+            p = S.arcs_path(ctx.store_dir)
+            st = p.stat() if p.exists() else None
+            name = _arc_names(str(ctx.store_dir), st and (st.st_mtime_ns, st.st_size)) \
+                .get(n.arc_id, n.arc_id)
+            main.append(_head(f"/arc?id={quote(n.arc_id)}", "arc", name))
     if n.spec.verdict:
         # Clipped on a board like the body: a check's `checked` ran to
         # three lines and pushed the next row off the screen.
         fit = (lambda t: summ.clip(t, summ.HEAD_CHARS)) if compact else (lambda t: t)
         if diff_to and (n.checked, n.result) != (diff_to.checked, diff_to.result):
-            ui.html(f"checked: {word_diff(n.checked, diff_to.checked)}   →   "
-                    f"result: {word_diff(n.result, diff_to.result)}", sanitize=False) \
-                .classes("sb-verdict").mark("note-verdict")
+            main.append({"k": "verdict", "m": "note-verdict",
+                         "html": f"checked: {word_diff(n.checked, diff_to.checked)}   →   "
+                                 f"result: {word_diff(n.result, diff_to.result)}"})
         else:
-            ui.label(f"checked: {fit(n.checked) or '—'}   →   result: {fit(n.result) or '—'}") \
-                .classes("sb-verdict").mark("note-verdict")
+            main.append({"k": "verdict", "m": "note-verdict",
+                         "t": f"checked: {fit(n.checked) or '—'}   →   "
+                              f"result: {fit(n.result) or '—'}"})
     if n.body and compact and (hit or len(summ.flatten(n.body)) > summ.BODY_CHARS):
         # A list to scan, not a page to read: one bug's four paragraphs
         # filled the boards (seen in the browser, 2026-09-27). A search
         # result is text too, even a short one, so every hit is marked.
         text = snippet(n.body, hit)
+        part = {"k": "text", "m": [], "t": text}
         # A clipped body is the link to the whole note: a "full note" link
         # under each one said it again (the user, 2026-10-01).
-        with (ui.link(target=href(id=n.id)).classes("sb-note-open").mark("note-full")
-              if text != summ.flatten(n.body) else nullcontext()):
-            if hit:
-                ui.html(marked(text, hit), sanitize=False) \
-                    .classes("sb-note-text sb-snippet").mark("note-snippet")
-            else:
-                ui.label(text).classes("sb-note-text")
+        if text != summ.flatten(n.body):
+            part["h"] = href(id=n.id)
+            part["m"].append("note-full")
+        if hit:
+            part["html"] = marked(text, hit)
+            part["m"].append("note-snippet")
+        main.append(part)
     elif diff_to and edited(n.body, diff_to.body):
         for op, text in diff_blocks(n.body, diff_to.body):
-            md = NoteMarkdown(link_ids(text, ctx.store_dir))
-            if op != "=":
-                side = "del" if op == "-" else "ins"
-                md.classes(f"sb-diff-{side}").mark(f"diff-{side}")
+            side = {"-": "del", "+": "ins"}.get(op)
+            md(text, **({"c": f"sb-diff-{side}", "m": f"diff-{side}"} if side else {}))
     elif n.body:
         # Each piece on its own, a rule in the kind's colour between: an
         # append's text after its seam, a prepend's before.
         start = 0
         for at, who, when, above, rewrote in seams:
-            NoteMarkdown(link_ids(n.body[start:at], ctx.store_dir))
-            said = (f"{who} {'edited the text above and ' if rewrote else ''}added "
-                    f"{'the above ' if above else ''}{summ.when_added(when)}")
-            with ui.element("div").classes("sb-seam"):
-                ui.label(said).tooltip(when).mark("seam")
+            md(n.body[start:at])
+            main.append({"k": "seam", "m": "seam", "tip": when,
+                         "t": f"{who} {'edited the text above and ' if rewrote else ''}added "
+                              f"{'the above ' if above else ''}{summ.when_added(when)}"})
             start = at
-        NoteMarkdown(link_ids(n.body[start:], ctx.store_dir))   # sanitize=True: DOMPurify
+        md(n.body[start:])   # sanitized in the browser, as ui.markdown: DOMPurify
     if n.measurements:
-        with ui.row().classes("gap-3 flex-wrap").mark("measurements"):
-            for k, v in n.measurements.items():
-                ui.label(f"{k}: {v}").classes("sb-note-meta")
+        main.append({"k": "meas", "m": "measurements",
+                     "items": [f"{k}: {v}" for k, v in n.measurements.items()]})
+    return main, sources
 
 
-def _note_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None) -> None:
+def _card_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None):
     """One wrapping line: what kind and state the row is and where it points
-    on the left; who wrote it, when, and its id on the right."""
-    with ui.element("div").classes("sb-note-foot"):
-        if n.due:
-            due_chip(n, status)
-        ui.link(n.kind, narrow(kind=n.kind)) \
-            .classes(f"sb-chip sb-kindchip {kind_class(n.kind)}").mark("note-kind")
-        if status:
-            ui.link(status, narrow(status=status)).classes(f"sb-chip sb-chip-{status}")
-        if n.spec.verdict:
-            _check_badge(ctx, n, git_head)
-        if show_target:
-            with ui.element("span").classes("sb-pair"):
-                if not bare(n):             # else the headline says it
-                    target_link(n)
-                view_button(ctx, n.target.name, ttype=n.target.type)
-        if since:
-            _since_chip(ctx, n, since)
-        if n.arc_id and (show_target or not bare(n)):
-            ui.link(f"arc: {n.arc_id}", f"/arc?id={quote(n.arc_id)}") \
-                .classes("sb-chip sb-target").mark("note-arc")
-        for r in n.refs:
-            with ui.element("span").classes("sb-pair"):
-                ui.link(f"↗ {summ.ref_label(r)}", target_href(r.type, r.name)) \
-                    .classes("sb-chip sb-ref").mark("note-ref")
-                view_button(ctx, r.name, ttype=r.type)
-        for t in n.tags:
-            ui.link(f"#{t}", narrow(tag=t)).classes("sb-tag").mark(f"tag-{t}")
-        with ui.element("span").classes("sb-note-by"):
-            ui.link(n.author, narrow(author=n.author)).classes("sb-note-meta")
-            ui.label(ago(n.created_at)).classes("sb-note-meta") \
-                .tooltip(S.shown(n.created_at)).mark("note-age")
-            id_link(n)
+    on the left; who wrote it, when, and its id on the right (card.js).
+    The chips, the tips each fills on its first hover, and the view buttons'
+    clicks, both by the chip's index."""
+    foot, hover, views = [], {}, {}
+
+    def pair(chip: dict, name, ttype) -> dict:
+        if ttype == "commit" and name and chip.get("t"):
+            # on hover, as the since chip's: a git call per chip at render
+            chip |= {"tip": "", "key": "commit"}
+            hover[len(foot)] = lambda: commit_tip(ctx.cfg, name)
+        if v := viewable(ctx, name, ttype):
+            icon, tip, click = v
+            chip["view"] = {"icon": icon, "tip": tip, "m": "file-open"}
+            views[len(foot)] = click
+        return chip
+
+    if n.due:
+        text, cls, tip = _due(n, status)
+        foot.append({"t": text, "c": cls, "tip": tip, "m": "note-due"})
+    foot.append({"t": n.kind, "h": narrow(kind=n.kind),
+                 "c": f"sb-chip sb-kindchip {kind_class(n.kind)}", "m": "note-kind"})
+    if status:
+        foot.append({"t": status, "h": narrow(status=status), "c": f"sb-chip sb-chip-{status}"})
+    if n.spec.verdict:
+        chip, fill, opens = _check_chip(ctx, n, git_head)
+        if fill:
+            hover[len(foot)] = fill
+        if opens:
+            views[len(foot)] = lambda shift: opens()
+        foot.append(chip)
+    if show_target:
+        t = n.target
+        chip = {"pair": True}
+        if not bare(n):             # else the headline says it
+            chip |= {"t": "project", "h": href(id=n.id)} if t.type == "project" or not t.name \
+                else {"t": f"{t.type}: {t.name}", "h": target_href(t.type, t.name)}
+            chip |= {"c": "sb-chip sb-target", "m": "note-target"}
+        foot.append(pair(chip, t.name, t.type))
+    if since:
+        # Neutral, not a warning: on a busy file nearly every row has one.
+        hover[len(foot)] = lambda: since_tip(ctx.cfg, n) + f"\n{_CLICK['since']}"
+        views[len(foot)] = lambda shift: since_dialog(ctx, n)
+        foot.append({"t": f"{summ._count(since, 'commit')} since", "c": "sb-chip", "tip": "",
+                     "key": "since", "m": "note-since", "open": True})
+    if n.arc_id and (show_target or not bare(n)):
+        foot.append({"t": f"arc: {n.arc_id}", "h": f"/arc?id={quote(n.arc_id)}",
+                     "c": "sb-chip sb-target", "m": "note-arc"})
+    for r in n.refs:
+        foot.append(pair({"pair": True, "t": f"↗ {summ.ref_label(r)}", "m": "note-ref",
+                          "h": target_href(r.type, r.name), "c": "sb-chip sb-ref"},
+                         r.name, r.type))
+    for t in n.tags:
+        foot.append({"t": f"#{t}", "h": narrow(tag=t), "c": "sb-tag", "m": f"tag-{t}"})
+    return foot, hover, views
 
 
 def history(ctx, every, head, author: str, git_head=None) -> None:
@@ -1064,26 +1306,6 @@ def say_after_reload(text: str, failed: bool = False) -> None:
 
 
 _ANSWERS = "sb-answers"
-
-
-def _kept_answer(field, nid: str) -> None:
-    """Words typed in an answer field outlive the reload another card's write
-    brings (audit, 2026-10-28): kept per tab, put back once the page connects."""
-    client = ui.context.client
-
-    def keep(e) -> None:
-        kept = app.storage.tab.setdefault(_ANSWERS, {})
-        if e.value:
-            kept[nid] = e.value
-        else:
-            kept.pop(nid, None)
-
-    def back() -> None:
-        with client:
-            if text := app.storage.tab.get(_ANSWERS, {}).get(nid):
-                field.value = text
-    field.on_value_change(keep)
-    client.on_connect(back)
 
 
 def show_said() -> None:

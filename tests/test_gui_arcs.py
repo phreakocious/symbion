@@ -9,8 +9,15 @@ from nicegui.testing import User          # noqa: E402
 
 from symbion import api, store            # noqa: E402
 from symbion.gui.arcs import checklist   # noqa: E402
+from _cards import cards, not_see, part, parts, see   # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
+
+
+def _tick(user, note_id: str):
+    """The resolve part of the box whose card carries `note_id`."""
+    (box,) = [c for c in cards(user) if c._props["data-id"] == note_id]
+    return part(user, "note-resolve", card=box)
 
 
 @pytest.fixture
@@ -42,7 +49,7 @@ async def test_ticking_a_row_resolves_its_task(user: User, seeded):
 
     item = store.arc_items(store.load(ctx.store_dir), act.id)[0]
     await user.open("/t")
-    user.find(marker=f"toggle-{item.id}").click()
+    _tick(user, item.id).click()
     await user.should_see("one")
 
     done, total = store.arc_progress(store.load(ctx.store_dir), act.id)
@@ -65,7 +72,7 @@ async def test_ticking_a_done_row_reopens_it(user: User, seeded):
     tip = next(n for n in store.arc_items(store.load(ctx.store_dir), act.id)
                if n.target.name == item.target.name)
     await user.open("/t")
-    user.find(marker=f"toggle-{tip.id}").click()
+    _tick(user, tip.id).click()
     await user.should_see("one")
 
     assert store.arc_progress(store.load(ctx.store_dir), act.id)[0] == 0
@@ -107,21 +114,21 @@ async def test_a_bodiless_box_is_its_target_and_kinds_show_only_when_mixed(user:
         checklist(ctx, act.id, lambda: None, author="ada")
 
     await user.open("/t")
-    assert len(user.find(marker="note-headline").elements) == 2
-    await user.should_not_see(marker="checklist-body")
-    await user.should_not_see(marker="checklist-kind")
+    assert len(parts(user, "note-headline")) == 2
+    await not_see(user, "checklist-body")
+    await not_see(user, "checklist-kind")
     api.add(ctx, {"kind": "bug", "target": {"type": "item", "name": "one"},
                   "body": "broken thing", "arc_id": act.id}, author="ada")
     await user.open("/t")
     await user.should_see("broken thing")
-    assert len(user.find(marker="checklist-kind").elements) == 3
-    assert len(user.find(marker="note-headline").elements) == 2
+    assert len(parts(user, "checklist-kind")) == 3
+    assert len(parts(user, "note-headline")) == 2
 
 
 async def test_a_project_row_on_the_checklist_is_clickable(user: User, seeded):
     """The bug: a project-target
     task filed under an arc rendered on the arc page with nothing
-    to click. The checklist row is only ever `target_link`, and `project` has no
+    to click. The checklist row is only ever its target chip, and `project` has no
     object page -- so this is the one target type for which the row's link had
     to be the note itself. Both directions: the seeded item row still points at
     the object view."""
@@ -135,7 +142,7 @@ async def test_a_project_row_on_the_checklist_is_clickable(user: User, seeded):
         checklist(ctx, act.id, lambda: None, author="ada")
 
     await user.open("/t")
-    hrefs = {e.props.get("href") for e in user.find(marker="note-target").elements}
+    hrefs = {e.props.get("href") for e in parts(user, "note-target")}
     assert f"/notes?id={g.id}" in hrefs, "the project entry must link to the note"
     assert "/object?type=item&name=one" in hrefs, "the item entry still links to its object"
 
@@ -158,7 +165,7 @@ async def test_ticking_a_prediction_opens_the_dialog_and_saving_a_result_resolve
         checklist(ctx, act.id, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker=f"toggle-{p.id}").click()
+    _tick(user, p.id).click()
     assert store.arc_progress(store.load(tmp_path), act.id) == (0, 1), "a tick alone must not close it"
     user.find(marker="edit-result").elements.pop().set_value("FIRED")
     user.find(marker="edit-save").click()
@@ -210,7 +217,7 @@ async def test_a_rows_text_links_to_its_note(user: User, seeded):
         checklist(ctx, act.id, lambda: None, author="ada")
 
     await user.open("/t")
-    assert {e.props.get("href") for e in user.find(marker="checklist-body").elements} \
+    assert {e.props.get("href") for e in parts(user, "checklist-body")} \
         == {f"/notes?id={b.id}"}
 
 
@@ -227,10 +234,10 @@ async def test_a_box_carries_a_cards_star_due_date_and_tags(user: User, seeded):
         checklist(ctx, act.id, lambda: None, author="ada")
 
     await user.open("/t")
-    stars = sorted(str(b.props.get("color")) for b in user.find(marker="note-star").elements)
+    stars = sorted(str(b.props.get("color")) for b in parts(user, "note-star"))
     assert stars == ["None", "warning"]
-    assert len(user.find(marker="note-due").elements) == 1
-    await user.should_see(marker="tag-ux")
+    assert len(parts(user, "note-due")) == 1
+    await see(user, "tag-ux")
     rows = [r for r in user.find(marker="checklist-row").elements]
     assert all("sb-resolvable" in r.classes for r in rows)
     starred = [r for r in rows if "sb-starred" in r.classes]

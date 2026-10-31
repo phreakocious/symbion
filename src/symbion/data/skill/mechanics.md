@@ -88,8 +88,9 @@ the summary below reads the local store`).
    any open entry is parked. A parked entry and an entry in an arc are not
    in the per-kind counts, so each says so in its brackets (`[idea,
    parked]`, `[task, arc release]`).
-2. `repos in <store>:`, in a store over several repos: where you stand, and
-   each other repo's path from here.
+2. `repos in <store>:`, in a store over several repos: where you stand,
+   each other repo's path from here, and `(not on this machine)` where no
+   repo is there.
 3. `N open entries wait on you`, and below it each of them: the open entries
    whose newest version someone else wrote, up to 10, a due one with its
    phrase. An edit by someone else that changes no text (options, a star,
@@ -170,7 +171,8 @@ An entry's line reads `[labels] [kind, …] TYPE:NAME  lead  id`:
   entry before you relay it.
 
 You are whoever your writes default to: `$SYMBION_AUTHOR`, else the harness
-(`claude` in Claude Code, `codex` in Codex, `hermes` in Hermes Agent), else
+(`claude` in Claude Code, `codex` in Codex, `antigravity` in Antigravity,
+`hermes` in Hermes Agent), else
 `git config user.name`, else `user`. The default names the harness, not the
 model, since no harness tells its shell which model runs: a review by another
 model passes `--author` to read apart. A person typing `! symbion add …` in a
@@ -191,9 +193,10 @@ typed, a verdict entry with no `--checked` or stamped on a dirty tree, and a
 parked entry of yours with no `--due`. In an agent session, it lists a
 target's open entries at your first add there and gives only their count after
 that, until the next session start. `add`, `resolve` and `supersede` say when
-the text they write runs past 500 characters. Each write ends with the count
-of entries not yet committed; an arc write with none pending says
-`arcs.jsonl not committed`.
+the text they write runs past 500 characters: in an agent session, once until
+the next session start. A pre-registration's body does not count. Each write
+ends with the count of entries not yet committed; an arc write with none
+pending says `arcs.jsonl not committed`.
 
 In a shared store, `add`, `resolve` and `supersede` also say `origin has N new
 store commits: symbion pull` when origin holds commits this clone lacks. They fetch

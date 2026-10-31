@@ -1,5 +1,6 @@
 """`init --agent codex`: the skill link and the hook, in a temporary HOME."""
 import json
+import io
 import os
 from pathlib import Path
 import shutil
@@ -33,7 +34,7 @@ def test_install_preview_apply_and_rerun(tmp_path, capsys, agent):
         in capsys.readouterr().out
     link = home / ".agents/skills/symbion"
     assert link.resolve() == SKILL  # a junction when Windows disallows symlinks
-    assert (home / ".claude/skills/symbion").exists() == (agent == "both")
+    assert not (home / ".claude").exists()      # Claude Code's half comes with the plugin
     hook_file = home / ".codex/hooks.json"
     entry = json.loads(hook_file.read_text())["hooks"]["SessionStart"][0]
     assert entry["matcher"] == "startup|resume|clear|compact"
@@ -46,7 +47,7 @@ def test_install_preview_apply_and_rerun(tmp_path, capsys, agent):
     out = capsys.readouterr().out
     # A re-run that changes nothing repeats no setup advice but the trust
     # step, which init cannot see: Codex skips an untrusted hook in silence.
-    assert "linked" not in out and out.count("run /hooks") == 1, out
+    assert "linked" not in out and out.count("run /hooks") == 2, out
 
 
 @pytest.mark.parametrize("contents", ['{"hooks": {"Stop": []}}\n', "{invalid"])
@@ -118,4 +119,66 @@ command = 'bash "$HOME/.agents/skills/symbion/session_start.sh"'
     assert cli.main(["--dir", str(tmp_path / "notes"), "init", "--agent", "codex", "--yes"]) == 0
     assert settings.read_text() == contents
     assert not settings.with_name("hooks.json").exists()
-    assert f"kept hook in {settings}" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert f"kept hook in {settings}" in out
+    assert "[[hooks.PreToolUse]]" in out
+
+
+def test_codex_gotchas_before_read_and_patch(tmp_path, monkeypatch):
+    """Run the installed handler against the real summary cache. A patch's
+    body can name other files; only its headers spend those files' warnings."""
+    notes = tmp_path / "notes"
+    assert cli.main(["--dir", str(notes), "init", "--agent", "codex", "--yes"]) == 0
+    for name in ("README.md", "src/other.py", "src/moved.py"):
+        store.add(notes, kind="note", target={"type": "file", "name": name},
+                  author="human", tags=["gotcha"], body=f"trap for {name}")
+    payload = json.dumps({"session_id": "codex-session", "hook_event_name": "SessionStart"})
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload.encode())))
+    assert cli.main(["--dir", str(notes), "summary", "--hook"]) == 0
+    hooks = json.loads((Path.home() / ".codex/hooks.json").read_text())["hooks"]
+    assert "PreToolUse" in hooks
+    handler = hooks["PreToolUse"][0]["hooks"][0]
+
+    def call(tool, args, **extra):
+        result = subprocess.run(handler["command"], shell=True, capture_output=True,
+                                text=True, input=json.dumps({"session_id": "codex-session",
+                                    "hook_event_name": "PreToolUse", "tool_name": tool,
+                                    "tool_input": args, **extra}))
+        assert result.returncode == 0 and not result.stderr, result
+        if not result.stdout:
+            return ""
+        out = json.loads(result.stdout)["hookSpecificOutput"]
+        assert out["hookEventName"] == "PreToolUse"
+        return out["additionalContext"]
+
+    assert call("Bash", {"command": "cat docs/README.md README.md.bak"}) == ""
+    assert "trap for README.md" in call("Bash", {"command": "cat README.md"})
+    assert call("Bash", {"command": "cat README.md"}) == ""
+    assert "trap for README.md" in call("Bash", {"command": "cat README.md"},
+                                       transcript_path="subagent.jsonl")
+    assert call("Bash", {"command": "cat README.md"}, transcript_path="subagent.jsonl") == ""
+    patch = "*** Begin Patch\n*** Update File: README.md\n@@\n-a\n+src/other.py\n*** End Patch"
+    said = call("apply_patch", {"command": patch})
+    assert "trap for README.md" in said and "trap for src/other.py" not in said
+    assert call("apply_patch", {"command": patch}) == ""
+    assert call("Bash", {"command": "true"}, tool_response="src/other.py") == ""
+    moved = "*** Begin Patch\n*** Update File: src/other.py\n*** Move to: src/moved.py\n@@\n-a\n+b\n*** End Patch"
+    said = call("apply_patch", {"command": moved})
+    assert "trap for src/other.py" in said and "trap for src/moved.py" in said
+    assert call("Bash", {"command": "cat src/other.py"}) == ""
+    assert call("Bash", {"command": "cat README.md"}, session_id="../bad") == ""
+
+
+def test_codex_existing_hooks_get_gotcha_merge(tmp_path):
+    settings = Path.home() / ".codex/hooks.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({"hooks": {"SessionStart": [cli._codex_hook_entry(
+        Path.home() / ".agents/skills/symbion")], "PreToolUse": [{"matcher": "foreign"}]}}))
+    args = ["--dir", str(tmp_path / "notes"), "init", "--agent", "codex", "--yes", "--merge-hook"]
+    assert cli.main(args) == 0
+    data = json.loads(settings.read_text())["hooks"]
+    assert data["PreToolUse"][0] == {"matcher": "foreign"}
+    assert len(data["PreToolUse"]) == 2 and len(data["SessionStart"]) == 1
+    before = settings.read_bytes()
+    assert cli.main(args) == 0
+    assert settings.read_bytes() == before

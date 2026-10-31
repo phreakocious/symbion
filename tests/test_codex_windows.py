@@ -135,4 +135,4 @@ def test_native_only_registration_is_not_duplicated(tmp_path, capsys):
     assert settings.read_text() == contents
     output = capsys.readouterr().out
     assert f"kept hook in {settings}" in output
-    assert "append this entry" not in output
+    assert 'append this entry to the "SessionStart" list' not in output   # PreToolUse's may follow

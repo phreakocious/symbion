@@ -159,11 +159,11 @@ def _git_user_name() -> str:
 
 def author_default() -> str:
     """The CLI rule: SYMBION_AUTHOR > "codex" if CODEX_THREAD_ID > "hermes" if
-    HERMES_AGENT > "claude" if CLAUDECODE > git user.name > "user". Each
-    agent sets its marker in the shell it runs commands in, which makes CLI
-    attribution self-configuring. Claude comes last: a Codex or a Hermes
-    launched from a Claude Code session inherits CLAUDECODE, and the innermost
-    agent is the one writing."""
+    HERMES_AGENT > "antigravity" if ANTIGRAVITY_CONVERSATION_ID > "claude" if
+    CLAUDECODE > git user.name > "user". Each agent sets its marker in the
+    shell it runs commands in, which makes CLI attribution self-configuring.
+    Claude comes last: a Codex, a Hermes or an agy launched from a Claude Code
+    session inherits CLAUDECODE, and the innermost agent is the one writing."""
     return os.environ.get("SYMBION_AUTHOR") or shell_author()
 
 
@@ -174,6 +174,10 @@ def shell_author() -> str:
         return "codex"
     if os.environ.get("HERMES_AGENT"):
         return "hermes"
+    # agy's hooks get ANTIGRAVITY_CONVERSATION_ID but not ANTIGRAVITY_AGENT, which
+    # only its shell commands get (agy 1.4.12, 2026-10-30).
+    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
+        return "antigravity"
     if os.environ.get("CLAUDECODE"):
         return "claude"
     return _git_user_name() or "user"
@@ -181,8 +185,8 @@ def shell_author() -> str:
 
 def gui_author() -> str:
     """The GUI rule: SYMBION_AUTHOR > git user.name > "user", the agent
-    markers (CLAUDECODE, CODEX_THREAD_ID, HERMES_AGENT) deliberately NOT
-    consulted.
+    markers (CLAUDECODE, CODEX_THREAD_ID, HERMES_AGENT,
+    ANTIGRAVITY_CONVERSATION_ID) deliberately NOT consulted.
 
     The explorer is the human's interface, so the identity is a property of
     the surface, not of the environment. `symbion serve` is launched from the
@@ -932,7 +936,7 @@ def add_many(ctx: Ctx, rows, *, author: str) -> list:
 
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
               add_refs=None, prepend_body: str | None = None, add_measurements=None,
-              keep_refs: bool = False, **fields) -> store.Note:
+              keep_refs: bool = False, external: bool = False, **fields) -> store.Note:
     """Target, provenance and target_blob are INHERITED from the superseded row
     and never re-resolved (a tag added later is no re-reading of the file), so
     an edit that names no target needs no canonicalization -- a departed
@@ -952,7 +956,9 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
     sha the verdict was made at. Any other supersede -- a body edit on the
     same row, a corrected verdict on a check -- inherits, because a
     correction is about the same run. The result requirement itself is the
-    store's (check_fields); this only adds the stamp.
+    store's (check_fields); this only adds the stamp. That stamp is external
+    when the registration's was, or when `external` says the verdict read
+    something outside the repo; `external` on any other row refuses.
 
     The tip is read outside the store lock, so two concurrent resolves of the
     same open pre-registration can both read it open and both re-stamp, the
@@ -979,12 +985,18 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
         check_measurements(add_measurements)
     if fields.get("options") is not None:
         fields["options"] = _stripped_options(fields["options"])
+    restamp = False
     if fields.get("status") == "resolved":
         tip = store.chain_tip(store.load(ctx.store_dir), note_id)
-        if tip.spec.status and tip.spec.verdict and store.read_status(tip) == "open":
-            fields["provenance"] = _stamp(ctx, tip.kind, tip.spec,
-                                         bool((tip.provenance or {}).get("external")),
+        restamp = tip.spec.status and tip.spec.verdict and store.read_status(tip) == "open"
+        if restamp:
+            fields["provenance"] = _stamp(ctx, tip.kind, tip.spec, external
+                                         or bool((tip.provenance or {}).get("external")),
                                          {"type": tip.target.type, "name": tip.target.name})
+    if external and not restamp:
+        raise ValueError("--external stamps the resolve of an open pre-registration (a kind "
+                         "with status and verdict); any other entry keeps the stamp it has, "
+                         "or has none")
 
     def canonicalize(f):
         f = canonicalize_rows(ctx, [f])[0]
@@ -1039,6 +1051,14 @@ def rename_arc(ctx: Ctx, arc_id: str, new_name: str) -> store.Arc:
 
 def archive_arc(ctx: Ctx, arc_id: str) -> store.Arc:
     return store.archive_arc(ctx.store_dir, arc_id)
+
+
+def unarchive_arc(ctx: Ctx, arc_id: str) -> store.Arc:
+    return store.unarchive_arc(ctx.store_dir, arc_id)
+
+
+def describe_arc(ctx: Ctx, arc_id: str, description: str) -> store.Arc:
+    return store.describe_arc(ctx.store_dir, arc_id, description)
 
 
 def own_rows(ctx: Ctx):

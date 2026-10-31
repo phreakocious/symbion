@@ -1,7 +1,8 @@
 [project]
 name = "symbion"
-version = "0.12.0"
-description = "A notebook and ticket registry for agents: dated rows attached to a commit, a file, an item, an arc or the project, kept in a sibling git repo of JSONL."
+version = "0.13.0"
+description = "A ticket queue your coding agent keeps: each new Claude Code, Codex or Hermes session starts with the open bugs, tasks and questions. Plain JSONL in a git repo beside yours. No server, no MCP."
+keywords = ["claude-code", "codex", "hermes", "agent-memory", "ai-agents", "issue-tracker", "session-handoff", "context", "jsonl", "git"]
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -13,6 +14,7 @@ dependencies = ["argcomplete>=3.5.2", "markdown-it-py>=2.2", "rich>=13", "rich-a
 
 [project.urls]
 Homepage = "https://github.com/phreakocious/symbion"
+Demo = "https://symbion.nullphase.net/"
 Issues = "https://github.com/phreakocious/symbion/issues"
 
 [project.scripts]

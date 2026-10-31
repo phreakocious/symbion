@@ -9,9 +9,12 @@ pytest.importorskip("nicegui")
 
 from nicegui import ui                      # noqa: E402
 from nicegui.testing import User            # noqa: E402
+from nicegui.testing.user_interaction import UserInteraction   # noqa: E402
 
 from symbion import api, store              # noqa: E402
 from symbion.gui.notes import changes, diff_blocks, edited, render_note   # noqa: E402
+
+from _cards import bodies, button, not_see, part, parts, template   # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
 
@@ -72,13 +75,13 @@ async def test_a_row_with_no_body_leads_with_its_target(user: User, repo, tmp_pa
 
     await user.open("/t")
     await user.should_see("alpha")
-    [lead] = user.find(marker="note-headline").elements
+    [lead] = parts(user, "note-headline")
     assert lead.props["href"] == "/object?type=item&name=alpha"
-    assert len(user.find(marker="note-target").elements) == 1, "the headline, not a chip too"
+    assert len(parts(user, "note-target")) == 1, "the headline, not a chip too"
     await user.open("/u")
     await user.should_see("words")
-    await user.should_not_see(marker="note-headline")
-    assert len(user.find(marker="note-target").elements) == 1
+    await not_see(user, "note-headline")
+    assert len(parts(user, "note-target")) == 1
 
 
 async def test_a_row_with_no_body_on_its_own_page_leads_with_its_arc(user: User, repo, tmp_path):
@@ -94,9 +97,9 @@ async def test_a_row_with_no_body_on_its_own_page_leads_with_its_arc(user: User,
 
     await user.open("/t")
     await user.should_see("Audit for accuracy")
-    [lead] = user.find(marker="note-headline").elements
+    [lead] = parts(user, "note-headline")
     assert lead.props["href"] == f"/arc?id={act.id}"
-    await user.should_not_see(marker="note-arc")
+    await not_see(user, "note-arc")
 
 
 async def test_a_check_with_no_stamp_reads_unstamped(user: User, repo, tmp_path):
@@ -146,7 +149,7 @@ async def test_tag_chip_is_a_link_into_the_filtered_view(user: User, repo, tmp_p
     await user.open("/t")
     # By marker, not by text: the star button's tooltip also says "#priority",
     # and find() returns a SET -- popping it is a coin flip between the two.
-    link = user.find(marker="tag-priority").elements.pop()
+    link = parts(user, "tag-priority").pop()
     assert link.props["href"] == "/notes?tag=priority"
 
 
@@ -180,7 +183,7 @@ async def test_a_check_whose_commit_was_amended_away_reads_dangling(user: User, 
 
     await user.open("/t")
     await user.should_see("dangling")
-    user.find(marker="check-state").trigger("mouseenter")
+    part(user, "check-state").hover()
     await user.should_see(f"stamped at {n.provenance['sha'][:7]}, which no branch or tag holds")
 
 
@@ -207,7 +210,7 @@ async def test_a_check_whose_commit_was_amended_without_change_reads_rewritten(u
 
     await user.open("/t")
     await user.should_see(f"rewritten — as {new[:7]}, same tree, current")
-    user.find(marker="check-state").trigger("mouseenter")
+    part(user, "check-state").hover()
     await user.should_see(f"stamped at {old[:7]}; rewritten as {new[:7]}, "
                           f"matched by author date and subject")
     await user.should_see(f"{new[:7]}, this checkout's HEAD")
@@ -258,7 +261,7 @@ async def test_a_behind_badge_lists_the_commits_since_its_stamp(user: User, repo
     await user.open("/t")
     await user.should_see("behind 10")
     await user.should_not_see(f"stamped at {n.provenance['sha'][:7]}")   # not yet: lazy
-    user.find(marker="check-state").trigger("mouseenter")
+    part(user, "check-state").hover()
     await user.should_see(f"stamped at {n.provenance['sha'][:7]}")       # the tooltip
 
 
@@ -283,7 +286,7 @@ async def test_a_diverged_badge_names_the_branch_that_holds_it(user: User, repo,
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (chip,) = user.find(marker="check-state").elements
+    chip = part(user, "check-state")
     assert (chip.text, "sb-chip-notable" in chip.classes) == ("diverged — on topic", True)
 
 
@@ -319,8 +322,7 @@ async def test_an_id_cited_in_a_body_links_to_that_note(user: User, repo, tmp_pa
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    html = md.props["innerHTML"]                  # rendered; .content is the source
+    (html,) = bodies(user)                         # rendered, as the browser gets it
     assert html.count(f'href="/notes?id={cited.id}"') == 1, html
     assert f"<code>{cited.id}</code>" in html
 
@@ -341,8 +343,7 @@ async def test_an_id_in_any_code_block_stays_text(user: User, repo, tmp_path):
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    html = md.props["innerHTML"]
+    (html,) = bodies(user)
     assert html.count(f'href="/notes?id={cited.id}"') == 2, html
     assert f"fenced {cited.id}" in html and f"indented {cited.id}" in html, html
 
@@ -364,8 +365,7 @@ async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    html = md.props["innerHTML"]
+    (html,) = bodies(user)
     assert html.count(f'href="/notes?id={cited.id}"') == 1, html
     assert "999999-fff" in html and "id=999999-fff" not in html, html
     assert f"<code>{tail}</code>" in html, html
@@ -376,15 +376,15 @@ async def test_a_cited_tail_of_a_row_links_to_it(user: User, repo, tmp_path):
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
                       "body": f"see {later.id[-10:]}"}, author="ada")
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    assert f'href="/notes?id={later.id}"' in md.props["innerHTML"]
+    (html,) = bodies(user)
+    assert f'href="/notes?id={later.id}"' in html
 
     # The 17-character tail `show` takes is a cite too, as `show` reads one.
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
                       "body": f"per {later.id[-17:]}"}, author="ada")
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    assert f'href="/notes?id={later.id}"' in md.props["innerHTML"], md.props["innerHTML"]
+    (html,) = bodies(user)
+    assert f'href="/notes?id={later.id}"' in html, html
 
 
 async def test_a_cited_entry_that_is_resolved_reads_struck(user: User, repo, tmp_path):
@@ -409,8 +409,7 @@ async def test_a_cited_entry_that_is_resolved_reads_struck(user: User, repo, tmp
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    html = md.props["innerHTML"]
+    (html,) = bodies(user)
     anchors = dict(re.findall(r'<a href="/notes\?id=([^"]+)"([^>]*>.*?)</a>', html))
     assert anchors[done] == f' title="resolved"><s>{done[-10:]}</s>', html
     assert anchors[earlier] == f' title="resolved"><s>{earlier}</s>', html
@@ -433,8 +432,7 @@ async def test_a_tag_in_a_body_prints_as_text(user: User, repo, tmp_path):
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    html = md.props["innerHTML"]
+    (html,) = bodies(user)
     assert "&lt;td&gt; cell" in html and "../&lt;repo&gt;-notes" in html, html
     assert "&lt;pre&gt; tags" in html, html
     assert "<pre" not in html and "<td" not in html, html
@@ -459,8 +457,7 @@ async def test_a_bare_url_in_a_body_is_a_link(user: User, repo, tmp_path):
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    html = md.props["innerHTML"]
+    (html,) = bodies(user)
     assert '<a href="https://example.org/a_b">https://example.org/a_b</a>.' in html, html
     assert '<a href="https://example.org/x_(y)">https://example.org/x_(y)</a>)' in html, html
     assert "<code>https://in.code</code>" in html, html
@@ -485,8 +482,7 @@ async def test_a_body_reads_as_it_does_at_a_terminal(user: User, repo, tmp_path)
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (md,) = user.find(ui.markdown).elements
-    html = md.props["innerHTML"]
+    (html,) = bodies(user)
     assert "<ol>" in html and "<li>a sample</li>" in html, html
     assert "<s>gone</s>" in html, html
     assert "__init__.py" in html and "<strong>" not in html, html
@@ -507,12 +503,70 @@ async def test_a_compact_row_clips_a_long_verdict_and_a_full_one_does_not(
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    short, full = sorted((e.text for e in user.find(marker="note-verdict").elements), key=len)
+    short, full = sorted((e.text for e in parts(user, "note-verdict")), key=len)
     assert "END" not in short and "…" in short
     assert full == f"checked: {long}   →   result: ok"
     # A check's verdict is its content, not metadata: one with no body
     # showed only this line, dim, beside bodies in Text (user, 2026-10-01).
-    assert all("sb-verdict" in e.classes for e in user.find(marker="note-verdict").elements)
+    assert all("sb-verdict" in e.classes for e in parts(user, "note-verdict"))
+
+
+async def test_a_commit_chip_names_its_subject_on_hover(user: User, repo, tmp_path):
+    """The user, 2026-10-30: a commit as a ref had no hover, and never had.
+    A commit chip, a ref or the target, shows the commit's subject, filled
+    on the first hover as a check's commits are: a git call per chip at
+    render time doubled a board of checks. A name no commit here has says so."""
+    import subprocess
+
+    def git(*a):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                              cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+    first = git("rev-parse", "HEAD")
+    git("commit", "-q", "--allow-empty", "-m", "c1")
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "commit", "name": git("rev-parse", "HEAD")},
+                      "refs": [{"type": "commit", "name": first[:7]},
+                               {"type": "commit", "name": "0" * 40}], "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada", show_target=True)
+
+    await user.open("/t")
+    tips = lambda m: [p.props.get("tip") for p in parts(user, m)]   # noqa: E731
+    assert (tips("note-target"), tips("note-ref")) == ([""], ["", ""])    # not yet: lazy
+    for p in (*parts(user, "note-target"), *parts(user, "note-ref")):
+        p.hover()
+    assert (tips("note-target"), tips("note-ref")) == \
+        (["c1"], ["c0", "not a commit in this checkout"])
+    assert ':data-tip-key="c.key" @mouseenter="ask(c, i)">{{ c.t }}</a>' in template()
+
+
+async def test_a_card_does_only_what_it_offers(user: User, repo, tmp_path):
+    """A card is one element, and every press comes back as one `act` event
+    whose arguments the browser sends: a name the card does not offer, an
+    index past its chips or of the wrong type, does nothing. An earlier
+    version offers no star, edit or resolve."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "b"}, author="ada")
+    before = (tmp_path / "notes.jsonl").read_bytes()
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada", actions=False)
+
+    await user.open("/t")
+    (card,) = user.find(marker="note-row").elements
+    for args in (["star"], ["edit"], ["resolve"], ["answer", "x"], ["typed", "x"],
+                 ["view", 0], ["view", "0"], ["tip", 99], ["tip", "x"], ["nope"], [], "star",
+                 None, {}):
+        UserInteraction(user, {card}, None).trigger("act", args)
+    await asyncio.sleep(0.1)
+    assert (tmp_path / "notes.jsonl").read_bytes() == before
+    with pytest.raises(AssertionError):
+        user.find(ui.dialog)                           # no edit dialog opened
+    assert (card._props["card"]["star"], card._props["card"]["resolve"]) == (None, False)
 
 
 async def test_icon_buttons_have_names_a_screen_reader_can_read(user: User, repo, tmp_path):
@@ -526,10 +580,11 @@ async def test_icon_buttons_have_names_a_screen_reader_can_read(user: User, repo
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    for marker, name in (("note-star", "toggle priority"), ("note-resolve", "resolve"),
-                         ("note-edit", "edit")):
-        (b,) = user.find(marker=marker).elements
-        assert b.props.get("aria-label") == name, (marker, b.props)
+    for marker, cls, name in (("note-star", "sb-star", "toggle priority"),
+                              ("note-resolve", "sb-resolve", "resolve"),
+                              ("note-edit", "sb-edit", "edit"), ("note-copy-id", "sb-copy", "copy id")):
+        assert parts(user, marker), marker
+        assert f'aria-label="{name}"' in button(cls), (cls, button(cls))
 
 
 async def test_a_cards_icon_buttons_take_the_theme_colour(user: User, repo, tmp_path):
@@ -550,10 +605,10 @@ async def test_a_cards_icon_buttons_take_the_theme_colour(user: User, repo, tmp_
             render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    for marker in ("note-edit", "note-copy-id"):
-        colours = [b.props.get("color") for b in user.find(marker=marker).elements]
-        assert colours == [None, None], (marker, colours)
-    stars = sorted(str(b.props.get("color")) for b in user.find(marker="note-star").elements)
+    for cls in ("sb-edit", "sb-copy"):            # card.js draws them
+        assert "color" not in button(cls), cls
+    assert ":color=\"card.star ? 'warning' : undefined\"" in button("sb-star")
+    stars = sorted(str(b.props.get("color")) for b in parts(user, "note-star"))
     assert stars == ["None", "warning"]
 
 
@@ -567,7 +622,7 @@ async def test_the_id_links_to_the_note_alone(user: User, repo, tmp_path):
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    (link,) = user.find(marker="note-id").elements
+    (link,) = parts(user, "note-id")
     assert link.props["href"] == f"/notes?id={n.id}"
 
 
@@ -581,7 +636,7 @@ async def test_a_non_project_target_links_to_the_object_view(user: User, repo, t
         render_note(ctx, n, lambda: None, author="ada", show_target=True)
 
     await user.open("/t")
-    link = user.find(marker="note-target").elements.pop()
+    link = parts(user, "note-target").pop()
     assert link.props["href"] == "/object?type=item&name=src%2Fx.py"
 
 
@@ -596,7 +651,7 @@ async def test_star_button_toggles_priority_through_retag(user: User, repo, tmp_
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-star").click()
+    part(user, "note-star").click()
 
     head = store.heads(store.load(tmp_path))[0]
     assert set(head.tags) == {"keep", "priority"}
@@ -615,7 +670,7 @@ async def test_star_button_unstars_an_already_starred_note(user: User, repo, tmp
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-star").click()
+    part(user, "note-star").click()
 
     assert set(store.heads(store.load(tmp_path))[0].tags) == {"keep"}
 
@@ -638,11 +693,10 @@ async def test_resolve_button_only_on_open_stateful_kinds(user: User, repo, tmp_
         render_note(ctx, decision, lambda: None, author="ada")
 
     await user.open("/a")
-    assert user.find(marker="note-resolve").elements, "an open bug resolves"
+    assert parts(user, "note-resolve"), "an open bug resolves"
 
     await user.open("/d")
-    with pytest.raises(AssertionError):
-        user.find(marker="note-resolve")     # a decision carries no status
+    assert not parts(user, "note-resolve"), "a decision carries no status"
 
 
 async def test_add_form_writes_through_api_with_provenance(user: User, repo, tmp_path):
@@ -794,7 +848,7 @@ async def test_a_project_target_links_to_the_note_itself(user: User, repo, tmp_p
         render_note(ctx, n, lambda: None, author="ada", show_target=True)
 
     await user.open("/t")
-    link = user.find(marker="note-target").elements.pop()
+    link = parts(user, "note-target").pop()
     assert link.props["href"] == f"/notes?id={n.id}"
 
 
@@ -812,7 +866,7 @@ async def test_edit_dialog_corrects_a_check_verdict(user: User, repo, tmp_path):
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-checked")
     user.find(marker="edit-checked").elements.pop().set_value("the suite")
     user.find(marker="edit-result").elements.pop().set_value("412 passed")
@@ -837,7 +891,7 @@ async def test_edit_dialog_hides_the_verdict_fields_on_a_non_check(
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-body")
     await user.should_not_see(marker="edit-checked")
 
@@ -912,7 +966,7 @@ async def test_resolve_button_on_a_prediction_opens_the_dialog_instead_of_resolv
         render_note(ctx, p, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-resolve").click()
+    part(user, "note-resolve").click()
     assert store.read_status(store.heads(store.load(tmp_path))[0]) == "open"
     user.find(marker="edit-save").click()                     # empty result: refused
     await user.should_see("result")
@@ -935,7 +989,7 @@ async def test_resolve_button_on_a_status_only_kind_still_resolves_in_one_click(
         render_note(ctx, b, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-resolve").click()
+    part(user, "note-resolve").click()
     assert store.read_status(store.heads(store.load(tmp_path))[0]) == "resolved"
 
 
@@ -956,10 +1010,10 @@ async def test_an_open_row_past_due_shows_it_and_a_resolved_one_does_not(
         render_note(ctx, done, lambda: None, author="ada")
 
     await user.open("/late")
-    chip = user.find(marker="note-due").elements.pop()
+    chip = parts(user, "note-due").pop()
     assert chip.text.startswith("overdue ") and "sb-chip-bad" in chip.classes
     await user.open("/done")
-    chip = user.find(marker="note-due").elements.pop()
+    chip = parts(user, "note-due").pop()
     assert chip.text == "due 2000-01-01" and "sb-chip-bad" not in chip.classes
 
 
@@ -975,7 +1029,7 @@ async def test_edit_dialog_keeps_an_untouched_datetime_due(user: User, repo, tmp
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-due")
     user.find(marker="edit-body").elements.pop().set_value("fixed")
     user.find(marker="edit-save").click()
@@ -990,7 +1044,7 @@ async def _append_in_dialog(user: User, ctx, n, text: str, *, body: str | None =
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-append")
     if body is not None:
         user.find(marker="edit-body").elements.pop().set_value(body)
@@ -1021,7 +1075,7 @@ async def test_an_edit_keeps_what_others_wrote_while_the_dialog_was_open(user: U
 
     async def open_dialog():
         await user.open("/t")
-        user.find(marker="note-edit").click()
+        part(user, "note-edit").click()
         await user.should_see(marker="edit-priority")
     arc = store.create_arc(tmp_path, "rig", "", "mixed").id
     await open_dialog()
@@ -1137,7 +1191,7 @@ async def test_the_edit_dialog_harvests_only_the_tags_typed_in_it(user: User, re
 
     async def save(body=None):
         await user.open("/t")
-        user.find(marker="note-edit").click()
+        part(user, "note-edit").click()
         await user.should_see(marker="edit-body")
         if body is None:
             user.find(marker="edit-priority").click()
@@ -1246,7 +1300,7 @@ async def test_edit_dialog_sets_and_clears_due(user: User, repo, tmp_path):
 
     for value, want in (("2026-10-01", "2026-10-01"), ("", None)):
         await user.open("/t")
-        user.find(marker="note-edit").click()
+        part(user, "note-edit").click()
         await user.should_see(marker="edit-due")
         user.find(marker="edit-due").elements.pop().set_value(value)
         user.find(marker="edit-save").click()
@@ -1273,7 +1327,7 @@ async def test_a_picked_date_fills_the_due_field(user: User, repo, tmp_path):
     assert store.load(tmp_path)[0].due == "2026-10-05"
 
     await user.open("/t")
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-due")
     user.find(marker="edit-due-pick").elements.pop().set_value("2026-11-01")
     user.find(marker="edit-save").click()
@@ -1290,7 +1344,7 @@ async def test_edit_dialog_offers_due_only_on_a_status_kind(user: User, repo, tm
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-body")
     await user.should_not_see(marker="edit-due")
 
@@ -1365,7 +1419,7 @@ async def test_a_catalog_refusal_shows_in_the_form(user: User, repo, tmp_path):
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/e")
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-refs")
     user.find(marker="edit-refs").elements.pop().set_value(["host:db8"])
     user.notify.messages.clear()
@@ -1459,7 +1513,7 @@ async def test_a_commit_form_reads_the_commits_once_and_stores_a_picked_sha_whol
 
     await user.open("/e")
     reads.clear()
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-refs")
     assert len(reads) == 1, "the edit dialog's pickers share one read too"
 
@@ -1557,10 +1611,10 @@ async def test_the_resolve_box_comes_after_the_text(user: User, repo, tmp_path):
 
     await user.open("/t")
     (row,) = user.find(marker="note-row").elements
-    kids = list(row.default_slot.children)
-    (box,) = user.find(marker="note-resolve").elements
+    assert parts(user, "note-resolve")
     assert "sb-resolvable" in row.classes
-    assert "sb-note-main" in kids[0].classes and kids.index(box) > 0
+    js = template()                                # card.js draws the main, then the ring
+    assert js.index('<div class="sb-note-main">') < js.index('class="sb-resolve"')
 
 
 async def test_the_copy_button_puts_the_whole_id_on_the_clipboard(user: User, repo, tmp_path,
@@ -1576,7 +1630,7 @@ async def test_the_copy_button_puts_the_whole_id_on_the_clipboard(user: User, re
         render_note(ctx, n, lambda: None, author="ada")
 
     await user.open("/t")
-    user.find(marker="note-copy-id").click()
+    part(user, "note-copy-id").click()
     await user.should_see(f"copied {n.id}")
     assert copied == [n.id]
 
@@ -1615,7 +1669,7 @@ async def test_the_tags_fields_offer_the_stores_tags_most_used_first(user: User,
     await user.open("/t")
     (tags,) = user.find(marker="note-tags").elements
     assert (tags.props["options"], tags.props["tokens"]) == (["ux", "gui", "perf"], True)
-    user.find(marker="note-edit").click()
+    part(user, "note-edit").click()
     await user.should_see(marker="edit-tags")
     (tags,) = user.find(marker="edit-tags").elements
     assert (tags.props["options"], tags.props["tokens"]) == (["ux", "gui", "perf"], True)
@@ -1685,7 +1739,7 @@ async def test_a_since_chip_lists_the_commits_it_counts(user: User, repo, tmp_pa
     await user.open("/t")
     await user.should_see("2 commits since")
     await user.should_not_see("edit 1")                     # not yet: lazy
-    user.find(marker="note-since").trigger("mouseenter")
+    part(user, "note-since").trigger("mouseenter")
     await user.should_see("edit 1")
 
 

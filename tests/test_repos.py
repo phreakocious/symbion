@@ -570,6 +570,19 @@ def test_the_summary_names_the_store_its_repos_and_where_you_stand(ws, sym):
     assert d["unlisted_repo"] is None
 
 
+def test_the_summary_marks_a_listed_repo_that_is_not_on_this_machine(ws, sym):
+    """The line gave a missing repo's path as if a repo were there, and only
+    a later write to it said otherwise: a layout that did not match the
+    store's [repos] read as fine at session start (2026-10-27)."""
+    (ws / "work-notes" / "symbion.toml").write_text(TOML + 'dns = "../tf-dns"\n')
+    rc, out, err = sym("summary")
+    assert rc == 0, err
+    assert "app ../tf-app, dns ../tf-dns (not on this machine); " in out, out
+    d = json.loads(sym("summary", "--json")[1])
+    assert [(r["name"], r["missing"]) for r in d["repos"]] == [
+        ("ansible", False), ("net", False), ("app", False), ("dns", True)]
+
+
 def test_the_summary_gives_an_unlisted_repo_the_line_to_add(ws, sym):
     r = _repo(ws / "tf-dns", "main.tf")
     (r / ".symbion").write_text("../work-notes\n")

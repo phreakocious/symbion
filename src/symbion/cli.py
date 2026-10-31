@@ -27,6 +27,7 @@ import textwrap
 import time
 import tomllib
 from collections import Counter
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -56,7 +57,12 @@ def _hermes_home() -> Path:
     """Hermes's profile home: its skills/ and config.yaml. A named profile
     has its own, named by HERMES_HOME."""
     return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
-_HOOK_COMMAND = 'sh "$HOME/.claude/skills/symbion/session_start.sh"'
+# On Claude Code the plugin carries the skill and the hooks (spec 2026-10-30).
+PLUGIN_INSTALL = "/plugin install symbion --marketplace phreakocious/symbion"
+# agy installs it too, reading the native manifest beside Claude Code's.
+AGY_PLUGIN_INSTALL = "agy plugin install https://github.com/phreakocious/symbion/tree/main/plugin"
+_AGY_PLUGIN = Path(".gemini/config/plugins/symbion")   # under $HOME, where agy installs it
+_AGY_SKILL = _AGY_PLUGIN / "skills/symbion/SKILL.md"
 # Codex runs a hook in the session's cwd (its hooks docs, 2026-10-02). The
 # project is named so a CLAUDE_PROJECT_DIR inherited from a Claude Code parent
 # cannot pick another one, and the author so `summary` knows its reader:
@@ -89,19 +95,41 @@ def _codex_hook_entry(link: Path) -> dict:
 # hand-written entry may spell it `~/...`; either way it runs this file.
 _HOOK_SCRIPT = "skills/symbion/session_start.sh"
 _WINDOWS_HOOK_SCRIPT = "skills/symbion/session_start.ps1"
-# The gotcha hook (gotchas.sh), after each tool call that can name a file.
-# Claude Code reads a matcher of plain names as an exact list (its hooks docs).
-_GOTCHA_COMMAND = 'sh "$HOME/.claude/skills/symbion/gotchas.sh"'
+# The gotcha hook (gotchas.sh) a Claude Code install from before the plugin registered.
 _GOTCHA_SCRIPT = "skills/symbion/gotchas.sh"
+_CODEX_GOTCHA_SCRIPT = "skills/symbion/codex_gotchas.py"
 
 
-def _gotcha_entry() -> dict:
-    return {"matcher": "Read|Edit|Write|NotebookEdit|Bash",
-            "hooks": [{"type": "command", "command": _GOTCHA_COMMAND, "timeout": 5}]}
+def _codex_gotcha_entry(link: Path) -> dict:
+    # Use the interpreter that installed symbion, including on native Windows.
+    argv = [sys.executable, str(link / "codex_gotchas.py")]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    return {"hooks": [{"type": "command", "command": command, "timeout": 5}]}
 
 
 def _skill_dir() -> Path:
     return Path(str(resources.files("symbion") / "data" / "skill"))
+
+
+_NO_STORE_SCHEMA = ("This project has no symbion store yet: /symbion:setup makes one, and "
+                    "symbion schema lists its kinds after that.")
+
+
+def _skill(ctx, path_only: bool) -> int:
+    """The skill as the plugin's stub injects it. Claude Code does not expand
+    text it injects (spike, 2026-10-30), so the skill's own `!`symbion schema``
+    is filled here, and the files it calls "beside this file" are named."""
+    where = _skill_dir().resolve().as_posix()
+    if path_only:
+        print(where)
+        return 0
+    body = (_skill_dir() / "SKILL.md").read_text(encoding="utf-8").split("\n---\n", 1)[1]
+    schema = (summ.render_schema(summ.schema(ctx.store_dir, ctx.cfg, ctx.kinds), summ.plain)
+              if store.exists(ctx.store_dir) else _NO_STORE_SCHEMA)
+    body = body.replace("!`symbion schema`", schema.rstrip("\n"), 1).strip("\n")
+    files = ", ".join(sorted(p.name for p in _skill_dir().glob("*.md") if p.name != "SKILL.md"))
+    print(f"symbion's skill files ({files}) are in {where}.\n\n{body}")
+    return 0
 
 
 # Each change init makes, printed in the past tense once made, and as
@@ -116,6 +144,54 @@ def _act(write: bool, verb: str, what: str) -> bool:
     return verb != "keep"
 
 
+def _claude_plugin_enabled() -> bool:
+    """Whether the user's Claude Code settings enable the symbion plugin, from
+    any marketplace: `enabledPlugins` holds `symbion@<marketplace>: true`."""
+    # ponytail: the user's settings.json only, where /plugin install puts it; a
+    # project-scope install reads as off until its two settings files are read too.
+    try:
+        data = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    on = data.get("enabledPlugins") if isinstance(data, dict) else None
+    return isinstance(on, dict) and any(
+        k.partition("@")[0] == "symbion" and v is True for k, v in on.items())
+
+
+def _claude_plugin_notes(merge: bool) -> bool:
+    """On Claude Code the plugin carries the skill and the hooks (spec
+    2026-10-30), so init wires nothing there. An install from before the plugin
+    keeps working beside it, doubled: each old piece is named with how to
+    remove it, and none is removed, since settings.json is the user's. Nothing
+    here is a change init makes, so it returns False."""
+    if not _claude_plugin_enabled():
+        print(f"note: on Claude Code the symbion plugin carries the skill and the hooks: "
+              f"{PLUGIN_INSTALL}, then /symbion:setup")
+    if merge:
+        print("note: --merge-hook merges nothing for Claude Code, whose hooks come with the "
+              "plugin")
+    link = Path.home() / _SKILL_LINK
+    if os.path.lexists(link):
+        twice = f"note: the plugin replaces {link}; with both, the agent gets the skill twice: "
+        # ponytail: os.path.isjunction is 3.12+; on 3.11 a Windows junction reads as a directory.
+        if link.is_symlink() or getattr(os.path, "isjunction", lambda p: False)(link):
+            rm = f'rmdir "{link}"' if os.name == "nt" else f"rm {shlex.quote(str(link))}"
+            print(twice + f"remove the link with `{rm}`")
+        else:
+            print(twice + "it is a directory, not symbion's link, so move it aside if it "
+                  "holds an old copy of the skill")
+    settings = Path.home() / ".claude" / "settings.json"
+    for event, scripts, what in (
+            ("SessionStart", (_HOOK_SCRIPT, _WINDOWS_HOOK_SCRIPT), "the summary"),
+            ("PostToolUse", (_GOTCHA_SCRIPT,), "each gotcha"),
+            ("PostToolUseFailure", (_GOTCHA_SCRIPT,), "each gotcha")):
+        if settings.exists() and _hook_registered(settings, event=event, scripts=scripts):
+            print(f"note: the plugin replaces the symbion {event} hook in {settings}; with "
+                  f"both, each session shows {what} twice: delete that entry from "
+                  f"hooks.{event}")
+    return False
+
+
 def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = False,
                      missing: list | None = None) -> bool:
     """Link the skill, and register the hook in the user's settings only when
@@ -126,16 +202,28 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
     merge was allowed in one run and denied as self-modification in the next
     (2026-10-10), and a command the person types is not the agent's. A skill
     dir that is not this link is someone's; it is named, never replaced.
-    Returns whether it changes anything."""
+    Claude Code's come with the plugin. Returns whether it changes anything."""
+    if agent == "claude":
+        return _claude_plugin_notes(merge)
+    if agent == "antigravity":
+        # A copy without the native manifest came from Claude Code's, whose
+        # hook agy cannot parse (agy 1.4.12, 2026-10-30).
+        if not (Path.home() / _AGY_PLUGIN / ".antigravity-plugin" / "plugin.json").exists():
+            print(f"note: on Antigravity the symbion plugin carries the skill and the hook: "
+                  f"{AGY_PLUGIN_INSTALL}")
+        if merge:
+            print("note: --merge-hook merges nothing for Antigravity, whose hook comes with "
+                  "the plugin")
+        return False
     codex = agent == "codex"
     # Hermes searches its own skills/ first and reads a link there, where
     # ~/.agents/skills took an edit to config.yaml, which cost a tester most
     # of 45 minutes (hermes-agent v0.22.1, 2026-10-15; the user's choice).
     link = (_hermes_home() / "skills" / "symbion" if agent == "hermes"
-            else Path.home() / (_SKILL_LINK if agent == "claude" else _CODEX_SKILL_LINK))
+            else Path.home() / _CODEX_SKILL_LINK)
     target = _skill_dir()
-    command = _CODEX_HOOK_COMMAND if codex else _HOOK_COMMAND
-    entry = _codex_hook_entry(link) if codex else _hook_entry(command)
+    command = _CODEX_HOOK_COMMAND
+    entry = _codex_hook_entry(link)
     command = entry["hooks"][0].get("commandWindows", command)
     changed = False
     # resolve() follows a symlink or a junction, and a real directory resolves
@@ -174,8 +262,7 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
         if merge:
             print("note: --merge-hook merges nothing for Hermes, which runs no symbion hook")
         return changed
-    settings = ((Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
-                 / "hooks.json") if codex else Path.home() / ".claude" / "settings.json")
+    settings = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser() / "hooks.json"
     # Codex skips a new or changed hook until the person trusts it, and says
     # nothing in the session that skipped it. init cannot read the trust (a
     # hash of Codex's own scheme), so a run that keeps the hook says it too.
@@ -184,19 +271,23 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
     inline = settings.with_name("config.toml")
     if codex and inline.exists() and _hook_registered(inline, toml=True):
         changed |= _act(write, "keep", f"hook in {inline}")
+        if not _hook_registered(inline, toml=True, event="PreToolUse",
+                                scripts=(_CODEX_GOTCHA_SCRIPT,)):
+            print(f"note: {inline} has no symbion gotcha hook; append this TOML:\n"
+                  "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\n"
+                  'type = "command"\ncommand = '
+                  + json.dumps(_codex_gotcha_entry(link)["hooks"][0]["command"])
+                  + "\ntimeout = 5")
+            if missing is not None:
+                missing.append(("PreToolUse", f"add the printed TOML to {inline}"))
         print(f"note: {trust}")
         return changed
-    # Claude Code also runs the gotcha hook after each call that can name a
-    # file, and after each that fails: a Bash call that exits non-zero never
-    # reaches PostToolUse (2026-10-13). Codex edits through apply_patch, which
-    # this matcher does not name.
+    # Codex delivers context before the call, and its gotcha handler
+    # understands apply_patch's file headers.
     hooks = [("SessionStart", entry, f"runs {command} in every session",
-              (_HOOK_SCRIPT, _WINDOWS_HOOK_SCRIPT))]
-    if agent == "claude":
-        hooks.append(("PostToolUse", _gotcha_entry(), f"runs {_GOTCHA_COMMAND} after each "
-                      "Read, Edit, Write, NotebookEdit and Bash call", (_GOTCHA_SCRIPT,)))
-        hooks.append(("PostToolUseFailure", _gotcha_entry(), "runs it after each of "
-                      "those calls that fails", (_GOTCHA_SCRIPT,)))
+              (_HOOK_SCRIPT, _WINDOWS_HOOK_SCRIPT)),
+             ("PreToolUse", _codex_gotcha_entry(link),
+              "shows file gotchas before tool calls", (_CODEX_GOTCHA_SCRIPT,))]
     if not settings.exists() and not merge:
         if write:
             settings.parent.mkdir(parents=True, exist_ok=True)
@@ -318,9 +409,10 @@ def _git_says(root: Path, path: Path) -> str:
 def _ignored_paths(store_dir, prefix: str) -> list[str]:
     """Paths under `prefix` that `git add -A` skips by a `.gitignore` in the
     store. `--ignored=matching` names each ignored FILE; the default collapses
-    them to the directory. -z: a quoted name failed the prefix test. A rule
-    from the user's own excludes file ignores their litter (`.DS_Store`), and
-    `add -f` would commit it."""
+    them to the directory. -z: a quoted name failed the prefix test. Only a
+    `.gitignore` under `prefix` counts, a copied tree's own: the store's root
+    `.gitignore` (`__pycache__/`) and the user's excludes file (`.DS_Store`)
+    hide byproducts on purpose, and `add -f` would commit them."""
     git = ["git", "-C", str(store_dir), "--no-optional-locks"]
     r = subprocess.run([*git, "status", "--porcelain", "-z", "--ignored=matching"],
                        capture_output=True, text=True, encoding="utf-8")
@@ -333,23 +425,22 @@ def _ignored_paths(store_dir, prefix: str) -> list[str]:
                        capture_output=True, text=True, encoding="utf-8")
     f = c.stdout.split("\0")
     return sorted(path for src, path in zip(f[0::4], f[3::4])
-                  if Path(src).name == ".gitignore" and not Path(src).is_absolute()
-                  and not src.startswith("~"))
+                  if Path(src).name == ".gitignore" and src.startswith(prefix + "/"))
 
 
 def _say_ignored_archive(store_dir, would=False) -> None:
     """`git add -A` skips ignored paths silently. A tree copied verbatim
     under archive/ can carry its own `.gitignore` of `*`, and then the copy
     is on disk, `diff -r` passes, and the store's git holds none of it
-    (2026-09-28). archive/ exists to be committed, so anything ignored there
-    is the bug, not a choice. The dry run says it too (a clean-room review,
+    (2026-09-28). archive/ exists to be committed, so what a copied tree's
+    own `.gitignore` hides there is the bug, not a choice. The dry run says it too (a clean-room review,
     2026-10-13)."""
     skipped = _ignored_paths(store_dir, "archive")
     if skipped:
         more = f", +{len(skipped) - 3} more" if len(skipped) > 3 else ""
         print(f"note: {len(skipped)} path(s) under archive/ are gitignored, so this "
               f"commit {'would not hold' if would else 'does not hold'} them: "
-              f"{', '.join(skipped[:3])}{more} (git -C {store_dir} add -f archive)",
+              f"{', '.join(skipped[:3])}{more} (git -C {shlex.quote(str(store_dir))} add -f archive)",
               file=sys.stderr)
 
 
@@ -357,8 +448,8 @@ def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
           repoint: bool = False, agent: str = "claude", merge_hook: bool = False) -> int:
     """Without `write`, list each change and make none (the user's call,
     2026-10-01): installed from pipx, init is run by someone who has not read
-    its source, and the skill link and the hook are instruction surfaces
-    every Claude Code session reads. Exit 1 when there is something to
+    its source, and the skill link and the hook it makes for Codex or Hermes
+    are instruction surfaces every session there reads. Exit 1 when there is something to
     change, so a run whose output was thrown away still fails."""
     # Under [repos] the roots stand in a listed repo, or in none outside
     # every one (config.load); init installs into the cwd's own.
@@ -607,7 +698,12 @@ def _painter(kinds=None, gui=None):
 def _hook_json(text: str, line: str) -> str:
     """A SessionStart hook's plain stdout reaches only the agent. In this JSON
     `additionalContext` goes to the agent and `systemMessage` to the person's
-    terminal. Codex shows `systemMessage` as a warning, so Codex gets none."""
+    terminal. Codex shows `systemMessage` as a warning, so Codex gets none.
+    agy reads only its own `injectSteps`, whose `systemMessage` goes to the
+    model. Its docs' `metadata.user_markdown` as a string made agy 1.4.12
+    panic and drop the hook's output (2026-10-30)."""
+    if api.shell_author() == "antigravity":
+        return json.dumps({"injectSteps": [{"systemMessage": {"systemMessage": text}}]})
     out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
     if api.author_default() != "codex":
         out["systemMessage"] = line
@@ -627,15 +723,16 @@ def _unknown_keys_note(ctx) -> str | None:
 
 
 def _hook_session() -> str | None:
-    """The session id in the hook input Claude Code writes on stdin. A
-    terminal, an empty stdin or another shape has none."""
+    """The session id in the hook input on stdin: Claude Code's `session_id`,
+    agy's `conversationId`. A terminal, an empty stdin or another shape has
+    none."""
     try:
         if sys.stdin is None or sys.stdin.isatty():
             return None
         data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "null")
     except (ValueError, OSError, AttributeError):
         return None
-    sid = data.get("session_id") if isinstance(data, dict) else None
+    sid = (data.get("session_id") or data.get("conversationId")) if isinstance(data, dict) else None
     return sid if isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid) else None
 
 
@@ -673,24 +770,33 @@ def _list_gotchas(ctx, sid: str, deadline: float) -> None:
     # store had changed since, by one commit to hundreds. The agent, in the file at
     # that moment, judges; the line gives it the age, the churn and the retire.
     left = min(HOOK_HISTORY_TIMEOUT, deadline - time.monotonic())
-    since = gitref.commits_since(ctx.cfg, rows, timeout=left) if left > 0 else {}
+    # A ref's line counts the ref's file. A ref keeps no blob, so its count
+    # starts at the row's first write.
+    asked = {(n.id, t): n if t == n.target else
+             replace(n, id=f"{n.id}\t{t.name}", target=t, target_blob=None)
+             for n in rows for t in _hook_targets(n)}
+    since = gitref.commits_since(ctx.cfg, list(asked.values()), timeout=left) if left > 0 else {}
     for n in rows:
         tail = n.id[-10:]
         sym = " ".join(filter(None, ["symbion", _named_store(ctx)]))
         at = n.first_written or n.created_at
         # The line is cached for the session: `6m ago` still read so 45 minutes on.
-        age = f"written {store.shown(at) if summ.age_days(at) == 0 else summ.when_added(at)}"
+        written = f"written {store.shown(at) if summ.age_days(at) == 0 else summ.when_added(at)}"
         if _other_side(by_id, n, side):
-            age += f" by {summ._root(by_id, n).author}"
-        if since.get(n.id):
-            age += f"; the file has changed in {summ._count(since[n.id], 'commit')} since"
+            written += f" by {summ._root(by_id, n).author}"
         body = summ.clip(n.body or "", summ.GOTCHA_CHARS)
         more = f"`{sym} show {tail}` prints all of it; " if _gotcha_len(n) > summ.GOTCHA_CHARS \
             else ""
-        text = (f"symbion entry {tail}, tagged gotcha, is on {n.target.type}"
-                f"{':' + n.target.name if n.target.name else ''} ({age}): {body} "
-                f"({more}if it no longer holds: `{sym} supersede {tail} --add-tag retired`)")
         for t in _hook_targets(n):
+            # A call that named a ref read "is on <target>" alone, as if misfiled (2026-10-30).
+            ref = "" if t == n.target else f" and refers to {t.type}:{t.name}"
+            age = written
+            if moved := since.get(asked[n.id, t].id):
+                age += (f"; {'the file' if t == n.target else t.name} has changed in "
+                        f"{summ._count(moved, 'commit')} since")
+            text = (f"symbion entry {tail}, tagged gotcha, is on {n.target.type}"
+                    f"{':' + n.target.name if n.target.name else ''}{ref} ({age}): {body} "
+                    f"({more}if it no longer holds: `{sym} supersede {tail} --add-tag retired`)")
             # The root's dir name: gotchas.sh matches `<root>/<name>`, so a
             # row on README.md does not fire on src/README.md.
             root = ctx.cfg.for_type(t.type).work_root
@@ -762,9 +868,11 @@ def _name_long_text(sized) -> None:
     entry (the user, 2026-10-14: "each addition should strive for that; some
     accumulation over time is inevitable"). After SKILL.md said so, agents'
     writes still often ran past it (2026-10-16). Say so at the write, as a
-    long gotcha's cut is."""
+    long gotcha's cut is. Once per agent context, as the clip note: a session
+    that heard it on every long write read past it, and most sessions heard it
+    once anyway (2026-10-30)."""
     long = [(i, c) for i, c in sized if c > _TEXT_CHARS]
-    if not long:
+    if not long or not _first_in_session("note", "long text"):
         return
     if len(sized) == 1:
         what = f"this write's text runs {long[0][1]} chars"
@@ -1236,6 +1344,11 @@ class _Parser(argparse.ArgumentParser):
         bad = re.match(r"argument cmd: invalid choice: '([^']*)'", message)
         if bad and bad[1] in _VERB_HINTS:        # the usage line lists the verbs
             message = f"no verb {bad[1]!r}: {_VERB_HINTS[bad[1]]}"
+        if "--status: invalid choice: 'parked'" in message and hasattr(self, "parked_kinds"):
+            # the summary counts `parked`, and no flag lists every parked kind (2026-10-30)
+            message += "; 'parked' is a kind bit, not a status: " + (
+                " or ".join(f"`list --kind {k} --status open`" for k in self.parked_kinds)
+                or "no kind in this store has it")
         stray = re.match(r"argument KIND: invalid kind '([^']*)'", message)
         if stray and (pair := self._measure_hint([stray[1]])):
             message = f"{stray[1]!r} was read as KIND: {pair}"
@@ -1278,8 +1391,10 @@ class _Parser(argparse.ArgumentParser):
             # which `list` lacks, and the next try failed too (dogfood, 2026-10-14).
             hints = []
             for x in extras:
+                # A hint that is no flag names another verb, which holds from any verb.
                 h = next((h for h in _FLAG_HINTS.get(x, ())
-                          if h.split()[0] in self._option_string_actions), None)
+                          if not h.startswith("-") or h.split()[0] in self._option_string_actions),
+                         None)
                 if h:
                     hints.append(f"{x}: use {h}")
             # A word right after an unknown flag is that flag's value: `-m x`
@@ -1368,10 +1483,51 @@ _VERB_HINTS = {
     "recent": "`list --since 2h`",
 }
 _FLAG_HINTS = {"--open": ("--status open",), "--closed": ("--status resolved",),
-               "--resolved": ("--status resolved",), "--search": ("--grep",),
+               "--resolved": ("--status resolved",),
                "--message": ("--body", "--grep"), "-m": ("--body", "--grep"),
                "--text": ("--body", "--grep"), "--title": ("--body", "--grep"),
-               "--body": ("--grep",), "-F": ("--body-file", '-m "$(cat FILE)"')}
+               "-F": ("--body-file", '-m "$(cat FILE)"'),
+               "--cites": ("`show ID`, which lists the entries that cite ID, or `list --grep ID`",)}
+# A guess runs when it is a read, its meaning is unambiguous and the field
+# shows it (2026-10-01); writes keep their hints above. Out of -h and
+# completion, which teach one form; the note names it (the user, 2026-10-30).
+_LIST_ALTS = {"--search": ["--grep"], "--text": ["--grep"], "--body": ["--grep"],
+              "--by": ["--author"], "--open": ["--status", "open"],
+              "--closed": ["--status", "resolved"], "--resolved": ["--status", "resolved"],
+              "-n": ["--limit"]}
+
+
+def _alternates(rest: list, kinds, types) -> tuple[list, list]:
+    """`rest` with each read guess in symbion's form, and a note for each:
+    `search TEXT` (agents guess it: a transcript sweep, 2026-10-30), list's
+    flags in _LIST_ALTS, `--type KIND`, and grep's `-i` and `-F` order."""
+    said = []
+    if rest[:1] == ["search"] and rest[1:2] and not rest[1].startswith("-"):
+        n = next((i for i, a in enumerate(rest[1:], 1) if a.startswith("-")), len(rest))
+        rest = ["list", "--grep", " ".join(rest[1:n]), *rest[n:]]
+        said.append("read `search TEXT` as `list --grep TEXT`, the form symbion documents")
+    if rest[:1] == ["list"]:
+        out = []
+        for a in rest:
+            out += _LIST_ALTS.get(a, [a])
+            if a in _LIST_ALTS:
+                said.append(f"read `list {a}` as `list {' '.join(_LIST_ALTS[a])}`, "
+                            f"the form symbion documents")
+        rest = out
+        for i, a in enumerate(rest[:-1]):
+            if a == "--type" and rest[i + 1] in kinds and rest[i + 1] not in types:
+                rest[i] = "--kind"
+                said.append(f"read `--type {rest[i + 1]}` as `--kind {rest[i + 1]}`: "
+                            f"{rest[i + 1]} is a kind")
+    if "--grep" in rest:
+        if "-i" in rest:
+            rest = [a for a in rest if a != "-i"]
+            said.append("read `--grep -i` as `--grep`, which ignores case already")
+        i = rest.index("--grep")
+        if rest[i + 1:i + 2] in (["-F"], ["--fixed-strings"]):
+            rest[i:i + 2] = [rest[i + 1], "--grep"]
+            said.append("read `--grep -F TEXT` as `--grep TEXT -F`, the form symbion documents")
+    return rest, said
 
 
 def _choice(legal, what, where, store_dir):
@@ -1488,6 +1644,10 @@ def _kind_choice(kinds, store_dir):
     toml = store_dir / "symbion.toml"
 
     def where(v):
+        if v == "gotcha":       # SKILL.md speaks of adding one (2026-10-30)
+            plain = next((k for k, s in kinds.items() if not s.status and not s.verdict), "KIND")
+            return (f"'gotcha' is a tag, not a kind: --tag gotcha "
+                    f"(a new trap: `add {plain} --tag gotcha --target TYPE:NAME`)")
         if v in K.DEFAULT_KINDS:
             line = K.render_toml({v: K.DEFAULT_KINDS[v]}).splitlines()[1]
             return f"{v!r} is a default kind: to use it here, add under [kinds] in {toml}: {line}"
@@ -1525,16 +1685,19 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     sub = p.add_subparsers(dest="cmd", required=True)
 
     init_says = ("create this project's store with a starter symbion.toml, and link the "
-                 "selected agent's skill and session-start hook outside it: ~/.claude for "
-                 "Claude Code, ~/.agents/skills and $CODEX_HOME (default ~/.codex) for "
+                 "selected agent's skill and session-start hook outside it: "
+                 "~/.agents/skills and $CODEX_HOME (default ~/.codex) for "
                  "Codex, $HERMES_HOME/skills (default ~/.hermes/skills) and no hook for "
-                 "Hermes. Existing "
+                 "Hermes. On Claude Code and on Antigravity the symbion plugin carries both, "
+                 "so init links and registers nothing there, and on Claude Code names any "
+                 "it finds from before. Existing "
                  "settings are preserved; a missing hook entry is printed for you to add, "
                  "or merged with --merge-hook. "
                  "Without --yes it lists each change and makes none, and exits 1 "
                  "if it has one to make")
     i = sub.add_parser("init", help=init_says, description=init_says)
-    i.add_argument("--agent", choices=("claude", "codex", "hermes", "both"), default="claude",
+    i.add_argument("--agent", choices=("claude", "codex", "hermes", "antigravity", "both"),
+                   default="claude",
                    help="agent integration to install; both is claude and codex "
                         "(default: claude)")
     i.add_argument("--yes", action="store_true", help="make the changes it lists")
@@ -1618,12 +1781,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="the same as --type TYPE --name NAME")
     li.add_argument("--kind", default=None, type=_kind_choice(kinds, store_dir),
                     help="only entries of this kind")
+    # `--open`, the guess agents made most (2026-09-21..29), is _LIST_ALTS'
     li.add_argument("--status", default=None, choices=sorted(store.STATUSES),
                     help="only open, or only resolved, entries of a status kind")
-    # The guess agents made most (2026-09-21..29). Out of -h, which teaches --status.
-    for flag, status in (("--open", "open"), ("--resolved", "resolved"), ("--closed", "resolved")):
-        li.add_argument(flag, dest="status", action="store_const", const=status,
-                        help=argparse.SUPPRESS)
+    li.parked_kinds = [k for k, s in kinds.items() if s.parked]     # for _Parser.error
     li.add_argument("--tag", default=None, help="only entries carrying this tag")
     li.add_argument("--arc", "--arc-id", dest="arc_id", default=None, metavar="ID",
                     help="only entries in this arc, resolved included "
@@ -1694,6 +1855,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                          "inherited refs stay")
     rs.add_argument("--result", default=None, help="the verdict; required on a "
                     "status+verdict kind (a pre-registration)")
+    rs.add_argument("--external", action="store_true",
+                    help="a pre-registration judged outside the repo (a host, a live "
+                         "database): stamp the resolve with its time, not HEAD")
     rs.add_argument("--measure", dest="measures", action="append", default=[],
                     metavar="KEY=VALUE", help=_MEASURE_MERGE_HELP)
     rs.add_argument("--author", default=None, help=_AUTHOR_HELP)
@@ -1844,6 +2008,11 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                       help="the kinds as a [kinds] table to paste into symbion.toml; a table "
                            "there replaces the defaults, so keep the ones you use")
 
+    sk = sub.add_parser("skill", help="the agent skill with this store's kinds in it, as the "
+                                      "Claude Code plugin loads it; needs no store")
+    sk.add_argument("--path", action="store_true",
+                    help="print only the directory that holds the skill's files")
+
     ctx = sub.add_parser("context", help="every entry on one object (--target), commit "
                                          "(--commit) or branch (--branch)")
     grp = ctx.add_mutually_exclusive_group()
@@ -1891,6 +2060,12 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     says = "take an arc off the summary; its open entries then list outside arcs"
     aa = asub.add_parser("archive", help=says, description=says)
     aa.add_argument("id")
+
+    says = "put an archived arc back on the summary, with its open entries"
+    asub.add_parser("unarchive", help=says, description=says).add_argument("id")
+    adesc = asub.add_parser("describe", help="give an arc a new description; arc list prints it")
+    adesc.add_argument("id")
+    adesc.add_argument("description")
 
     asd = asub.add_parser("seed", help="add one task per --name, or per entry of a "
                                        "configured catalog")
@@ -2244,7 +2419,7 @@ def _name_unchecked(written) -> None:
           f"names what ran, or on a prediction, what will run", file=sys.stderr)
 
 
-def _name_dirty(written, external: bool = True) -> None:
+def _name_dirty(written) -> None:
     """A verdict row stamped on a dirty tree reads `unverifiable (dirty
     tree)` for good, even once the tree is committed, and the write said
     nothing (2026-10-14). Name the paths while the run can still be redone:
@@ -2263,8 +2438,8 @@ def _name_dirty(written, external: bool = True) -> None:
            if count else "uncommitted changes")    # a [provenance] command may name none
     print(f"note: {tree} has {has}, so {what} "
           f"`unverifiable (dirty tree)` for good. To stamp a commit: commit, re-run, "
-          f"then `undo` and write again" + (". A run outside the repo takes --external"
-                                            if external else ""), file=sys.stderr)
+          f"then `undo` and write again. A run outside the repo takes --external",
+          file=sys.stderr)
 
 
 def _name_undated(written) -> None:
@@ -2361,7 +2536,8 @@ def _mark_read(ctx, sid: str, at: str) -> None:
     (`_first_listing`): a compacted session has lost them."""
     store._replace_atomically(_session_cache() / f"{sid}.read",
                               f"{Path(ctx.store_dir).resolve()}\t{at}\n")
-    (_session_cache() / f"{sid}.open").unlink(missing_ok=True)
+    for said in ("open", "alt", "clip", "note"):   # and the notes heard once
+        (_session_cache() / f"{sid}.{said}").unlink(missing_ok=True)
 
 
 def _session_mark(suffix: str) -> Path | None:
@@ -2389,10 +2565,15 @@ def _first_listing(store_dir, target) -> bool:
     """False once this agent session's open-rows note has listed the rows on
     `target` (type, name, title) in this store; true, and marked, the first
     time. With no session key, every time."""
-    mark = _session_mark("open")
+    return _first_in_session("open", json.dumps([str(Path(store_dir).resolve()), *target]))
+
+
+def _first_in_session(suffix: str, line: str) -> bool:
+    """False once this agent session's `suffix` mark holds `line`; true, and
+    marked, the first time. With no session key, every time."""
+    mark = _session_mark(suffix)
     if mark is None:
         return True
-    line = json.dumps([str(Path(store_dir).resolve()), *target])
     try:
         if line in mark.read_text(encoding="utf-8").splitlines():
             return False
@@ -2410,8 +2591,9 @@ def _first_listing(store_dir, target) -> bool:
 def _first_clip_note() -> bool:
     """False once this agent session has had the clip note. Each `add` is its
     own process, and one session's batches printed it 23 times, each echoing
-    text just written (2026-10-11). SKILL.md teaches the rule, so a compacted
-    session keeps it. With no session key, every time, as before.
+    text just written (2026-10-11). Session start clears the mark: SKILL.md
+    teaches the rule, but a compacted session has lost the note (the user,
+    2026-10-30). With no session key, every time, as before.
     # ponytail: a subagent shares its session's key and so its mark; a
     # machine whose session-start hook never runs keeps every mark."""
     mark = _session_mark("clip")
@@ -2939,6 +3121,8 @@ def _dispatch(args, ctx) -> int:
         return 0
     if args.cmd == "serve" and (args.restart or args.stop):
         return _serve_all(restart=args.restart)
+    if args.cmd == "skill":                      # the plugin loads it before a store exists
+        return _skill(ctx, args.path)
 
     # An absent store is never a first session: `init` creates it. It is a
     # `.symbion` pointer to nowhere, a renamed repo, a wrong --dir or
@@ -3059,7 +3243,10 @@ def _dispatch(args, ctx) -> int:
             _name_catalog_misses(ctx.cfg, fields, written)
         _echo_clipped_heads(store_dir, written)
         _echo_gotcha_notes(written, ctx.input_types)
-        _name_long_text([(n.id, len((n.body or "").strip())) for n in written])
+        # A registration's body is the contract its resolve is scored on: it
+        # cannot move to docs/, so the note fired on every one (2026-10-30).
+        _name_long_text([(n.id, len((n.body or "").strip())) for n in written
+                         if not (n.spec.status and n.spec.verdict)])
         return 0
 
     if args.cmd == "list":
@@ -3220,6 +3407,15 @@ def _dispatch(args, ctx) -> int:
             if n_alt:
                 print(f"note: --grep is a Python regex, where '\\|' is a literal pipe; "
                       f"as {shlex.quote(alt)} it matches {n_alt}", file=sys.stderr)
+        if grep is not None and (arcs := [a for a in store.load_arcs(store_dir) if grep.search(
+                "\n".join((a.id, a.name, a.description or "")))]):
+            # `list` lists entries, so an arc named for the words read as
+            # nothing filed on them (the user chose a note, 2026-10-29).
+            print(f"note: {summ._count(len(arcs), 'arc')} "
+                  f"{'matches' if len(arcs) == 1 else 'match'} too: "
+                  + ", ".join(f"{a.id} ({a.name}{', archived' if a.archived else ''})"
+                              for a in arcs)
+                  + " (list --arc ID lists its entries)", file=sys.stderr)
         # Text is bounded by default; --json only on an explicit --limit, so
         # the agent's array is never a silent page. 0 lifts the cap.
         cap = args.limit if args.limit is not None else \
@@ -3332,7 +3528,7 @@ def _dispatch(args, ctx) -> int:
         measures = _measures_from_flags(args.measures)
         if args.add_tags:             # onto the tip; a missing id raises below
             fields["tags"] = sorted(set(tip.tags if tip else ()) | set(args.add_tags))
-        if tip is not None and store.read_status(tip) == "resolved" \
+        if tip is not None and store.read_status(tip) == "resolved" and not args.external \
                 and set(fields) == {"status"} and not measures and not args.refs:
             # It printed `already resolved`, then `edited in place` at exit 0,
             # which contradicted, and there was nothing to add (2026-10-09 review).
@@ -3342,7 +3538,7 @@ def _dispatch(args, ctx) -> int:
         try:
             note = api.supersede(ctx, args.id, author=_resolved_author(args),
                                  add_refs=_refs_from_flags(args.refs),
-                                 add_measurements=measures, **fields)
+                                 add_measurements=measures, external=args.external, **fields)
         except KeyError:
             _no_note(args.id, store_dir)
             return 1
@@ -3354,7 +3550,7 @@ def _dispatch(args, ctx) -> int:
         _name_new_items(store_dir, [note], tip.refs if tip else ())
         if tip is not None and tip.spec.status and tip.spec.verdict \
                 and store.read_status(tip) == "open":
-            _name_dirty([note], external=False)   # a pre-registration's resolve is stamped anew
+            _name_dirty([note])                   # a pre-registration's resolve is stamped anew
         if args.body:
             _name_long_text([(note.id, len(args.body.strip()))])
         return 0
@@ -3543,18 +3739,25 @@ def _dispatch(args, ctx) -> int:
         return 0 if ok else 1
 
     if args.cmd == "push":
-        if gitref.unpushed(store_dir) is None:
+        n = gitref.unpushed(store_dir)
+        if n is None:
             print("no remote: this store exists on one disk", file=sys.stderr)
             return 1
         rc = api.push(ctx).returncode
+        if rc == 0 and n:
+            # Flushed: in an agent's shell, one pipe for both streams, it came after the stderr below.
+            print(f"pushed {summ._count(n, 'commit')} to origin", flush=True)
+        # Read as a refusal after a push that had succeeded, when it began
+        # `not pushed:` as a failed push does (dogfood, 2026-10-31).
         notes, registry = gitref.uncommitted(store_dir)
         bits = []
         if notes:
-            bits.append(summ._count(notes, "entry"))
+            bits.append(f"{summ._count(notes, 'entry')} "
+                        f"({store.rows_by_author(store.pending_rows(store_dir))})")
         if registry:
             bits.append("arc changes")
         if bits:
-            print(f"not pushed: {' and '.join(bits)} not yet in the store's git "
+            print(f"not in this push: {' and '.join(bits)} not yet in the store's git "
                   f"({_commit_hint(ctx)})", file=sys.stderr)
         return rc
 
@@ -3671,6 +3874,15 @@ def _dispatch(args, ctx) -> int:
             # model read the path as where the skill loads from (a tester,
             # 2026-10-13).
             data["skill"] = "skill_view symbion"
+        if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") and (Path.home() / _AGY_SKILL).exists():
+            # agy lists each skill by the path of its copy and reads it from
+            # there (an agy session's report, 2026-10-30).
+            data["skill"] = f"~/{_AGY_SKILL.as_posix()}"
+        if os.environ.get("CLAUDE_PLUGIN_ROOT") or (reader == "claude" and _claude_plugin_enabled()):
+            # The plugin's hook (the spike measured the variable in its
+            # environment), or Claude Code's shell with the plugin on: its skill
+            # is the stub, which fills the schema in.
+            data["skill"] = "symbion:symbion"
         if at_terminal:
             data["skill"] = None      # the line is for an agent; the hook reads a pipe
         data["named_store"] = _named_store(ctx)
@@ -3827,7 +4039,25 @@ def _dispatch_arc(args, ctx) -> int:
         done, total = store.arc_progress(store.load(store_dir), args.id)
         if total > done:
             print(f"note: {summ._count(total - done, 'open entry')} in {args.id}, now listed "
-                  f"outside arcs (list --arc {args.id} --status open)", file=sys.stderr)
+                  f"outside arcs (list --arc {args.id} --status open); arc unarchive {args.id} "
+                  f"undoes the archive", file=sys.stderr)
+        return 0
+
+    if args.acmd in ("unarchive", "describe"):
+        try:
+            if args.acmd == "unarchive":
+                api.unarchive_arc(ctx, args.id)
+            else:
+                api.describe_arc(ctx, args.id, args.description)
+        except KeyError:
+            _no_arc(store_dir, args.id)
+            return 1
+        print(args.id)
+        if args.acmd == "unarchive" and not was.archived:
+            print(f"note: {args.id} is not archived; nothing changed", file=sys.stderr)
+        elif args.acmd == "describe" and was.description == args.description:
+            print(f"note: {args.id} has that description already; nothing changed",
+                  file=sys.stderr)
         return 0
 
     if args.acmd == "seed":
@@ -4136,10 +4366,11 @@ def _main(argv) -> int:
             # directory before creating the store (measured 2026-09-28).
             # The cwd stands in as a named store: it makes a Ctx with the
             # built-in types and kinds, and no repo to derive one from is
-            # exactly when there is nothing store-specific to list.
-            if not {"-h", "--help"} & set(rest):
+            # exactly when there is nothing store-specific to list. `skill`
+            # too: the plugin's stub loads it wherever a session starts.
+            if not {"-h", "--help"} & set(rest) and rest[:1] != ["skill"]:
                 raise
-            no_store = e
+            no_store = None if rest[:1] == ["skill"] else e
             ctx = api.resolve(os.getcwd(), follow_owner=False)
         # The hook merges stderr into its JSON: summary --hook puts it in the text.
         if (note := _unknown_keys_note(ctx)) and not (rest[:1] == ["summary"] and "--hook" in rest):
@@ -4165,9 +4396,11 @@ def _main(argv) -> int:
         # grep's -i carried over: --grep is case-insensitive already, and
         # `--grep -i PATTERN` read -i as a flag and refused (seen
         # repeatedly, 2026-10-14).
-        if "--grep" in rest:
-            rest = [a for a in rest if a != "-i"]
+        rest, said = _alternates(rest, ctx.kinds, ctx.input_types)
         args = parser.parse_args(rest)
+        for line in said:                        # once it ran: a refusal says its own
+            if _first_in_session("alt", line):
+                print(f"note: {line}", file=sys.stderr)
         args.argv = argv                         # serve --reload re-runs it
         args.wrote = set()                       # a write's rows, for _say_news
         if no_store is not None:
@@ -4202,7 +4435,7 @@ def _main(argv) -> int:
         row_write = args.cmd in ("add", "resolve", "supersede") or \
             args.cmd == "arc" and args.acmd == "seed" and bool(args.wrote)
         write = row_write or args.cmd == "rename" or args.cmd == "arc" and (
-            args.acmd in ("create", "rename", "archive")
+            args.acmd in ("create", "rename", "archive", "unarchive", "describe")
             or args.acmd == "reconcile" and (args.apply or args.resolve_stale))
         if rc == 0 and write:
             _say_pending(ctx)

@@ -221,7 +221,7 @@ def _ground(body: str, q: dict) -> str:
 
 # Not words on a card: a mark, whose floor is 3:1 (WCAG 2, 1.4.11), or dark
 # text on a filled control, whose ground is the control's own colour.
-_NOT_WORDS = (".sb-sep", ".text-dim", ".sb-docs > .q-icon", ".q-btn.text-white")
+_NOT_WORDS = (".sb-sep", ".text-dim", ".sb-docs-row > .q-icon", ".q-btn.text-white")
 
 
 def test_every_rule_that_sets_a_colour_reads_at_4_5_to_1():
@@ -371,3 +371,25 @@ def test_every_page_keeps_room_for_the_scrollbar():
     (measured in headless Chrome at 1440px, 2026-10-16)."""
     from symbion.gui.theme import DARK_CSS
     assert re.search(r"html\s*\{\s*scrollbar-gutter:\s*stable;", DARK_CSS)
+
+
+def test_every_map_tile_colour_reads_under_its_text():
+    """The map's ramps start past the band where neither text colour reads:
+    a straight mix from the surface colour failed 4.5:1 for a third of its way."""
+    from symbion import kinds as K
+    from symbion import term
+    from symbion.gui import theme as Th
+    assert len(Th.MAP_OPEN) == len(Th.MAP_NEW) == 5
+    assert (Th.MAP_OPEN[-1], Th.MAP_NEW[-1]) == (Th.PALETTE.notable, Th.PALETTE.good)
+    low = [(c, r) for c in (*Th.MAP_OPEN, *Th.MAP_NEW) if (r := _ratio(c, Th.MAP_TEXT)) < 4.5]
+    assert not low, low
+    assert _ratio(Th.MAP_EMPTY, Th.PALETTE.text_emph) >= 4.5
+    # kind_hex picks from all three: a store's colour, a built-in's, a declared kind's
+    assert not [h for h in (*K.COLORS.values(), *term.KIND.values(), term.OWN_KIND)
+                if _ratio(h, Th.MAP_TEXT) < 4.5]
+
+
+def test_a_map_row_shows_keyboard_focus():
+    """A panel row is `display: contents`, which draws no focus ring of its own."""
+    from symbion.gui.theme import DARK_CSS
+    assert "a.sb-map-row:focus-visible > *" in DARK_CSS
