@@ -191,12 +191,16 @@ def test_a_rename_lists_its_new_path(repo):
 
 
 def test_a_read_only_serve_keeps_no_diff(repo, monkeypatch):
-    """`_git` keeps each answer for good under --read-only: a whole-tree
-    diff kept there would hold the demo's memory."""
+    """`_git` keeps answers under --read-only: a whole-tree diff kept there
+    would hold the demo's memory. Each ask runs git again."""
     monkeypatch.setenv("SYMBION_READ_ONLY", "1")
     (repo / "f").write_text("y\n")
     sha = _commit(repo, "y")
-    gitref._ANSWERS.clear()
-    assert gitref.diff_text(repo, "HEAD~1", "HEAD")
-    assert gitref.commit_show(repo, sha)[4]
-    assert not [k for k in gitref._ANSWERS if k[1][0] in ("diff", "show")]
+    gitref._asked.cache_clear()
+    runs, real = [], subprocess.run
+    monkeypatch.setattr(gitref.subprocess, "run",
+                        lambda *a, **k: runs.append(a[0][3]) or real(*a, **k))
+    for _ in range(2):
+        assert gitref.diff_text(repo, "HEAD~1", "HEAD")
+        assert gitref.commit_show(repo, sha)[4]
+    assert runs.count("diff") == runs.count("show") == 2

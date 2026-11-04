@@ -45,7 +45,8 @@ def _isolated_home(tmp_path_factory, monkeypatch):
         monkeypatch.setenv(k, "t@t")
     # The agent running pytest must not be the author a test reads.
     for k in ("SYMBION_AUTHOR", "CLAUDECODE", "CODEX_THREAD_ID", "HERMES_AGENT",
-              "CLAUDE_CODE_SESSION_ID", "ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_AGENT"):
+              "CLAUDE_CODE_SESSION_ID", "ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_AGENT",
+              "SYMBION_HOST", "AI_AGENT", "PI_SESSION_ID"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -89,6 +90,10 @@ def _isolated_cwd(_neutral_repo, monkeypatch):
     which is no repo, 14 of them failed. One empty repo shared by the session:
     a test that writes into its cwd or commits asks for `repo` instead."""
     monkeypatch.chdir(_neutral_repo)
+    yield
+    # `init --dir X --yes` writes a .symbion here, and every later init on the
+    # worker then named X's path: a Codex test's path failed a Pi test (2026-11-03).
+    (_neutral_repo / ".symbion").unlink(missing_ok=True)
 
 
 @pytest.fixture

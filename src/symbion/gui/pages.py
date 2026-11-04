@@ -19,7 +19,7 @@ from .. import term as T
 from .. import store as S
 from .. import summary as summ
 from . import arcs, diffview, filters, palette, servers, treemap
-from .chrome import shell, store_name
+from .chrome import SOURCE, shell, store_name
 from .notes import (NoteMarkdown, ago, commit_meta, demo_says, file_buttons, forge_buttons,
                     history, link_ids,
                     kind_class, read_only_refused, reading, refusal_shown, render_note,
@@ -38,6 +38,18 @@ DEMO_ROWS = 30
 
 def _page_rows() -> int:
     return min(PAGE_ROWS, DEMO_ROWS) if S.read_only() else PAGE_ROWS
+
+
+def _not_shown(n: int, noun: str, page: str) -> None:
+    """After a capped list: the `n` it left out, and a link to the whole
+    list on `page`, which a read-only serve never draws."""
+    if n <= 0:
+        return
+    what = f"+{summ._count(n, 'more ' + noun)} not shown"
+    if S.read_only():
+        ui.label(what).classes("sb-subtitle").mark("not-shown")
+    else:
+        ui.link(f"{what} — show all", f"{page}&all=1").classes("text-body").mark("show-all")
 
 # A "recent <kind>" board holds verdict rows this young, and older ones still
 # current at HEAD. It held the 25 newest of any age: suite runs from weeks
@@ -141,11 +153,12 @@ def _naming(notes) -> dict[tuple, list]:
     return on
 
 
-def _commit_card(ctx, sha: str, loaded) -> None:
+def _commit_card(ctx, sha: str, loaded, every: bool = False) -> None:
     """A commit's page leads with the commit: its subject, who and when, its
     message, its buttons, and each file it changed with its counts and the
     entries on it, as the Docs page lists a file's (the diff viewer design,
-    2026-10-30)."""
+    2026-10-30). A page of files unless `every`: a 2,000-file commit drew
+    14,161 elements (audit 2026-11-02)."""
     cfg = gitref.commit_cfg(ctx.cfg, sha)
     got = gitref.commit_show(cfg, sha, patch=False)
     if got is None:
@@ -167,10 +180,12 @@ def _commit_card(ctx, sha: str, loaded) -> None:
                 .props('flat dense round size=sm color=muted aria-label="copy the full sha"') \
                 .tooltip(f"copy {sha}")
         plus, minus = (sum(f[i] or 0 for f in files) for i in (1, 2))
-        ui.label(f"{summ._count(len(files), 'file')} · +{plus} −{minus} · the entries on each") \
-            .classes("sb-subtitle").mark("commit-stat")
+        shown = files if every else files[:_page_rows()]
+        cut = f"; the first {len(shown)} shown" if len(shown) < len(files) else ""
+        ui.label(f"{summ._count(len(files), 'file')} · +{plus} −{minus} · the entries on "
+                 f"each{cut}").classes("sb-subtitle").mark("commit-stat")
         with ui.element("div").classes("sb-docs sb-commit-files"):
-            for path, added, deleted in files:
+            for path, added, deleted in shown:
                 rows = on.get((ftype, path), [])
                 n_open = sum(map(treemap.live, rows))
                 with ui.element("div").classes("sb-docs-row").mark("commit-file"):
@@ -183,6 +198,7 @@ def _commit_card(ctx, sha: str, loaded) -> None:
                         if n_open:
                             ui.label(f"{n_open} open").classes("text-notable")
                     view_button(ctx, path, ttype=ftype) or ui.element("span")
+        _not_shown(len(files) - len(shown), "file", target_href("commit", sha))
 
 
 def _docs_board(ctx, title: str, docs, on, mark: str, all: str, aside: str = "") -> None:
@@ -343,6 +359,12 @@ def build_page(ctx, *, author: str) -> None:
             raise HTTPException(404, f"not a web+symbion: link to a running serve: {to}")
         return RedirectResponse(urlunsplit(("http", url.netloc, url.path, url.query, url.fragment)),
                                 status_code=302)
+
+    @app.get("/go/github")
+    def go_github():
+        """The source, by way of this serve (`chrome.source_href`). A 302 is
+        not cached, so each click reaches the access log."""
+        return RedirectResponse(SOURCE + "#readme", status_code=302)
 
     # The ⌘K palette's rows for what is typed (palette.py). A plain def:
     # FastAPI runs it on a thread, off the loop every page's socket shares.
@@ -708,7 +730,7 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/object")
     @gitref.heads_once()           # each repo's HEAD once a page
-    def object_page(type: str = "", name: str = ""):
+    def object_page(type: str = "", name: str = "", all: str = ""):
         # Guard BEFORE the shell: rendering a header for ": " and then
         # navigating away paints a frame of a page that does not exist.
         if not type or not name:
@@ -729,23 +751,29 @@ def build_page(ctx, *, author: str) -> None:
         live = lambda n: S.read_status(n) == "open" and not n.spec.parked   # noqa: E731
         rows.sort(key=lambda n: not live(n))      # stable: newest within each
         git_head = gitref.head_sha(ctx.cfg)
+        # A page of cards, as /notes draws: 2,000 rows on one object took
+        # 0.88 s on the loop every visitor shares (audit 2026-11-02).
+        every = bool(all) and not S.read_only()
+        shown = rows if every else rows[:_page_rows()]
+        cut = f"; {len(shown)} shown, open work first" if len(shown) < len(rows) else ""
         with ui.column().classes("sb-main gap-4"):
             if type == "commit":
-                _commit_card(ctx, name, rd.loaded)
+                _commit_card(ctx, name, rd.loaded, every)
             with ui.row().classes("items-center gap-3"):
-                ui.label(f"{summ._count(len(rows), 'entry')} on or referencing this object") \
+                ui.label(f"{summ._count(len(rows), 'entry')} on or referencing this object{cut}") \
                     .classes("sb-subtitle")
                 if type != "commit":
                     view_button(ctx, name, "read the file", ttype=type)
                     if (path := api.object_path(ctx, type, name)) and path.is_file():
                         file_buttons(path)
-            since = gitref.commits_since(ctx.cfg, rows, git_head)
-            for n in rows:
+            since = gitref.commits_since(ctx.cfg, shown, git_head)
+            for n in shown:
                 # The page names the object: a row only referring to it names its own.
                 render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
                             compact=not live(n) and bool(n.spec.status), git_head=git_head,
                             since=since[n.id], seen=rd,
                             show_target=(n.target.type, n.target.name) != (type, name))
+            _not_shown(len(rows) - len(shown), "entry", target_href(type, name))
 
     @ui.page("/arcs")
     def arcs_page():
@@ -755,7 +783,7 @@ def build_page(ctx, *, author: str) -> None:
 
     @ui.page("/arc")
     @gitref.heads_once()           # each repo's HEAD once a page
-    def arc_page(id: str = ""):
+    def arc_page(id: str = "", all: str = ""):
         if not id:
             ui.navigate.to("/arcs")
             return
@@ -846,7 +874,9 @@ def build_page(ctx, *, author: str) -> None:
                         ui.button(f"Seed all {a.target_scope}s", icon="playlist_add",
                                   on_click=_seed).props("flat dense").mark("arc-seed")
 
-                arcs.checklist(ctx, id, body.refresh, author=author, seen=rd)
+                left = arcs.checklist(ctx, id, body.refresh, author=author, seen=rd,
+                                      limit=None if all and not S.read_only() else _page_rows())
+                _not_shown(left, "entry", target_href("arc", id))
 
                 # Notes ABOUT the arc (its target or a ref), not its boxes:
                 # the page showed only the checklist (the gui spec).

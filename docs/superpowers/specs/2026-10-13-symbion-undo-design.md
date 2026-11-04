@@ -27,6 +27,11 @@ new row that reverts it, and needs no new verb.
   (`symbion-undo/`). After the write, the copy becomes the undo level if a file
   changed. A write that changed nothing, such as one refused under the lock,
   leaves the previous level in place.
+  *2026-11-02: the copy and the sessions file moved to `.symbion-state/` in
+  the store's working tree, which ignores itself with a `.gitignore` of `*`.
+  agy's sandbox keeps every workspace's `.git/` read-only, and the sessions
+  write there raised after `notes.jsonl` was written. The first write moves
+  both from the git dir.*
 - **The whole write.** A batch (`add --from-json`, `arc seed`, `rename`) is one
   write under one lock, so one undo takes back all of it.
 - **`undo ID`, guarded.** It refuses, naming the last write, unless:

@@ -40,7 +40,7 @@ It ends by starting `symbion serve` and giving you the address. A project with
 nothing to bring in gets the [live demo](https://symbion.nullphase.net/)'s link,
 to see a store weeks in.
 
-### Codex, Antigravity, Hermes Agent, or the CLI alone
+### Codex, Antigravity, Pi, Hermes Agent, or the CLI alone
 
 Python 3.11+ and git. On Windows, use Git for Windows: catalogs and
 resolvers run in its `sh`, which symbion finds beside git even when only
@@ -110,19 +110,39 @@ agy plugin install https://github.com/phreakocious/symbion/tree/main/plugin
 ```
 
 agy copies the plugin into `~/.gemini/config/plugins/symbion` and finds it at its
-next start. The copy holds the stub skill and the session-start hook. agy loads
-no plugin commands, so it has no `/symbion:setup` or `/symbion:wrap`, and no
+next start. The copy holds the stub skill, the setup and wrap skills
+(`/symbion:setup` and `/symbion:wrap`), and the session-start hook. agy has no
 gotcha hook. The hook runs in `sh`; on Windows that is untested. It names a `~/.claude/skills/symbion`
 link or a symbion hook in `~/.claude/settings.json` left from an install before
 the plugin: with both, each session gets the skill, the summary and each gotcha
 twice. It says how to remove each, and removes neither.
 
+`--agent pi` makes only the store as well, and prints the Pi package's install
+line until Pi's `settings.json` lists it:
+
+```bash
+pi install git:github.com/phreakocious/symbion
+```
+
+Pi clones the repo and loads `plugin/pi/symbion.ts` from it at its next start.
+The extension runs the plugin's two hooks: the summary at session start and
+after each compaction, and the gotcha line on the results of `read`, `edit`,
+`write` and `bash`. It adds the installed CLI's skill as `/skill:symbion`, and
+the commands `/symbion-setup` and `/symbion-wrap`. After setup installs the
+CLI, run `/reload` so Pi loads the skill. The hooks run in `sh`; on Windows
+that is untested. To try it with a local model, add an Ollama provider to
+`~/.pi/agent/models.json`, as Pi's `docs/models.md` shows. Without a large GPU,
+Ollama serves a 4k context (`ollama ps` shows it), far less than Pi assumes, and
+drops what does not fit without an error, the summary included. Start `ollama
+serve` with `OLLAMA_CONTEXT_LENGTH` raised, and set the model's `contextWindow`
+in `models.json` to match.
+
 This creates `../<repo>-notes`, a git repo with no remote, holding a commented
 `symbion.toml` whose every value has a default and a README.md that says what
-the store is. Out of the box an entry goes on a commit, an item, the project or
-an arc. For entries on files, uncomment `file =` under `[catalogs]` and `file =
-"git"` under `[renames]`; a file target refused before then names both lines,
-by number.
+the store is. Out of the box an entry goes on a commit, an item, a file, the
+project or an arc. In a store made before 0.14, uncomment `file =` under
+`[catalogs]` and `file = "git"` under `[renames]` for entries on files; a file
+target refused before then names both lines, by number.
 
 In Claude Code the plugin's hooks run the installed package's scripts. At each
 session start the hook gives the agent `symbion summary` and shows you one line of it: the open counts, the soonest due
@@ -138,7 +158,9 @@ the session-start hook writes under
 `~/.cache/symbion/gotchas/`, and the package's directory from
 `~/.cache/symbion/skill_dir`, which the plugin's session-start hook writes from
 `symbion skill --path` when it is missing or stale. So it costs a few
-milliseconds and never runs `symbion`. The plugin's skill is `symbion:symbion`: its stub runs `symbion
+milliseconds and never runs `symbion`. A gotcha written after a session starts,
+by you or by another session, reaches it at its next start, resume, `/clear` or
+compaction. The plugin's skill is `symbion:symbion`: its stub runs `symbion
 skill`, which prints the installed skill with this store's kinds in it.
 
 For Codex, `init --agent codex` links `~/.agents/skills/symbion` to the same
@@ -168,6 +190,19 @@ project, and the store sits beside it. Launch `codex --add-dir
 in Codex's `config.toml`; `init` prints the path. A `.symbion` pointer grants
 no access, and `symbion commit` may still ask for approval. A linked worktree
 uses the main checkout's store, so grant that one.
+
+**Give Antigravity access to the store.** In agy's default mode, shell calls
+run outside its sandbox and reach the store, each after your approval unless
+you allowed it. In auto mode, calls run in the sandbox, which reads only the
+workspace and system directories: symbion's install and the store are outside
+it, so `symbion` does not start there. `symbion init --agent antigravity`
+prints the permission rules that fix this: a `read_file` rule for each
+directory symbion runs from, and a `write_file` rule for the store, which also
+lets `symbion commit` run in the sandbox. Add each at agy's `/permissions`
+(press A, Global scope) exactly as printed. `/symbion:setup` asks for them before
+it makes the store: a rule may name a directory that does not exist yet. agy refuses a rule with `~`, and
+then runs no sandboxed command at all. agy 1.4.12 drops `--mode auto` at
+startup, so switch to auto in the session.
 
 For Hermes Agent, `init --agent hermes` links `$HERMES_HOME/skills/symbion`
 (default `~/.hermes/skills/symbion`), where Hermes finds it with no change to
@@ -318,7 +353,9 @@ then, so a session that changed only the repo still leaves its handoff. The firs
 `commit` takes your entries: in a Claude Code or Codex session, the ones that session
 wrote; at a plain terminal, your author's. Two sessions on one store each commit
 their own. It names the entries it left and the newest one's age, and `commit --all`
-takes them too, for a session that ended without committing.
+takes them too, for a session that ended without committing. From another project's
+tree, as with `--dir ../other-notes`, it takes no file but the new docs your entries
+name: the store's other changed files are its own project's work, and it names them.
 
 ## Share a store
 
@@ -518,7 +555,9 @@ connect, an address or a network, once each: `symbion serve --host 0.0.0.0
 --allow 192.168.1.0/24`. This machine always may, and `serve` refuses a `--host`
 past loopback with no `--allow`. There is no login: every machine allowed writes
 as the serve's author. `--read-only` serves a public demo: every control answers
-with a notice, and nothing writes.
+with a notice, and nothing writes. Its links to GitHub go through the serve's
+`/go/github?from=LINK`, a redirect, so the access log of a proxy in front of it
+counts each click out and names the link.
 
 One `serve` per store: run it in each project, and each one's sidebar links
 the other stores a `serve` is running on, on this machine. Each running

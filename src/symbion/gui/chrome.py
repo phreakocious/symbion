@@ -249,23 +249,6 @@ document.addEventListener('keydown', e => {
 });
 </script>"""
 
-# NiceGUI's page template hides all that follows its ES-module notice with
-# `#esm-fallback ~ *`, and the rule stays after the notice is gone. Every
-# element tests it against each of its earlier siblings: cli.py in the file
-# viewer, 27,000 spans in one <code>, took 4.5 s a style pass and 24 s to
-# paint in headless Chrome; with the rule deleted, a pass took 90 ms
-# (2026-10-16). A browser with no ES modules runs none of the page anyway.
-_ESM_JS = """<script>
-document.addEventListener('DOMContentLoaded', () => {
-  for (const s of document.styleSheets) {
-    let rules;
-    try { rules = s.cssRules; } catch { continue; }        // another origin's sheet
-    for (let i = rules.length - 1; i >= 0; i--)
-      if (rules[i].selectorText === '#esm-fallback ~ *') s.deleteRule(i);
-  }
-});
-</script>"""
-
 # The palette (the user, 2026-10-16): Cmd or Ctrl K, from anywhere but an open dialog,
 # opens one box for the places, the top bar's actions and the entries here
 # and in every other running store. `/palette` gives the rows for what is
@@ -539,10 +522,10 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     ui.add_head_html(_TIPS_JS)
     ui.add_head_html(_PEEK_JS)
     ui.add_head_html(_PALETTE_JS)
-    ui.add_head_html(_ESM_JS)
     # Scripts off, as a blocker leaves a page: nothing is drawn, and NiceGUI's
-    # notice blames the browser's ES modules. This says what is missing. The
-    # template styles that notice after this HTML: only !important hides it.
+    # notice says only that the page needs JavaScript. This one also says what
+    # symbion is. The template styles that notice after this HTML: only
+    # !important hides it.
     # An agent's fetch runs no script and drops <noscript>, but reads text
     # hidden by CSS: sb-about tells it what symbion is, and <noscript> shows it.
     ui.add_body_html('<noscript><style>#esm-fallback{display:none!important}'
@@ -552,7 +535,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                      '<p>symbion\'s GUI needs JavaScript. Allow scripts for this site, then '
                      f'reload.</p><p>{ABOUT} An agent reads a store with the '
                      '<code>symbion</code> command, not this page. Source, install and docs: '
-                     f'<a href="{SOURCE}">{SOURCE}</a></p></div></div>')
+                     f'<a href="{source_href("noscript")}">{SOURCE}</a></p></div></div>')
     heads = S.heads(S.load(ctx.store_dir))
     # value=None: open beside the page on a wide window, a slide-over behind
     # the menu button on a narrow one (open by default, it covered a phone).
@@ -578,7 +561,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                 with ui.row(wrap=False).classes("items-center gap-1 text-body sb-demo") \
                         .mark("demo-banner"):
                     ui.label("read-only demo of")
-                    ui.link(f"symbion {metadata.version('symbion')}", SOURCE + "#readme",
+                    ui.link(f"symbion {metadata.version('symbion')}", source_href("banner"),
                             new_tab=True).mark("demo-link")
             # Left of New entry, so that button stays put as these come and go
             # (the user, 2026-10-02).
@@ -885,6 +868,16 @@ def _help(ctx) -> None:
 
 
 SOURCE = "https://github.com/phreakocious/symbion"
+
+
+def source_href(link: str) -> str:
+    """A link to the source. On a read-only serve, the public demo, by way of
+    /go/github: its proxy's access log then keeps each click out, which
+    nothing else sees, and `?from=` names the link there (the user,
+    2026-11-03)."""
+    return f"/go/github?from={link}" if S.read_only() else SOURCE
+
+
 ABOUT = ("symbion is a notebook and ticket registry for one project, shared by you and your "
          "coding agent.")
 
@@ -950,7 +943,7 @@ def _sidebar(ctx, author: str, name: str, heads, here: str) -> None:
                 ui.button(icon="help_outline", on_click=lambda: _help(ctx)) \
                     .props('flat dense round size=sm aria-label="how symbion works"') \
                     .classes("sb-help").mark("help-open").tooltip("how symbion works")
-        ui.link(f"symbion {metadata.version('symbion')}", SOURCE, new_tab=True) \
+        ui.link(f"symbion {metadata.version('symbion')}", source_href("sidebar"), new_tab=True) \
             .classes("sb-source").mark("source").tooltip("source on GitHub")
         # Shown only under html.sb-untabbed (the head script). A page cannot
         # link to chrome://, so the flag is text, selected whole on a click.

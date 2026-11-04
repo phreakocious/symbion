@@ -64,6 +64,27 @@ def test_a_load_reads_a_hand_edit_of_the_same_length_and_gives_its_own_list(tmp_
     assert store.load(tmp_path)[0].body == "bbbb"
 
 
+def test_a_changed_file_parses_only_its_changed_lines_and_reads_as_a_fresh_parse(
+        tmp_path, monkeypatch):
+    """A write's read-back parsed the whole store again (audit 2026-11-02).
+    A line the last parse read is not parsed again, and a load returns what
+    a parse from nothing returns, each revision's first time included."""
+    t = {"type": "project", "name": None}
+    a = store.add(tmp_path, kind="task", target=t, body="row 0")
+    for i in range(1, 10):
+        store.add(tmp_path, kind="task", target=t, body=f"row {i}")
+    store.load(tmp_path)
+    store.supersede(tmp_path, a.id, body="row 0, edited")    # one line rewritten, one appended
+    parsed, real = [], store.note_from_dict
+    monkeypatch.setattr(store, "note_from_dict",
+                        lambda d, **k: parsed.append(d["id"]) or real(d, **k))
+    rows = store.load(tmp_path)
+    assert len(parsed) == 2, parsed
+    store._PARSED.clear()
+    assert rows == store.load(tmp_path)
+    assert next(n for n in rows if n.id == a.id).first_written
+
+
 def test_supersede_collapses_to_one_head(tmp_path):
     a = store.add(tmp_path, kind="bug", target={"type": "project", "name": None})
     b = store.supersede(tmp_path, a.id, status="resolved")
@@ -970,6 +991,70 @@ def test_a_commit_forgets_the_sessions_of_the_rows_it_took(tmp_path, monkeypatch
     assert [r["id"] for r in store.pending_rows(tmp_path)] == [a.id]
 
 
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="a read-only dir by mode bits: POSIX, not root")
+def test_a_write_with_a_read_only_git_dir_records_its_session_and_says_nothing(
+        tmp_path, monkeypatch):
+    """agy's sandbox keeps every workspace's `.git/` read-only. The sessions
+    record lived there, and its write raised after notes.jsonl was written,
+    so the CLI exited 1 on a row it had written and a retry wrote it twice
+    (2026-11-01). It lives in the store's tree now, out of git's sight."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    git_dir = tmp_path / ".git"
+    git_dir.chmod(0o555)
+    try:
+        n = store.add(tmp_path, kind="note", target={"type": "project", "name": None},
+                      body="a", author="claude")
+    finally:
+        git_dir.chmod(0o755)
+    assert store.sessions(tmp_path) == {n.id: "s1"}
+    assert not (git_dir / store.SESSIONS_FILE).exists()
+    status = subprocess.run(["git", "-C", str(tmp_path), "status", "--porcelain",
+                             "--untracked-files=all"], capture_output=True, text=True).stdout
+    assert store.STATE_DIR not in status and "notes.jsonl" in status
+
+
+def test_a_write_whose_session_record_fails_writes_no_row(tmp_path, monkeypatch):
+    """The record came after the row: when it raised, the row was written
+    as no session's, and its session's `commit` left it (2026-11-02). The
+    record goes first, so a failure there leaves notes.jsonl as it was."""
+    project = {"type": "project", "name": None}
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    n = store.add(tmp_path, kind="bug", target=project, body="a", author="claude")
+    before = store.notes_path(tmp_path).read_bytes()
+
+    def fail(*a, **kw):
+        raise OSError("the record could not be written")
+
+    monkeypatch.setattr(store, "_record_session", fail)
+    with pytest.raises(OSError):
+        store.add(tmp_path, kind="note", target=project, body="b", author="claude")
+    with pytest.raises(OSError):
+        store.supersede(tmp_path, n.id, status="resolved")
+    assert store.notes_path(tmp_path).read_bytes() == before
+
+
+def test_the_first_write_moves_the_git_dirs_sessions_and_undo_level(tmp_path, monkeypatch):
+    """A store an older symbion wrote keeps its sessions record and undo
+    level in the git dir. The first write moves both, so a pending row is
+    still its session's to commit, and the last write still undoes."""
+    project = {"type": "project", "name": None}
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    old = store.add(tmp_path, kind="note", target=project, body="old", author="claude")
+    state = tmp_path / store.STATE_DIR
+    legacy = store._legacy_sessions_path(tmp_path)
+    (state / store.UNDO_DIR).rename(legacy.with_name(store.UNDO_DIR))
+    (state / store.SESSIONS_FILE).rename(legacy)
+    for f in state.iterdir():
+        f.unlink()
+    state.rmdir()                               # the store as 0.13.0 left it
+    assert store.sessions(tmp_path) == {old.id: "s1"} and store.undoable(tmp_path)
+    store._snapshot(tmp_path)                   # a write's first step, as _lock takes it
+    assert not legacy.exists() and not legacy.with_name(store.UNDO_DIR).exists()
+    assert store.sessions(tmp_path) == {old.id: "s1"} and store.undoable(tmp_path)
+    assert (state / ".gitignore").read_text() == "*\n"
+
+
 def test_each_version_is_pending_for_the_session_that_wrote_it(tmp_path, monkeypatch):
     """One Claude session's edit of another's uncommitted `claude` row keeps
     that session's version, and that version is still that session's to
@@ -1128,6 +1213,31 @@ def test_a_kept_version_is_not_a_pending_row(tmp_path):
                           text=True).stdout == ""
 
 
+def test_a_keep_commit_of_a_kept_version_moves_heads_line_to_it(tmp_path):
+    """The user amended a committed row and claude resolved it, both
+    pending. The user's commit took their revision and its kept base, but
+    left HEAD's line under the row's id; claude's commit then held that id
+    twice, and a clone read the row as never amended (2026-11-02)."""
+    import subprocess
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    a = store.add(tmp_path, kind="question", target={"type": "project", "name": None},
+                  body="v1", author="claude", status="open")
+    assert store.commit(tmp_path, "c", cfg)
+    store.supersede(tmp_path, a.id, author="human", append_body="yes")
+    store.supersede(tmp_path, a.id, author="claude", status="resolved")
+    git = ["git", "-C", str(tmp_path)]
+    head = lambda: subprocess.run([*git, "show", "HEAD:notes.jsonl"], capture_output=True,
+                                  text=True).stdout
+    assert store.commit(tmp_path, "c2", cfg, keep=lambda r: r.get("author") == "human")
+    assert a.id not in head()                 # its head is claude's, still pending
+    assert store.commit(tmp_path, "c3", cfg, keep=lambda r: r.get("author") == "claude")
+    ids = [json.loads(ln)["id"] for ln in head().splitlines()]
+    assert len(ids) == len(set(ids)) == 3, ids
+    assert subprocess.run([*git, "status", "--porcelain"], capture_output=True,
+                          text=True).stdout == ""
+
+
 def test_of_rows_written_in_one_second_the_later_write_lists_first(tmp_path, monkeypatch):
     """A stamp is to the second, and the id broke the tie. An edit keeps the
     row's id, so an edit of an older row sorted behind a row it followed."""
@@ -1147,6 +1257,55 @@ def test_a_rename_sweep_keeps_every_rows_id(tmp_path):
     rows = store.load(tmp_path)
     assert len({n.id for n in rows}) == len(rows) == 4
     assert {h.id: h.target.name for h in store.heads(rows)} == {a.id: "new", b.id: "new"}
+
+
+def test_a_sweep_writes_the_notes_file_once(tmp_path, monkeypatch):
+    """A sweep wrote the whole file once a row: two 1,500-row renames took
+    149 s under the lock (audit 2026-11-02). It writes once, and its rows
+    read as a write a row left them: a row holding two of the type's names
+    gets two versions, and the second version is the session's that wrote
+    the first."""
+    a = store.add(tmp_path, kind="task", target=_ref("item", "a"), refs=[_ref("item", "b")],
+                  body="both", author="ann")
+    c = store.add(tmp_path, kind="note", target=_ref("item", "c"), body="one", author="ann")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    writes, real = [], store._replace_atomically
+    monkeypatch.setattr(store, "_replace_atomically",
+                        lambda path, body: writes.append(path) or real(path, body))
+    assert store.retype(tmp_path, "item", "thing", author="claude") == (2, 1)
+    assert writes.count(store.notes_path(tmp_path)) == 1
+    rows = store.load(tmp_path)
+    by_id = {n.id: n for n in rows}
+    assert len(by_id) == len(rows) == 5
+    chain = [by_id[a.id]]
+    while chain[-1].supersedes:
+        chain.append(by_id[chain[-1].supersedes])
+    assert [(n.target.type, [r.type for r in n.refs]) for n in chain] == \
+        [("thing", ["thing"]), ("thing", ["item"]), ("item", ["item"])]
+    assert by_id[c.id].target == store.Target("thing", "c")
+    assert store.sessions(tmp_path) == {a.id: "s1", chain[1].id: "s1", c.id: "s1"}
+
+
+def test_a_sweep_that_refuses_a_row_writes_none(tmp_path, monkeypatch):
+    """A sweep wrote each row as it went, so a refusal at row 2 left row 1
+    moved and the rest not. It writes them together, or none."""
+    for i in range(3):
+        store.add(tmp_path, kind="task", target=_ref("item", "old"), body=f"r{i}")
+    before = store.notes_path(tmp_path).read_bytes()
+    real, calls = store.check_fields, []
+
+    def second_refuses(*a, **kw):
+        calls.append(1)
+        if len(calls) == 2:
+            raise ValueError("refused")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(store, "check_fields", second_refuses)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    with pytest.raises(ValueError, match="refused"):
+        store.rename_target(tmp_path, "item", "old", "new", author="ann")
+    assert store.notes_path(tmp_path).read_bytes() == before
+    assert store.sessions(tmp_path) == {}
 
 
 def test_a_store_is_written_lf_on_every_platform(tmp_path):

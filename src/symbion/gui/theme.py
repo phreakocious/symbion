@@ -290,9 +290,11 @@ body[data-sb-drop]::after { content: attr(data-sb-drop); position: fixed; inset:
 /* a long line wraps: a diff that scrolled sideways hid what changed */
 .sb-diff-grid > span { padding: 0 10px; white-space: pre-wrap; overflow-wrap: anywhere;
                        min-height: 1.55em; color: var(--q-emph); }
-.sb-diff-grid > .ln { color: var(--q-muted); text-align: right; padding: 0 8px; user-select: none; }
-.sb-diff-grid > .hk, .sb-diff-grid > .nl { grid-column: 1 / -1; color: var(--q-muted); }
-.sb-diff-grid > .hk { background: var(--q-panel); padding: 2px 10px; }
+/* `muted` read 4.44:1 on the grid's raise, so its words there are `body`;
+   a hunk head keeps `muted` on its own panel band */
+.sb-diff-grid > .ln { color: var(--q-body); text-align: right; padding: 0 8px; user-select: none; }
+.sb-diff-grid > .hk, .sb-diff-grid > .nl { grid-column: 1 / -1; color: var(--q-body); }
+.sb-diff-grid > .hk { background: var(--q-panel); padding: 2px 10px; color: var(--q-muted); }
 .sb-diff-grid > .del { background: color-mix(in srgb, var(--q-bad) 7%, transparent); }
 .sb-diff-grid > .ins { background: color-mix(in srgb, var(--q-good) 7%, transparent); }
 .sb-diff-grid > .none { background: color-mix(in srgb, var(--q-panel) 55%, transparent); }
@@ -301,7 +303,8 @@ body[data-sb-drop]::after { content: attr(data-sb-drop); position: fixed; inset:
 .sb-diff-unified > .ctx::before { content: "  "; }
 .sb-dx { border-radius: 2px; }
 .del > .sb-dx { background: color-mix(in srgb, var(--q-bad) 30%, transparent); }
-.ins > .sb-dx { background: color-mix(in srgb, var(--q-good) 30%, transparent); }
+/* green is the lighter hue: at 30% its words read 4.48:1 */
+.ins > .sb-dx { background: color-mix(in srgb, var(--q-good) 28%, transparent); }
 /* commits to click (notes.commit_list): sha, age, subject, read button */
 .sb-commits { display: grid; grid-template-columns: auto auto minmax(0, 1fr) 32px;
               align-items: center; column-gap: 12px; row-gap: 2px; font-size: 13px; }

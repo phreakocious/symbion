@@ -516,6 +516,43 @@ def test_a_gotcha_fires_on_its_own_file_and_again_at_its_first_edit(git_repo, tm
     assert "readme trap" in call("s2", "Bash", command="cat ./README.md")
 
 
+def test_a_gotcha_fires_on_its_file_in_a_linked_worktree(git_repo, tmp_path):
+    """Read and Edit name a file by absolute path, and in a linked worktree the
+    dir above the row's name is the worktree's, not the root's: every such call
+    got nothing (dogfood, 2026-11-04). The worktree's `.git` file names the
+    root's git dir. A worktree made after session start counts, as does one
+    under a dir with a blank; another repo's worktree and a plain dir do not."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    store.add(s, kind="note", target={"type": "file", "name": "src/serve.py"}, author="ann",
+              tags=["gotcha"], body="serve trap")
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
+    for sid in ("s1", "s2", "s3", "s4"):
+        r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                           env=env, input=json.dumps({"session_id": sid,
+                                                      "hook_event_name": "SessionStart"}))
+        assert r.returncode == 0, r
+    inside, spaced = git_repo / ".worktrees" / "feature", tmp_path / "my work" / "feature"
+    for wt in (inside, spaced):
+        _git(git_repo, "worktree", "add", "-q", "--detach", str(wt))
+    other = tmp_path / "other" / "feature"
+    other.mkdir(parents=True)
+    (other / ".git").write_text(f"gitdir: {tmp_path}/elsewhere/.git/worktrees/feature\n")
+
+    def call(sid, tool, **tool_input):
+        return _touch(env, {"session_id": sid, "tool_name": tool, "tool_input": tool_input})
+
+    for d in (other, tmp_path / "plain"):
+        assert call("s1", "Read", file_path=f"{d}/src/serve.py") == "", d
+    assert "serve trap" in call("s1", "Read", file_path=f"{inside}/src/serve.py")
+    assert "serve trap" in call("s1", "Edit", file_path=f"{inside}/src/serve.py",
+                                old_string="a", new_string="b"), "again at the first edit"
+    assert "serve trap" in call("s2", "Edit", file_path=f"{spaced}/src/serve.py",
+                                old_string="a", new_string="b")
+    assert "serve trap" in call("s3", "Read", file_path=f"{spaced}/src/serve.py")
+    assert "serve trap" in call("s4", "Bash", command=f"sed -n 1p {inside}/src/serve.py")
+
+
 def test_a_failed_call_gets_its_files_gotcha_too(git_repo, tmp_path):
     """A Bash call that exited non-zero, when a trap has most likely just
     bitten, heard nothing: Claude Code sends a failed call to

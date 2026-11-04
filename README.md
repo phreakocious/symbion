@@ -26,7 +26,7 @@ project's notebook, read-only.
 - **Entries attach to things.** An entry sits on a commit, a file, a named item
   or the whole project, so `symbion context --target file:src/x.py` finds
   every entry on that file.
-- **A trap shows up when it matters.** In Claude Code and Codex, an entry
+- **A trap shows up when it matters.** In Claude Code, Codex and Pi, an entry
   tagged `gotcha` on a file reaches the agent the first time it reads or edits
   that file, with its age and how many commits have changed the file since.
 - **Checklists across a codebase.** An arc is a named line of work with one
@@ -75,7 +75,7 @@ before it brings anything in. Then it starts the web page on your project's
 notebook and gives you its address. The plugin carries no copy of the skill: its hooks and skill run the
 installed CLI's own, so the two always match.
 
-## Codex, Antigravity, Hermes Agent, or the CLI alone
+## Codex, Antigravity, Pi, Hermes Agent, or the CLI alone
 
 Python 3.11+ and git. On Windows, use Git for Windows.
 
@@ -99,10 +99,10 @@ entries the first time it touches that file. When the file exists, `init` prints
 each entry to add, or says the hook is already there. `symbion init --agent codex
 --merge-hook` adds the entries for you and keeps the rest of the file.
 
-A new store takes entries on a commit, an item, the project or an arc. For entries
-on files, open `../<repo>-notes/symbion.toml` and uncomment `file =` under
-`[catalogs]` and `file = "git"` under `[renames]`. A file target refused before
-then names both lines.
+A new store takes entries on a commit, an item, a file, the project or an arc. A
+store made before 0.14 takes file entries once you open its `symbion.toml` and
+uncomment `file =` under `[catalogs]` and `file = "git"` under `[renames]`. A
+file target refused before then names both lines.
 
 Then add one line to `AGENTS.md`, and start a session:
 
@@ -121,8 +121,21 @@ agy plugin install https://github.com/phreakocious/symbion/tree/main/plugin
 symbion init --agent antigravity --yes   # the store: the plugin carries the skill and the hook
 ```
 
-Antigravity loads no plugin commands, so `/symbion:setup` and `/symbion:wrap`
-are Claude Code's alone, and it gets no gotcha hook.
+The plugin carries `/symbion:setup` and `/symbion:wrap` as plugin skills;
+Antigravity has no gotcha hook.
+
+For Pi, the repo itself is the package. Install it, then run `/symbion-setup`
+in a new `pi` session: as in Claude Code, it installs the CLI, makes the store
+and brings in the project's open threads.
+
+```bash
+pi install git:github.com/phreakocious/symbion
+```
+
+The package gives Pi the session-start summary, the gotcha hook, the skill
+(`/skill:symbion`, after a `/reload` once the CLI is installed) and
+`/symbion-wrap`. With the CLI already installed, `symbion init --agent pi --yes`
+makes the store.
 
 ## Docs
 

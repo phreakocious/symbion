@@ -24,7 +24,7 @@ import shlex
 import shutil
 import subprocess
 import tomllib
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, fields as dc_fields, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -396,7 +396,7 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
     return Note(
         id=d["id"], kind=d["kind"], target=target,
         created_at=d["created_at"], author=d.get("author", "unknown"),
-        body=d.get("body", ""), status=d.get("status"),
+        body=d.get("body") or "", status=d.get("status"),
         checked=d.get("checked"), result=d.get("result"),
         arc_id=d.get("arc_id"), supersedes=d.get("supersedes"), due=d.get("due"),
         tags=tuple(d.get("tags") or ()),
@@ -793,16 +793,14 @@ def _stamps(store) -> list:
 
 
 def _snapshot(store):
-    """Copy the files a write may change into the store's git dir, where git
-    never sees them. A copy, not `git add`: each add left a blob of the whole
+    """Copy the files a write may change into STATE_DIR, where git never
+    sees them. A copy, not `git add`: each add left a blob of the whole
     file that nothing references, over a quarter of its size, and git
     prunes those after two weeks (measured 2026-10-13; a copy took 5-8 ms).
     A failed copy costs the undo, never the write."""
-    sess = _sessions_path(store)
-    if sess is None:
-        return None
-    new = sess.with_name(UNDO_DIR + ".new")
     try:
+        sess = _state_dir(store, make=True) / SESSIONS_FILE
+        new = sess.with_name(UNDO_DIR + ".new")
         shutil.rmtree(new, ignore_errors=True)
         new.mkdir()
         for f in (notes_path(store), arcs_path(store), sess):
@@ -972,29 +970,37 @@ def ensure_store(store) -> bool:
 
 
 # ---- notes I/O ----
-# file -> (text, kinds, notes, malformed), its last parse. A serve page parsed
-# the store two or three times and `summary` twice, at 40 ms a parse on a large
-# one (the user, 2026-10-09). The file is read every time and its parse kept only for an
-# equal text, so no write, git checkout or hand edit can leave it stale.
-# ponytail: one entry per store path a process reads, each a copy of the file.
+# file -> (text, kinds, notes, malformed, {line: row}), its last parse. A serve
+# page parsed the store two or three times and `summary` twice, at 40 ms a parse
+# on a large one (the user, 2026-10-09). The file is read every time and its parse
+# kept only for an equal text, so no write, git checkout or hand edit can leave it
+# stale. A text that changed parses only its new lines: a write's own read-back
+# parsed the whole store again (audit 2026-11-02).
+# ponytail: one entry per store path a process reads, each two copies of the file.
 _PARSED: dict = {}
 
 
-def _parse_jsonl(text: str, parse) -> tuple[list, list]:
+def _parse_jsonl(text: str, parse, known=None, fresh=None) -> tuple[list, list]:
     """(parse(row) for each line, [(lineno, raw, error)]). The error travels
     with the row so a reader that skips it can still say WHY: an un-migrated
     or hand-edited store must not read as an empty one. A second line with
     an id already read is skipped too: two copies of a store that edit one
-    row, merged keeping both sides, give two heads one id (2026-10-13)."""
+    row, merged keeping both sides, give two heads one id (2026-10-13).
+    `known`, line -> row from a last parse, skips each line's parse that it
+    holds; `fresh` is filled with this text's."""
     good, bad, seen = [], [], {}
     for i, raw in enumerate(jsonl_lines(text), 1):
         if not raw.strip():
             continue
-        try:
-            row = parse(json.loads(raw))
-        except Exception as e:                  # malformed hand-edit can't take down a read
-            bad.append((i, raw, f"missing key {e}" if isinstance(e, KeyError) else str(e)))
-            continue
+        row = known.get(raw) if known else None
+        if row is None:
+            try:
+                row = parse(json.loads(raw))
+            except Exception as e:              # malformed hand-edit can't take down a read
+                bad.append((i, raw, f"missing key {e}" if isinstance(e, KeyError) else str(e)))
+                continue
+        if fresh is not None:
+            fresh[raw] = row
         rid = getattr(row, "id", None)          # a Note or an Arc; undo parses dicts
         if rid is not None and rid in seen:
             bad.append((i, raw, f"duplicate id {rid}: line {seen[rid]} has it too, so "
@@ -1028,7 +1034,9 @@ def _read_notes(file: Path, kinds):
     hit = _PARSED.get(file)
     if hit and hit[0] == text and hit[1] == kinds:
         return list(hit[2]), list(hit[3])
-    good, bad = _parse_jsonl(text, lambda d: note_from_dict(d, kinds=kinds))
+    fresh: dict = {}
+    good, bad = _parse_jsonl(text, lambda d: note_from_dict(d, kinds=kinds),
+                             hit[4] if hit and hit[1] == kinds else None, fresh)
     # A revision is appended after the row it revises, so one pass in file
     # order finds each chain's start; a predecessor not yet read leaves the
     # revision's own time.
@@ -1037,7 +1045,7 @@ def _read_notes(file: Path, kinds):
         if n.supersedes in first:
             good[i] = n = replace(n, first_written=first[n.supersedes])
         first[n.id] = n.first_written or n.created_at
-    _PARSED[file] = (text, kinds, good, bad)
+    _PARSED[file] = (text, kinds, good, bad, fresh)
     return list(good), list(bad)
 
 
@@ -1068,8 +1076,11 @@ def _append_line_unlocked(file, line: str) -> None:
 
 
 def _append_note_unlocked(store, note: Note) -> None:
-    _append_line_unlocked(notes_path(store), _dumps(note_to_dict(note)))
+    # The session first: a record of a row that never landed is dropped by
+    # the next commit, but a row whose record failed was written as no
+    # session's, and its session's `commit` left it (2026-11-02).
     _record_session(store, note.id)
+    _append_line_unlocked(notes_path(store), _dumps(note_to_dict(note)))
 
 
 def add_many(store, rows, target_types=None, canonicalize=None, refuse_twins=False) -> list:
@@ -1188,23 +1199,37 @@ def chain_tip(notes, note_id: str) -> Note:
     KeyError(note_id) when no row has that id. A cyclic chain (a hand edit,
     or two unvalidated add() calls) raises ValueError: the walk would
     otherwise spin forever, under the store-wide lock in a supersede."""
+    return chain_tips(notes)(note_id)
+
+
+def chain_tips(notes):
+    """`chain_tip` over one map, for many ids: in a loop, `chain_tip` rebuilt
+    its map per call, and `list` over a large store spent half its time there
+    (audit 2026-11-02). Only the ids asked for are walked, so a cycle elsewhere
+    raises nothing."""
     by_supersedes = {n.supersedes: n for n in notes if n.supersedes}
-    cur = next((n for n in notes if n.id == note_id), None)
-    if cur is None:
-        raise KeyError(note_id)
-    seen = {cur.id}
-    while cur.id in by_supersedes:
-        cur = by_supersedes[cur.id]
-        if cur.id in seen:
-            raise ValueError(f"cycle in supersede chain at {cur.id}")
-        seen.add(cur.id)
-    return cur
+    first: dict = {}
+    for n in notes:
+        first.setdefault(n.id, n)
+
+    def tip(note_id: str) -> Note:
+        cur = first.get(note_id)
+        if cur is None:
+            raise KeyError(note_id)
+        seen = {cur.id}
+        while cur.id in by_supersedes:
+            cur = by_supersedes[cur.id]
+            if cur.id in seen:
+                raise ValueError(f"cycle in supersede chain at {cur.id}")
+            seen.add(cur.id)
+        return cur
+    return tip
 
 
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
                         prepend_body: str | None = None,
-                        add_measurements=None, *, side, **fields) -> Note:
+                        add_measurements=None, *, side, pending=None, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
     multi-row aggregate (`rename_target`, `apply_reconciliation`) can hold
@@ -1226,11 +1251,13 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
 
     `kinds` lets a sweep read the table once and pass it; a single-row caller
     may omit it. `side` is `shared_side`'s, read once by the caller before its
-    lock: a sweep that asked per row ran one `git config` per row.
+    lock: a sweep that asked per row ran one `git config` per row. A sweep's
+    `pending` list takes the edit in place of the write, and the sweep
+    writes them all with one `_rewrite_notes_unlocked`.
 
     A caller that will look up further ids in the same transaction must
     append the returned Note to its `notes` list itself -- this function
-    does not mutate the list it was given.
+    only swaps the old version in that list for its kept copy.
 
     `append_body` adds to the TIP's body, read here under the caller's lock,
     so a revision that landed after the caller read the row is kept.
@@ -1290,10 +1317,16 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         body = base.get("body") or ""
         if not body.startswith(old.body or "") and \
                 not body.startswith(_committed_floor(store, notes, old)):
+            # An uncommitted one read as editable, since all of it was added
+            # since the last commit, and undo went unnamed (dogfood, 2026-10-31).
+            fresh = _never_committed(store, notes, old)
             raise ValueError(f"{old.id} is a pre-registration: its registered text and each "
                              f"committed amendment stay as written, so a body may change only "
                              f"text added since the last `symbion commit` (--append adds "
-                             f"after it)")
+                             f"after it)" + (f". None of it is committed: `symbion undo "
+                                             f"{old.id[-10:]}` takes back its last write if "
+                                             f"that is the store's last, then add it anew"
+                                             if fresh else ""))
         if base.get("checked") != old.checked:
             raise ValueError(f"{old.id} is a pre-registration: --checked names its registered "
                              f"run and stays as written; a different run is a new entry")
@@ -1329,7 +1362,10 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     if side is not None:                    # the edit is the editor's
         base["side"] = side
     note = note_from_dict(base, kinds=kinds)
-    _rewrite_note_unlocked(store, note, kept_id=kept.id)
+    if pending is None:
+        _rewrite_notes_unlocked(store, [(note, kept.id)])
+    else:
+        pending.append((note, kept.id))
     notes[notes.index(old)] = kept      # a sweep reads this list for its next row
     return note
 
@@ -1410,6 +1446,18 @@ def _committed_floor(store, notes, tip: Note) -> str:
     return root.body or ""
 
 
+def _never_committed(store, notes, tip: Note) -> bool:
+    """No version of `tip`'s chain is in git; False when git cannot say."""
+    committed = _committed_lines(store)
+    if committed is None:
+        return False
+    ids, by_id, n = set(), {x.id: x for x in notes}, tip
+    while n is not None and n.id not in ids:      # a cycle ends the walk
+        ids.add(n.id)
+        n = by_id.get(n.supersedes)
+    return not any(_line_id(raw) in ids for raw in committed)
+
+
 def _committed_lines(store) -> set | None:
     """The lines of notes.jsonl in the store's last commit: none before the
     first one. None when git cannot say."""
@@ -1433,26 +1481,71 @@ def _line_id(raw: str):
 # Every Claude session writes as `claude`, so an author cannot tell one
 # session's pending rows from another's, and `commit` took a live session's
 # rows under another's message four times (2026-10-06 to 10-10). The runtime's
-# session key can. The record lives in the store's git dir, so no commit
-# takes it, and a commit forgets the rows it took.
+# session key can. The record lives in STATE_DIR, so no commit takes it, and
+# a commit forgets the rows it took.
 SESSIONS_FILE = "symbion-sessions"
+# The store's local state: the sessions record and the undo level. In the
+# working tree, not the git dir: agy's sandbox keeps every workspace's `.git/`
+# read-only, and a write there raised after notes.jsonl was written (2026-11-01).
+# Its own `.gitignore` of `*` keeps it out of `commit`'s `git add -A` with no
+# change to a store's tracked .gitignore. Before 0.13.1 both lived in the git
+# dir, under the same names; the first write moves them (_state_dir).
+STATE_DIR = ".symbion-state"
+
+
+def _state_dir(store, make: bool = False) -> Path:
+    """The store's STATE_DIR. `make`, for a write: create it, with what an
+    older symbion kept in the git dir moved in. It is built aside, under the
+    store's `.tmp.*` ignore, and renamed whole, so a half-made one is never
+    seen. A legacy file that cannot be removed (a read-only `.git/`) is
+    left: once the dir exists, nothing reads it."""
+    d = Path(store).absolute() / STATE_DIR
+    if not make or d.is_dir():
+        return d
+    legacy = _legacy_sessions_path(store)
+    old_undo = legacy.with_name(UNDO_DIR) if legacy is not None else None
+    tmp = d.with_name(f".tmp.{os.getpid()}.{STATE_DIR}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        tmp.mkdir()
+        (tmp / ".gitignore").write_text("*\n", encoding="utf-8", newline="\n")
+        if legacy is not None and legacy.exists():
+            shutil.copyfile(legacy, tmp / SESSIONS_FILE)
+        if old_undo is not None and old_undo.is_dir():
+            with suppress(OSError):      # an undo level is worth less than the write
+                shutil.copytree(old_undo, tmp / UNDO_DIR)
+        os.replace(tmp, d)
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not d.is_dir():                          # another process made it first: fine
+            raise
+        return d
+    if legacy is not None:
+        with suppress(OSError):
+            legacy.unlink()
+    if old_undo is not None:
+        shutil.rmtree(old_undo, ignore_errors=True)
+    return d
 
 
 def session_key() -> str | None:
     """The agent session this process runs in, when its runtime names one.
-    Codex and Antigravity before Claude Code: one launched from Claude Code
+    Codex, Antigravity and Pi before Claude Code: one launched from Claude Code
     inherits its key, and the innermost agent is the one writing (as in
-    api.author_default)."""
+    api.author_default). A Claude Code launched from Pi inherits PI_SESSION_ID,
+    so it counts only while AI_AGENT names Pi."""
+    pi = os.environ.get("PI_SESSION_ID") if os.environ.get("AI_AGENT") == "pi" else None
     return (os.environ.get("CODEX_THREAD_ID") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-            or os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
+            or pi or os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
 
 
 _SESSIONS_PATHS: dict = {}
 
 
-def _sessions_path(store) -> Path | None:
-    # Asked once per store: per row, it was most of a batch write's time
-    # under the lock. A miss is not kept: the store may be a repo by the next.
+def _legacy_sessions_path(store) -> Path | None:
+    """Where symbion before 0.13.1 kept the sessions record: the git dir.
+    Asked once per store: per row, it was most of a batch write's time under
+    the lock. A miss is not kept: the store may be a repo by the next."""
     store = Path(store).absolute()
     if (p := _SESSIONS_PATHS.get(store)) is None:
         r = subprocess.run(["git", "-C", str(store), "rev-parse", "--git-path", SESSIONS_FILE],
@@ -1462,17 +1555,25 @@ def _sessions_path(store) -> Path | None:
     return p
 
 
+def _sessions_path(store) -> Path | None:
+    """The sessions record to read: the legacy one until STATE_DIR exists."""
+    d = _state_dir(store)
+    return d / SESSIONS_FILE if d.is_dir() else _legacy_sessions_path(store)
+
+
 def _record_session(store, note_id: str, kept_id: str | None = None,
-                    prior: str | None = None) -> None:
+                    prior: str | None = None) -> list[str]:
     """`note_id` is this session's now. An edit's `kept_id` stays with the
     session that wrote the version it holds (`prior`), and an edit outside
-    any session takes the row from the session that had it."""
+    any session takes the row from the session that had it. Returns the
+    lines written, so a sweep keeps the record without reading it again."""
     key = session_key()
     lines = ([f"{kept_id}\t{prior}"] if kept_id and prior else []) + \
         ([f"{note_id}\t{key or ''}"] if key or prior else [])
-    path = lines and _sessions_path(store)
+    path = lines and _state_dir(store, make=True) / SESSIONS_FILE
     for line in lines if path else []:
         _append_line_unlocked(path, line)
+    return lines
 
 
 def sessions(store) -> dict:
@@ -1504,30 +1605,42 @@ def _forget_committed(store) -> None:
         return
     live = {_line_id(ln) for ln in jsonl_lines(notes_path(store).read_text(encoding="utf-8"))
             if ln and ln not in committed}
-    _replace_atomically(_sessions_path(store),
+    _replace_atomically(_state_dir(store, make=True) / SESSIONS_FILE,
                         "".join(f"{i}\t{k}\n" for i, k in known.items() if i in live))
 
 
-def _rewrite_note_unlocked(store, note: Note, kept_id: str) -> None:
-    """Move the line holding note.id to `kept_id`, as written, and append
-    the note, whole-file and atomically: a reader without the lock sees the
-    old file or the new one, never half, and no crash leaves the id on
-    neither line.
-    # ponytail: a sweep rewrites the file once per row; write a sweep's rows
-    # in one pass if a rename over a large store gets slow."""
+def _rewrite_notes_unlocked(store, edits) -> None:
+    """For each (note, kept_id), in order: move the line holding note.id to
+    `kept_id`, as written, and append the note. Whole-file and atomically: a
+    reader without the lock sees the old file or the new one, never half,
+    and no crash leaves an id on neither line. A sweep passes all its rows
+    at once: a write a row read, parsed and wrote the file each time, and
+    two 1,500-row renames took 149 s under the lock (audit 2026-11-02)."""
     path = notes_path(store)
     raws = jsonl_lines(path.read_text(encoding="utf-8"))
-    at = [str(i) for i, raw in enumerate(raws, 1) if _line_id(raw) == note.id]
-    if len(at) > 1:                 # a merge kept both sides (_parse_jsonl)
-        raise ValueError(f"{note.id} is on lines {', '.join(at[:-1])} and {at[-1]} of "
-                         f"{NOTES_FILE}, and this write would change each. Change the last "
-                         f"3 characters of one line's id to other hex digits, then write again")
-    prior = sessions(store).get(note.id)
-    line = _dumps(note_to_dict(note))
-    rows = [_dumps({**json.loads(raw), "id": kept_id}) if _line_id(raw) == note.id else raw
-            for raw in raws]
-    _replace_atomically(path, "\n".join(rows + [line]) + "\n")
-    _record_session(store, note.id, kept_id, prior)
+    where: dict = {}
+    for i, raw in enumerate(raws):
+        where.setdefault(_line_id(raw), []).append(i)
+    for note, _ in edits:
+        at = [str(i + 1) for i in where.get(note.id, ())]
+        if len(at) > 1:             # a merge kept both sides (_parse_jsonl)
+            raise ValueError(f"{note.id} is on lines {', '.join(at[:-1])} and {at[-1]} of "
+                             f"{NOTES_FILE}, and this write would change each. Change the last "
+                             f"3 characters of one line's id to other hex digits, then write "
+                             f"again")
+    # The records first, as in _append_note_unlocked.
+    # ponytail: if the rewrite below then fails, each note.id's record names
+    # this session while its line is still the prior version; restore the
+    # records if a failed rewrite is ever seen.
+    known = sessions(store)
+    for note, kept_id in edits:
+        lines = _record_session(store, note.id, kept_id, known.get(note.id) or None)
+        known.update(ln.split("\t", 1) for ln in lines)
+        for i in where.get(note.id, ()):
+            raws[i] = _dumps({**json.loads(raws[i]), "id": kept_id})
+        where[note.id] = [len(raws)]
+        raws.append(_dumps(note_to_dict(note)))
+    _replace_atomically(path, "\n".join(raws) + "\n")
 
 
 def heads(notes):
@@ -1626,13 +1739,14 @@ nfc = catalog.nfc  # was defined identically here and in catalog.py; catalog
 
 
 def _rename_unlocked(store, notes, kinds, target_type, old, new, author,
-                     new_type=None, *, side) -> tuple[int, int]:
+                     new_type=None, *, side, pending) -> tuple[int, int]:
     """Move every HEAD off (target_type, old): its target, and each ref naming
     it, onto (new_type, new), one supersede per row; `new_type` defaults to
     `target_type`. The other refs keep their place.
     Returns (re-targeted, re-pointed) row counts; a row carrying both counts in
     each. The caller holds the lock and passes `notes` loaded under it; the new
-    rows are appended to that list.
+    rows are appended to that list, and their edits to `pending`, which the
+    caller writes with `_rewrite_notes_unlocked`.
 
     Refs are half the name: `context --target` reads them, so a sweep over
     targets alone left every `--ref` on a name nothing else carried."""
@@ -1655,7 +1769,7 @@ def _rename_unlocked(store, notes, kinds, target_type, old, new, author,
             fields["refs"] = [{"type": r.type, "name": r.name} for r in refs]
         if fields:
             notes.append(_supersede_unlocked(store, notes, note.id, author=author,
-                                             kinds=kinds, side=side, **fields))
+                                             kinds=kinds, side=side, pending=pending, **fields))
             moved += "target" in fields
             repointed += was in note.refs
     return moved, repointed
@@ -1698,11 +1812,15 @@ def rename_target(store, target_type, old, new, author=None,
     with _lock(store):
         if canonicalize is not None:
             new = canonicalize(new)
-        notes = load(store)
+        notes, pending = load(store), []
         if target_type == "commit":
             old = _stored_commit(notes, old)
-        return _rename_unlocked(store, notes, K.read_kinds(store),
-                                target_type, old, new, author, new_type, side=side)
+        counts = _rename_unlocked(store, notes, K.read_kinds(store),
+                                  target_type, old, new, author, new_type, side=side,
+                                  pending=pending)
+        if pending:
+            _rewrite_notes_unlocked(store, pending)
+        return counts
 
 
 def _stored_commit(notes, old):
@@ -1732,7 +1850,7 @@ def retype(store, from_type, to_type, author=None, target_types=None) -> tuple[i
     require_store(store)
     side = shared_side(store)
     with _lock(store):
-        notes, kinds = load(store), K.read_kinds(store)
+        notes, kinds, pending = load(store), K.read_kinds(store), []
         names = sorted({o.name for n in heads(notes) for o in (n.target, *n.refs)
                         if o.type == from_type and o.name is not None})
         moved = repointed = 0
@@ -1742,8 +1860,10 @@ def retype(store, from_type, to_type, author=None, target_types=None) -> tuple[i
         # appends what it writes to `notes`.
         for name in names:
             m, r = _rename_unlocked(store, notes, kinds, from_type, name, name, author, to_type,
-                                    side=side)
+                                    side=side, pending=pending)
             moved, repointed = moved + m, repointed + r
+        if pending:
+            _rewrite_notes_unlocked(store, pending)
         return moved, repointed
 
 
@@ -1933,7 +2053,12 @@ def _stage_kept(store: Path, keep) -> subprocess.CompletedProcess:
     taken = with_bases([r for _, r in pending], lambda r: keep(r) and r.get("id") not in kept_ids)
     take = {r["id"] for _, r in pending if r.get("id") and taken(r)}
     old_ids = [_line_id(ln) for ln in old]
-    head_rows = [moved[i] if i in take and i in moved else ln for ln, i in zip(old, old_ids)]
+    # HEAD's line gave way to the kept version on disk; by the kept version's
+    # id, as a commit can take it, a revision's base, without the head that
+    # holds the row's id now. A pull leaves the upstream's kept line on disk.
+    on_disk = set(disk)
+    head_rows = [moved[i] if ln not in on_disk and i in moved and _line_id(moved[i]) in take
+                 else ln for ln, i in zip(old, old_ids)]
     rows = head_rows + [ln for ln, r in pending if r.get("id") in take and ln not in head_rows]
     text = "".join(ln + "\n" for ln in rows)
     # A version an edit kept and this commit leaves sorts where its HEAD line is.
@@ -2055,11 +2180,12 @@ def _read_aside(store, aside: Path) -> tuple:
 
 def _keep_sessions(store, old: dict, now: dict, splits: list) -> None:
     """A pending head under a new id stays its session's, for its `commit`."""
-    known, path = sessions(store), _sessions_path(store)
+    known = sessions(store)
     held = {_line_id(ln) for ln in set(now[NOTES_FILE]) - set(old[NOTES_FILE])}
     for was, new in splits:
-        if was in held and known.get(was) and path:
-            _append_line_unlocked(path, f"{new}\t{known[was]}")
+        if was in held and known.get(was):
+            _append_line_unlocked(_state_dir(store, make=True) / SESSIONS_FILE,
+                                  f"{new}\t{known[was]}")
 
 
 def _recover_unlocked(store) -> tuple:
@@ -2548,20 +2674,22 @@ def apply_reconciliation(store, rows, resolve_stale=False, author=None):
     kinds = K.read_kinds(store)
     side = shared_side(store)
     with _lock(store):
-        notes = load(store)
+        notes, pending = load(store), []
         for r in rows:
             if r["status"] == "renamed":
                 moved, refs = _rename_unlocked(store, notes, kinds, r["target_type"],
                                                r["target_name"], r["suggestion"], author,
-                                               side=side)
+                                               side=side, pending=pending)
                 retargeted += moved
                 repointed += refs
             elif r["status"] == "stale" and resolve_stale and not r.get("needs_result"):
                 new_note = _supersede_unlocked(
                     store, notes, r["id"], author=author, kinds=kinds, side=side,
-                    status="resolved",
+                    pending=pending, status="resolved",
                     append_body=f"reconcile: target {r['target_name']!r} disappeared "
                                 f"from the {r['target_type']} catalog; no rename evidence.")
                 notes.append(new_note)
                 resolved += 1
+        if pending:
+            _rewrite_notes_unlocked(store, pending)
     return retargeted, repointed, resolved

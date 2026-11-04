@@ -127,6 +127,11 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
                         return r.status, None
                 except urllib.error.HTTPError as e:
                     return e.code, e.headers.get("location")
+            try:
+                opener.open(f"http://127.0.0.1:{port}/go/github?from=banner", timeout=2)
+                github = None
+            except urllib.error.HTTPError as e:
+                github = e.code, e.headers.get("location")
             goes = [go(f"web+symbion://127.0.0.1:{port}/notes?id=x"),
                     go("web+symbion://example.com/notes?id=x"),
                     go(f"http://127.0.0.1:{port}/notes?id=x")]
@@ -160,7 +165,7 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     # is under /_nicegui/. Not an inline data: URL, which Obsidian's web viewer
     # cannot fetch.
     assert 'href="/favicon.ico"' in page, page[:2000]
-    # A browser with scripts blocked is told so, not that it lacks ES modules.
+    # A browser with scripts blocked is told so, and what symbion is.
     assert "<noscript><style>#esm-fallback{display:none!important}" in page
     assert "GUI needs JavaScript" in page
     # An agent's fetch runs no script, and its converter drops <noscript>
@@ -185,6 +190,9 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     assert manifest[1]["protocol_handlers"] == \
         [{"protocol": "web+symbion", "url": "/go?to=%s"}], manifest
     assert goes == [(302, f"http://127.0.0.1:{port}/notes?id=x"), (404, None), (404, None)], goes
+    # The demo's links to the source come through here, so its access log
+    # counts each click out (the user, 2026-11-03).
+    assert github == (302, "https://github.com/phreakocious/symbion#readme"), github
     # The ⌘K palette's rows, which the page's script asks for as one types.
     assert rows[0] == "application/json" and rows[1][0]["head"] == "go to", rows
     # Frame and active tab differ, or the current tab cannot be told apart;
@@ -358,6 +366,8 @@ def test_a_serve_writes_in_no_agent_session(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
     monkeypatch.setenv("CODEX_THREAD_ID", "t1")
     monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", "a1")
+    monkeypatch.setenv("AI_AGENT", "pi")
+    monkeypatch.setenv("PI_SESSION_ID", "p1")
     store.ensure_store(tmp_path / "s")
     serve.main(api.resolve(str(tmp_path / "s")), author="t", port=1111, show=False)
     assert store.session_key() is None

@@ -311,9 +311,10 @@ def _claims(cand: Path, store: Path) -> Path | None:
 
 def uncomment_hint(store, name: str) -> str | None:
     """The commented `name =` lines that would declare catalog type `name`,
-    or None. The starter toml ships its catalogs commented out, and "catalog
-    types are declared in ... under [catalogs]" left the user of a new store to
-    find the line and the [renames] pair (2026-10-09)."""
+    or None. The starter toml shipped its catalogs commented out until
+    2026-11-04 (`file` is on since), and "catalog types are declared in ...
+    under [catalogs]" left the user of such a store to find the line and the
+    [renames] pair (2026-10-09)."""
     p = Path(store) / CONFIG_FILE
     try:
         lines = p.read_text(encoding="utf-8").splitlines()

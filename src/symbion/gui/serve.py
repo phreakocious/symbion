@@ -168,7 +168,8 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
         os.environ["SYMBION_READ_ONLY"] = "1"
     # The person's rows belong to no agent session, though the shell that
     # started the serve may run in one (store.session_key).
-    for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID"):
+    for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID",
+              "PI_SESSION_ID"):
         os.environ.pop(k, None)
     if not loopback(host) and not allow:
         print(f"error: --host {host} lets other machines connect, and the GUI writes "

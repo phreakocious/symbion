@@ -56,11 +56,30 @@ def test_skill_inlines_the_schema_and_names_the_files_dir(repo, tmp_path, capsys
     out = capsys.readouterr().out
     first = out.splitlines()[0]
     assert first == (f"symbion's skill files (adoption.md, catalogs.md, mechanics.md, "
-                     f"wrap.md) are in {SKILL_DIR.as_posix()}.")
+                     f"wrap.md) are in {SKILL_DIR.as_posix()}; `symbion skill NAME` "
+                     f"prints one (`symbion skill wrap`).")
     assert "!`symbion schema`" not in out and "\n---\n" not in out and "name: symbion" not in out
     assert schema.strip() in out
     last = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").rstrip().splitlines()[-1]
     assert out.rstrip().endswith(last)
+
+
+# The bytes of `symbion skill` on a fresh store, less its first line, which names
+# this machine's path: 11,923 on 2026-11-03, plus 5%.
+SKILL_BUDGET = 12519
+
+
+def test_the_skill_an_agent_loads_stays_in_its_budget(repo, tmp_path, capsys):
+    """SKILL.md and its schema table load into every session that writes: under
+    16 KB, and a line goes in only when another comes out (the user, 2026-10-14).
+    A ratchet holds the second (the user, 2026-11-03): a cut lowers the budget,
+    and a raise goes in a commit that says why."""
+    s = tmp_path / "p-notes"
+    store.ensure_store(s)
+    assert cli.main(["--dir", str(s), "skill"]) == 0
+    size = len(capsys.readouterr().out.split("\n", 1)[1].encode())
+    assert size <= SKILL_BUDGET, f"{size} bytes: cut a line, or raise SKILL_BUDGET in a commit that says why"
+    assert round(size * 1.05) >= SKILL_BUDGET, f"{size} bytes: lower SKILL_BUDGET to {round(size * 1.05)}"
 
 
 def test_skill_without_a_store_says_how_to_make_one(repo, capsys):
@@ -77,6 +96,57 @@ def test_skill_outside_a_git_repo_still_prints(tmp_path, monkeypatch, capsys):
     assert NO_STORE in capsys.readouterr().out
     assert cli.main(["skill", "--path"]) == 0
     assert capsys.readouterr().out.strip() == SKILL_DIR.as_posix()
+
+
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root reads a mode-0 file")
+@pytest.mark.skipif(os.name == "nt", reason="chmod cannot make a file unreadable on Windows")
+def test_skill_prints_when_the_store_is_unreadable(repo, tmp_path, capsys):
+    """A sandboxed agent shell (agy's) stats the sibling store and refuses to
+    open its symbion.toml: the stub's `symbion skill` printed a traceback, and
+    no skill. The store exists, so the skill must not say it is missing."""
+    s = tmp_path / "p-notes"
+    store.ensure_store(s)
+    (s / "symbion.toml").write_text("")
+    (s / "symbion.toml").chmod(0)
+    try:
+        assert cli.main(["skill"]) == 0
+        out = capsys.readouterr().out
+        assert cli.main(["skill", "--path"]) == 0
+        path = capsys.readouterr().out.strip()
+    finally:
+        (s / "symbion.toml").chmod(0o644)
+    assert out.startswith("symbion's skill files") and NO_STORE not in out
+    assert "could not read this project's store" in out and "symbion.toml" in out
+    assert path == SKILL_DIR.as_posix()
+
+
+def test_skill_path_answers_when_the_store_config_is_broken(repo, tmp_path, capsys):
+    """The plugin's hook asks `skill --path` first and reads a failure as a
+    CLI that does not run. A bad key in symbion.toml failed it, so the hook
+    sent the user to /symbion:setup, and the package's hook, which names the
+    key, never ran (audit 2026-11-02)."""
+    s = tmp_path / "p-notes"
+    store.ensure_store(s)
+    (s / "symbion.toml").write_text('provenance = "x"\n')
+    assert cli.main(["skill", "--path"]) == 0
+    assert capsys.readouterr().out.strip() == SKILL_DIR.as_posix()
+
+
+def test_skill_name_prints_that_file_before_any_store(repo, tmp_path, capsys):
+    """Setup's Read of adoption.md, in the installed package, asked Claude
+    Code's "read outside the working directories" question of each new user
+    (a stranger run, 2026-11-04). `symbion skill adoption` prints it through
+    the shell call the plugin already makes. Like `--path`, it answers
+    before any store resolves, a broken symbion.toml included."""
+    s = tmp_path / "p-notes"
+    store.ensure_store(s)
+    (s / "symbion.toml").write_text('provenance = "x"\n')
+    for name, f in (("adoption", "adoption.md"), ("wrap.md", "wrap.md"), ("catalogs", "catalogs.md"),
+                    ("mechanics", "mechanics.md")):
+        assert cli.main(["skill", name]) == 0, name
+        assert capsys.readouterr().out == (SKILL_DIR / f).read_text(encoding="utf-8"), name
+    assert cli.main(["skill", "SKILL"]) == 2
+    assert "one of adoption, catalogs, mechanics, wrap" in capsys.readouterr().err
 
 
 def _description(skill_md: Path) -> str:
@@ -292,6 +362,20 @@ def test_start_shim_under_agy_without_a_workspace_says_nothing(tmp_path):
 
 
 @AGY_PATHS
+def test_start_shim_names_its_host_to_the_package_hook(tmp_path):
+    """The package hook answers in the host's JSON; an env marker can name the
+    wrong one when one agent starts in another's terminal."""
+    env, skill = _env(tmp_path), _skill(tmp_path / "pkg" / "skill")
+    (skill / "session_start.sh").write_text('echo "PKG-START $SYMBION_HOST"\n')
+    _cli(tmp_path, skill)
+    project = _project(tmp_path)
+    marked = {**env, "ANTIGRAVITY_CONVERSATION_ID": "c1"}
+    assert _run(START, project, marked).stdout == "PKG-START claude\n"
+    call = json.dumps({"workspacePaths": [str(project)]})
+    assert _run_agy(tmp_path, env, call).stdout == "PKG-START antigravity\n"
+
+
+@AGY_PATHS
 def test_start_shim_under_agy_speaks_json_when_the_cli_does_not_run(tmp_path):
     """agy reads only JSON, and has no /symbion:setup to send anyone to."""
     env = _env(tmp_path)
@@ -303,6 +387,35 @@ def test_start_shim_under_agy_speaks_json_when_the_cli_does_not_run(tmp_path):
     (step,) = json.loads(r.stdout)["injectSteps"]
     said = step["systemMessage"]["systemMessage"]
     assert "the symbion CLI is not installed or does not run" in said and "/symbion:" not in said
+
+
+TO_PI_SETUP = ("symbion: this project has a symbion store, but the symbion CLI is not "
+               "installed or does not run: run /symbion-setup.\n")
+
+
+def _run_pi(project, env, stdin=""):
+    """As Pi's extension runs the hook: in the project, named in SYMBION_PROJECT_DIR."""
+    return subprocess.run(["sh", str(START), "pi"], cwd=project, input=stdin, text=True,
+                          capture_output=True, env={**env, "SYMBION_PROJECT_DIR": str(project)})
+
+
+def test_start_shim_under_pi_names_its_host_to_the_package_hook(tmp_path):
+    env, skill = _env(tmp_path), _skill(tmp_path / "pkg" / "skill")
+    (skill / "session_start.sh").write_text('echo "PKG-START $SYMBION_HOST"\ncat\n')
+    _cli(tmp_path, skill)
+    r = _run_pi(_project(tmp_path), env, '{"session_id": "p1"}\n')
+    assert (r.returncode, r.stdout) == (0, 'PKG-START pi\n{"session_id": "p1"}\n')
+
+
+def test_start_shim_under_pi_sends_an_adopted_project_to_symbion_setup(tmp_path):
+    """Pi's command is /symbion-setup: its prompt names take no namespace."""
+    env = _env(tmp_path)
+    _cli(tmp_path, None, broken=True)
+    project = _project(tmp_path / "a")
+    (tmp_path / "a" / "p-notes").mkdir()
+    (tmp_path / "a" / "p-notes" / "notes.jsonl").write_text("")
+    assert _run_pi(project, env).stdout == TO_PI_SETUP
+    assert _run_pi(_project(tmp_path / "b"), env).stdout == ""
 
 
 def test_shims_quote_paths_with_spaces(tmp_path):
@@ -345,7 +458,10 @@ def test_setup_command_carries_the_specs_strings():
     """/symbion:setup is prose an agent follows, so this holds what can be held:
     the spec's exact strings, the plugin's own version as the CLI it needs, an
     approval at the install and at adoption, and no bare pip."""
-    text = (PLUGIN / "commands" / "setup.md").read_text(encoding="utf-8")
+    assert not (PLUGIN / "commands").exists()
+    text = (PLUGIN / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
+    assert _description(PLUGIN / "skills" / "setup" / "SKILL.md") == \
+        "Install symbion and set it up in this project, saying what each step writes and asking before each write"
     version = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())["version"]
     for s in ("uv tool install --python '>=3.11' 'symbion[gui]'", "pipx install 'symbion[gui]'",
               "uv tool upgrade symbion", "pipx upgrade symbion", f"symbion {version} or later",
@@ -361,7 +477,7 @@ def test_setup_command_carries_the_specs_strings():
     assert "pip install" not in text.replace("pipx install", "")
     assert "not a git repository" in text
     steps = re.split(r"\n(?=\d+\. )", text)
-    for marker in ("`symbion init --yes`", "adoption.md"):
+    for marker in ("`symbion init --yes`", "Run `symbion skill adoption`"):
         step = next(s for s in steps if marker in s)
         assert "approv" in step, (marker, step)
     # uv and pipx put the command in a bin dir a stock PATH may lack, and their
@@ -370,16 +486,45 @@ def test_setup_command_carries_the_specs_strings():
     for s in ("command -v symbion", "uv tool update-shell", "pipx ensurepath",
               "ask before any change to a shell's rc file"):
         assert s in install, s
-    assert len(text.encode()) < 4096, "it loads into context on every /symbion:setup"
-    assert "in full" in next(s for s in steps if "adoption.md" in s), "a dialog alone hid the table"
+    # init's re-check runs alone: the plugin review's minors (the user, 2026-10-30).
+    assert "in a call of its own, run `symbion init` again" in install
+    # agy never reads CLAUDE.md, and its model skipped a parenthetical naming its
+    # file; a new AGENTS.md would hide CLAUDE.md from Pi (live run, 2026-11-03).
+    store = next(s for s in steps if s.startswith("4. "))
+    for s in ("Antigravity never reads `CLAUDE.md`", "else create `GEMINI.md`",
+              "`--agent antigravity`", "`/permissions`"):
+        assert s in store, s
+    # In auto mode, symbion fails in agy's sandbox until those rules are in, and the
+    # fact line's `|| echo` reads that as no install (2026-11-03).
+    cli_step = next(s for s in steps if s.startswith("3. "))
+    for s in ("operation not permitted", "`BypassSandbox`"):
+        assert s in cli_step, s
+    # Rules asked for after init: each later call took 5-41 s of review and each read
+    # outside the workspace prompted. A rule may name a store init has not made, so they
+    # go in at the approval, and a sandboxed -V shows they are in (agy trial, 2026-11-03).
+    assert "before approving" in store
+    assert "`symbion -V` without `BypassSandbox`" in install
+    # With no bypass after the rules, the sandbox refused to list the repo's parent and
+    # zsh read the sibling-store sweep as `no matches found` (agy run, 2026-11-03).
+    assert "`BypassSandbox` only for what `adoption.md` reads outside the repo" in install
+    adoption = (SKILL_DIR / "adoption.md").read_text(encoding="utf-8")
+    for s in ("Antigravity's auto mode", "`no matches found`", "in agy, with `BypassSandbox`"):
+        assert s in adoption, s
+    # agy's read_file refused serve's log in /tmp even with the rules.
+    assert "head -1" in next(s for s in steps if "symbion serve" in s and s[0] == "8")
+    # 1 KB more for each host's file and init flag (the user, 2026-11-03).
+    assert len(text.encode()) < 5120, "it loads into context on every /symbion:setup"
+    assert "in full" in next(s for s in steps if "Run `symbion skill adoption`" in s), "a dialog alone hid the table"
     assert "--no-browser" in next(s for s in steps if "symbion serve" in s and s[0] == "8")
 
 
 def test_wrap_command_sends_the_agent_to_the_package_wrap():
     """/symbion:wrap: `/symbion wrap` was the user skill's, and the plugin has
-    no user skill (the user, 2026-10-30). The steps stay in wrap.md, found as
-    setup finds adoption.md."""
-    text = (PLUGIN / "commands" / "wrap.md").read_text(encoding="utf-8")
-    assert "read `wrap.md` in the directory `symbion skill --path` prints" in text
+    no user skill (the user, 2026-10-30). The steps stay in wrap.md, printed as
+    setup prints adoption.md."""
+    text = (PLUGIN / "skills" / "wrap" / "SKILL.md").read_text(encoding="utf-8")
+    assert _description(PLUGIN / "skills" / "wrap" / "SKILL.md") == \
+        "End the session: put what it knows that no symbion entry holds into the store, then commit the store with the next session's handoff as the message"
+    assert "run `symbion skill wrap` and follow it" in text
     assert "`symbion:symbion`" in text and (SKILL_DIR / "wrap.md").is_file()
     assert not re.findall(r"!`([^`]*)`", text)

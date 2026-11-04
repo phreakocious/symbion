@@ -1,0 +1,7 @@
+{
+  "name": "symbion",
+  "private": true,
+  "type": "module",
+  "description": "symbion for Pi: the session-start summary, gotcha lines, the skill, /symbion-setup and /symbion-wrap. Needs the symbion CLI, which /symbion-setup installs.",
+  "pi": { "extensions": ["./plugin/pi/symbion.ts"] }
+}

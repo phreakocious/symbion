@@ -205,41 +205,85 @@ def _bodies(selector: str) -> list[str]:
     return [body for sels, body in _rules() if selector in sels]
 
 
-def _ground(body: str, q: dict) -> str:
-    """The ground a rule's words sit on: its own wash over a card, its own
-    background, else a card's."""
+def _decls() -> dict[str, str]:
+    """Each selector's declarations, from every rule that names it."""
+    out: dict[str, str] = {}
+    for sels, body in _rules():
+        for s in sels:
+            out[s] = out.get(s, "") + body
+    return out
+
+
+def _chain(sel: str, decls: dict) -> list[str]:
+    """The selector, then each element it sits in as far as the selector
+    names them: the part before its last combinator, else a selector that
+    ends in that part. A pseudo-element sits in its own element."""
+    chain = [sel]
+    while True:
+        s = chain[-1]
+        if "::" in s:
+            up = s.split("::")[0]
+        elif m := re.fullmatch(r"(.*\S)(?: > | )\S+", s):
+            up = m[1] if m[1] in decls else next(
+                (d for d in decls if d.endswith(" " + m[1])), m[1])
+        else:
+            return chain
+        if up in chain:
+            return chain
+        chain.append(up)
+
+
+def _ground(sel: str, q: dict, decls: dict) -> str:
+    """The ground a selector's words sit on: its own background, else its
+    element's, else a card's. A wash mixes over the ground beneath it."""
     from symbion.gui.theme import PALETTE
-    if w := re.search(r"background(?:-color)?:\s*color-mix\(in srgb, var\(--q-([a-z-]+)\) (\d+)%",
-                      body):
-        wash, t = q[w[1]], int(w[2]) / 100
-        return "#" + "".join(f"{round(int(wash[i:i + 2], 16) * t + int(PALETTE.bg_panel[i:i + 2], 16) * (1 - t)):02x}"
-                             for i in (1, 3, 5))
-    if s := re.search(r"background(?:-color)?:\s*var\(--q-([a-z-]+)\)", body):
-        return q[s[1]]
-    return PALETTE.bg_panel
+    ground = PALETTE.bg_panel
+    for s in reversed(_chain(sel, decls)):
+        bg = _background(decls.get(s, ""))
+        if w := re.match(r"color-mix\(in srgb, var\(--q-([a-z-]+)\) (\d+)%, "
+                         r"(?:var\(--q-([a-z-]+)\)|transparent)\)", bg):
+            wash, base, t = q[w[1]], q[w[3]] if w[3] else ground, int(w[2]) / 100
+            ground = "#" + "".join(f"{round(int(wash[i:i + 2], 16) * t + int(base[i:i + 2], 16) * (1 - t)):02x}"
+                                   for i in (1, 3, 5))
+        elif v := re.match(r"var\(--q-([a-z-]+)\)", bg):
+            ground = q[v[1]]
+    return ground
+
+
+def _colour(sel: str, decls: dict) -> str | None:
+    """The palette slot a selector's words take: its own, else its
+    element's, else the page's `emph`. None for a colour off the palette."""
+    return next((m[1] for s in _chain(sel, decls) if (m := re.search(
+        r"(?<![-\w])color:\s*(?:var\(--q-([a-z-]+)\)|\S)", decls.get(s, "")))), "emph")
 
 
 # Not words on a card: a mark, whose floor is 3:1 (WCAG 2, 1.4.11), or dark
-# text on a filled control, whose ground is the control's own colour.
-_NOT_WORDS = (".sb-sep", ".text-dim", ".sb-docs-row > .q-icon", ".q-btn.text-white")
+# text on a filled control or notice, whose ground is its own colour.
+_NOT_WORDS = (".sb-sep", ".text-dim", ".sb-docs-row > .q-icon", ".q-btn.text-white",
+              ".q-notification[class*=bg-]")
 
 
 def test_every_rule_that_sets_a_colour_reads_at_4_5_to_1():
     """An amendment's who-and-when was `dim` on the card, 3.6:1, and a
     deleted block's words `muted` on a red wash, 4.3:1 (measured 2026-10-16):
     text needs 4.5:1 (WCAG 2, 1.4.3). Three selectors named by hand missed
-    every rule added after them, so each rule that sets a palette colour is
-    read on its own ground, else a card's."""
+    every rule added after them, so each selector that sets a palette colour
+    or a wash is read on its own ground, else its element's, else a card's.
+    A diff's line numbers read 4.44:1 on its grid's ground, and its changed
+    words, which set no colour, 4.48:1 on their wash (2026-11-02): the audit
+    had read each on a card, or not at all."""
     from symbion.gui.theme import quasar_colors
     q = {k.replace("_", "-"): v for k, v in quasar_colors().items()}
-    read, low = 0, []
-    for sels, body in _rules():
-        m = re.search(r"(?<![-\w])color:\s*var\(--q-([a-z-]+)\)", body)
-        if not m or m[1] not in q or any(s in sels for s in _NOT_WORDS):
+    decls, read, low = _decls(), 0, []
+    for sel, body in decls.items():
+        if sel in _NOT_WORDS or not (re.search(r"(?<![-\w])color:", body)
+                                     or "color-mix" in _background(body)):
+            continue
+        if (slot := _colour(sel, decls)) not in q:
             continue
         read += 1
-        if (r := _ratio(q[m[1]], ground := _ground(body, q))) < 4.5:
-            low.append((sels, m[1], ground, round(r, 2)))
+        if (r := _ratio(q[slot], ground := _ground(sel, q, decls))) < 4.5:
+            low.append((sel, slot, ground, round(r, 2)))
     assert read > 100 and not low, (read, low)
 
 
@@ -253,8 +297,9 @@ def test_a_wash_over_a_whole_card_steps_its_small_words_up():
     washes = [(sels, body) for sels, body in _rules()
               if any(card.fullmatch(s) for s in sels) and "color-mix" in _background(body)]
     assert washes, "the pick's wash is one"
+    decls = _decls()
     for sels, body in washes:
-        if _ratio(q["muted"], _ground(body, q)) < 4.5:
+        if _ratio(q["muted"], _ground(sels[0], q, decls)) < 4.5:
             assert re.search(r"--q-muted:\s*var\(--q-(body|emph)\)", body), sels
 
 

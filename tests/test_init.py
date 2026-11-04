@@ -389,26 +389,37 @@ def test_init_starter_toml_offers_shared_above_its_first_table(repo, tmp_path):
     assert store.shared(d)
 
 
-def test_a_file_target_on_a_new_store_names_the_lines_that_declare_it(repo, tmp_path, capsys):
-    """A new store refused `--target file:…` with "catalog types are declared
-    in … under [catalogs]", and the README leads with file notes (2026-10-09).
-    The refusal names the commented lines; uncommenting exactly those makes a
-    note on any file land, not only a `.py` one."""
+def test_a_new_store_takes_file_targets_and_an_older_one_names_its_lines(repo, tmp_path, capsys):
+    """`init` writes the `file` catalog on: every /symbion:setup turned it on in
+    adoption, an edit outside the repo that Claude Code asked about, and the user
+    reversed the 2026-10-09 call that kept it commented (2026-11-04). A store
+    from before still refuses `--target file:…`, naming the commented lines;
+    uncommenting exactly those makes a note on any file land, not only a `.py` one."""
     store = tmp_path / "store"
     assert run("init", "--yes", store_dir=store) == 0
-    capsys.readouterr()
     (repo / "main.rs").write_text("x")
-    assert run("add", "note", "--target", "file:main.rs", store_dir=store) == 2
+    capsys.readouterr()
+    assert run("add", "note", "--target", "file:main.rs", "--body", "a new store",
+               store_dir=store) == 0
+    assert "taken as typed" not in capsys.readouterr().err
+    toml = store / "symbion.toml"
+    text = toml.read_text()
+    for line in ('file = "git ls-files --cached --others --exclude-standard"', 'file = "git"'):
+        assert f"\n{line}" in text, line
+        text = text.replace(f"\n{line}", f"\n# {line}", 1)
+    toml.write_text(text)                       # the starter as init wrote it before
+    assert run("add", "note", "--target", "file:main.rs", "--body", "an older store",
+               store_dir=store) == 2
     err = capsys.readouterr().err
     m = re.search(r"uncomment `file =` in \S+: line (\d+) under \[catalogs\], "
                   r"line (\d+) under \[renames\]", err)
     assert m, err
-    toml = store / "symbion.toml"
     lines = toml.read_text().splitlines()
     for n in m.groups():
         lines[int(n) - 1] = lines[int(n) - 1].removeprefix("# ")
     toml.write_text("\n".join(lines) + "\n")
-    assert run("add", "note", "--target", "file:main.rs", store_dir=store) == 0
+    assert run("add", "note", "--target", "file:main.rs", "--body", "an older store",
+               store_dir=store) == 0
     assert "taken as typed" not in capsys.readouterr().err
 
 

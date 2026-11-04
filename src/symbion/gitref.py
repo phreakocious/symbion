@@ -15,6 +15,7 @@ from collections import Counter
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
@@ -46,17 +47,19 @@ def _git(cfg_or_path, *args, input: str | None = None, errors: str = "strict",
         # has one answer a process. The public demo asked about 60 a render,
         # 59 distinct over 5 renders: 5 s a page on its box, 2 s answered once
         # (2026-10-22).
-        key = (str(root), args, input, errors)
-        if key not in _ANSWERS:
-            _ANSWERS[key] = subprocess.run(["git", "-C", str(root), *args], input=input,
-                                           capture_output=True, text=True, encoding="utf-8",
-                                           errors=errors)
-        return _ANSWERS[key]
-    return subprocess.run(["git", "-C", str(root), *args], input=input,
+        return _asked(str(root), args, input, errors)
+    return _run(str(root), args, input, errors)
+
+
+def _run(root, args, input, errors):
+    return subprocess.run(["git", "-C", root, *args], input=input,
                           capture_output=True, text=True, encoding="utf-8", errors=errors)
 
 
-_ANSWERS: dict = {}
+# The least recently asked answer goes first: each distinct name a visitor
+# typed at `/object` kept its answers for the process's life (audit 2026-11-02).
+# 4,096 held every answer a crawl of each page of a busy store asked.
+_asked = lru_cache(maxsize=4096)(_run)
 
 
 def _root(cfg_or_path):
@@ -223,8 +226,22 @@ def ignored_here(cfg, name) -> bool:
 
 
 def tracked(cfg, path) -> bool:
-    """`path`, inside this worktree, is a file git tracks."""
-    return _git(cfg, "ls-files", "--error-unmatch", "--", str(path)).returncode == 0
+    """`path`, inside this worktree, is a file git tracks. Read-only, one
+    `ls-files` a worktree answers every path: a commit page asks once a file,
+    and a 2,000-file commit ran 2,006 git calls (audit 2026-11-02)."""
+    if not store.read_only():
+        return _git(cfg, "ls-files", "--error-unmatch", "--", str(path)).returncode == 0
+    root = _root(cfg)
+    if root not in _TRACKED:
+        r = _git(cfg, "ls-files", "-z", keep=False)
+        _TRACKED[root] = (Path(root or ".").resolve(),
+                          frozenset(r.stdout.split("\0")) if r.returncode == 0 else frozenset())
+    top, names = _TRACKED[root]
+    path = Path(path)
+    return path.is_relative_to(top) and path.relative_to(top).as_posix() in names
+
+
+_TRACKED: dict = {}     # read-only: a worktree's tracked paths, as `_asked` keeps git's answers
 
 
 def markdown_files(cfg_or_path) -> list[str]:
@@ -1147,8 +1164,9 @@ def commits_since(cfg, notes, head: str | None = None, timeout: float | None = N
             for k, v in changed_since(cfg, notes, head, timeout).items()}
 
 
-def uncommitted(store_dir) -> tuple[int, bool]:
-    """(entries not committed, registry modified).
+def uncommitted(store_dir, rows=None) -> tuple[int, bool]:
+    """(entries not committed, registry modified). `rows`, the store's
+    `pending_rows` when the caller has them already.
 
     The entries `commit` would take — a count git status cannot give, since
     200 appends are one changed path. A line count read an entry edited
@@ -1157,7 +1175,8 @@ def uncommitted(store_dir) -> tuple[int, bool]:
     unconditionally, never only after a write."""
     # ponytail: an untracked notes.jsonl beside a HEAD (only by hand-run git)
     # reads 0; pending_rows would need an ls-files to read it whole.
-    return len(store.entries(store.pending_rows(store_dir))), registry_modified(store_dir)
+    rows = store.pending_rows(store_dir) if rows is None else rows
+    return len(store.entries(rows)), registry_modified(store_dir)
 
 
 def registry_modified(store_dir) -> bool:

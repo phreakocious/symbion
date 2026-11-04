@@ -84,6 +84,27 @@ def test_an_agy_shell_writes_as_antigravity_and_its_gui_as_the_person(monkeypatc
     assert store.session_key() == "c1"
 
 
+def test_a_pi_shell_writes_as_pi_and_its_gui_as_the_person(monkeypatch):
+    """Pi sets AI_AGENT=pi for itself and its children, and its bash tool
+    gives each command PI_SESSION_ID (Pi's docs, 2026-11-02). Claude Code sets
+    AI_AGENT to its own value, so AI_AGENT names the inner of the two: a Pi
+    launched from Claude Code carries CLAUDECODE and Claude's session id, and
+    a Claude Code launched from Pi carries PI_SESSION_ID."""
+    monkeypatch.setenv("AI_AGENT", "pi")
+    monkeypatch.setenv("PI_SESSION_ID", "p1")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+
+    assert api.author_default() == "pi"
+    assert api.gui_author() == "ada"
+    assert store.session_key() == "p1"
+
+    monkeypatch.setenv("AI_AGENT", "claude-code_2-1-316_agent")
+    assert api.author_default() == "claude"
+    assert store.session_key() == "s1"
+
+
 def test_symbion_author_wins_for_both(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("SYMBION_AUTHOR", "sam")
@@ -270,6 +291,22 @@ def test_chain_tip_returns_the_tip_not_the_named_row(repo, tmp_path):
     assert out.id == tip.id
 
 
+def test_list_reads_heads_through_one_map_and_a_cycle_elsewhere_breaks_nothing(
+        repo, tmp_path, capsys):
+    """`list` read each listed row's head with `chain_tip`, which rebuilt its
+    map per row (audit 2026-11-02); `chain_tips` builds one. It walks only
+    the ids asked, so a cycle among rows not listed, a hand edit, still lists."""
+    target = {"type": "project", "name": None}
+    store.add(tmp_path, id="aaa", kind="note", target=target, supersedes="bbb")
+    store.add(tmp_path, id="bbb", kind="note", target=target, supersedes="aaa")
+    first = store.add(tmp_path, kind="task", target=target, body="the first claim")
+    head = store.supersede(tmp_path, first.id, author="t", body="the claim now")
+    assert store.chain_tips(store.load(tmp_path))(first.id).id == head.id
+    for extra in (["--all"], ["--json"]):      # each of list's two head reads
+        assert cli.main(["--dir", str(tmp_path), "list", "--kind", "task", *extra]) == 0
+        assert "the claim now" in capsys.readouterr().out, extra
+
+
 def test_chain_tip_on_a_missing_id_raises_keyerror(repo, tmp_path):
     with pytest.raises(KeyError):
         store.chain_tip(store.load(tmp_path), "nope")
@@ -319,6 +356,8 @@ _NON_WRITERS = {
     "describe_arc",   # ditto
     "commit",            # writes git, not a note
     "own_rows",          # a read: which pending rows `commit` would take
+    "docs_named",        # a read: which docs/ files those rows name
+    "elsewhere",         # a read: whether the cwd stands outside the store's project
     "push",              # ditto
     "pull",              # writes git, and moves no row's author
     "sync",              # pull, then push
@@ -1284,7 +1323,7 @@ def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
     READS = {"Ctx", "Pulled", "Synced", "add_fields", "as_dropped", "as_object", "author_default",
              "canonicalize_names", "canonicalize_rows", "check_arc", "check_arc_targets",
              "check_measurements", "check_name", "check_options", "check_refs",
-             "check_target", "fields_from_row", "free_doc_name", "gui_author",
+             "check_target", "docs_named", "elsewhere", "fields_from_row", "free_doc_name", "gui_author",
              "harvest_hashtags", "harvest_kind", "kind_as_type", "known_files", "no_arc",
              "object_path", "own_rows", "resolve", "seed_names",
              "rewritten_words", "shell_author", "verdict_state", "why_unverifiable"}

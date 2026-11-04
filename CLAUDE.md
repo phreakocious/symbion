@@ -35,7 +35,10 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
   codex` or `--agent hermes` links it.
 - `plugin/`: the Claude Code plugin, which holds no copy of the skill: a stub skill,
   `/symbion:setup`, `/symbion:wrap` and two `sh` hooks that run the package's scripts.
-  `.claude-plugin/marketplace.json` makes the repo its marketplace.
+  `.claude-plugin/marketplace.json` makes the repo its marketplace. `package.json`
+  makes the repo a Pi package whose one extension, `plugin/pi/symbion.ts`, runs the
+  same hooks and sends the setup and wrap skills as `/symbion-setup` and
+  `/symbion-wrap`.
 - `README.md`: what symbion does and how to install it. `docs/guide.md`: install
   in full and adopting symbion in a project. `docs/reference.md`: how it behaves, and
   development.
@@ -79,7 +82,14 @@ When the `symbion` on PATH is this checkout's editable install and the symbion p
 is installed, every `symbion` call and the plugin's hooks run this `src/`, and every
 Claude Code session on the machine reads its skill and hooks from
 `src/symbion/data/skill/`. A broken save then prints a traceback at the start of every
-session, in every project. Keep each save runnable: edit bottom-up (store, api, cli),
-and do not edit `src/` while a `symbion` command runs in another session. A scripted
-edit to `src/` (sed, a Python rewrite) ends with `python -m py_compile` of each file it
-wrote, in the same command.
+session, in every project, and a save that compiles can still break another session's
+write: a call saved before its import passed `py_compile` and raised NameError there
+until the import landed (2026-11-02).
+
+So edit `src/` in a git worktree, never in this checkout. `git worktree add
+.worktrees/NAME` makes one on branch NAME, and `.gitignore` covers it. In the worktree,
+run the tests with this checkout's venv, `../../.venv/bin/python -m pytest -q -n auto`:
+`tests/conftest.py` puts the worktree's `src/` first. `.venv/bin/symbion` and
+`.venv/bin/python -c` run this checkout's `src/` unless you prefix them with
+`PYTHONPATH=$PWD/src`. When the branch's tests pass, run `git merge --ff-only NAME`
+here, then `git worktree remove .worktrees/NAME`.

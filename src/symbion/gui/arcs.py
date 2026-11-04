@@ -35,7 +35,7 @@ def seedable(ctx, kind: str = "task") -> bool:
     return bool(spec and spec.status and not spec.parked and not spec.verdict)
 
 
-def checklist(ctx, arc_id: str, refresh, *, author: str, seen=None) -> None:
+def checklist(ctx, arc_id: str, refresh, *, author: str, seen=None, limit=None) -> int:
     """Head tasks for an arc, not-done first, then by target name, then in
     the order written. Each row carries its clipped body: six boxes on one
     file drew six identical target lines (2026-09-27). A row is the
@@ -46,16 +46,19 @@ def checklist(ctx, arc_id: str, refresh, *, author: str, seen=None) -> None:
     and the kind shows only when the arc holds more than one (every row said
     `task`). `seen` is the page's notes.reading. Each box is one Card, as a
     note is: as server elements a seeded arc of a few hundred boxes took a
-    second or more to draw (2026-10-30)."""
+    second or more to draw (2026-10-30). `limit` caps the boxes drawn, open
+    first: 2,000 boxes took 0.59 s (audit 2026-11-02). Returns how many it
+    left out."""
     items = S.arc_items((seen or reading(ctx)).loaded, arc_id)
     items.sort(key=lambda n: (S.read_status(n) == "resolved",
                               (n.target.name or "").lower(), S.written_at(n), n.id))
     if not items:
         ui.label("no targets yet — seed a scope above").classes("text-muted")
-        return
+        return 0
     mixed = len({fu.kind for fu in items}) > 1
-    for fu in items:
+    for fu in items[:limit]:
         _box(ctx, fu, refresh, author=author, mixed=mixed)
+    return len(items[limit:]) if limit is not None else 0
 
 
 def _box(ctx, fu, refresh, *, author: str, mixed: bool) -> None:

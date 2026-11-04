@@ -3,4 +3,5 @@ include docs/*.md
 include docs/images/gui.png
 global-exclude *.py[cod]
 graft plugin
+include package.json
 include .claude-plugin/marketplace.json

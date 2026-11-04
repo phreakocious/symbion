@@ -45,10 +45,13 @@ esac
 case "$call" in *'\\'*) call=$(printf '%s' "$call" | sed 's#\\\\#/#g') ;; esac
 # Whether the call names file $2 of a repo whose root dir is named $3: at a
 # path boundary, from the root (`cat src/x.py`, `./src/x.py`) or under a dir
-# named as the root is (`/home/u/proj/src/x.py`). A row on README.md fired on
-# src/README.md (a clean-room review, 2026-10-13).
+# named as the root is (`/home/u/proj/src/x.py`), or under a linked worktree of
+# it, whose `.git` file names `<root>/.git/worktrees/`: a Read or Edit in
+# `.worktrees/NAME/` by absolute path got no gotcha (dogfood, 2026-11-04). A
+# row on README.md fired on src/README.md (a clean-room review, 2026-10-13).
 # ponytail: the root by its name, so a symlink that keeps the name matches;
-# from a cwd below the root, `cat x.py` reads as the root's x.py.
+# from a cwd below the root, `cat x.py` reads as the root's x.py; a relative
+# gitdir (worktree.useRelativePaths) never matches: resolve it if that bites.
 names() {
   rest=$1 lead=
   while :; do
@@ -60,7 +63,13 @@ names() {
     case "$pre" in ''|*[!A-Za-z0-9._~/@+-]|*[!A-Za-z0-9._~/@+-]./) return 0 ;; esac
     # No root (a list from before roots, or a repo not on this machine): any
     # dir, as before.
-    case "$pre" in */"$3"/) return 0 ;; */) [ -z "$3" ] && return 0 ;; esac
+    case "$pre" in */"$3"/) return 0 ;; */) [ -z "$3" ] && return 0 ;; *) continue ;; esac
+    # The dir: a JSON string's whole tail (a path with a blank), else a word's.
+    for p in "${pre##*\"}" "${pre##*[!A-Za-z0-9._~/@+:-]}"; do
+      [ -f "${p}.git" ] || continue
+      g=; { IFS= read -r g < "${p}.git"; } 2>/dev/null
+      case "$g" in "gitdir: "*/"$3/.git/worktrees/"*) return 0 ;; esac
+    done
   done
 }
 nl='

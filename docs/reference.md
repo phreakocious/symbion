@@ -335,8 +335,8 @@ The specs in `docs/superpowers/specs/` are dated design records: why each
 decision was made. `SKILL.md` (in `src/symbion/data/skill/`, beside
 `adoption.md` and the hook) is what an agent reads; keep it short and its
 footgun list honest. If this clone is your installed symbion (an editable
-install), the plugin's stub and hooks, in Claude Code and in Antigravity, reach
-that directory through `symbion skill`, and with `symbion init --yes --agent
+install), the plugin's stub and hooks, in Claude Code and in Antigravity, and
+Pi's extension reach that directory through `symbion skill`, and with `symbion init --yes --agent
 codex` or `--agent hermes`, `~/.agents/skills/symbion` or
 `~/.hermes/skills/symbion` link to it. So an edit there reaches every session on
 the machine at once, as an edit to `src/` reaches every `symbion` call. To try a
@@ -344,4 +344,7 @@ change to `plugin/` itself, install it from the clone: `/plugin install symbion
 --marketplace /path/to/symbion`. A path source runs the plugin in place. agy
 copies it instead (`agy plugin install /path/to/symbion/plugin`), so install
 again after each change. `plugin/hooks.json` is agy's, in agy's format, and
-`plugin/hooks/hooks.json` is Claude Code's: each reads only its own.
+`plugin/hooks/hooks.json` is Claude Code's: each reads only its own. To try a
+change to the Pi extension, `pi install /path/to/symbion`: a local path loads
+in place, so a broken save there breaks every Pi session. Its helpers have
+Node tests, `plugin/pi/symbion.test.ts`, which pytest runs on Node 23.6 or later.

@@ -1824,3 +1824,43 @@ def test_a_read_only_viewer_reads_only_files_git_tracks(repo, tmp_path, monkeypa
     monkeypatch.setenv("SYMBION_READ_ONLY", "1")
     assert view_path(ctx, "secret.md", "file") is None
     assert view_path(ctx, "README.md", "file")[0].name == "README.md"
+
+
+def test_a_read_only_viewer_reads_only_docs_the_store_tracks(repo, tmp_path, monkeypatch):
+    """The tracked rule skipped the store's own docs/: a gitignored file
+    there, a token say, read under SYMBION_READ_ONLY (audit 2026-11-02)."""
+    import subprocess
+    from symbion.gui.notes import view_path
+    (tmp_path / ".gitignore").write_text("docs/local.md\n")
+    (tmp_path / "docs" / "kept.md").write_text("# tracked\n")
+    subprocess.run(["git", "add", ".gitignore", "docs/kept.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "c1"], cwd=tmp_path, check=True)
+    (tmp_path / "docs" / "local.md").write_text("canary\n")
+    ctx = api.resolve(str(tmp_path))
+    assert view_path(ctx, "local.md", "doc") is not None          # a local serve reads it
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    assert view_path(ctx, "local.md", "doc") is None
+    assert view_path(ctx, "kept.md", "doc")[0].name == "kept.md"
+
+
+def test_a_read_only_viewer_asks_git_once_for_every_file(repo, tmp_path, monkeypatch):
+    """A commit page draws a view button per file, and read-only asked
+    `ls-files --error-unmatch` per file, on the event loop: 2,006 git calls
+    for a 2,000-file commit (audit 2026-11-02). One `ls-files` answers all."""
+    import subprocess
+    from symbion.gui.notes import view_path
+    names = [f"d/f{i}.md" for i in range(20)]
+    (repo / "d").mkdir()
+    for name in names:
+        (repo / name).write_text("x\n")
+    subprocess.run(["git", "add", "d"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c1"],
+                   cwd=repo, check=True)
+    (repo / "d" / "new.md").write_text("x\n")
+    ctx = api.resolve(str(tmp_path))
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    runs, real = [], subprocess.run
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: runs.append(a[0]) or real(*a, **k))
+    assert all(view_path(ctx, name, "file") for name in names)
+    assert view_path(ctx, "d/new.md", "file") is None
+    assert len(runs) == 1, runs

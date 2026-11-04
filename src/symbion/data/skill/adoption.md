@@ -17,11 +17,11 @@ summary` shows the satellite's store there, and the same `--dir` writes to it.
 Repos whose changes go together (one change starts in one repo and ends in
 another) share one store that lists them under `[repos]` (`catalogs.md`).
 
-1. **A `file` catalog first.** A bootstrap enables one, so entries can attach to
-   files, one not yet committed included: under `[catalogs]` in the store's
-   `symbion.toml`,
-   `file = "git ls-files --cached --others --exclude-standard"`, with a
-   pathspec when entries will attach only to code. `symbion arc seed --scope file
+1. **A `file` catalog first.** Entries attach to files, one not yet committed
+   included, through `file = "git ls-files --cached --others
+   --exclude-standard"` under `[catalogs]` in the store's `symbion.toml`. `init`
+   writes it on; in a store made before 0.14, uncomment it and `file = "git"`
+   under `[renames]`. Add a pathspec when entries will attach only to code. `symbion arc seed --scope file
    --dry-run` lists its names. Without it, every entry is `item` or `project`. A
    store with `[repos]` has a type per repo instead. Other types come at step
    5, once the candidates show them.
@@ -38,6 +38,11 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
      project before it had a store of its own;
    - a folder beside the repo that belongs to the project but sits outside
      it, which a tracked file comes from with nothing in the repo saying so.
+
+   Several of these sit outside the repo. A sandbox that reads only the
+   workspace (Antigravity's auto mode) refuses them, and zsh reports a glob
+   it cannot read, such as `../*-notes`, as `no matches found`: run those
+   reads outside the sandbox (in agy, with `BypassSandbox`).
 
    What a source is decides what it gives. The only copy migrates, and step 7
    retires it. A tracked file gets a pointer, never a copy. Memory gives what
@@ -167,14 +172,16 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
    in the same session, so no list survives in two places. A file to delete
    goes on a list the user runs at the end of this step. An edit in place (a
    `MEMORY.md` line, a shared file's section) the bootstrap makes itself.
-   - **Scratch.** Untracked: a verbatim copy goes under `<store>/archive/`
-     with `git add -f` (a scratch directory can carry its own `.gitignore` of
-     `*`), and the file goes on the delete list. Tracked: the delete list;
-     git keeps it. First, the bootstrap fixes the tree's references to it,
-     and carries its preamble (what the file was for) into the project
-     `decision` that records the migration. A scratch file shared with other
-     projects is still theirs: after the archive copy, the bootstrap replaces
-     only this project's section, with a pointer naming each new entry.
+   - **Scratch.** Untracked, or tracked with changes HEAD lacks (`git diff
+     --quiet HEAD -- FILE` exits 1): a verbatim copy goes under
+     `<store>/archive/` with `git add -f` (a scratch directory can carry its
+     own `.gitignore` of `*`), and the file goes on the delete list. Tracked
+     and unchanged: the delete list; git keeps it. First, the bootstrap fixes
+     the tree's references to it, and carries its preamble (what the file was
+     for) into the project `decision` that records the migration. A scratch
+     file shared with other projects is still theirs: after the archive copy,
+     the bootstrap replaces only this project's section, with a pointer naming
+     each new entry.
    - **The handoff file.** Each item no entry, instruction or memory holds
      becomes an entry: a trap is its file's `gotcha`, and a practice that names
      the failure behind it is a `task` tagged `practice` on the instruction

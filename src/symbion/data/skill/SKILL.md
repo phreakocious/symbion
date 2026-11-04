@@ -18,7 +18,7 @@ verb's flags. A command finds its store by `--dir PATH`, else `$SYMBION_DIR`,
 else a `.symbion` file in the repo root naming it, else `../<repo>-notes`. A
 store outside your writable workspace needs the runtime's approval or the
 user's permission: a `.symbion` pointer grants none. A new store in a project
-with history starts from `adoption.md`, beside this file.
+with history starts from `adoption.md` (`symbion skill adoption`).
 
 ## Entries
 
@@ -91,8 +91,8 @@ A store over several repos has a type per repo instead of `file`: see
 ## Ids and edits
 
 `add` prints an entry's id, and the entry keeps it through every edit: show, cite,
-supersede and resolve it by that id. Commands take a unique tail of an id:
-cite the 10-character tail (`412907-3be`). An id cited in a body is a link:
+supersede and resolve it by that id, or a unique tail: cite the 10-character tail
+(`412907-3be`), or in a script the whole id. An id cited in a body is a link:
 `show` lists each cited entry with its state, and each entry that cites this one.
 
 `supersede <id> --body TEXT` rewrites an entry; with `--append` or `--prepend`,
@@ -101,7 +101,7 @@ TEXT goes below or above. Tags, refs, the target and the due date change alike.
 entry is never deleted, and `list --all` shows its earlier versions. `undo <id>`
 takes back this session's last write while no commit has run since.
 
-`mechanics.md`, beside this file, says which edits keep an earlier version and
+`mechanics.md` (`symbion skill mechanics`) says which edits keep an earlier version and
 what each summary line and label means. Read it when symbion's output shows
 something this file does not explain.
 
@@ -122,8 +122,8 @@ model you hand work to, writes under its own name (`--author sonnet-review`).
 
 A write is pending until `symbion commit`, and on this disk only until
 `symbion push`. `commit` takes the entries this session wrote, under any author,
-and the store's changed files; `--all` takes other sessions' entries too, and
-`--dry-run` lists what it would take. Each write and each commit says what is
+and the store's changed files (from another project's tree, only new docs they
+name); `--all` takes every entry and file, `--dry-run` lists what it would take. Each write and each commit says what is
 still pending or unpushed.
 
 ## Reading
@@ -160,8 +160,8 @@ under the store's `docs/`; the entry names it by its path there
 --grep` finds an entry before you write its twin.
 
 A trap, such as a test that passes alone and fails in its file's run or a step
-that must come before an edit, goes on its file tagged `gotcha`: in Claude Code
-and Codex, the first call in each session or subagent that names the file prints
+that must come before an edit, goes on its file tagged `gotcha`: in Claude Code,
+Codex and Pi, the first call in each session or subagent that names the file prints
 its first 200 characters, and its first edit of the file prints them again, so
 the trap and its fix fit in them. One trap is one entry; a how-to is a plain note.
 
@@ -191,13 +191,13 @@ resolved; `arc todo ID` lists the open ones, and the session-start summary
 shows each arc's progress. Archiving a finished arc is the user's: until then
 the summary shows it done. `arc -h` lists the rest. Before `arc seed`, `arc
 reconcile`, or a change to `[catalogs]` or `[resolvers]`, read `catalogs.md`
-beside this file.
+(`symbion skill catalogs`).
 
 ## Session end
 
 The store is the project's one open list. A session ends when the user says
 so, or, in a run the user left to you, when you judge the work done. Its wrap
-(`/symbion:wrap`, or any tool's wrap) follows `wrap.md`, beside this file.
+(`/symbion:wrap`, or any tool's wrap) follows `wrap.md` (`symbion skill wrap`).
 
 ## Bugs in symbion
 

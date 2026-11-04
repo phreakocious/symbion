@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 from datetime import date, timedelta
+from urllib.parse import urlencode
 
 import pytest
 
@@ -43,20 +44,6 @@ def _nav_n(item) -> str:
     """A sidebar kind's count, found by its class: its tooltip comes after it."""
     (n,) = [c for c in item.default_slot.children if "sb-nav-n" in c.classes]
     return n.text
-
-
-def test_the_template_rule_the_shell_deletes_is_still_niceguis():
-    """chrome._ESM_JS deletes NiceGUI's `#esm-fallback ~ *`, which cost 4.5 s
-    a style pass with a large file in the viewer (2026-10-16). When a NiceGUI
-    upgrade drops or renames the rule, the script deletes nothing: drop it."""
-    from pathlib import Path
-
-    import nicegui
-
-    from symbion.gui import chrome
-    template = (Path(nicegui.__file__).parent / "templates" / "index.html").read_text()
-    assert "#esm-fallback ~ * {" in template
-    assert "selectorText === '#esm-fallback ~ *'" in chrome._ESM_JS
 
 
 async def test_the_menu_button_takes_the_theme_colour(user: User, ctx_with_notes):
@@ -332,8 +319,14 @@ async def test_shift_enter_adds_a_note_and_keeps_the_composer_open(
     assert {"first of two", "second of two"} <= \
         {n.body for n in store.load(ctx_with_notes.store_dir)}
     (dialog,) = user.find(ui.dialog).elements
+    # NiceGUI 3.19 sends a reload as `history.go(0)`, and the fixture sees it a loop turn later.
+    await asyncio.sleep(0.1)
     assert dialog.value and not body.elements.pop().value and not reloads
     dialog.close()                                    # Esc: the page shows them
+    for _ in range(100):
+        if reloads:
+            break
+        await asyncio.sleep(0.02)
     assert reloads == [1]
 
 
@@ -1314,6 +1307,69 @@ async def test_targets_draws_a_page_of_cards_and_names_the_rest(user: User, repo
     await user.should_not_see(marker="show-all")
 
 
+async def test_an_objects_page_draws_a_page_of_entries_and_files_and_names_the_rest(
+        user: User, repo, tmp_path, monkeypatch):
+    """/object drew every entry, and a commit's page every file: 2,000 cards
+    took 0.88 s, and a 2,000-file commit 14,161 elements, on the loop every
+    visitor shares (audit 2026-11-02). Each draws a page, as /notes does,
+    names the cut, and a read-only serve ignores `all=1`."""
+    monkeypatch.setitem(build_page.__globals__, "PAGE_ROWS", 2)
+    for i in range(3):
+        (repo / f"f{i}.py").write_text("x\n")
+    sha = _commit_all(repo, "three files")
+    ctx = api.resolve(str(tmp_path))
+    for i in range(3):
+        api.add(ctx, {"kind": "note", "target": {"type": "commit", "name": sha},
+                      "body": f"entry {i}"}, author="ada")
+    build_page(ctx, author="ada")
+    page = f"/object?type=commit&name={sha}"
+    await user.open(page)
+    assert len(user.find(marker="note-row").elements) == 2
+    assert len(user.find(marker="commit-file").elements) == 2
+    await user.should_see("3 files · +3 −0 · the entries on each; the first 2 shown")
+    await user.should_see("3 entries on or referencing this object; 2 shown, open work first")
+    assert {(m.text, m.props["href"]) for m in user.find(marker="show-all").elements} == {
+        ("+1 more file not shown — show all", page + "&all=1"),
+        ("+1 more entry not shown — show all", page + "&all=1")}
+    await user.open(page + "&all=1")
+    assert len(user.find(marker="note-row").elements) == 3
+    assert len(user.find(marker="commit-file").elements) == 3
+    await user.should_not_see(marker="show-all")
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    await user.open(page + "&all=1")
+    assert len(user.find(marker="note-row").elements) == 2
+    assert len(user.find(marker="commit-file").elements) == 2
+    await user.should_not_see(marker="show-all")
+
+
+async def test_an_arcs_page_draws_a_page_of_boxes_open_first_and_names_the_rest(
+        user: User, repo, tmp_path, monkeypatch):
+    """/arc drew every box: a seeded arc of 2,000 took 0.59 s on the loop
+    every visitor shares (audit 2026-11-02). It draws a page, open boxes
+    first; read-only, the rest are named and no link lifts the cap."""
+    monkeypatch.setitem(build_page.__globals__, "PAGE_ROWS", 2)
+    ctx = api.resolve(str(tmp_path))
+    act = api.create_arc(ctx, "camp", "d", "item", author="ada")
+    first, *_ = api.seed(ctx, act.id, "item", ["alpha", "beta", "gamma"], author="ada")
+    store.supersede(ctx.store_dir, first.id, status="resolved", author="ada")
+    build_page(ctx, author="ada")
+    page = f"/arc?id={act.id}"
+    await user.open(page)
+    assert len(user.find(marker="checklist-row").elements) == 2
+    assert first.id not in {c._props["data-id"] for c in cards(user)}   # the done box is cut
+    (more,) = user.find(marker="show-all").elements
+    assert (more.text, more.props["href"]) == ("+1 more entry not shown — show all",
+                                               page + "&all=1")
+    await user.open(page + "&all=1")
+    assert len(user.find(marker="checklist-row").elements) == 3
+    await user.should_not_see(marker="show-all")
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    await user.open(page + "&all=1")
+    assert len(user.find(marker="checklist-row").elements) == 2
+    await user.should_not_see(marker="show-all")
+    await user.should_see("+1 more entry not shown")
+
+
 async def test_a_read_only_serve_draws_a_shorter_page(user: User, repo, tmp_path, monkeypatch):
     """A read-only serve renders a 100-row /notes in about twice the time
     of a 30-row one, and a visitor's tabs queue behind each other."""
@@ -1995,11 +2051,35 @@ async def test_a_diff_reads_unified_or_side_by_side_and_keeps_the_pick(user: Use
     assert "sb-diff-unified" in view.content and "sb-diff-split" not in view.content
     assert "y = 2" in view.content
     _newest(user, "diff-mode").set_value("split")
+    await asyncio.sleep(0.1)                        # the render runs on a worker thread
     assert "sb-diff-split" in view.content
     assert "sb-diff-narrow" in view.content       # unified too, for a narrow window
     user.find("read the diff").click()
     await asyncio.sleep(0.1)
     assert "sb-diff-split" in _newest(user, "diff-view").content
+
+
+async def test_a_diff_parses_and_renders_off_the_event_loop(user: User, repo, tmp_path,
+                                                            monkeypatch):
+    """A diff click parsed and rendered in its handler, on the event loop: a
+    large diff held every visitor for its render, and a side-by-side pick
+    renders twice (audit 2026-11-02). Each runs on a worker thread now."""
+    import threading
+    from symbion.gui import diffview
+    sha = _pushed_commit(repo)
+    build_page(api.resolve(str(tmp_path)), author="ada")
+    ran = []
+    for name in ("parse", "render"):
+        real = getattr(diffview, name)
+        monkeypatch.setattr(diffview, name, lambda *a, real=real, name=name:
+                            ran.append((name, threading.get_ident())) or real(*a))
+    await user.open(f"/object?type=commit&name={sha}")
+    user.find("read the diff").click()
+    await user.should_see(marker="diff-view")
+    _newest(user, "diff-mode").set_value("split")
+    await asyncio.sleep(0.1)
+    assert [n for n, _ in ran] == ["parse", "render", "render", "render"]
+    assert threading.get_ident() not in {t for _, t in ran}
 
 
 async def test_a_merge_reads_as_what_it_brought_onto_its_branch(user: User, repo, tmp_path):
@@ -2077,6 +2157,28 @@ async def test_a_since_chip_opens_the_commits_and_the_files_diff_since_the_entry
     await user.should_see(marker="file-view")
     was = _newest(user, "file-view").content
     assert "value = two" in was and "TWO" not in was
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a file name cannot hold a double quote")
+async def test_a_quoted_file_name_is_one_prop_in_the_since_dialog(user: User, repo, tmp_path):
+    """`.props(f'aria-label="read {path} …"')` let a file name close the
+    quote and add a `:`-prop, which nicegui.js runs as JavaScript (audit
+    2026-11-02)."""
+    ctx = _since_repo(repo, tmp_path)
+    evil = 'a" :title="alert(1)" x="'
+    (repo / evil).write_text("one\n")
+    _commit_all(repo, "evil")
+    api.add(ctx, {"kind": "bug", "target": {"type": "file", "name": evil}, "body": "on it"},
+            author="ada")
+    (repo / evil).write_text("two\n")
+    _commit_all(repo, "change it")
+    build_page(ctx, author="ada")
+    await user.open("/object?" + urlencode({"type": "file", "name": evil}))
+    part(user, "note-since").click()
+    await user.should_see(marker="since-was")
+    (b,) = user.find(marker="since-was").elements
+    assert b._props["aria-label"] == f"read {evil} as this entry saw it" \
+        and ":title" not in b._props
 
 
 async def test_a_since_diff_from_edits_no_commit_holds_reads_the_nearest_commit(
@@ -2418,8 +2520,13 @@ async def test_a_read_only_page_says_so_and_links_the_readme(user: User, ctx_wit
     monkeypatch.setenv("SYMBION_READ_ONLY", "1")
     await user.open("/")
     await user.should_see("read-only demo of")
-    (link,) = user.find(marker="demo-link").elements
-    assert link.props["href"].endswith("#readme")
+    # Each link to the source goes by /go/github, which 302s to the readme: the
+    # demo's access log then counts clicks out, and names the link (the user,
+    # 2026-11-03). /go/github itself is in test_gui_serve.py.
+    hrefs = {m: next(iter(user.find(marker=m).elements)).props["href"]
+             for m in ("demo-link", "source")}
+    assert hrefs == {"demo-link": "/go/github?from=banner", "source": "/go/github?from=sidebar"}
+    assert 'href="/go/github?from=noscript"' in user._client.body_html
     await user.should_see("viewing as ada")
     await user.should_not_see("writing as ada")
 

@@ -63,6 +63,8 @@ PLUGIN_INSTALL = "/plugin install symbion --marketplace phreakocious/symbion"
 AGY_PLUGIN_INSTALL = "agy plugin install https://github.com/phreakocious/symbion/tree/main/plugin"
 _AGY_PLUGIN = Path(".gemini/config/plugins/symbion")   # under $HOME, where agy installs it
 _AGY_SKILL = _AGY_PLUGIN / "skills/symbion/SKILL.md"
+# On Pi the repo is the package: it carries the skill and the hooks (spec 2026-11-02).
+PI_PACKAGE_INSTALL = "pi install git:github.com/phreakocious/symbion"
 # Codex runs a hook in the session's cwd (its hooks docs, 2026-10-02). The
 # project is named so a CLAUDE_PROJECT_DIR inherited from a Claude Code parent
 # cannot pick another one, and the author so `summary` knows its reader:
@@ -107,28 +109,66 @@ def _codex_gotcha_entry(link: Path) -> dict:
     return {"hooks": [{"type": "command", "command": command, "timeout": 5}]}
 
 
+def _agy_rules(store_dir) -> list[str]:
+    """agy's permission rules that let symbion start, write the store and
+    commit in auto mode's sandbox (headless runs, agy 1.4.12, 2026-11-03):
+    a read of each dir it runs from, the PATH entry and the link's target
+    both, and a write of the store, which also covers its `.git`."""
+    exe = shutil.which("symbion")
+    dirs = [Path(exe).parent] if exe else []
+    for p in (sys.prefix, sys.base_prefix, Path(str(resources.files("symbion"))).parent):
+        dirs += [Path(p).absolute(), Path(p).resolve()]
+    # /usr is readable already: the probes' Python ran from /usr/local unasked.
+    dirs = [d for d in dict.fromkeys(dirs) if not d.is_relative_to("/usr")]
+    keep = [d for d in dirs if not any(o != d and d.is_relative_to(o) for o in dirs)]
+    return [f"read_file({d.as_posix()})" for d in keep] + \
+        [f"write_file({Path(store_dir).resolve().as_posix()})"]
+
+
 def _skill_dir() -> Path:
     return Path(str(resources.files("symbion") / "data" / "skill"))
 
 
 _NO_STORE_SCHEMA = ("This project has no symbion store yet: /symbion:setup makes one, and "
                     "symbion schema lists its kinds after that.")
+# A sandboxed agent shell (agy's) stats a store outside its workspace and
+# refuses the open, so the store reads as there but unreadable.
+_OUT_OF_REACH = ("a store outside an agent's writable workspace needs the runtime's "
+                 "approval or the user's permission")
 
 
-def _skill(ctx, path_only: bool) -> int:
+def _skill(ctx, path_only: bool, unreadable: PermissionError | None = None) -> int:
     """The skill as the plugin's stub injects it. Claude Code does not expand
     text it injects (spike, 2026-10-30), so the skill's own `!`symbion schema``
-    is filled here, and the files it calls "beside this file" are named."""
+    is filled here, and its other files are named."""
     where = _skill_dir().resolve().as_posix()
     if path_only:
         print(where)
         return 0
     body = (_skill_dir() / "SKILL.md").read_text(encoding="utf-8").split("\n---\n", 1)[1]
-    schema = (summ.render_schema(summ.schema(ctx.store_dir, ctx.cfg, ctx.kinds), summ.plain)
+    schema = (f"symbion could not read this project's store ({unreadable.strerror}: "
+              f"{unreadable.filename}): {_OUT_OF_REACH}. `symbion schema` lists its kinds "
+              f"once it can." if unreadable else
+              summ.render_schema(summ.schema(ctx.store_dir, ctx.cfg, ctx.kinds), summ.plain)
               if store.exists(ctx.store_dir) else _NO_STORE_SCHEMA)
     body = body.replace("!`symbion schema`", schema.rstrip("\n"), 1).strip("\n")
     files = ", ".join(sorted(p.name for p in _skill_dir().glob("*.md") if p.name != "SKILL.md"))
-    print(f"symbion's skill files ({files}) are in {where}.\n\n{body}")
+    print(f"symbion's skill files ({files}) are in {where}; `symbion skill NAME` prints one "
+          f"(`symbion skill wrap`).\n\n{body}")
+    return 0
+
+
+def _skill_file(name: str) -> int:
+    """One of the skill's other files, printed. A Read of it in the installed
+    package asked Claude Code's "read outside the working directories"
+    question of each new user's setup (2026-11-04); this is a shell call."""
+    names = sorted(p.stem for p in _skill_dir().glob("*.md") if p.name != "SKILL.md")
+    stem = name.removesuffix(".md")
+    if stem not in names:
+        print(f"symbion skill: no skill file {name!r}; name one of {', '.join(names)}",
+              file=sys.stderr)
+        return 2
+    print((_skill_dir() / f"{stem}.md").read_text(encoding="utf-8"), end="")
     return 0
 
 
@@ -192,6 +232,23 @@ def _claude_plugin_notes(merge: bool) -> bool:
     return False
 
 
+def _pi_package_installed() -> bool:
+    """Whether Pi's settings list a package whose source names symbion: the
+    git source, or a local path to a checkout while one is developed. Pi
+    expands `~` in PI_CODING_AGENT_DIR, and reads `.pi/settings.json` in its
+    cwd once the user trusts the project (Pi 1.5.0's config.js and
+    settings-manager.js), so an untrusted one only skips the note."""
+    d = Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent").expanduser()
+    for settings in (d / "settings.json", Path(".pi/settings.json")):
+        try:
+            packages = json.loads(settings.read_text(encoding="utf-8"))["packages"]
+            if any("symbion" in (p["source"] if isinstance(p, dict) else p) for p in packages):
+                return True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return False
+
+
 def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = False,
                      missing: list | None = None) -> bool:
     """Link the skill, and register the hook in the user's settings only when
@@ -214,6 +271,13 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
         if merge:
             print("note: --merge-hook merges nothing for Antigravity, whose hook comes with "
                   "the plugin")
+        return False
+    if agent == "pi":
+        if not _pi_package_installed():
+            print(f"note: on Pi the symbion package carries the skill and the hooks: "
+                  f"{PI_PACKAGE_INSTALL}")
+        if merge:
+            print("note: --merge-hook merges nothing for Pi, whose hooks come with the package")
         return False
     codex = agent == "codex"
     # Hermes searches its own skills/ first and reads a link there, where
@@ -485,12 +549,19 @@ def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
     missing = []
     for selected in (("claude", "codex") if agent == "both" else (agent,)):
         changed |= _link_user_skill(write, selected, merge_hook, missing)
+    s = shlex.quote(Path(store_dir).resolve().as_posix())
     if changed and agent in ("codex", "both"):
-        s = shlex.quote(Path(store_dir).resolve().as_posix())
         print(f"note: Codex's sandbox writes only inside the project, and the store is "
               f"outside it: launch `codex --add-dir {s}`, or add {s} to "
               "sandbox_workspace_write.writable_roots in Codex's config.toml. "
               "`symbion commit` may still ask for approval.")
+    if agent == "antigravity":
+        # Every run: the rules are needed whether or not this run made the store.
+        rules = "".join(f"\n  {r}" for r in _agy_rules(store_dir))
+        print("note: in auto mode agy runs symbion in a sandbox that reads only the "
+              "workspace and system dirs. Add each rule below at agy's /permissions "
+              "(press A; Global scope), exactly as printed: agy refuses a rule with `~`, "
+              f"and then runs no sandboxed command.{rules}")
     changed |= _record_pointer(Path(store_dir), Path(root), store_from_env,
                                write, repoint)
     if sys.stdout.isatty():
@@ -648,7 +719,7 @@ default_branch = "{gitref.repo_default_branch(cfg) or cfg.default_branch}"
 # `--others --exclude-standard` lists files not yet committed, so a note on a
 # file made this session resolves instead of warning `taken as typed`. To leave
 # a vendored tree out of the catalog, end the command with `-- . ':!vendor'`.
-# file = "git ls-files --cached --others --exclude-standard"   # pair with `file = "git"` under [renames] below
+file = "git ls-files --cached --others --exclude-standard"   # pair with `file = "git"` under [renames] below
 # test = "git ls-files --cached --others --exclude-standard 'tests/test_*.py'"
 # A STORE-DERIVED catalog is empty until its first entry exists, and that entry
 # cannot be written while the catalog is empty: it NEEDS its [resolvers]
@@ -667,8 +738,8 @@ default_branch = "{gitref.repo_default_branch(cfg) or cfg.default_branch}"
 # host = "closed"   # the built-in match, refusing a name the catalog does not list
 
 [renames]
-# file = "git"      # built-in NUL-safe rename detection with transitive chains;
-#                   # without it `arc reconcile` cannot follow a renamed file
+file = "git"      # built-in NUL-safe rename detection with transitive chains;
+                  # without it `arc reconcile` cannot follow a renamed file
 
 # Kinds: a label on three bits. status = carries open/resolved and counts
 # in arcs and at session start; parked = has a status but is hidden from
@@ -701,8 +772,10 @@ def _hook_json(text: str, line: str) -> str:
     terminal. Codex shows `systemMessage` as a warning, so Codex gets none.
     agy reads only its own `injectSteps`, whose `systemMessage` goes to the
     model. Its docs' `metadata.user_markdown` as a string made agy 1.4.12
-    panic and drop the hook's output (2026-10-30)."""
-    if api.shell_author() == "antigravity":
+    panic and drop the hook's output (2026-10-30). The plugin's shim names its
+    host in SYMBION_HOST: a `claude` started in agy's terminal can inherit
+    agy's marker, which `shell_author` ranks first (audit 2026-11-02)."""
+    if (os.environ.get("SYMBION_HOST") or api.shell_author()) == "antigravity":
         return json.dumps({"injectSteps": [{"systemMessage": {"systemMessage": text}}]})
     out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
     if api.author_default() != "codex":
@@ -1342,7 +1415,9 @@ class _Parser(argparse.ArgumentParser):
             self.print_help(sys.stderr)
             self.exit(2)
         bad = re.match(r"argument cmd: invalid choice: '([^']*)'", message)
-        if bad and bad[1] in _VERB_HINTS:        # the usage line lists the verbs
+        if bad and bad[1] in getattr(self, "kinds", ()):    # `symbion check …` (2026-11-04)
+            message = f"no verb {bad[1]!r}: {bad[1]!r} is a kind: `add {bad[1]} --target TYPE:NAME`"
+        elif bad and bad[1] in _VERB_HINTS:      # the usage line lists the verbs
             message = f"no verb {bad[1]!r}: {_VERB_HINTS[bad[1]]}"
         if "--status: invalid choice: 'parked'" in message and hasattr(self, "parked_kinds"):
             # the summary counts `parked`, and no flag lists every parked kind (2026-10-30)
@@ -1676,6 +1751,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     input_types = input_types or target_types
     p = _Parser(prog="symbion", description="a per-project notebook and ticket registry",
                 epilog=_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.kinds = kinds                                                 # for _Parser.error
     p.add_argument("--dir", default=None,
                    help="store dir (default: $SYMBION_DIR, else a .symbion file in the repo "
                         "or, outside one, at or above the cwd, else ../<repo>-notes)")
@@ -1689,6 +1765,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                  "~/.agents/skills and $CODEX_HOME (default ~/.codex) for "
                  "Codex, $HERMES_HOME/skills (default ~/.hermes/skills) and no hook for "
                  "Hermes. On Claude Code and on Antigravity the symbion plugin carries both, "
+                 "and on Pi the symbion package does, "
                  "so init links and registers nothing there, and on Claude Code names any "
                  "it finds from before. Existing "
                  "settings are preserved; a missing hook entry is printed for you to add, "
@@ -1696,7 +1773,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                  "Without --yes it lists each change and makes none, and exits 1 "
                  "if it has one to make")
     i = sub.add_parser("init", help=init_says, description=init_says)
-    i.add_argument("--agent", choices=("claude", "codex", "hermes", "antigravity", "both"),
+    i.add_argument("--agent", choices=("claude", "codex", "hermes", "antigravity", "pi", "both"),
                    default="claude",
                    help="agent integration to install; both is claude and codex "
                         "(default: claude)")
@@ -1804,7 +1881,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     li.add_argument("--since", default=None, metavar="WHEN", type=_since,
                     help="only entries written since WHEN: 30m, 2h, 3d, 1w, a date or an "
                          "ISO datetime, UTC unless TZ is set, or `wrap`, the last wrap's "
-                         "commit (a revision counts as written when it was)")
+                         "commit, else this agent session's start (a revision counts as "
+                         "written when it was)")
     li.add_argument("--all", action="store_true", help="include superseded entries")
     li.add_argument("--author", metavar="NAME",
                     help="only entries whose newest version NAME wrote")
@@ -1817,7 +1895,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     li.add_argument("--full", action="store_true",
                     help="print bodies as stored instead of one clipped line (--id implies it)")
     li.add_argument("--json", action="store_true",
-                    help="a JSON array of entries. `--limit 1` prints the keys every entry has; a "
+                    help="a JSON array of entries. `--limit 1` prints the keys every entry has; "
+                         "a project entry's `target.name` is null. A "
                          "verdict kind adds `state` and `distance`, a `rewritten` one "
                          "`successor`, `successor_state` and `same_tree`, and a superseded entry "
                          "(`--all`) `head`")
@@ -1927,8 +2006,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="list each pending entry (its id's tail, author, kind and lead) "
                          "and each other changed file; commit nothing")
     cm.add_argument("--all", dest="everyone", action="store_true",
-                    help="take every pending entry: by default a commit takes the entries this "
-                         "agent session wrote, or with no session, your author's")
+                    help="take every pending entry and file: by default a commit takes the entries "
+                         "this agent session wrote, or with no session, your author's, and from "
+                         "another project's tree no file but the new docs they name")
     sub.add_parser("push", help="git push the store to its remote; commit first")
     sub.add_parser("pull", help="fetch a shared store's origin and merge it; pending entries "
                                 "stay pending, each its session's")
@@ -2012,6 +2092,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                                       "Claude Code plugin loads it; needs no store")
     sk.add_argument("--path", action="store_true",
                     help="print only the directory that holds the skill's files")
+    sk.add_argument("name", nargs="?", metavar="NAME",
+                    help="print one of the skill's other files: adoption, catalogs, "
+                         "mechanics or wrap")
 
     ctx = sub.add_parser("context", help="every entry on one object (--target), commit "
                                          "(--commit) or branch (--branch)")
@@ -2419,6 +2502,22 @@ def _name_unchecked(written) -> None:
           f"names what ran, or on a prediction, what will run", file=sys.stderr)
 
 
+def _name_bodiless(ctx, written) -> None:
+    """A stray `add` with no --body wrote an empty bug, and the next write put
+    it out of `undo`'s reach (dogfood, 2026-10-31). A run's record or an arc's
+    box may have no body; any other bodiless entry is named while undo still
+    reaches it."""
+    miss = [n.id for n in written if not (n.body or "").strip()
+            and not (n.result or n.checked or n.measurements or n.arc_id)]
+    if not miss:
+        return
+    me = " ".join(filter(None, ["symbion", _named_store(ctx)]))
+    ids = " ".join(i[-10:] for i in miss)
+    print(f"note: no body on {ids}: `{me} undo {miss[-1][-10:]}` takes this write back "
+          f"while it is the store's last, or `supersede ID --body TEXT` gives one",
+          file=sys.stderr)
+
+
 def _name_dirty(written) -> None:
     """A verdict row stamped on a dirty tree reads `unverifiable (dirty
     tree)` for good, even once the tree is committed, and the write said
@@ -2549,9 +2648,10 @@ def _session_mark(suffix: str) -> Path | None:
     return _session_cache() / f"{key}.{suffix}"
 
 
-def _session_read(ctx):
-    """When this agent session's start summary read this store, or None."""
-    mark = _session_mark("read")
+def _session_read(ctx, suffix: str = "read"):
+    """When this agent session's start summary read this store, or with
+    `commit`, when it last committed it; None if not."""
+    mark = _session_mark(suffix)
     if mark is None:
         return None
     try:
@@ -2656,7 +2756,7 @@ def _no_note(note_id: str, store_dir=None) -> None:
             print(f"  {where} has it: symbion --dir {where} show {hits[0]}", file=sys.stderr)
 
 
-def _say_tip(store_dir, nid: str, *, resolving: bool):
+def _say_tip(store_dir, nid: str):
     """A write to a superseded id lands on its chain's tip (the fast-forward
     that closes a race), and printed only the new id: a newcomer's
     `supersede <old> --body` replaced the newer row's text unawares
@@ -2669,8 +2769,6 @@ def _say_tip(store_dir, nid: str, *, resolving: bool):
     if tip.id != nid:
         print(f"note: {nid} was superseded by {tip.id}; this applies to {tip.id}",
               file=sys.stderr)
-    if resolving and store.read_status(tip) == "resolved":
-        print(f"note: {tip.id} is already resolved", file=sys.stderr)
     return tip
 
 
@@ -2680,6 +2778,28 @@ def _others() -> str:
     (`it leaves 5 rows of other writers (claude 5)`, read by claude,
     2026-10-12); with no session, other writers'."""
     return "other sessions" if store.session_key() else "other writers"
+
+
+_ELSEWHERE = "as the store is another project's"   # why a commit left its files (api.elsewhere)
+
+
+def _commit_files(ctx, everyone: bool) -> tuple[list[str], list[str]]:
+    """The store's changed files but notes.jsonl, split as `commit` takes and
+    leaves them: from another project's tree (api.elsewhere) it takes only
+    arcs.jsonl and the new docs its entries name. Each file, as `commit`
+    names them: status shows an untracked dir as one."""
+    s = ctx.store_dir
+    changed = (["diff", "HEAD", "--name-only", "-z"]
+               if gitref._git(s, "rev-parse", "-q", "--verify", "HEAD").returncode == 0
+               else ["ls-files", "-z", "--cached"])
+    new = {f for f in gitref._git(s, "ls-files", "-z", "--others", "--exclude-standard")
+           .stdout.split("\0") if f}
+    files = sorted((new | {f for f in gitref._git(s, *changed).stdout.split("\0") if f})
+                   - {store.NOTES_FILE})
+    if everyone or not api.elsewhere(ctx):
+        return files, []
+    take = {store.ARCS_FILE} | (new & set(api.docs_named(ctx, api.own_rows(ctx))))
+    return [f for f in files if f in take], [f for f in files if f not in take]
 
 
 def _say_pulled(ctx, p, quiet=False, cap=None) -> int:
@@ -2855,12 +2975,12 @@ def _pull_then_push(ctx) -> None:
     print(f"push failed: {why}; retry: {me} pull, then {me} push")
 
 
-def _commit_hint(ctx) -> str:
+def _commit_hint(ctx, rows=None) -> str:
     """The command that commits the pending rows. `commit` takes only the
     caller's, so beside rows that are all someone else's it committed none
     of them (2026-10-12): name `--all`, and when it is safe."""
     cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit"]))
-    rows = store.pending_rows(ctx.store_dir)
+    rows = store.pending_rows(ctx.store_dir) if rows is None else rows
     keep = store.with_bases(rows, api.own_rows(ctx))
     if rows and not any(keep(r) for r in rows):
         return f"{cmd} --all once their session has ended"
@@ -2910,8 +3030,18 @@ def _say_news(ctx, wrote) -> None:
     seconds: a write in the second the next command began did not count, and
     commands run in parallel all began before any of them wrote, so each
     repeated the same news (2026-10-15)."""
+    if found := _news(ctx, wrote):
+        _print_news(*found, file=sys.stderr)
+
+
+def _news(ctx, wrote, commit: bool = False):
+    """(header, rows, by_id, reader, since) for `_say_news`, or None. With
+    `commit`, for `symbion commit`: the floor is the later of this session's
+    start summary and its previous commit here, with none outside a session.
+    A write's note printed once, and an agent piped it through `tail -1`: the
+    user's answers waited hours for the next session start (2026-11-03)."""
     if sys.stdout.isatty():
-        return
+        return None
     reader = api.author_default()
     side = store.read_side(ctx.store_dir)
     # The other side's `claude` is someone else here: its write is no news
@@ -2927,28 +3057,43 @@ def _say_news(ctx, wrote) -> None:
     # news once. A session key on each row would close it.
     sk = store.session_key()
     ours = {i for i, k in store.sessions(ctx.store_dir).items() if k == sk} if sk else set()
-    mine = [key(n) for n in loaded[:at] if n.author == reader or n.id in ours]
-    if not mine:
-        return
     read = _session_read(ctx)          # -1: a row in that second may postdate it
-    since, by_id = max(mine + ([(read, -1)] if read else [])), {n.id: n for n in loaded}
+    if commit:
+        committed = _session_read(ctx, "commit")
+        if not (read or committed):
+            return None
+        # ponytail: whole-second stamps, so a row written in the second of the
+        # previous commit lists again; a row position in the mark would close it.
+        since = (max(filter(None, (read, committed))), -1)
+        header = ("since your previous commit" if committed and since[0] == committed
+                  else "since this session's start")
+    else:
+        mine = [key(n) for n in loaded[:at] if n.author == reader or n.id in ours]
+        if not mine:
+            return None
+        since = max(mine + ([(read, -1)] if read else []))
+        header = "since your previous write"
+    by_id = {n.id: n for n in loaded}
     news = store.newest_first(
         h for h in store.heads(loaded) if h.id not in wrote and summ.on_side(by_id, h, side)
-        and any(summ.wrote_it(reader, v.author) and key(v) > since and pos[v.id] < at
-                for v in summ._chain(by_id, h)))
-    if not news:
-        return
-    print("note: written by someone else since your previous write:", file=sys.stderr)
+        and any(summ.wrote_it(reader, v.author) and v.id not in ours and key(v) > since
+                and pos[v.id] < at for v in summ._chain(by_id, h)))
+    return (f"note: written by someone else {header}:", news, by_id, reader, since) if news else None
+
+
+def _print_news(header, news, by_id, reader, since, file) -> None:
+    """What `_news` found, each row as the summary prints it."""
+    print(header, file=file)
     for h in news[:_NEWS_CAP]:
         r = summ.row_digest(by_id, h, summ.HEAD_CHARS, reader)
         closer = summ._closer(by_id, h).author if store.read_status(h) == "resolved" else None
         if closer and r.get("last") == closer:
             del r["last"]
         print("  " + summ._labelled(summ.plain, r, first=closer and f"closed by {closer}"),
-              file=sys.stderr)
+              file=file)
     if len(news) > _NEWS_CAP:
         print(f"  +{len(news) - _NEWS_CAP} more: symbion list --since "
-              f"{since[0].isoformat(timespec='seconds')}", file=sys.stderr)
+              f"{since[0].isoformat(timespec='seconds')}", file=file)
 
 
 _NEWS_CAP = 5
@@ -3122,7 +3267,7 @@ def _dispatch(args, ctx) -> int:
     if args.cmd == "serve" and (args.restart or args.stop):
         return _serve_all(restart=args.restart)
     if args.cmd == "skill":                      # the plugin loads it before a store exists
-        return _skill(ctx, args.path)
+        return _skill_file(args.name) if args.name else _skill(ctx, args.path, args.unreadable)
 
     # An absent store is never a first session: `init` creates it. It is a
     # `.symbion` pointer to nowhere, a renamed repo, a wrong --dir or
@@ -3162,7 +3307,7 @@ def _dispatch(args, ctx) -> int:
             return 1
         setattr(args, attr, full)
         if args.cmd in ("resolve", "supersede"):
-            tip = _say_tip(store_dir, full, resolving=args.cmd == "resolve")
+            tip = _say_tip(store_dir, full)
 
     if args.cmd == "undo":
         try:
@@ -3205,14 +3350,17 @@ def _dispatch(args, ctx) -> int:
             # Every failing line, in line order: the key check ran over the
             # whole batch first, so line 3 was named before line 2 (2026-10-09).
             errors.sort(key=lambda e: e[0] or 0)
-            where = "--from-json " if args.from_json else ""
+            # The outcome first: a bare refusal at exit 1 read as a warning
+            # beside a commit that exited 0 (2026-11-01).
+            where = "--from-json " if args.from_json else "nothing was written: "
             for _, e, *row in errors[:_ERROR_CAP]:
                 print(f"add: {where}{e}", file=sys.stderr)
                 if row:
                     _name_named_project_rows(ctx, row[0])
-            if len(errors) > _ERROR_CAP:
-                print(f"add: +{len(errors) - _ERROR_CAP} more failing lines; nothing was written",
-                      file=sys.stderr)
+            if args.from_json:
+                more = len(errors) - _ERROR_CAP
+                print(f"add: {f'+{more} more failing lines; ' if more > 0 else ''}"
+                      f"nothing was written", file=sys.stderr)
             return 1
         try:
             written = api.add_fields(ctx, fields)
@@ -3236,6 +3384,7 @@ def _dispatch(args, ctx) -> int:
         _name_new_items(store_dir, written)
         _name_unchecked(written)
         _name_dirty(written)
+        _name_bodiless(ctx, written)
         _name_undated(written)
         _name_past_due(written)
         _name_archived_arcs(store_dir, written)
@@ -3319,11 +3468,18 @@ def _dispatch(args, ctx) -> int:
         if args.since and args.since[1] is None:
             # A wrap writes its handoff from this: what the session did, as
             # the store holds it (wrap.md, step 3).
-            if not (w := gitref.last_wrap(store_dir, cfg, side)):
+            if w := gitref.last_wrap(store_dir, cfg, side):
+                args.since = (args.since[0], store.written_at(None, w["at"]))
+            elif start := _session_read(ctx):
+                # A store's first wrap read exit 2 here (the user chose this
+                # session's start over the store's, 2026-11-04).
+                print("note: --since wrap: no wrap in this store yet; listing since "
+                      "this session's start", file=sys.stderr)
+                args.since = (args.since[0], start)
+            else:
                 print("list: --since wrap: no wrap in this store yet; give a time "
                       "instead (2h, 2026-10-16)", file=sys.stderr)
                 return 2
-            args.since = (args.since[0], store.written_at(None, w["at"]))
         filt = dict(target_type=ttype, target_name=name,
                     kind=args.kind, tag=args.tag, arc_id=args.arc_id, author=args.author,
                     grep=grep, overdue=args.overdue or None,
@@ -3423,7 +3579,8 @@ def _dispatch(args, ctx) -> int:
         if cap:
             notes = notes[:cap]
         superseded = {n.supersedes for n in every if n.supersedes}
-        heads_of = {n.id: store.chain_tip(every, n.id) for n in notes if n.id in superseded}
+        tip_of = store.chain_tips(every)
+        heads_of = {n.id: tip_of(n.id) for n in notes if n.id in superseded}
         given = []
         if not args.note_id:
             given = [f"--{flag} {shlex.quote(str(v))}" for flag, v in (
@@ -3466,7 +3623,8 @@ def _dispatch(args, ctx) -> int:
             hidden = [h for h in (_hidden(scope, base, args, filt) if given else ())
                       if h.startswith("+") and not h.endswith("(--all)")]
             if given and not args.all:
-                older = {store.chain_tip(scope, n.id).id
+                scope_tip = store.chain_tips(scope)
+                older = {scope_tip(n.id).id
                          for n in store.query(scope, status=args.status, **filt)
                          if n.id in superseded} - matched
                 if older:
@@ -3528,13 +3686,20 @@ def _dispatch(args, ctx) -> int:
         measures = _measures_from_flags(args.measures)
         if args.add_tags:             # onto the tip; a missing id raises below
             fields["tags"] = sorted(set(tip.tags if tip else ()) | set(args.add_tags))
-        if tip is not None and store.read_status(tip) == "resolved" and not args.external \
-                and set(fields) == {"status"} and not measures and not args.refs:
-            # It printed `already resolved`, then `edited in place` at exit 0,
-            # which contradicted, and there was nothing to add (2026-10-09 review).
-            print(tip.id)
-            print("note: nothing to add, so nothing was written", file=sys.stderr)
-            return 0
+        if tip is not None and store.read_status(tip) == "resolved" and not args.external:
+            if set(fields) == {"status"} and not measures and not args.refs:
+                # It printed `already resolved`, then `edited in place` at exit 0,
+                # which contradicted, and there was nothing to add (2026-10-09 review).
+                print(tip.id)
+                print(f"note: {tip.id} is already resolved and there is nothing to add, "
+                      f"so nothing was written", file=sys.stderr)
+                return 0
+            # A second resolve appended a second judgment, which a prediction
+            # keeps for good (2026-10-31); the user chose a refusal (2026-11-02).
+            print(f"resolve: {tip.id} is already resolved, so nothing was written; "
+                  f"`symbion supersede {tip.id[-10:]} --append --body TEXT` adds below it, "
+                  f"and `supersede -h` lists its other changes", file=sys.stderr)
+            return 1
         try:
             note = api.supersede(ctx, args.id, author=_resolved_author(args),
                                  add_refs=_refs_from_flags(args.refs),
@@ -3672,14 +3837,7 @@ def _dispatch(args, ctx) -> int:
         keep = (lambda r: True) if args.everyone else \
             store.with_bases(rows, api.own_rows(ctx))
         mine, left = [r for r in rows if keep(r)], [r for r in rows if not keep(r)]
-        # Each file, as `commit` names them: status shows an untracked dir as one.
-        changed = ["diff", "HEAD", "--name-only", "-z"] if gitref._git(
-            store_dir, "rev-parse", "-q", "--verify", "HEAD").returncode == 0 \
-            else ["ls-files", "-z", "--cached"]
-        files = sorted({f for cmd in (changed, ["ls-files", "-z", "--others",
-                                                "--exclude-standard"])
-                        for f in gitref._git(store_dir, *cmd).stdout.split("\0")
-                        if f and f != store.NOTES_FILE})
+        files, away = _commit_files(ctx, args.everyone)
         def listed(rows):
             for r in rows:
                 print(f"  {(r.get('id') or '?')[-10:]}  {r.get('author') or '?'}  "
@@ -3693,6 +3851,10 @@ def _dispatch(args, ctx) -> int:
         if left:
             print(f"would leave, {_others()}': entries {store.rows_by_author(left)}")
             listed(store.entries(left))
+        if away:
+            print(f"would leave, {_ELSEWHERE}: {summ._count(len(away), 'file')}")
+            for f in away:
+                print(f"  {f}")
         _say_ignored_archive(store_dir, would=True)
         return 0
 
@@ -3709,19 +3871,34 @@ def _dispatch(args, ctx) -> int:
             print("error: --wrap needs -m: the message is the handoff the next session "
                   "reads", file=sys.stderr)
             return 2
+        # Before the commit: it clears the record of what this session wrote.
+        news = _news(ctx, (), commit=True)
         ok = api.commit(ctx, args.message or "update entries", everyone=args.everyone,
                         wrap=args.wrap)
         print(gitref.committed(store_dir) if ok else "nothing to commit")
         # A row left here may be a live session's, or one a session left
         # when it ended: the newest's age tells them apart.
         left = store.pending_rows(store_dir)
+        cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit", "--all"]))
         if left:
             newest = max(r.get("created_at") or "" for r in left)
-            cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit", "--all"]))
             print(f"left pending, {_others()}': entries {store.rows_by_author(left)}"
                   + (f", the newest written {summ.when_added(newest)}" if newest else "")
                   + f": {cmd} takes them")
+        away = _commit_files(ctx, True)[0] if not args.everyone and api.elsewhere(ctx) else []
+        if away:
+            more = f", +{len(away) - 3} more" if len(away) > 3 else ""
+            print(f"left uncommitted, {_ELSEWHERE}: {summ._count(len(away), 'file')}: "
+                  f"{', '.join(away[:3])}{more}; {cmd} takes them")
         _say_ignored_archive(store_dir)
+        if news:
+            _print_news(*news, file=sys.stdout)
+        if (mark := _session_mark("commit")) is not None:
+            try:
+                mark.parent.mkdir(parents=True, exist_ok=True)
+                store._replace_atomically(mark, f"{Path(ctx.store_dir).resolve()}\t{store._now_iso()}\n")
+            except OSError:
+                pass                       # the next commit repeats the list; nothing is lost
         # The second half of the footgun: committed is not off this disk.
         # Measured 2026-09-22, the first session with an origin on the
         # store -- "committed" read as done and the commit sat unpushed.
@@ -3860,14 +4037,17 @@ def _dispatch(args, ctx) -> int:
         if args.hook and (note := _untrusted_note(ctx)):          # each session until `trust`
             sync, told = [*sync, note], [*told, note]
         side = store.read_side(store_dir)      # after the pull: it can bring `shared`
-        data = summ.summary(store_dir, cfg, full=args.full, reader=reader, side=side)
+        # Read once: summary counts them, and the commit hint names whose they are.
+        pending = store.pending_rows(store_dir)
+        data = summ.summary(store_dir, cfg, full=args.full, reader=reader, side=side,
+                            pending=pending)
         data["sync"] = sync
         # A $SYMBION_AUTHOR left exported changes whose view this is: named,
         # unless it is the shell's agent's own name, as Codex's hook sets it.
         data["reader"] = reader if reader and reader != api.shell_author() else None
         # Both links lead to the same skill directory, so either serves.
-        data["skill"] = next((f"~/{link.as_posix()}/SKILL.md" for link in (_SKILL_LINK, _CODEX_SKILL_LINK)
-                              if (Path.home() / link / "SKILL.md").exists()), None)
+        data["skill"] = linked = next((f"~/{link.as_posix()}/SKILL.md" for link in (_SKILL_LINK, _CODEX_SKILL_LINK)
+                                       if (Path.home() / link / "SKILL.md").exists()), None)
         if os.environ.get("HERMES_AGENT") and (
                 data["skill"] or (_hermes_home() / "skills/symbion/SKILL.md").exists()):
             # Hermes lists skills by name and loads one with skill_view: a
@@ -3878,6 +4058,13 @@ def _dispatch(args, ctx) -> int:
             # agy lists each skill by the path of its copy and reads it from
             # there (an agy session's report, 2026-10-30).
             data["skill"] = f"~/{_AGY_SKILL.as_posix()}"
+        if (os.environ.get("SYMBION_HOST") or api.shell_author()) == "pi":
+            # Pi's model loads a skill by reading the SKILL.md its skills list
+            # names: a link above, else the package's own, which the extension's
+            # resources_discover adds. `/skill:symbion` is the user's to type. A Pi
+            # started from a Hermes or agy shell inherits their variables, never
+            # their hint.
+            data["skill"] = linked or (_skill_dir() / "SKILL.md").as_posix()
         if os.environ.get("CLAUDE_PLUGIN_ROOT") or (reader == "claude" and _claude_plugin_enabled()):
             # The plugin's hook (the spike measured the variable in its
             # environment), or Claude Code's shell with the plugin on: its skill
@@ -3886,7 +4073,7 @@ def _dispatch(args, ctx) -> int:
         if at_terminal:
             data["skill"] = None      # the line is for an agent; the hook reads a pipe
         data["named_store"] = _named_store(ctx)
-        data["commit_hint"] = _commit_hint(ctx) if data["uncommitted_notes"] else None
+        data["commit_hint"] = _commit_hint(ctx, pending) if data["uncommitted_notes"] else None
         if args.hook:
             sid = _hook_session()
             try:
@@ -4058,6 +4245,8 @@ def _dispatch_arc(args, ctx) -> int:
         elif args.acmd == "describe" and was.description == args.description:
             print(f"note: {args.id} has that description already; nothing changed",
                   file=sys.stderr)
+        elif args.acmd == "describe":                   # as `arc create --desc` does
+            _name_unknown_ids(store_dir, [args.description], "the description")
         return 0
 
     if args.acmd == "seed":
@@ -4347,6 +4536,13 @@ def _main(argv) -> int:
         if rest[:1] in (["-V"], ["--version"]):
             print(_version())
             return 0
+        # The plugin's hook asks this first and reads a failure as a CLI that
+        # does not run: a bad key in symbion.toml sent the user to setup, and
+        # the package's hook, which names the key, never ran (audit 2026-11-02).
+        if rest == ["skill", "--path"]:
+            return _skill(None, True)
+        if rest[:1] == ["skill"] and len(rest) == 2 and not rest[1].startswith("-"):
+            return _skill_file(rest[1])
         # `init` installs into the cwd's project, so it never follows a
         # named store to the project that owns it. `completion` runs from a
         # shell's rc file, wherever the shell starts, and reads no store: the
@@ -4356,10 +4552,10 @@ def _main(argv) -> int:
                      or rest[:1] == ["serve"] and bool({"--restart", "--stop"} & set(rest)))
         if storeless:
             dir_value = os.getcwd()
-        no_store = None
+        no_store = unreadable = None
         try:
             ctx = api.resolve(dir_value, follow_owner=rest[:1] != ["init"] and not storeless)
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, PermissionError) as e:
             # Help needs no store, but argparse reaches `-h` only after the
             # store resolves, so outside a repo every `--help` exited 1 with
             # no usage -- including `init --help`, read from the parent
@@ -4367,10 +4563,14 @@ def _main(argv) -> int:
             # The cwd stands in as a named store: it makes a Ctx with the
             # built-in types and kinds, and no repo to derive one from is
             # exactly when there is nothing store-specific to list. `skill`
-            # too: the plugin's stub loads it wherever a session starts.
+            # too: the plugin's stub loads it wherever a session starts. An
+            # unreadable store (_OUT_OF_REACH) takes the same way out, and
+            # `skill` says so where the store's kinds would be.
             if not {"-h", "--help"} & set(rest) and rest[:1] != ["skill"]:
                 raise
             no_store = None if rest[:1] == ["skill"] else e
+            if isinstance(e, PermissionError):
+                unreadable = e
             ctx = api.resolve(os.getcwd(), follow_owner=False)
         # The hook merges stderr into its JSON: summary --hook puts it in the text.
         if (note := _unknown_keys_note(ctx)) and not (rest[:1] == ["summary"] and "--hook" in rest):
@@ -4403,6 +4603,7 @@ def _main(argv) -> int:
                 print(f"note: {line}", file=sys.stderr)
         args.argv = argv                         # serve --reload re-runs it
         args.wrote = set()                       # a write's rows, for _say_news
+        args.unreadable = unreadable             # for `skill`
         if no_store is not None:
             raise no_store                       # `-h` was a value, not help
         # A command reads each repo's HEAD once (gitref.heads_once). Not serve:
@@ -4473,6 +4674,12 @@ def _main(argv) -> int:
             raise
         print(f"error: symbion runs git, and no `git` is on PATH "
               f"({os.environ.get('PATH', '')})", file=sys.stderr)
+        return 1
+    except PermissionError as e:
+        # Every verb printed this as a traceback (_OUT_OF_REACH, 2026-11-01).
+        if e.filename is None:
+            raise
+        print(f"error: {e.strerror}: {e.filename}; {_OUT_OF_REACH}", file=sys.stderr)
         return 1
     except tomllib.TOMLDecodeError as e:
         # store_dir isn't bound in this frame when api.resolve() raises

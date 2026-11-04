@@ -505,7 +505,7 @@ def view_path(ctx, name, ttype=None):
     if path.is_file():
         # Read-only, the public demo: only what git tracks, which the leak
         # scan read; a gitignored file was readable (a reviewer, 2026-10-22).
-        if S.read_only() and ttype != "doc" and not gitref.tracked(ctx.cfg.for_type(ttype), path):
+        if S.read_only() and not gitref.tracked(ctx.cfg.for_type(ttype), path):
             return None
         return (path, None) if _viewable(path.name) else None
     # ponytail: the default branch only; a file only another branch holds reads nothing
@@ -752,8 +752,8 @@ def _commit_viewable(ctx, sha):
 
         def lead():
             commit_meta(sha, author, date, parents, body)
-        diff_dialog(subject or f"commit {sha[:12]}", diff, lead=lead,
-                    head=lambda: forge_buttons(cfg, sha), mono=False)
+        return diff_dialog(subject or f"commit {sha[:12]}", diff, lead=lead,
+                           head=lambda: forge_buttons(cfg, sha), mono=False)
 
     return "difference", f"read commit {sha[:7]}", click
 
@@ -789,12 +789,17 @@ def diff_mode() -> str:
     return mode if mode in diffview.MODES else "unified"
 
 
-def diff_dialog(title: str, text: str, *, lead=None, head=None, mono: bool = True) -> None:
+async def diff_dialog(title: str, text: str, *, lead=None, head=None,
+                      mono: bool = True) -> None:
     """The viewer, wide, on the diff `text`, with the unified / side-by-side
     toggle in its head: `lead()` draws what goes above the diff, `head()`
     buttons beside the toggle. Side by side, the unified drawing comes too:
-    a window too narrow for two sides shows it instead (theme.py)."""
-    files = diffview.parse(text[:VIEW_CHARS])
+    a window too narrow for two sides shows it instead (theme.py). Parse and
+    render run on a worker thread: on the event loop, a large diff held
+    every visitor for its render (audit 2026-11-02). A caller returns this
+    coroutine to its handler, which NiceGUI awaits."""
+    mode = diff_mode()
+    files = await run.io_bound(diffview.parse, text[:VIEW_CHARS])
     uid = f"sb-d{next(_DIFF_IDS)}"
     held = {}
 
@@ -804,16 +809,18 @@ def diff_dialog(title: str, text: str, *, lead=None, head=None, mono: bool = Tru
         return (f'<div class="sb-diff-wide">{diffview.render(files, mode, uid)}</div>'
                 f'<div class="sb-diff-narrow">{diffview.render(files, "unified", uid + "n")}</div>')
 
-    def pick(e) -> None:
+    async def pick(e) -> None:
         ui.context.client.storage[DIFF_COOKIE] = e.value
         ui.run_javascript(f'document.cookie = "{DIFF_COOKIE}={e.value}; path=/; '
                           f'max-age=31536000; samesite=lax"')
         if view := held.get("view"):
-            view.set_content(drawn(e.value))
+            view.set_content(await run.io_bound(drawn, e.value))
+
+    shown = await run.io_bound(drawn, mode) if files else ""
 
     def heads() -> None:
         if files:
-            ui.toggle(diffview.MODES, value=diff_mode(), on_change=pick) \
+            ui.toggle(diffview.MODES, value=mode, on_change=pick) \
                 .props("dense no-caps unelevated toggle-color=primary") \
                 .classes("sb-diff-mode").mark("diff-mode")
         if head:
@@ -825,8 +832,7 @@ def diff_dialog(title: str, text: str, *, lead=None, head=None, mono: bool = Tru
         if not files:
             ui.label("no changes").classes("sb-subtitle").mark("diff-none")
             return
-        held["view"] = ui.html(drawn(diff_mode()), sanitize=False) \
-            .classes("w-full").mark("diff-view")
+        held["view"] = ui.html(shown, sanitize=False).classes("w-full").mark("diff-view")
         if len(text) > VIEW_CHARS:
             ui.label(f"cut at {VIEW_CHARS:,} characters").classes("sb-subtitle")
     viewer(title, fill, mono=mono, head=heads, wide=True)
@@ -849,10 +855,11 @@ def commit_list(ctx, cfg, rows, total: int) -> None:
         ui.label(f"+{total - len(rows)} more").classes("sb-subtitle").mark("commit-more")
 
 
-def since_dialog(ctx, n) -> None:
+def since_dialog(ctx, n):
     """A file entry's `N commits since`, opened: the commits, then the file's
     diff from what the entry saw to the file now, uncommitted edits
-    included, which is what the count compares (gitref.changed_since)."""
+    included, which is what the count compares (gitref.changed_since).
+    Returns diff_dialog's coroutine, for the click's handler."""
     shas = gitref.changed_since(ctx.cfg, [n])[n.id] or []
     if not shas:
         ui.notify(f"no commit has changed {n.target.name} since this entry")
@@ -884,16 +891,19 @@ def since_dialog(ctx, n) -> None:
         viewer(f"{path}, {saw}", fill, mono=True)
 
     def head() -> None:
-        ui.button(icon="history", on_click=was) \
-            .props(f'flat dense round size=sm color=muted aria-label="read {path} {saw}"') \
+        b = ui.button(icon="history", on_click=was) \
+            .props("flat dense round size=sm color=muted") \
             .tooltip(f"read {path} {saw}").mark("since-was")
-    diff_dialog(f"{path} since this entry", gitref.diff_text(cfg, base, "--", f":(literal){path}")
-                or "", lead=lead, head=head)
+        b._props["aria-label"] = f"read {path} {saw}"   # set, not parsed: a file name may hold a quote
+    return diff_dialog(f"{path} since this entry",
+                       gitref.diff_text(cfg, base, "--", f":(literal){path}") or "",
+                       lead=lead, head=head)
 
 
-def check_dialog(ctx, n, state: str, distance: int) -> None:
+def check_dialog(ctx, n, state: str, distance: int):
     """A check's `behind N` or `ahead N`, opened: the commits between its
-    stamp and HEAD, and for `behind`, what they changed, the whole tree."""
+    stamp and HEAD, and for `behind`, what they changed, the whole tree.
+    `behind` returns diff_dialog's coroutine, for the click's handler."""
     sha = S.stamp_sha(n.provenance)
     cfg = gitref.stamp_cfg(ctx.cfg, n.provenance)
     rows = gitref.commit_rows(cfg, [f"{sha}..HEAD" if state == "behind" else f"HEAD..{sha}"],
@@ -909,8 +919,8 @@ def check_dialog(ctx, n, state: str, distance: int) -> None:
     if state == "ahead":
         viewer(f"commits since HEAD, to {sha[:7]}", lead, mono=True)
         return
-    diff_dialog(f"since this run, at {sha[:7]}", gitref.diff_text(cfg, sha, "HEAD") or "",
-                lead=lead)
+    return diff_dialog(f"since this run, at {sha[:7]}", gitref.diff_text(cfg, sha, "HEAD") or "",
+                       lead=lead)
 
 
 def view_button(ctx, name, label: str = "", ttype=None):

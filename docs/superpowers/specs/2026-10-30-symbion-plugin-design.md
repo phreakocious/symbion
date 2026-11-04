@@ -105,7 +105,7 @@ that runs them (the user, after review). The plugin holds:
 - `.claude-plugin/plugin.json`, and `.claude-plugin/marketplace.json` naming the
   repo as its own marketplace;
 - `icon.png`;
-- `commands/setup.md`, the setup command (§3);
+- `skills/setup/SKILL.md`, the setup skill (§3);
 - a stub skill, `skills/symbion/SKILL.md`: the full skill's frontmatter
   description, so it triggers as today, and a body whose `` !`cmd` `` prints the
   installed package's skill, or says to run `/symbion:setup` when no CLI is
@@ -183,6 +183,50 @@ SKILL.md, whose size is capped. The agent:
 The store sits beside the project, outside its directory. Where Claude Code's
 permissions or sandbox fence writes to the project, the store's writes ask too. The
 step-5 explanation names the store's path so that prompt is no surprise.
+
+*Changed 2026-11-02:* `/symbion:setup` and `/symbion:wrap` are plugin skills
+(`skills/setup/SKILL.md`, `skills/wrap/SKILL.md`), not commands. Antigravity's
+plugin loader reads no `commands/`, and it offered the stub skill as the slash
+command `/symbion:symbion`; Claude Code offers a plugin skill as
+`/<plugin>:<name>` too. As skills, both are also model-invocable in Claude Code,
+which the commands were not. Setup's prose is host-neutral: an agent whose host
+left a `` !`cmd` `` line unrun runs it, and in Antigravity the project's line goes
+in `AGENTS.md`.
+
+*Changed 2026-11-03:* in Antigravity the line goes in whichever of `AGENTS.md` and
+`GEMINI.md` exists, else in a new `GEMINI.md`, and each `init` takes `--agent
+antigravity`. agy loads `GEMINI.md` and `AGENTS.md`, never `CLAUDE.md` (its docs, in
+the agy 1.4.12 binary), and a new `AGENTS.md` would hide `CLAUDE.md` from Pi and
+Hermes, which read only the first they find. In a live run the model skipped the old
+parenthetical and offered `CLAUDE.md`, so each host's file now has a sentence of its
+own. A bare `init` there ran as `--agent claude`, which never names the `agy
+--add-dir` that auto mode needs. The setup file's cap rose from 4,096 to 5,120 bytes
+for it (the user's call).
+
+*Changed 2026-11-03, later:* `init --agent antigravity` names agy permission rules
+in place of `agy --add-dir`: `read_file` on each directory symbion runs from, and
+`write_file` on the store. In headless auto-mode runs, a sandboxed `symbion` could
+not start without the reads, and with them and the write it could add and commit,
+while `--add-dir` left the store's `.git` unwritable. The user adds the rules at agy's
+`/permissions`, never the agent: agy's reviewer treats its settings as safety
+controls (the user's call). Until they are in, setup runs symbion with
+`BypassSandbox`.
+
+*Changed 2026-11-03, after a live run:* setup asks the user to add the rules before
+they approve step 5, then runs a sandboxed `symbion -V` before `init --yes`; once it
+starts, no symbion call takes `BypassSandbox`. In a headless auto-mode run, setup
+showed the rules at step 4 and ran the rest before they were in: each bypassed call
+took 5 to 41 s of review, and each read outside the workspace (`adoption.md`, the
+store's `symbion.toml`) needed a prompt. A `write_file` rule on a directory that did
+not exist yet let a sandboxed `mkdir` make it, so the rules can name the store before
+init does. Step 8 reads serve's URL with `head -1`: agy's `read_file` refused serve's
+log in `/tmp` even with the rules.
+
+*Changed 2026-11-03, after a second live run:* once symbion starts in the sandbox,
+setup takes `BypassSandbox` only for what `adoption.md` reads outside the repo. With
+no bypass at all, the sandbox refused to list the repo's parent, zsh reported the
+sibling-store sweep's `../*-notes` as `no matches found`, and setup said it found
+nothing to migrate while stores sat beside the repo.
 
 ### 4. `init` on Claude Code
 

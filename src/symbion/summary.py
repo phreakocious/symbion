@@ -461,9 +461,11 @@ def on_side(by_id, n, side) -> bool:
     return side is None or side_of(by_id, n) in (None, side)
 
 
-def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None) -> dict:
+def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
+            pending=None) -> dict:
     """`side` is the reader's in a shared store, else None: session start
-    is that side's, and each other side reaches it as one line, `others`."""
+    is that side's, and each other side reaches it as one line, `others`.
+    `pending`, the store's `pending_rows`, when the caller reads them too."""
     loaded = seen_from(S.load(store_dir), side)
     every = S.heads(loaded)
     by_id = {n.id: n for n in loaded}
@@ -588,7 +590,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None) -> di
     a_cap = len(rows) if full else ARC_CAP
     p_cap = len(priority) if full else PRIORITY_CAP
     d_cap = len(due) if full else DUE_CAP
-    notes_n, registry = gitref.uncommitted(store_dir)
+    notes_n, registry = gitref.uncommitted(store_dir, pending)
     wrap = gitref.last_wrap(store_dir, cfg, side)
     if wrap:
         wrap["changed"] = wrap_changes(loaded, by_id, wrap)

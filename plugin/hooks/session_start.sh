@@ -11,6 +11,10 @@
 # agy runs it as `sh hooks/session_start.sh antigravity` in the plugin's own
 # dir, and names the project only in its stdin JSON, as workspacePaths[0]
 # (agy 1.4.12, 2026-10-30). That JSON is replayed to the package script.
+# SYMBION_HOST names the host to the package's hook, which answers in its JSON:
+# a Claude Code started in agy's terminal can carry agy's marker.
+# Pi's extension runs it as `sh session_start.sh pi`, in the project, which it
+# also names in SYMBION_PROJECT_DIR (spec 2026-11-02).
 # shortcut: a sed match, not a JSON parse: a project path holding `"` or `\`
 # reads as no project and the hook says nothing; parse it in Python if one does.
 agy=
@@ -19,7 +23,11 @@ if [ "$1" = antigravity ]; then
   SYMBION_PROJECT_DIR=$(printf '%s' "$agy" | tr -d '\n' | sed -n \
     's/.*"workspacePaths"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"\\]*\)".*/\1/p')
   [ -n "$SYMBION_PROJECT_DIR" ] || exit 0
-  export SYMBION_PROJECT_DIR
+  export SYMBION_PROJECT_DIR SYMBION_HOST=antigravity
+elif [ "$1" = pi ]; then
+  export SYMBION_HOST=pi
+else
+  export SYMBION_HOST=claude
 fi
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/symbion/skill_dir"
 d=
@@ -55,6 +63,8 @@ name=${main##*/}; name=${name##*\\}
 if [ -n "$SYMBION_DIR" ] || [ -s "$p" ] || [ -L "$p" ] || [ -e "$main/../$name-notes/notes.jsonl" ]; then
   if [ "$1" = antigravity ]; then   # agy reads only JSON, and has no /symbion:setup
     echo '{"injectSteps":[{"systemMessage":{"systemMessage":"symbion: this project has a symbion store, but the symbion CLI is not installed or does not run: see Install at https://github.com/phreakocious/symbion"}}]}'
+  elif [ "$1" = pi ]; then   # Pi's prompt names take no namespace
+    echo "symbion: this project has a symbion store, but the symbion CLI is not installed or does not run: run /symbion-setup."
   else
     echo "symbion: this project has a symbion store, but the symbion CLI is not installed or does not run: run /symbion:setup."
   fi

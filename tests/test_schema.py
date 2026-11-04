@@ -12,6 +12,17 @@ def test_note_round_trips_through_dict():
     assert store.note_from_dict(store.note_to_dict(n)) == n
 
 
+def test_a_null_body_reads_as_empty():
+    """Every writer stores `""`; a `null` from a hand edit or another tool
+    crashed summary, list and the session-start hook once someone else had
+    amended the row (audit 2026-11-02)."""
+    n = store.note_from_dict({
+        "id": "x", "kind": "task", "target": {"type": "project", "name": None},
+        "created_at": "t", "body": None,
+    })
+    assert n.body == ""
+
+
 def test_the_atlas_key_is_no_longer_read():
     """v1's read-side synonym for `provenance`; repealed with v1 §Migration
     (spec 2026-09-08)."""

@@ -2171,6 +2171,20 @@ def test_summary_json_on_an_absent_store_is_a_valid_empty_object(repo, tmp_path,
     assert set(json.loads(capsys.readouterr().out)) == set(data)
 
 
+def test_summary_reads_the_pending_rows_once(repo, tmp_path, capsys, monkeypatch):
+    """Its count and its commit hint each ran a `git diff-index -p` over
+    notes.jsonl, at every session start with rows pending (audit 2026-11-02)."""
+    run("add", "--kind", "task", "--type", "project", "--body", "a pending task",
+        store_dir=tmp_path)
+    capsys.readouterr()
+    calls, real = [], store.pending_rows
+    monkeypatch.setattr(store, "pending_rows", lambda d: calls.append(d) or real(d))
+    assert run("summary", "--json", store_dir=tmp_path) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["uncommitted_notes"] == 1 and data["commit_hint"].endswith(" commit")
+    assert len(calls) == 1
+
+
 # ---- THE BLOCKER: cli.main must resolve HEAD/dirty against the worktree the
 # caller is actually standing in (cfg.work_root), never the main worktree used
 # only to derive the store path (cfg.project_root). Every other linked-
@@ -2602,8 +2616,9 @@ def test_add_from_json_names_every_failing_line_in_order(tmp_path, capsys, monke
         '{"kind": "note", "target": {"type": "project"}, "title": "x"}\n'
         '[1]\n'))
     assert run("add", "--from-json", "-", store_dir=tmp_path) == 1
-    err = capsys.readouterr().err.splitlines()
+    *err, last = capsys.readouterr().err.splitlines()
     assert [re.match(r"add: --from-json line (\d)", e)[1] for e in err] == ["2", "3", "4"], err
+    assert last == "add: nothing was written"
     assert store.load(tmp_path) == []
 
 
@@ -2912,7 +2927,8 @@ def test_resolve_ref_adds_to_the_inherited_refs(tmp_path, capsys):
     assert head.status == "resolved"
     assert [(r.type, r.name) for r in head.refs] == [
         ("item", "a"), ("file", "gone.py"), ("item", "b"), ("file", "live.py")]
-    assert run("resolve", head.id, "--ref", "itm:c", store_dir=tmp_path) == 1
+    # resolve on a resolved entry refuses first (2026-11-02); supersede adds refs alike.
+    assert run("supersede", head.id, "--add-ref", "itm:c", store_dir=tmp_path) == 1
     assert "itm" in capsys.readouterr().err
     assert len(store.load(tmp_path)) == 2
 
@@ -3708,10 +3724,27 @@ def test_a_pre_registrations_uncommitted_amendment_takes_a_rewrite(repo, tmp_pat
     for rid, body in ((p, "x rises\n\nn = 40"), (p, "x rises\n\nseen: z\n\nn = 40"),
                       (q, "q fails\n\nn = 40")):
         assert run("supersede", rid, "--body", body, store_dir=tmp_path) == 1, body
-        assert "a body may change only text added since" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "a body may change only text added since" in err
+        # Only q is wholly uncommitted, and read as editable (dogfood, 2026-10-31).
+        assert ("None of it is committed: `symbion undo " in err) == (rid == q), err
     for rid, body in ((p, "x rises\n\nseen: y\n\nn = 40"), (q, "q holds\n\nn = 40")):
         assert run("supersede", rid, "--body", body, store_dir=tmp_path) == 0
         assert store.chain_tip(store.load(tmp_path), rid).body == body
+
+
+def test_an_add_with_no_body_names_undo(repo, tmp_path, capsys):
+    """A stray `add bug` with no --body wrote an empty entry, and the next
+    write put it out of undo's reach (dogfood, 2026-10-31). The add says so.
+    A run's record goes bodiless by design and hears nothing."""
+    run("add", "bug", "--target", "project", store_dir=tmp_path)
+    out, err = capsys.readouterr()
+    tail = out.strip()[-10:]
+    assert re.search(rf"note: no body on {tail}: `symbion --dir \S+ undo {tail}` takes", err), err
+    assert run("undo", tail, store_dir=tmp_path) == 0
+    run("add", "check", "--target", "project", "--checked", "ran x", "--result", "ok",
+        store_dir=tmp_path)
+    assert "note: no body on" not in capsys.readouterr().err
 
 
 def test_a_fresh_store_keeps_a_predictions_registered_text(repo, tmp_path, capsys):
@@ -4039,11 +4072,12 @@ def test_a_new_tag_near_an_existing_one_names_it(tmp_path, capsys):
     want = ("note: new tag 'flaky-tests'; this store has 'flaky-test' (2): if they mean "
             "the same, reuse it\n")
     assert err("add", "--kind", "note", "--type", "item", "--name", "b",
-               "--tag", "flaky-tests") == want
+               "--tag", "flaky-tests", "--body", "b") == want
     assert "this store has 'flaky-test' (2)" in err(
-        "add", "--kind", "note", "--type", "item", "--name", "c", "--tag", "Flaky_Test")
+        "add", "--kind", "note", "--type", "item", "--name", "c", "--tag", "Flaky_Test",
+        "--body", "c")
     assert err("add", "--kind", "note", "--type", "item", "--name", "d",
-               "--tag", "flaky-test", "--tag", "unrelated") == ""
+               "--tag", "flaky-test", "--tag", "unrelated", "--body", "d") == ""
     nid = store.heads(store.load(tmp_path))[0].id
     assert "new tag 'flaky-tests'" not in err("supersede", nid, "--add-tag", "flaky-tests"), \
         "a tag another head carries is not new"
@@ -4232,6 +4266,10 @@ def test_supersede_takes_append_file_and_prepend_file(tmp_path, capsys, monkeypa
     (["edit", "x"], "`supersede ID --body"),
     (["append", "x"], "`supersede ID --append --body"),   # dogfood, 2026-10-01
     (["close", "x"], "`resolve ID`"),
+    # a kind typed as the verb, by a Gemini model in Pi during setup (2026-11-04)
+    (["check", "--external", "--target", "project", "--body", "x"],
+     "no verb 'check': 'check' is a kind: `add check --target TYPE:NAME`"),
+    (["note", "--target", "project"], "no verb 'note': 'note' is a kind: `add note"),
     (["search"], "`list --grep TEXT`"),       # `search TEXT` runs as it
     (["due", "--help"], "`list --overdue`"),         # an adopter's agent, 2026-09-25
     (["add", "bug", "--target", "item:x", "login times out"], 'text goes in --body "…"'),
@@ -4694,6 +4732,48 @@ def test_a_sessions_first_write_skips_what_its_start_summary_printed(tmp_path, c
         "an entry this session wrote in the user's words is not news to it"
 
 
+def test_commit_names_what_others_wrote_since_the_session_began_or_last_committed(
+        tmp_path, capsys, monkeypatch):
+    """A write names someone else's rows once, and an agent piped that write
+    through `tail -1`: the user's answers waited hours for the next session
+    start (2026-11-03). `commit` names them again, from the later of this
+    session's start summary and its previous commit; never a row this session
+    wrote in the user's words, and nothing outside a session."""
+    clock = (f"2026-10-13T10:00:{s:02d}+00:00" for s in range(60))
+    monkeypatch.setattr(store, "_now_iso", lambda: next(clock))
+    monkeypatch.setenv("SYMBION_AUTHOR", "agent")
+
+    def by_human(body):                 # the user, at a terminal or in the GUI
+        with monkeypatch.context() as m:
+            m.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+            run("add", "bug", "--target", "item:x", "--body", body, "--author", "human",
+                store_dir=tmp_path)
+
+    def commit() -> str:
+        capsys.readouterr()
+        run("commit", store_dir=tmp_path)     # 1 with none of the session's own to take
+        return capsys.readouterr().out
+
+    by_human("x broke")
+    out = commit()
+    assert "left pending" in out and "someone else" not in out, "outside a session"
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"session_id": "s1"}')))
+    run("summary", "--hook", store_dir=tmp_path)
+    run("add", "task", "--target", "project", "--body", "mine", store_dir=tmp_path)
+    by_human("y broke")
+    run("add", "note", "--target", "project", "--body", "the user's words", "--author", "human",
+        store_dir=tmp_path)
+    out = commit()
+    assert "note: written by someone else since this session's start:\n" in out, out
+    assert "y broke" in out and "x broke" not in out and "the user's words" not in out, out
+    by_human("z broke")
+    out = commit()
+    assert "note: written by someone else since your previous commit:\n" in out, out
+    assert "z broke" in out and "y broke" not in out, out
+    assert "someone else" not in commit(), "each row once a commit"
+
+
 def test_the_news_floor_is_the_writers_row_above_this_write(tmp_path, capsys, monkeypatch):
     """The floor was the writer's last row stamped before the command began,
     and a stamp holds whole seconds. A write in the second the next command
@@ -4771,8 +4851,27 @@ def test_a_write_to_an_old_id_names_the_row_it_changed(tmp_path, capsys):
     # written, and the id printed is the row's own (2026-10-09 review).
     assert "nothing to add, so nothing was written" in err and "in place" not in err, err
     assert out.strip() == head.id and len(store.load(tmp_path)) == rows
-    assert run("resolve", head.id, "--body", "and why", store_dir=tmp_path) == 0
-    assert "nothing to add" not in capsys.readouterr().err
+
+
+def test_resolve_on_a_resolved_entry_refuses_and_names_supersede(tmp_path, capsys):
+    """A second `resolve --result` on a resolved prediction wrote a second
+    judgment, and a prediction keeps each addition below its registration
+    (2026-10-31). The user chose a refusal (2026-11-02): supersede corrects
+    a resolved entry. A bare repeat still writes nothing at exit 0."""
+    pid = _add(tmp_path, capsys, "prediction", "--target", "item:p", "--checked", "the run",
+               "--body", "x rises")
+    assert run("resolve", pid, "--result", "rose", store_dir=tmp_path) == 0
+    capsys.readouterr()
+    rows = len(store.load(tmp_path))
+    for extra in (["--result", "rose again"], ["--body", "and why"], ["--add-tag", "t"],
+                  ["--ref", "item:r"]):
+        assert run("resolve", pid, *extra, store_dir=tmp_path) == 1, extra
+        out, err = capsys.readouterr()
+        assert out == "" and err.startswith(
+            f"resolve: {pid} is already resolved, so nothing was written; "
+            f"`symbion supersede {pid[-10:]} --append --body TEXT` adds below it"), err
+    assert len(store.load(tmp_path)) == rows
+    assert run("supersede", pid, "--append", "--body", "and why", store_dir=tmp_path) == 0
 
 
 def test_text_a_human_reads_says_what_it_means(tmp_path, capsys, monkeypatch):
@@ -5618,6 +5717,27 @@ def test_list_since_wrap_opens_the_window_at_the_last_wrap(tmp_store, tmp_path, 
     assert "result: mostly held; missed one" in out and "early fact" not in out
 
 
+def test_list_since_wrap_with_no_wrap_yet_lists_this_sessions_rows(tmp_path, capsys, monkeypatch):
+    """wrap.md step 3 runs `list --since wrap`, so a store's first wrap read
+    exit 2 (a stranger run, 2026-11-04). In an agent session it lists from the
+    session's start summary, as the user chose; outside one it says what to type."""
+    clock = (f"2026-10-13T10:00:{s:02d}+00:00" for s in range(60))
+    monkeypatch.setattr(store, "_now_iso", lambda: next(clock))
+    run("add", "note", "--target", "project", "--body", "before the session", store_dir=tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"session_id": "s1"}')))
+    run("summary", "--hook", store_dir=tmp_path)
+    run("add", "task", "--target", "project", "--body", "this session's task", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("list", "--since", "wrap", store_dir=tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert "this session's task" in out and "before the session" not in out, out
+    assert "no wrap in this store yet; listing since this session's start" in err, err
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    assert run("list", "--since", "wrap", store_dir=tmp_path) == 2
+    assert "give a time instead" in capsys.readouterr().err
+
+
 def test_an_arc_line_symbion_cannot_read_survives_every_arc_write(tmp_path, capsys):
     """load_arcs skipped an unreadable line silently and every arc write
     rewrote the registry from what it had read, so the next `arc create`
@@ -6029,6 +6149,10 @@ def test_arc_text_marks_archived_arcs_and_checks_a_desc(tmp_path, capsys):
     c = capsys.readouterr()
     assert "matches 20991231-000000-000000-abc (cited in --desc)" in c.err
     aid = c.out.strip()
+    # describe skipped the check (audit 2026-11-02)
+    run("arc", "describe", aid, "now see 20991231-000000-000000-def", store_dir=tmp_path)
+    assert "matches 20991231-000000-000000-def (cited in the description)" in \
+        capsys.readouterr().err
     run("arc", "archive", aid, store_dir=tmp_path)
     capsys.readouterr()
     run("arc", "list", "--all", store_dir=tmp_path)
@@ -6049,7 +6173,7 @@ def test_add_says_when_a_catalog_name_is_stored_as_typed(tmp_path, capsys):
     substring hit names the pick."""
     (tmp_path / "symbion.toml").write_text('[catalogs]\nfile = "echo src/parser.py"\n')
     assert run("add", "--kind", "bug", "--type", "file", "--name", "src/parsre.py",
-               store_dir=tmp_path) == 0
+               "--body", "b", store_dir=tmp_path) == 0
     out, err = capsys.readouterr()
     assert "'src/parsre.py' matches nothing in the file catalog; taken as typed" in err
     # the likely fix on the same line, as `rename` and arc misses give it
@@ -6063,7 +6187,7 @@ def test_add_says_when_a_catalog_name_is_stored_as_typed(tmp_path, capsys):
     assert capsys.readouterr().err.splitlines()[0].endswith("; did you mean 'src/parser.py'?")
     assert out.strip() == store.load(tmp_path)[-1].id, "stdout is still just the id"
     assert run("add", "--kind", "bug", "--type", "file", "--name", "src/parser.py",
-               store_dir=tmp_path) == 0
+               "--body", "b", store_dir=tmp_path) == 0
     out, err = capsys.readouterr()
     assert _sans_pending(err) == "", err
     assert run("add", "--kind", "bug", "--type", "file", "--name", "parser",
@@ -6365,6 +6489,44 @@ def test_commit_takes_this_sessions_rows_and_names_the_ones_it_leaves(
     assert capsys.readouterr().out.startswith("nothing to commit\nleft pending")
     assert run("commit", "--all", store_dir=tmp_path) == 0
     assert store.pending_rows(tmp_path) == []
+
+
+def test_a_commit_from_another_projects_tree_leaves_the_stores_files(tmp_path, capsys, monkeypatch):
+    """A dogfood row's commit, run with --dir from another project, took two
+    files a session of the store's own had changed, and its push shipped
+    them (2026-10-31). From outside the store's project it takes its rows and
+    the new docs they name, and names each file it left."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    proj, s = tmp_path / "proj", tmp_path / "proj-notes"
+    proj.mkdir()
+    _git(proj, "init", "-q", "-b", "main")
+    run("add", "note", "--target", "project", "--body", "w", store_dir=s)
+    run("commit", "--all", store_dir=s)                 # the store's own first files
+    (s / "tools").mkdir()
+    (s / "tools" / "lint.sh").write_text("echo\n")     # a session of proj's own, at work
+    (s / "docs").mkdir(exist_ok=True)
+    (s / "docs" / "mine.md").write_text("detail\n")
+    run("add", "note", "--target", "project", "--body", "from afar", "--ref", "doc:mine.md",
+        store_dir=s)
+    nid = capsys.readouterr().out.strip()
+    assert run("commit", "--dry-run", store_dir=s) == 0     # the cwd: another project
+    assert capsys.readouterr().out == (
+        "would commit: entries user 1; 1 file\n"
+        f"  {nid[-10:]}  user  note  from afar\n"
+        "  docs/mine.md\n"
+        "would leave, as the store is another project's: 1 file\n"
+        "  tools/lint.sh\n")
+    assert run("commit", store_dir=s) == 0
+    out = capsys.readouterr().out
+    assert "committed: entries user 1; 1 file: docs/mine.md\n" in out, out
+    assert re.search(r"left uncommitted, as the store is another project's: 1 file: "
+                     r"tools/lint\.sh; symbion --dir \S+ commit --all takes them\n", out), out
+    for cwd in (s, proj):                               # standing in the store, or its project
+        monkeypatch.chdir(cwd)
+        assert run("commit", "--dry-run", store_dir=s) == 0
+        assert capsys.readouterr().out == "would commit: 1 file\n  tools/lint.sh\n"
+    assert run("commit", store_dir=s) == 0
+    assert capsys.readouterr().out.startswith("committed: 1 file: tools/lint.sh\n")
 
 
 def test_commit_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capsys):
@@ -7239,6 +7401,24 @@ def test_no_git_on_path_is_named_not_a_traceback(tmp_path, monkeypatch, capsys):
     assert err.startswith("error: symbion runs git, and no `git` is on PATH") and "Traceback" not in err
 
 
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root reads a mode-0 file")
+@pytest.mark.skipif(os.name == "nt", reason="chmod cannot make a file unreadable on Windows")
+def test_an_unreadable_store_is_named_not_a_traceback(tmp_path, capsys):
+    """A sandboxed agent shell (agy's) stats a store outside its workspace and
+    refuses the open: every verb raised a PermissionError traceback."""
+    s = tmp_path / "s"
+    store.ensure_store(s)
+    (s / "symbion.toml").write_text("")
+    (s / "symbion.toml").chmod(0)
+    try:
+        assert cli.main(["--dir", str(s), "list"]) == 1
+    finally:
+        (s / "symbion.toml").chmod(0o644)
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "symbion.toml" in err
+    assert "needs the runtime's approval or the user's permission" in err
+
+
 def test_the_store_refuses_a_write_the_cli_did_not_screen(tmp_path):
     """The GUI and api write through store, not the CLI's guard: the store's
     own check is what keeps them from starting one."""
@@ -8001,6 +8181,21 @@ def test_add_help_gives_the_option_cap_the_write_enforces(tmp_path, capsys):
     assert run("add", "question", "--target", "project", "--body", "?", "--option", "a" * 61,
                store_dir=tmp_path) == 1
     assert "over 60 characters" in capsys.readouterr().err
+
+
+def test_a_refused_add_says_first_that_nothing_was_written(tmp_path, capsys, monkeypatch):
+    """`add: option 2 is over 60 characters: …` at exit 1 read as a warning
+    beside a `commit` in the same call that exited 0; only the missing id
+    showed that nothing was written (2026-11-01). A refusal leads with the
+    outcome; a --from-json one ends with it, after each failing line."""
+    assert run("add", "question", "--target", "project", "--body", "?", "--option", "a",
+               "--option", "b" * 61, store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("add: nothing was written: option 2 is over 60 characters"), err
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"kind": "nope", "target": {"type": "project"}}\n'))
+    assert run("add", "--from-json", "-", store_dir=tmp_path) == 1
+    assert capsys.readouterr().err.splitlines()[-1] == "add: nothing was written"
+    assert store.load(tmp_path) == []
 
 
 def test_a_long_options_line_clips_in_the_list_and_prints_whole_in_show(tmp_path, capsys):

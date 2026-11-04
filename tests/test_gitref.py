@@ -1157,7 +1157,7 @@ def test_a_read_only_serve_asks_git_each_question_once(repo, monkeypatch):
     5 s; answered once a process, 2 s (2026-10-22). Read-only, each distinct
     question runs once; otherwise every time."""
     cfg = Config(project_root=repo)
-    monkeypatch.setattr(gitref, "_ANSWERS", {})
+    gitref._asked.cache_clear()
     runs, real = [], subprocess.run
     monkeypatch.setattr(gitref.subprocess, "run",
                         lambda *a, **k: runs.append(a[0]) or real(*a, **k))
@@ -1171,12 +1171,32 @@ def test_a_read_only_serve_asks_git_each_question_once(repo, monkeypatch):
     assert heads[0].returncode == 0 and heads[0].stdout == heads[1].stdout
 
 
+def test_a_read_only_serve_keeps_a_bounded_number_of_answers(repo, monkeypatch):
+    """Each distinct name a demo visitor typed at `/object` kept its git
+    answers for the process's life (audit 2026-11-02). Past the cap the least
+    recently asked goes first: the first question runs again, a recent one
+    does not."""
+    cfg = Config(project_root=repo)
+    gitref._asked.cache_clear()
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    runs = []
+    monkeypatch.setattr(gitref.subprocess, "run",
+                        lambda a, **k: runs.append(a) or subprocess.CompletedProcess(a, 0, "", ""))
+    gitref._git(cfg, "rev-parse", "first")
+    for i in range(5000):
+        gitref._git(cfg, "rev-parse", f"q{i}")
+    gitref._git(cfg, "rev-parse", "q4999")
+    gitref._git(cfg, "rev-parse", "first")
+    assert len(runs) == 5002
+    gitref._asked.cache_clear()
+
+
 def test_markdown_files_are_the_tracked_and_new_not_ignored_and_read_only_the_tracked(
         repo, monkeypatch):
     """The Docs page lists them. The public demo shows only what git tracks:
     the leak scan read those."""
     cfg = Config(project_root=repo)
-    monkeypatch.setattr(gitref, "_ANSWERS", {})
+    gitref._asked.cache_clear()
     (repo / "sub").mkdir()
     for name in ("README.md", "sub/Guide.MD", "secret.md", "notes.txt"):
         (repo / name).write_text("x\n")

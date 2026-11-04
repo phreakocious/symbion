@@ -22,8 +22,8 @@ version it replaces stays on its own line under its new id. Of a committed
 line, only that id ever changes.
 
 `undo ID` puts back the whole of the store's last write, a batch too: each
-write first copies `notes.jsonl`, `arcs.jsonl` and the sessions file into the
-store's git dir (`symbion-undo/`, which git never sees). It works when ID is an
+write first copies `notes.jsonl`, `arcs.jsonl` and the sessions file into
+`.symbion-state/` in the store, which git never sees. It works when ID is an
 entry or arc that write touched, the write was this agent session's (with no
 session, your author's), no commit has run since, and nothing outside symbion
 changed the files. One level: an undo leaves nothing more to undo. In
@@ -172,7 +172,7 @@ An entry's line reads `[labels] [kind, …] TYPE:NAME  lead  id`:
 
 You are whoever your writes default to: `$SYMBION_AUTHOR`, else the harness
 (`claude` in Claude Code, `codex` in Codex, `antigravity` in Antigravity,
-`hermes` in Hermes Agent), else
+`hermes` in Hermes Agent, `pi` in Pi), else
 `git config user.name`, else `user`. The default names the harness, not the
 model, since no harness tells its shell which model runs: a review by another
 model passes `--author` to read apart. A person typing `! symbion add …` in a
@@ -185,7 +185,9 @@ prints.
 A reply that lands mid-session reaches you on your next write. `add`,
 `resolve` and `supersede` end by naming, on stderr and in the summary's form,
 each entry someone else wrote or amended since your previous write, or since
-the session-start summary if that came later.
+the session-start summary if that came later. In an agent session, `commit`
+names them again: each one since the session-start summary or the session's
+previous commit, whichever came later.
 
 `add` also prints a `note:` line on stderr for the open entries already on its
 target, an id in the body that matches no entry, a catalog name stored as
@@ -224,7 +226,9 @@ store, or a tail two entries share, names no entry.
 ## Store commits
 
 `symbion commit` takes the entries this agent session wrote, under any author
-(with no session, your author's), and every changed file in the store. An edit
+(with no session, your author's), and every changed file in the store. From
+another project's tree (`--dir` from outside the store's project) it takes no
+file but the new docs those entries name, and names each file it left. An edit
 of another session's uncommitted entry brings that entry into your commit: a
 commit never holds an edit without the version it edits. Its
 commit message ends with a `Rows: claude 3` trailer naming them by author.

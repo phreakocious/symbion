@@ -159,11 +159,12 @@ def _git_user_name() -> str:
 
 def author_default() -> str:
     """The CLI rule: SYMBION_AUTHOR > "codex" if CODEX_THREAD_ID > "hermes" if
-    HERMES_AGENT > "antigravity" if ANTIGRAVITY_CONVERSATION_ID > "claude" if
-    CLAUDECODE > git user.name > "user". Each agent sets its marker in the
-    shell it runs commands in, which makes CLI attribution self-configuring.
-    Claude comes last: a Codex, a Hermes or an agy launched from a Claude Code
-    session inherits CLAUDECODE, and the innermost agent is the one writing."""
+    HERMES_AGENT > "antigravity" if ANTIGRAVITY_CONVERSATION_ID > "pi" if
+    AI_AGENT is pi > "claude" if CLAUDECODE > git user.name > "user". Each
+    agent sets its marker in the shell it runs commands in, which makes CLI
+    attribution self-configuring. Claude comes last: a Codex, a Hermes, an agy
+    or a Pi launched from a Claude Code session inherits CLAUDECODE, and the
+    innermost agent is the one writing."""
     return os.environ.get("SYMBION_AUTHOR") or shell_author()
 
 
@@ -178,6 +179,9 @@ def shell_author() -> str:
     # only its shell commands get (agy 1.4.12, 2026-10-30).
     if os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
         return "antigravity"
+    # Pi sets AI_AGENT=pi and Claude Code its own value: it names the inner one.
+    if os.environ.get("AI_AGENT") == "pi":
+        return "pi"
     if os.environ.get("CLAUDECODE"):
         return "claude"
     return _git_user_name() or "user"
@@ -186,7 +190,7 @@ def shell_author() -> str:
 def gui_author() -> str:
     """The GUI rule: SYMBION_AUTHOR > git user.name > "user", the agent
     markers (CLAUDECODE, CODEX_THREAD_ID, HERMES_AGENT,
-    ANTIGRAVITY_CONVERSATION_ID) deliberately NOT consulted.
+    ANTIGRAVITY_CONVERSATION_ID, AI_AGENT) deliberately NOT consulted.
 
     The explorer is the human's interface, so the identity is a property of
     the surface, not of the environment. `symbion serve` is launched from the
@@ -1082,7 +1086,16 @@ def undo(ctx: Ctx, note_id: str | None, *, author: str, apply: bool = True) -> d
     return store.undo(ctx.store_dir, note_id, mine, apply)
 
 
-def _docs_named(ctx: Ctx, keep) -> list[str]:
+def elsewhere(ctx: Ctx) -> bool:
+    """The store is another project's (Ctx.followed_owner), and the cwd is in
+    neither that project nor the store. A commit from there takes no file but
+    the new docs its rows name: a dogfood row's commit from another project
+    took two files a session of the store's own had changed, and its push
+    shipped them (2026-10-31)."""
+    return ctx.followed_owner and not Path.cwd().resolve().is_relative_to(ctx.store_dir)
+
+
+def docs_named(ctx: Ctx, keep) -> list[str]:
     """The docs/ files, store-relative, that the pending rows a commit takes
     name as target or ref. A name that leads out of docs/ names nothing:
     `doc:../notes.jsonl` would stage every pending row."""
@@ -1103,13 +1116,15 @@ def commit(ctx: Ctx, message: str, *, author: str | None = None,
     push hint the CLI prints works on the first try. With `author` (the
     GUI), only that author's pending rows go in, and the new docs/ files
     they name: a doc saved from the GUI had no other way in. With `everyone`,
-    every row; else the caller's own rows (store.own_rows) and every file.
+    every row and file; else the caller's own rows (store.own_rows) and every
+    file, or from another project (`elsewhere`) the new docs/ files they name.
     `wrap` marks a session's end: the message is the next session's handoff."""
     keep = (None if everyone else (lambda r: r.get("author") == author) if author
             else own_rows(ctx))
-    ok = store.commit(ctx.store_dir, message, ctx.cfg, keep=keep, files=not author,
+    named = bool(author) or (not everyone and elsewhere(ctx))
+    ok = store.commit(ctx.store_dir, message, ctx.cfg, keep=keep, files=not named,
                       wrap=(author or author_default()) if wrap else None,
-                      paths=_docs_named(ctx, keep) if author else ())
+                      paths=docs_named(ctx, keep) if named else ())
     gitref.set_upstream(ctx.store_dir)
     return ok
 
