@@ -1,13 +1,38 @@
-# symbion
+<h1 align="center">symbion</h1>
+
+<p align="center">
+  <b>A notebook and ticket registry for one project, shared by you and your coding agent.</b><br>
+  <sub>Bugs, tasks, decisions and verified results go in as dated entries, so what a session learned is still there when the next one starts.</sub>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11%2B-6c7086?labelColor=313244" alt="python 3.11+">
+  <a href="https://pypi.org/project/symbion/"><img src="https://img.shields.io/pypi/v/symbion?label=pypi&color=6c7086&labelColor=313244" alt="pypi version"></a>
+  <a href="https://github.com/phreakocious/symbion/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c7086?labelColor=313244" alt="license MIT"></a>
+  <a href="https://github.com/phreakocious/symbion/blob/main/docs/guide.md#install"><img src="https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux%20%7C%20Windows-6c7086?labelColor=313244" alt="runs on macOS, Linux and Windows"></a>
+</p>
+
+<p align="center">
+  <b>Works with</b><br>
+  <a href="https://github.com/phreakocious/symbion#install"><img src="https://img.shields.io/badge/Claude%20Code-full-a6e3a1?labelColor=313244" alt="Claude Code: full"></a>
+  <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Codex-full-a6e3a1?labelColor=313244" alt="Codex: full"></a>
+  <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Pi-full-a6e3a1?labelColor=313244" alt="Pi: full"></a>
+  <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Antigravity-no%20gotcha%20hook-f9e2af?labelColor=313244" alt="Antigravity: no gotcha hook"></a>
+  <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Hermes%20Agent-no%20hooks-cdd6f4?labelColor=313244" alt="Hermes Agent: no hooks"></a>
+  <br>
+  <sub><b>full</b>: the open entries at session start, and a file's gotchas the first time the agent touches that file. Hermes Agent gets the open entries from one line in AGENTS.md. The CLI works without any of them.</sub>
+</p>
+
+<p align="center">
+  <a href="https://symbion.nullphase.net/" title="the browser view of a real project's notebook, read-only"><b>Live demo</b></a> ·
+  <a href="https://github.com/phreakocious/symbion#install">Install</a> ·
+  <a href="https://github.com/phreakocious/symbion/blob/main/docs/guide.md">Guide</a> ·
+  <a href="https://github.com/phreakocious/symbion/blob/main/docs/reference.md">Reference</a> ·
+  <a href="https://github.com/phreakocious/symbion/blob/main/src/symbion/data/skill/SKILL.md">SKILL.md</a> ·
+  <a href="https://github.com/phreakocious/symbion/blob/main/docs/superpowers/specs/2026-09-04-symbion-design.md">Design</a>
+</p>
 
 ![symbion: a project's notebook in the browser, and `symbion list` in a terminal over it](https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/banner.png)
-
-A notebook and ticket registry for one project, shared by you and your coding
-agent. Bugs, tasks, decisions and verified results go in as dated entries, so
-what a session learned is still there when the next one starts.
-
-**[Live demo](https://symbion.nullphase.net/)**: the browser view of a real
-project's notebook, read-only.
 
 <img src="https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/session.svg" width="100%" alt="A Claude Code session: symbion's hook hands the agent the open entries; asked to work them, it fixes the bug, resolves its entry, and hands the question back.">
 
@@ -40,9 +65,6 @@ project's notebook, read-only.
   peek at any entry beside the page (`j`/`k`), and search across every store
   you serve (`⌘K`). It installs as an app. [How symbion works](https://github.com/phreakocious/symbion/blob/main/src/symbion/data/help.md),
   its help page, explains the model for a person rather than an agent.
-
-symbion works with Claude Code, Codex, Antigravity and Hermes Agent, and the
-CLI works without any of them.
 
 ## How it compares
 
