@@ -938,6 +938,19 @@ def add_many(ctx: Ctx, rows, *, author: str) -> list:
     return add_fields(ctx, [fields_from_row(ctx, r, author) for r in rows])
 
 
+def kind_losses(n: store.Note, kind: str, spec) -> list[str]:
+    """What moving `n` to `kind` (bits `spec`) drops from the head, each with its
+    value, for the CLI and the edit dialog to name; the earlier version keeps
+    them. Empty when the move drops nothing."""
+    if kind == n.kind:
+        return []
+    off = n.spec.status and not spec.status
+    return [*([f"status {n.status}"] if off and n.status else []),
+            *([f"due {n.due}"] if off and n.due else []),
+            *([f"its box on arc {n.arc_id}"] if off and n.arc_id and not n.spec.parked else []),
+            *(["its answer choices"] if n.options and kind != "question" else [])]
+
+
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
               add_refs=None, prepend_body: str | None = None, add_measurements=None,
               keep_refs: bool = False, external: bool = False, **fields) -> store.Note:

@@ -1961,8 +1961,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     sp.add_argument("--status", default=None, choices=sorted(store.STATUSES),
                     help="set the status; `resolve ID` is the usual way to close")
     sp.add_argument("--kind", default=None, metavar="KIND",
-                    help="move the entry to a kind with the same status and verdict bits; "
-                         "--kind idea parks a task")
+                    help="move the entry to a kind with the same verdict bit; --kind idea "
+                         "parks a task, --kind note drops a bug's status and due date, and "
+                         "--kind task opens a note")
     sp.add_argument("--checked", default=None,
                     help="check: correct what was checked")
     sp.add_argument("--result", default=None,
@@ -3125,7 +3126,15 @@ def _say_upstream(ctx) -> None:
 def _say_dropped(tip, note) -> None:
     """A legacy row's field its kind cannot hold leaves the head on the next
     write (store.unholdable), and only the old row keeps it: a migrated
-    store's rows lost that text from the head unseen."""
+    store's rows lost that text from the head unseen. A kind change names
+    what it drops the same way (`api.kind_losses`)."""
+    if lost := api.kind_losses(tip, note.kind, note.spec) if tip is not None else []:
+        print(f"note: the move to {note.kind!r} drops {', '.join(lost)}"
+              + (": it leaves the open views with no resolve"
+                 if "status open" in lost else "")
+              + f". Its earlier version {note.supersedes} keeps them "
+              f"(show {note.supersedes} --all --json)", file=sys.stderr)
+        return
     gone = store.unholdable(tip) if tip is not None and note.kind == tip.kind else []
     if gone:
         why = " and ".join([*(f"has no {b} bit" for b, keys in (("verdict", {"checked", "result"}),

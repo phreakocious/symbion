@@ -8262,6 +8262,27 @@ def test_a_question_changing_kind_is_told_how_to_drop_its_answers(tmp_path, caps
     assert store.heads(store.load(tmp_path))[0].kind == "idea"
 
 
+def test_a_move_off_the_status_bit_names_what_the_entry_loses(tmp_path, capsys):
+    """A bug moved to a note in place leaves the open views with no resolve,
+    and its due date and arc box go with the status (the user, 2026-11-05)."""
+    run("arc", "create", "--name", "fixes", store_dir=tmp_path)
+    arc = capsys.readouterr().out.strip()
+    run("add", "bug", "--target", "project", "--body", "b", "--due", "2026-12-01",
+        "--arc-id", arc, store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    assert run("supersede", nid, "--kind", "note", store_dir=tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert out.strip() == nid
+    assert (f"note: the move to 'note' drops status open, due 2026-12-01, its box on arc "
+            f"{arc}: it leaves the open views with no resolve") in err, err
+    assert f"Its earlier version {_earlier(tmp_path, capsys, nid)} keeps them" in err
+
+    capsys.readouterr()
+    assert run("supersede", nid, "--kind", "task", store_dir=tmp_path) == 0
+    assert "note: the move to" not in capsys.readouterr().err, "a move onto it loses nothing"
+    assert store.heads(store.load(tmp_path))[0].status == "open"
+
+
 def test_list_grep_reads_options(tmp_path, capsys):
     run("add", "question", "--target", "project", "--body", "Ship it?",
         "--option", "ship", "--option", "hold for a check", store_dir=tmp_path)

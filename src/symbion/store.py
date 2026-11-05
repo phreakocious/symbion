@@ -1299,14 +1299,25 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     if spec is None:
         raise ValueError(f"unknown kind {base['kind']!r}; this store's kinds are "
                          f"{', '.join(kinds)} (declared under [kinds] in symbion.toml)")
-    # Parked may change, so a task parks as an idea in place. Across the other
-    # bits a note became a task with no status, and a task a pre-registration
-    # with no registered run and no stamp (2026-10-14).
-    if base["kind"] != old.kind and \
-            (spec.status, spec.verdict) != (old.spec.status, old.spec.verdict):
-        raise ValueError(f"{old.kind} to {base['kind']}: a kind change keeps the status and "
-                         f"verdict bits, and these differ (`symbion schema` lists each kind's "
-                         f"bits); a different thing is a new entry")
+    # Parked may change, so a task parks as an idea in place. A task moved to
+    # a pre-registration had no registered run and no stamp (2026-10-14), so
+    # the verdict bit stays, and on a verdict kind the status bit too. Off
+    # verdict kinds the status bit may change (the user, 2026-11-05): gaining it
+    # opens the entry, and losing it drops status and due, which the kept
+    # version holds and the CLI names.
+    if base["kind"] != old.kind:
+        if spec.verdict != old.spec.verdict or \
+                (spec.verdict and spec.status != old.spec.status):
+            raise ValueError(f"{old.kind} to {base['kind']}: a kind change keeps the verdict "
+                             f"bit, and on a verdict kind the status bit, and these differ "
+                             f"(`symbion schema` lists each kind's bits); a different thing "
+                             f"is a new entry")
+        if spec.status and not old.spec.status and base.get("status") is None:
+            base["status"] = "open"
+        if old.spec.status and not spec.status:
+            for key in ("status", "due"):
+                if key not in fields:
+                    base[key] = None
     if spec.status and spec.verdict:
         if prepend_body is not None:
             raise ValueError(f"{old.id} is a pre-registration: its registered text stays on "
@@ -1336,8 +1347,9 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     # from the new row rather than refused with a message naming flags the
     # caller never passed (measured 2026-09-22: a `checked` on a `note` blocked
     # every later supersede). The same field passed in `fields` still refuses,
-    # and so does a KIND CHANGE that would shed a field: that is not a legacy
-    # row, it is the caller moving a row somewhere its fields do not fit.
+    # and so does a KIND CHANGE that would shed any field but status and due:
+    # that is not a legacy row, it is the caller moving a row somewhere its
+    # fields do not fit.
     dropped = [k for k in unholdable(old) if k not in fields] if base["kind"] == old.kind else []
     for key in dropped:
         base[key] = None

@@ -488,6 +488,12 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     ui.page_title(f"{name} · {page} · symbion")
     ui.add_head_html(f'<meta name="description" content="{ABOUT}">'
                      f'<meta property="og:description" content="{ABOUT}">')
+    # A shared demo link previewed as the store's page title with no image
+    # (the demo home review, 2026-11-05); a serve of your own is never previewed.
+    if S.read_only():
+        ui.add_head_html('<meta property="og:title" content="symbion: live demo">'
+                         f'<meta property="og:image" content="{BANNER}">'
+                         '<meta name="twitter:card" content="summary_large_image">')
     js_page = json.dumps(page).replace("<", "\\u003c")   # a search is in it: no </script>
     ui.add_head_html('<script>if (matchMedia("(display-mode: tabbed)").matches) '
                      f'document.title = {js_page}</script>')
@@ -560,8 +566,10 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                 # and where to get it (the spec, 2026-10-22).
                 with ui.row(wrap=False).classes("items-center gap-1 text-body sb-demo") \
                         .mark("demo-banner"):
-                    ui.label("read-only demo of")
-                    ui.link(f"symbion {metadata.version('symbion')}", source_href("banner"),
+                    # The link named a version and read as a label: few visitors
+                    # clicked it (2026-11-05). The sidebar's foot keeps the version.
+                    ui.label("read-only demo ·")
+                    ui.link("symbion on GitHub", source_href("banner"),
                             new_tab=True).mark("demo-link")
             # Left of New entry, so that button stays put as these come and go
             # (the user, 2026-10-02).
@@ -868,6 +876,7 @@ def _help(ctx) -> None:
 
 
 SOURCE = "https://github.com/phreakocious/symbion"
+BANNER = "https://raw.githubusercontent.com/phreakocious/symbion/main/docs/images/banner.png"
 
 
 def source_href(link: str) -> str:

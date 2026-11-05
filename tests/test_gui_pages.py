@@ -2517,15 +2517,31 @@ async def test_a_read_only_page_says_so_and_links_the_readme(user: User, ctx_wit
     """A visitor who lands on the public demo from a link learns what they
     see and where to get it, and no badge says they write (the spec,
     2026-10-22)."""
+    await user.open("/")
+    await user.should_not_see(marker="demo-intro")       # a serve of your own: no intro
+    assert 'property="og:title"' not in user._client.head_html
     monkeypatch.setenv("SYMBION_READ_ONLY", "1")
     await user.open("/")
-    await user.should_see("read-only demo of")
+    # A shared demo link previews as the demo, with the repo's banner.
+    head = user._client.head_html
+    assert '<meta property="og:title" content="symbion: live demo">' in head
+    assert 'property="og:image" content="https://raw.githubusercontent.com/' in head
+    await user.should_see("read-only demo")
+    # A visitor from a social post lands on the demo before the README, and most
+    # left from the summary alone: it opens with what symbion is and what this
+    # store is (the user, 2026-11-05).
+    await user.should_see("symbion is a notebook and ticket registry")
+    name = build_page.__globals__["store_name"](ctx_with_notes)
+    await user.should_see(f"This is {name}'s store")
     # Each link to the source goes by /go/github, which 302s to the readme: the
     # demo's access log then counts clicks out, and names the link (the user,
     # 2026-11-03). /go/github itself is in test_gui_serve.py.
     hrefs = {m: next(iter(user.find(marker=m).elements)).props["href"]
-             for m in ("demo-link", "source")}
-    assert hrefs == {"demo-link": "/go/github?from=banner", "source": "/go/github?from=sidebar"}
+             for m in ("demo-link", "demo-intro-link", "source")}
+    assert hrefs == {"demo-link": "/go/github?from=banner",
+                     "demo-intro-link": "/go/github?from=intro",
+                     "source": "/go/github?from=sidebar"}
+    assert next(iter(user.find(marker="demo-link").elements)).text == "symbion on GitHub"
     assert 'href="/go/github?from=noscript"' in user._client.body_html
     await user.should_see("viewing as ada")
     await user.should_not_see("writing as ada")

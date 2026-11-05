@@ -87,7 +87,11 @@ notices say demo. Every page draws as it does without it, with every control.
 - **The flag reaches every process of the serve**, the `--reload` worker included.
 - **A banner.** One line in the top bar says the page is a read-only demo of symbion,
   names the symbion version it runs, and links to the README on GitHub. A visitor who lands from a link learns what
-  they see and how to get it.
+  they see and how to get it. *Amended 2026-11-05, at the user's word: visitors from a
+  social post landed on the demo before the README, and most left from the summary
+  alone; the version link read as a label and few clicked it. The banner's link now
+  reads "symbion on GitHub", the sidebar's foot keeps the version, and the summary
+  opens with an intro card: what symbion is, what this store is, and a link out.*
 - **Controls that draw only with something to act on stay as they are.** Commit,
   push and undo draw only with pending rows, unpushed commits or an undo level; seed
   only for an arc over a cataloged type. A clean snapshot has none, and the page

@@ -1324,8 +1324,8 @@ def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
              "canonicalize_names", "canonicalize_rows", "check_arc", "check_arc_targets",
              "check_measurements", "check_name", "check_options", "check_refs",
              "check_target", "docs_named", "elsewhere", "fields_from_row", "free_doc_name", "gui_author",
-             "harvest_hashtags", "harvest_kind", "kind_as_type", "known_files", "no_arc",
-             "object_path", "own_rows", "resolve", "seed_names",
+             "harvest_hashtags", "harvest_kind", "kind_as_type", "kind_losses", "known_files",
+             "no_arc", "object_path", "own_rows", "resolve", "seed_names",
              "rewritten_words", "shell_author", "verdict_state", "why_unverifiable"}
     public = {n for n, f in vars(api).items() if callable(f) and not n.startswith("_")
               and getattr(f, "__module__", None) == "symbion.api"}

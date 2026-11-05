@@ -268,7 +268,9 @@ def test_supersede_with_a_new_kind_that_cannot_hold_the_merged_fields_is_refused
     must be the one checked, not what it WAS."""
     b = store.add(tmp_path, kind="bug", target={"type": "project", "name": None})
     with pytest.raises(ValueError, match="status"):
-        store.supersede(tmp_path, b.id, kind="note")
+        store.supersede(tmp_path, b.id, kind="note", status="open")
+    with pytest.raises(ValueError, match="due"):
+        store.supersede(tmp_path, b.id, kind="note", due="2026-12-01")
 
 
 def test_supersede_with_a_new_kind_that_can_hold_the_merged_fields_succeeds(tmp_path):
@@ -279,19 +281,36 @@ def test_supersede_with_a_new_kind_that_can_hold_the_merged_fields_succeeds(tmp_
     assert (t.kind, t.status) == ("task", "open")
 
 
-def test_a_kind_change_keeps_the_status_and_verdict_bits(tmp_path):
-    """A note moved to task landed with no status, and a task moved to
-    prediction landed with no registered run and no stamp: rows `add` refuses
-    (2026-10-14). The parked bit may change, so a task parks as an idea in
-    place; status and verdict may not."""
+def test_a_kind_change_keeps_the_verdict_bit(tmp_path):
+    """A task moved to prediction landed with no registered run and no stamp,
+    a row `add` refuses (2026-10-14). On a verdict kind the status bit stays
+    too: a pending prediction is no check. The parked bit may change, so a
+    task parks as an idea in place."""
     P = {"type": "project", "name": None}
     t = store.add(tmp_path, kind="task", target=P)
-    n = store.add(tmp_path, kind="note", target=P)
-    for nid, kind in [(n.id, "task"), (t.id, "prediction"), (t.id, "note")]:
-        with pytest.raises(ValueError, match="status and verdict bits"):
+    p = store.add(tmp_path, kind="prediction", target=P)
+    c = store.add(tmp_path, kind="check", target=P)
+    for nid, kind in [(t.id, "prediction"), (t.id, "check"), (p.id, "check"),
+                      (c.id, "prediction"), (c.id, "note")]:
+        with pytest.raises(ValueError, match="verdict bit"):
             store.supersede(tmp_path, nid, kind=kind)
     assert store.supersede(tmp_path, t.id, kind="idea").kind == "idea"
-    assert store.supersede(tmp_path, n.id, kind="decision").kind == "decision"
+
+
+def test_a_kind_change_across_the_status_bit_opens_or_drops_the_status(tmp_path):
+    """A bug that turned out to be a lasting fact moves to a note in place (the
+    user, 2026-11-05). Gaining the status bit opens the entry; losing it drops
+    the status and the due date, and the earlier version keeps them."""
+    b = store.add(tmp_path, kind="bug", target={"type": "project", "name": None},
+                  due="2026-12-01")
+    n = store.supersede(tmp_path, b.id, kind="note")
+    assert (n.kind, n.status, n.due) == ("note", None, None)
+    kept = {x.id: x for x in store.load(tmp_path)}[n.supersedes]
+    assert (kept.status, kept.due) == ("open", "2026-12-01")
+    t = store.supersede(tmp_path, n.id, kind="task")
+    assert (t.kind, t.status) == ("task", "open")
+    store.supersede(tmp_path, t.id, kind="decision")
+    assert store.supersede(tmp_path, t.id, kind="bug", status="resolved").status == "resolved"
 
 
 def test_supersede_to_an_undeclared_kind_names_the_kinds_table(tmp_path):

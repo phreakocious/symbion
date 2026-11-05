@@ -1334,6 +1334,32 @@ async def test_a_picked_date_fills_the_due_field(user: User, repo, tmp_path):
     assert store.heads(store.load(tmp_path))[0].due == "2026-11-01"
 
 
+async def test_the_edit_dialog_moves_a_kind_and_names_what_the_move_drops(user: User, repo,
+                                                                         tmp_path):
+    """Only the CLI could change a kind (a user, 2026-11-05). The select offers
+    the kinds the store allows, so no verdict kind for a bug, and names what
+    the move drops before the save."""
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "bug", "target": {"type": "project", "name": None},
+                  "body": "b", "due": "2026-12-01"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, store.heads(store.load(tmp_path))[0], lambda: None, author="ada")
+
+    await user.open("/t")
+    part(user, "note-edit").click()
+    await user.should_see(marker="edit-kind")
+    pick = user.find(marker="edit-kind").elements.pop()
+    assert {"task", "note", "idea"} <= set(pick.options)
+    assert not {"check", "prediction"} & set(pick.options)
+    pick.set_value("note")
+    await user.should_see("the move drops status open, due 2026-12-01")
+    user.find(marker="edit-save").click()
+    head = store.heads(store.load(tmp_path))[0]
+    assert (head.kind, head.status, head.due) == ("note", None, None)
+
+
 async def test_edit_dialog_offers_due_only_on_a_status_kind(user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},

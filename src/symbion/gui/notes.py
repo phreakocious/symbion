@@ -1426,9 +1426,26 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
         arc = ui.select(arc_options(ctx), value=n.arc_id or "",
                              label="arc").props("dense outlined") \
             .classes("w-full").mark("edit-arc")
+        # The kinds the store lets this entry move to, and what the move
+        # drops, named before the save (a user, 2026-11-05): only the CLI
+        # could change a kind.
+        movable = [k for k, s in ctx.kinds.items() if s.verdict == n.spec.verdict
+                   and (not s.verdict or s.status == n.spec.status)]
+        kind = None
+        if len(movable) > 1:
+            kind = ui.select(movable, value=n.kind, label="kind") \
+                .props("dense outlined").classes("w-full").mark("edit-kind")
+
+            def drops(k):
+                lost = api.kind_losses(n, k, ctx.kinds[k])
+                return f"the move drops {', '.join(lost)}; its earlier version keeps them" \
+                    if lost else ""
+            ui.label().classes("text-muted text-xs").mark("edit-kind-drops") \
+                .bind_text_from(kind, "value", drops) \
+                .bind_visibility_from(kind, "value", lambda k: bool(drops(k)))  # no empty gap
         # A verdict is the part `list` prints and queries, so a typo in it is
         # the one thing the body edit above cannot reach. Rendered only on a
-        # verdict kind: the edited row's kind is fixed, so this needs no
+        # verdict kind: an edit never changes the verdict bit, so this needs no
         # visibility binding the way add_form's kind select does.
         # Text, not a native date input: that cannot hold a datetime, so it
         # would render empty and the next save would clear the date.
@@ -1499,13 +1516,16 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             gone = [t for t in n.tags if t not in final]
             kept = [t for t in tip.tags if t not in gone]
             arc_v = arc.value or None
+            kinded = {"kind": kind.value} if kind is not None and kind.value != n.kind else {}
+            if kinded and n.options and kind.value != "question":
+                kinded["options"] = None            # named under the select
             if demo_says("saves the edit"):
                 return
             try:
                 api.supersede(ctx, n.id, author=author, **text,
                               tags=kept + [t for t in final if t not in n.tags and t not in kept],
                               arc_id=arc_v if arc_v != n.arc_id else tip.arc_id,
-                              **verdict, **closing, **dated, **on)
+                              **verdict, **closing, **dated, **on, **kinded)
             except (ValueError, catalog.CatalogError) as e:    # a closed catalog's refusal
                 ui.notify(str(e), type="negative")
                 return

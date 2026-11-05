@@ -1,6 +1,6 @@
 [project]
 name = "symbion"
-version = "0.14.0"
+version = "0.14.1"
 description = "A ticket queue your coding agent keeps: each new Claude Code, Codex or Hermes session starts with the open bugs, tasks and questions. Plain JSONL in a git repo beside yours. No server, no MCP."
 keywords = ["claude-code", "codex", "hermes", "agent-memory", "ai-agents", "issue-tracker", "session-handoff", "context", "jsonl", "git"]
 readme = "README.md"

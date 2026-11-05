@@ -66,6 +66,59 @@
   you serve (`⌘K`). It installs as an app. [How symbion works](https://github.com/phreakocious/symbion/blob/main/src/symbion/data/help.md),
   its help page, explains the model for a person rather than an agent.
 
+## Install
+
+> [!TIP]
+> **Claude Code**, in a session in your project:
+>
+> ```
+> /plugin install symbion --marketplace phreakocious/symbion
+> /symbion:setup
+> ```
+>
+> **Pi**, then `/symbion-setup` in a new `pi` session:
+>
+> ```bash
+> pi install git:github.com/phreakocious/symbion
+> ```
+>
+> **Antigravity**, then `/symbion:setup` in a new `agy` session:
+>
+> ```bash
+> pipx install 'symbion[gui]'
+> agy plugin install https://github.com/phreakocious/symbion/tree/main/plugin
+> ```
+>
+> **Codex**, from your project's root, once `AGENTS.md` has the line
+> `- We use symbion for durable notes and tickets.` Trust symbion's hooks at
+> `/hooks` in the first session:
+>
+> ```bash
+> pipx install 'symbion[gui]'
+> symbion init --agent codex --yes
+> codex --add-dir "../$(basename "$PWD")-notes"
+> ```
+>
+> **Hermes Agent**, from your project's root, then the two lines the
+> [guide](https://github.com/phreakocious/symbion/blob/main/docs/guide.md#adopt-in-a-fresh-repo)
+> gives for `AGENTS.md`:
+>
+> ```bash
+> pipx install 'symbion[gui]'
+> symbion init --agent hermes --yes
+> ```
+>
+> **The CLI alone**: `pipx install 'symbion[gui]'`, then `symbion init --yes` in
+> your project.
+
+The setup command installs the `symbion` CLI if it is missing, creates the
+project's store and brings in its open threads: TODO files, handoff notes, an
+agent's memory. It says what each step writes and where, and asks before the
+install and again before it brings anything in. Then it starts the web page on
+your project's notebook and gives you its address. The plugin carries no copy
+of the skill: its hooks and skill run the installed CLI's own, so the two
+always match.
+
 ## How it compares
 
 - **Claude Code's memory.** Keep it on: the two do different jobs. Memory
@@ -80,22 +133,6 @@
 - **Memory tools.** symbion runs no model: no API key, no embeddings, no cost
   per write. Nothing leaves the machine until you push the store. It is a
   ticket queue the agent keeps, and each new session reads it first.
-
-## Install
-
-In Claude Code, from your project:
-
-```
-/plugin install symbion --marketplace phreakocious/symbion
-/symbion:setup
-```
-
-`/symbion:setup` installs the `symbion` CLI, creates the project's store and
-brings in its open threads: TODO files, handoff notes, Claude Code's memory. It
-says what each step writes and where, and asks before the install and again
-before it brings anything in. Then it starts the web page on your project's
-notebook and gives you its address. The plugin carries no copy of the skill: its hooks and skill run the
-installed CLI's own, so the two always match.
 
 ## Codex, Antigravity, Pi, Hermes Agent, or the CLI alone
 

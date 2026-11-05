@@ -19,7 +19,7 @@ from .. import term as T
 from .. import store as S
 from .. import summary as summ
 from . import arcs, diffview, filters, palette, servers, treemap
-from .chrome import SOURCE, shell, store_name
+from .chrome import ABOUT, SOURCE, shell, source_href, store_name
 from .notes import (NoteMarkdown, ago, commit_meta, demo_says, file_buttons, forge_buttons,
                     history, link_ids,
                     kind_class, read_only_refused, reading, refusal_shown, render_note,
@@ -401,6 +401,21 @@ def build_page(ctx, *, author: str) -> None:
                                                or S.read_status(n) == "open"
                                                or "priority" in n.tags], git_head)
         with ui.column().classes("sb-main gap-5"):
+            if S.read_only():
+                # A visitor from a social post lands here before the README, and
+                # most left from this page alone: it says what symbion is and what
+                # this store is, with no click (the user, 2026-11-05).
+                with ui.card().classes("bg-panel w-full gap-3").mark("demo-intro"):
+                    ui.label(f"{ABOUT} Each new agent session starts with what is open, "
+                             f"from plain JSONL in a git repo beside yours.") \
+                        .classes("text-emph")
+                    ui.label(f"This is {store_name(ctx)}'s store, as its agents and owner "
+                             f"keep it. You see what its owner sees; nothing you click "
+                             f"here writes.").classes("text-body")
+                    ui.button("symbion on GitHub", icon="open_in_new") \
+                        .props(f'unelevated dense no-caps color=primary '
+                               f'href="{source_href("intro")}" target=_blank') \
+                        .classes("px-3 self-start").mark("demo-intro-link")
             # Read-only, the page is public: the store's name, not its path there.
             where = store_name(ctx) if S.read_only() else ctx.store_dir
             ui.label(f"{summ._count(len(heads), 'entry')} · {where}") \
