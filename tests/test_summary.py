@@ -1275,3 +1275,38 @@ def test_a_cycled_chain_cited_by_an_open_question_keeps_the_summary(tmp_path):
                   status="open")
     assert "question" in summary.summary(tmp_path, cfg)["open"]
     assert summary.links(store.load(tmp_path), q) == []
+
+
+def _phased(tmp_path, moves):
+    """An arc with phases next, doing, review and a box per (phase) in moves; the arc."""
+    a = store.create_arc(tmp_path, "board", "", "item")
+    store.set_phases(tmp_path, a.id, ["next", "doing", "review"])
+    for i, ph in enumerate(moves):
+        n = store.add(tmp_path, kind="task", target={"type": "item", "name": f"t{i}"},
+                      arc_id=a.id)
+        if ph:
+            store.move_box(tmp_path, n.id, phase=ph, author="user")
+    return a
+
+
+def test_summary_arc_line_shows_phase_counts_past_the_first(tmp_path):
+    cfg = Config(project_root=tmp_path)
+    _phased(tmp_path, [None, "review", "review"])        # `doing` holds none: left out
+    d = summary.summary(tmp_path, cfg)
+    assert d["arcs"][0]["phases"] == [["review", 2]]
+    assert "0/3" in (line := next(l for l in summary.render_summary(d).splitlines()
+                                  if "board" in l))
+    assert line.endswith("board  review 2"), line
+
+
+def test_summary_arc_line_without_phases_is_unchanged(tmp_path):
+    cfg = Config(project_root=tmp_path)
+    a = store.create_arc(tmp_path, "flat", "", "item")
+    store.add(tmp_path, kind="task", target={"type": "item", "name": "t"}, arc_id=a.id)
+    d = summary.summary(tmp_path, cfg)
+    assert "phases" not in d["arcs"][0]
+    assert next(l for l in summary.render_summary(d).splitlines()
+                if "flat" in l).endswith("flat")
+    _phased(tmp_path, [None, None])               # all in the first phase: no counts either
+    d = summary.summary(tmp_path, cfg)
+    assert next(r for r in d["arcs"] if r["name"] == "board")["phases"] == []

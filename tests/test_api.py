@@ -354,6 +354,7 @@ _NON_WRITERS = {
     "archive_arc",  # ditto
     "unarchive_arc",  # ditto
     "describe_arc",   # ditto
+    "set_phases",     # ditto
     "commit",            # writes git, not a note
     "own_rows",          # a read: which pending rows `commit` would take
     "docs_named",        # a read: which docs/ files those rows name
@@ -416,6 +417,8 @@ def test_every_write_requires_author_by_keyword(repo, tmp_path):
         (api.rename_target,   (ctx, "item", "old", "new")),
         (api.retype,          (ctx, "file", "item")),
         (api.undo,            (ctx, "someid")),
+        (api.move_box,        (ctx, "someid")),
+        (api.reopen_and_place, (ctx, "someid")),
     ]
     assert sorted(fn.__name__ for fn, _ in cases) == sorted(writers), \
         "cases must cover every author-required writer api.py actually has"
@@ -1312,7 +1315,7 @@ def test_supersede_judges_a_given_options_list(repo, tmp_path):
 # Every api function that writes. test_gui_seam imports it.
 WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
           "rename_arc", "archive_arc", "unarchive_arc", "describe_arc", "undo", "commit",
-          "push", "pull", "sync",
+          "push", "pull", "sync", "set_phases", "move_box", "reopen_and_place",
           "rename_target", "retype"}
 
 
@@ -1358,6 +1361,9 @@ def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
         "archive_arc": lambda: api.archive_arc(ctx, arc.id),
         "unarchive_arc": lambda: api.unarchive_arc(ctx, arc.id),
         "describe_arc": lambda: api.describe_arc(ctx, arc.id, "e"),
+        "set_phases": lambda: api.set_phases(ctx, arc.id, ["next"]),
+        "move_box": lambda: api.move_box(ctx, t.id, top=True, author="ada"),
+        "reopen_and_place": lambda: api.reopen_and_place(ctx, t.id, top=True, author="ada"),
         "undo": lambda: api.undo(ctx, None, author="ada", apply=False),
         "commit": lambda: api.commit(ctx, "m"),
         "push": lambda: api.push(ctx, capture=True),

@@ -391,18 +391,21 @@ async def test_a_cited_entry_that_is_resolved_reads_struck(user: User, repo, tmp
     """The user, 2026-10-16: a link to a resolved entry is struck through,
     as a done item is. Its title says the word, so the strike is not the only
     sign. An open entry's link stays plain; a cite of an earlier version
-    reads as its entry does now."""
+    reads as its entry does now. Every title is the entry's kind, status and
+    first words (the design critique, 2026-11-07)."""
     ctx = api.resolve(str(tmp_path))
 
     def task(body):
         return api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
                              "body": body}, author="ada").id
     done, still, moved = task("done one"), task("still open"), task("edited, then done")
+    quoted = task('say "hi" \\ there')          # a title is quoted markdown: escaped
     api.supersede(ctx, done, author="sam", status="resolved")
     earlier = api.supersede(ctx, moved, author="sam", body="edited").supersedes
     api.supersede(ctx, moved, author="sam", status="resolved")
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
-                      "body": f"see {done[-10:]}, {still[-10:]} and {earlier}"}, author="ada")
+                      "body": f"see {done[-10:]}, {still[-10:]}, {quoted[-10:]} and {earlier}"},
+                author="ada")
 
     @ui.page("/t")
     def page():
@@ -411,9 +414,13 @@ async def test_a_cited_entry_that_is_resolved_reads_struck(user: User, repo, tmp
     await user.open("/t")
     (html,) = bodies(user)
     anchors = dict(re.findall(r'<a href="/notes\?id=([^"]+)"([^>]*>.*?)</a>', html))
-    assert anchors[done] == f' title="resolved"><s>{done[-10:]}</s>', html
-    assert anchors[earlier] == f' title="resolved"><s>{earlier}</s>', html
-    assert anchors[still] == f">{still[-10:]}", html
+
+    def tip(t):    # the GUI's own tip, not the browser's slow title (the user, 2026-11-07)
+        return f' data-tip="{t}" aria-description="{t}">'
+    assert anchors[done] == tip("task · resolved · done one") + f"<s>{done[-10:]}</s>", html
+    assert anchors[earlier] == tip("task · resolved · edited") + f"<s>{earlier}</s>", html
+    assert anchors[still] == tip("task · open · still open") + still[-10:], html
+    assert anchors[quoted] == tip("task · open · say &quot;hi&quot; \\ there") + quoted[-10:], html
 
 
 async def test_a_tag_in_a_body_prints_as_text(user: User, repo, tmp_path):
@@ -539,7 +546,9 @@ async def test_a_commit_chip_names_its_subject_on_hover(user: User, repo, tmp_pa
         p.hover()
     assert (tips("note-target"), tips("note-ref")) == \
         (["c1"], ["c0", "not a commit in this checkout"])
-    assert ':data-tip-key="c.key" @mouseenter="ask(c, i)">{{ c.t }}</a>' in template()
+    # Asked on focus too: a tip held facts no keyboard reached (the GUI review, 2026-11-07).
+    assert ':data-tip-key="c.key" @mouseenter="ask(c, i)" @focus="ask(c, i)">{{ c.t }}</a>' \
+        in template()
 
 
 async def test_a_card_does_only_what_it_offers(user: User, repo, tmp_path):
@@ -894,6 +903,9 @@ async def test_edit_dialog_hides_the_verdict_fields_on_a_non_check(
     part(user, "note-edit").click()
     await user.should_see(marker="edit-body")
     await user.should_not_see(marker="edit-checked")
+    # the head is a label; the sentence under it is no uppercase label
+    (what,) = user.find(marker="edit-what").elements
+    assert what.text == "Its earlier version is kept." and "sb-stat-label" not in what.classes
 
 
 PREREG = ('[kinds]\nprediction = { status = true, verdict = true }\n'
@@ -1110,6 +1122,110 @@ async def test_the_edit_dialog_adds_text_after_the_body(user: User, repo, tmp_pa
                       "body": "first"}, author="ada")
     head = await _append_in_dialog(user, ctx, n, "more #ux", keys=True)
     assert (head.body, list(head.tags)) == ("first\n\nmore", ["ux"])
+
+
+async def test_an_edit_closed_unsaved_is_kept_until_a_save_or_a_discard(user: User, repo,
+                                                                         tmp_path):
+    """A click outside the edit dialog, or Esc, closed it and dropped what was
+    typed (the GUI review, 2026-11-07). The text comes back when the dialog
+    opens again, as the composer's draft does, and a save or a discard ends it."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "frist"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    def field(marker):
+        return user.find(marker=marker).elements.pop()
+
+    async def reopen():
+        part(user, "note-edit").click()
+        await user.should_see(marker="edit-append")
+
+    await user.open("/t")
+    await reopen()
+    await user.should_not_see(marker="edit-kept")
+    field("edit-body").set_value("first")
+    user.find(marker="edit-append").type("half a thought")
+    field("edit-dialog").close()
+    await reopen()
+    assert (field("edit-body").value, field("edit-append").value) == ("first", "half a thought")
+    await user.should_see(marker="edit-kept")
+    user.find(marker="edit-discard").click()
+    assert (field("edit-body").value, field("edit-append").value) == ("frist", "")
+    await user.should_not_see(marker="edit-kept")
+    field("edit-dialog").close()
+    await reopen()
+    assert field("edit-append").value == "", "a discard ends the draft"
+    user.find(marker="edit-append").type("the rest")
+    field("edit-dialog").close()
+    await reopen()
+    user.find(marker="edit-save").click()
+    assert store.chain_tip(store.load(tmp_path), n.id).body == "frist\n\nthe rest"
+    await reopen()
+    assert field("edit-append").value == "", "a save ends the draft"
+
+
+async def test_a_resolved_entry_reopens_from_its_edit_dialog(user: User, repo, tmp_path):
+    """Only an arc's box reopened, and undo reaches the last write alone: a
+    resolve found wrong a day later took the CLI (the GUI review,
+    2026-11-07). A prediction, which closes with its result, has no reopen."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "bug", "target": {"type": "project", "name": None},
+                      "body": "b", "status": "resolved"}, author="ada")
+    p = api.add(ctx, {"kind": "prediction", "target": {"type": "project", "name": None},
+                      "body": "p", "checked": "c"}, author="ada")
+    p = api.supersede(ctx, p.id, author="ada", status="resolved", result="held")
+
+    @ui.page("/t")
+    def page():
+        for e in (n, p):
+            render_note(ctx, store.chain_tip(store.load(tmp_path), e.id), lambda: None,
+                        author="ada")
+
+    await user.open("/t")
+    parts(user, "note-edit")[0].click()
+    await user.should_see(marker="edit-reopen")
+    await user.should_not_see(marker="edit-resolve")
+    user.find(marker="edit-reopen").elements.pop().value = True
+    user.find(marker="edit-save").click()
+    assert store.read_status(store.chain_tip(store.load(tmp_path), n.id)) == "open"
+    await user.open("/t")
+    parts(user, "note-edit")[1].click()
+    await user.should_see(marker="edit-result")
+    await user.should_not_see(marker="edit-reopen")
+
+
+async def test_a_kept_body_edit_never_writes_over_a_body_changed_since(user: User, repo,
+                                                                     tmp_path):
+    """The kept body was an edit of the body as it then read. Saved over a
+    body someone changed since, it would have written over their change: the
+    save refuses it, as a body changed while the dialog is open is refused."""
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "first"}, author="ada")
+
+    @ui.page("/t")
+    def page():                     # the entry as it is now, as a page draws it
+        render_note(ctx, store.chain_tip(store.load(tmp_path), n.id), lambda: None,
+                    author="ada")
+
+    await user.open("/t")
+    part(user, "note-edit").click()
+    await user.should_see(marker="edit-body")
+    user.find(marker="edit-body").elements.pop().set_value("rewritten by ada")
+    user.find(marker="edit-dialog").elements.pop().close()
+    api.supersede(ctx, n.id, author="claude", append_body="the agent's addition")
+    await user.open("/t")           # a reload: the tab keeps the draft
+    part(user, "note-edit").click()
+    await user.should_see(marker="edit-body")
+    assert user.find(marker="edit-body").elements.pop().value == "rewritten by ada"
+    user.find(marker="edit-save").click()
+    assert user.notify.contains("changed since this dialog opened"), user.notify.messages
+    head = store.chain_tip(store.load(tmp_path), n.id)
+    assert head.body == "first\n\nthe agent's addition", head.body
 
 
 async def test_the_added_text_lands_after_a_revision_made_meanwhile(user: User, repo,

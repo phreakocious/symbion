@@ -149,8 +149,8 @@ session start the hook gives the agent `symbion summary` and shows you one line 
 entry and, while `symbion serve` runs, its address. The gotcha hook runs
 `gotchas.sh` after each Read, Edit, Write, NotebookEdit and Bash call, failed
 calls included (a Bash command that exits non-zero is one): the first time a
-session's call names a file that an entry tagged `gotcha` is on, and again the
-first time it edits that file, the agent
+session's call names a file that an entry tagged `gotcha` is on, a symbion
+command aside, and again the first time it edits that file, the agent
 gets that entry's lead, its age, how many commits have changed the file since,
 and the command that retires it: a gotcha has no status, and the agent in
 the file is the one placed to judge whether it still holds. It reads a list
@@ -260,7 +260,7 @@ print as plain text, and the PowerShell hook prints all of it that way.
 | `symbion: open outside arcs: bug 0, task 0, question 0, prediction 0` (`; N open in arcs` when arcs hold any, `; N parked` when any open entry is parked), then a line per arc and the open entries | working |
 | `symbion --dir ../other-notes: open outside arcs: …` | working, on a store this repo's tree does not name (`--dir`, `SYMBION_DIR`, or a cwd inside a store); the header names it, so two summaries in one session can be told apart |
 | either, then `  N entries not yet in the store's git (symbion commit)` | working; `/symbion:wrap` at session end commits them |
-| either, then `… (symbion commit --all once their session has ended)` | the entries are another session's, and `symbion commit` takes only yours: `--all` takes them once that session has ended |
+| either, then `… (symbion commit --all once their session has ended, the newest written 2h ago)` | the entries are another session's, and `symbion commit` takes only yours: `--all` takes them once that session has ended. The age is the only clue to whether it has: an idle session that is still open writes nothing either |
 | `symbion: cannot read store at … because 'symbion' is not on PATH` | see [Install](#install) |
 | `symbion: this project has a symbion store, but the symbion CLI is not installed or does not run: run /symbion:setup.` | the plugin's hook, with no `symbion` that runs: `/symbion:setup` installs it. In Antigravity the line ends `see Install at https://github.com/phreakocious/symbion` |
 | `symbion: no store at …; run \`symbion init\`` | no store yet, or `.symbion`/`SYMBION_DIR` names a missing path |
@@ -322,6 +322,15 @@ symbion arc todo "$aid" --json      # open items
 symbion resolve <id>                # tick one: <id> reads resolved, its open version kept under a new id
 symbion arc list                    # done/total per arc
 symbion list --arc "$aid" --json    # every item, resolved included
+```
+
+**An arc is a board too.** `arc phases` names its columns, left to right.
+Each open box sits in one column, and the resolved boxes sit in done. `arc
+move` moves a box, and `arc todo` lists the open boxes in board order:
+
+```bash
+symbion arc phases "$aid" todo doing review   # no names clears them
+symbion arc move <id> --phase doing           # --top, --before ID or --after ID place it in its column
 ```
 
 **End a session with `/symbion:wrap`.** Writes never commit, so a git failure
@@ -491,7 +500,10 @@ to an entry stays good (`serve` prints it, and `--port` picks another). It has:
   or its text goes in at the cursor;
 - a page per note: a rule in its body marks where each amendment joined it,
   with who added it and when, and its earlier versions show an edit as a
-  diff; a tag index, and arc checklists you tick;
+  diff; a tag index;
+- an arc's page, as a checklist you tick or as a board: drag a box to another
+  column or along one, or move it with its arrows. A drop on done resolves the
+  box, and a drag out of done reopens it. Edit arc sets the columns;
 - commit and push buttons, shown while there is something to commit or push.
   The commit button takes only the entries written as you, and the `docs/`
   files they name, so an agent's pending entries stay for it to commit. In a

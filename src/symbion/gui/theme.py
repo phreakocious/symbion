@@ -17,6 +17,7 @@ dashboard's.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import atan2, cos, degrees, hypot, radians, sin
 from pathlib import Path
 
 from pygments.formatters import HtmlFormatter
@@ -151,6 +152,22 @@ body.body--dark { color: var(--q-emph) !important; font-size: 14px; }
    top bar moved half a scrollbar between pages, wherever one takes room */
 html { scrollbar-gutter: stable; }
 .q-page { padding: 0 !important; }
+/* a title's h1 or h2 looks as its own class says (notes.heading) */
+.sb-h { margin: 0; font-size: inherit; font-weight: inherit; line-height: inherit;
+        letter-spacing: inherit; }
+.sb-h > a.sb-board-title { display: inline-block; }   /* ::first-letter needs a block */
+/* an active filter on /notes: its × takes off that one */
+.sb-filter-chip { gap: 4px; padding-right: 4px; }
+.sb-filter-chip .sb-filter-x { font-size: 14px; }
+/* the first stop on every page, shown on focus; it lands on .sb-start */
+.sb-skip { position: absolute; left: 8px; top: 8px; z-index: 10; padding: 2px 10px;
+           background: var(--q-panel); border: 1px solid var(--q-border); border-radius: 7px;
+           color: var(--q-emph); font: 11px/1.5 var(--mono); transform: translateY(-300%); }
+.sb-skip:focus { transform: none; }
+.sb-start { position: absolute; width: 1px; height: 1px; outline: none; }
+/* read by a screen reader, drawn nowhere */
+.sb-sr { position: absolute; width: 1px; height: 1px; overflow: hidden;
+         clip-path: inset(50%); white-space: nowrap; }
 /* Links set no underline of their own; a row of them read as a ransom note. */
 a { text-decoration: none; }
 
@@ -345,6 +362,9 @@ a.sb-commits-sha:hover { color: var(--q-primary); }
 /* a board: a heading and its cards, no box around them */
 .sb-board  { display: flex; flex-direction: column; gap: 10px; width: 100%; }
 .sb-board + .sb-board { margin-top: 18px; }
+/* the Summary's rule between the boards to act on and the records of runs */
+.sb-boards-rule { align-self: stretch; margin: 18px 0 0; border: 0;
+                  border-top: 1px solid var(--q-border); }
 .sb-board-head { display: flex; align-items: baseline; gap: 10px; }
 .sb-board-title { font-size: 18px; font-weight: 600; color: var(--q-emph); }
 .sb-board-title::first-letter { text-transform: uppercase; }
@@ -352,9 +372,62 @@ a.sb-commits-sha:hover { color: var(--q-primary); }
 .sb-board-aside { font-size: 12px; color: var(--q-muted); }
 a.sb-board-aside:hover { color: var(--q-primary); }
 .sb-board-empty .sb-board-title { color: var(--q-muted); font-weight: 500; font-size: 15px; }
-/* the Docs page: a markdown file a row, its entries, its read button */
+/* an arc's board (arcs.board): its phase columns side by side, four of
+   them within .sb-main (three phases and done, the user's mockup,
+   2026-11-05), the row scrolling sideways past that; the column a card is
+   dragged over is washed. Each column is a board: a head, then cards 10px
+   apart, and columns 18px apart card to card, as two boards are; the 6px
+   that washes past a column's cards is taken back at the row's ends, so
+   the cards line up with the page. A phase name is a board title in the
+   arc name's size (a name as the person wrote it: case-sensitive, no
+   capital forced). */
+.sb-board.sb-phases { flex-direction: row; align-items: flex-start; gap: 6px; overflow-x: auto;
+                      width: calc(100% + 12px); margin: 0 -6px; }
+.sb-phase { flex: 1 1 200px; min-width: 180px; display: flex; flex-direction: column; gap: 10px;
+            padding: 6px; border-radius: 12px; }
+.sb-phase-cards { display: flex; flex-direction: column; gap: 10px; min-height: 48px; }
+.sb-phase-name { font-size: 16px; font-weight: 600; color: var(--q-emph); }
+.sb-phase.sb-dropping { background: color-mix(in srgb, var(--q-primary) 7%, transparent); }
+.sb-phases .sb-note[draggable="true"] { cursor: grab; }
+/* A board card is narrow (about 190px in four columns), and the list's
+   100px corner left its words 70px, broken mid-word (2026-11-05). At rest
+   its corner holds the resolve box alone: star and edit show on hover or
+   focus, over the text, starred or not (a starred box keeps its #priority
+   tag). 28px clears the box, 14px in from the edge and 22px wide, past the
+   card's 16px padding. Its words break whole, a token too long for a line
+   alone excepted, and its foot's meta never breaks inside. */
+.sb-phases .sb-resolvable .sb-note-main > :first-child::before { width: 28px; }
+.sb-phases .sb-resolvable .sb-note-main > .sb-note-foot:first-child { padding-right: 28px; }
+.sb-phases .sb-note .sb-actions { opacity: 0; }
+.sb-phases .sb-note:hover .sb-actions, .sb-phases .sb-note:focus-within .sb-actions { opacity: 1; }
+.sb-phases .sb-note-text { overflow-wrap: break-word; }
+.sb-phases a.sb-note-open { min-width: 0; }
+.sb-phases .sb-note-foot .sb-note-meta { white-space: nowrap; }
+/* an arc's list (arcs.checklist): its rows a board's 10px apart, not the
+   page column's 16px */
+.nicegui-column.sb-list { gap: 10px; }
+/* the list's drag grip (arcs._box): in the card's 16px left padding, out of
+   its flow, shown on hover as the toolbar is. A finger never drags (chrome's
+   _BOARD_JS), so a screen with no hover has none. Where a dragged row will
+   land: a 2px line, as the focus ring, on the edge of the row it drops
+   beside. */
+.sb-grip { position: absolute; left: 0; top: 0; bottom: 0; width: 16px; display: flex;
+           align-items: center; justify-content: center; cursor: grab; color: var(--q-muted);
+           opacity: 0; transition: opacity .15s; }
+.sb-grip .q-icon { font-size: 16px; }
+.sb-note:hover .sb-grip { opacity: 1; }
+@media (hover: none) { .sb-grip { display: none; } }
+.sb-list .sb-note.sb-drop-above { box-shadow: 0 -2px 0 var(--q-primary); }
+.sb-list .sb-note.sb-drop-below { box-shadow: 0 2px 0 var(--q-primary); }
+/* the demo's intro card (pages.summary): its source link is in prose, so
+   underlined, as a link in an entry is */
+.sb-demo-intro a { color: var(--q-primary); text-decoration: underline;
+                   text-underline-offset: 2px; }
+/* the Docs page: a markdown file a row, its entries, its read button. Rows
+   26px apart: at 22, a name and its read button sat within 24px of the next
+   row's, under WCAG 2.2's target size (2.5.8; the design critique, 2026-11-07) */
 .sb-docs { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto 32px;
-           align-items: center; column-gap: 12px; row-gap: 2px; font-size: 13px; }
+           align-items: center; column-gap: 12px; row-gap: 6px; font-size: 13px; }
 .sb-docs-row { display: contents; }
 .sb-docs-row > .q-icon { font-size: 18px; color: var(--q-dim); }
 a.sb-docs-name { font-family: var(--mono); color: var(--q-emph); text-decoration: none;
@@ -368,17 +441,40 @@ a.sb-docs-more { grid-column: 2 / -1; font-family: var(--mono); font-size: 12px;
 .sb-map    { height: 70vh; min-height: 420px; }
 .sb-map-rows { display: grid; grid-template-columns: auto auto minmax(0, 16rem) minmax(0, 1fr);
                column-gap: 12px; row-gap: 2px; font-size: 13px; margin-top: 8px; }
-a.sb-map-row { display: contents; color: var(--q-body); text-decoration: none; }
+/* a row is a box of its own on the grid's columns: Chrome focuses no
+   `display: contents` link, so Tab skipped every entry (2026-11-07) */
+a.sb-map-row { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid;
+               color: var(--q-body); text-decoration: none; }
 a.sb-map-row > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-a.sb-map-row:hover > * { color: var(--q-primary); }
-/* `display: contents` draws no focus ring: the row's cells show it */
-a.sb-map-row:focus-visible > * { color: var(--q-primary); text-decoration: underline; }
+a.sb-map-row:hover > *, a.sb-map-row:focus-visible > * { color: var(--q-primary); }
 .sb-map-kind { font-family: var(--mono); color: var(--kind); }
 .sb-map-meta { font-family: var(--mono); font-size: 12px; color: var(--q-muted); }
+/* the map's tiles as buttons, for a keyboard and a screen reader: out of
+   sight, as .sb-sr, until focus enters, as the skip link does */
+.sb-map-tiles { display: flex; flex-wrap: wrap; gap: 6px; max-height: 30vh;
+                overflow-y: auto; padding: 4px; }
+.sb-map-tiles:not(:focus-within) { position: absolute; width: 1px; height: 1px; padding: 0;
+                                   overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.sb-map-tiles button { min-height: 24px; padding: 2px 8px; font: inherit; font-size: 13px;
+                       color: var(--q-emph); background: var(--q-panel); cursor: pointer;
+                       border: 1px solid var(--q-border-hi); border-radius: 4px; }
+.sb-map-tiles button:focus-visible { outline: 2px solid var(--q-primary); outline-offset: 2px; }
 /* an arc on the index: its name as the person wrote it (no capital forced) */
 .sb-arc    { display: flex; flex-direction: column; gap: 10px; }
 a.sb-arc-name { font-size: 16px; font-weight: 600; color: var(--q-emph); }
 a.sb-arc-name:hover { color: var(--q-primary); }
+/* an arc whose boxes are all done steps back, as a done box does, and says
+   so: it read as an active one (the design critique, 2026-11-07) */
+.sb-arc.sb-done a.sb-arc-name { color: var(--q-muted); }
+.sb-arc.sb-done .sb-count { color: var(--q-good); }
+/* a toggle (list | board, a diff's modes): one group outlined as the house's
+   outlined buttons are, the pick filled; unfilled, the word not picked read
+   as a bare label (the design critique, 2026-11-07) */
+.sb-seg { outline: 1px solid var(--q-dim); outline-offset: -1px; }
+.sb-seg > .q-btn:not(.bg-primary) { color: var(--q-body); }
+/* an entry's whole body: about 70 characters a line, not 99 (the design
+   critique, 2026-11-07). Its prose only: code and tables keep the width. */
+.sb-note .nicegui-markdown :is(p, li, blockquote, h1, h2, h3, h4) { max-width: 62ch; }
 
 /* the composer: a card holding a borderless body and one toolbar. Its frame
    is the body's boundary, so it reads 3:1 like a field's outline, and
@@ -442,6 +538,10 @@ a.sb-tag:hover { color: var(--q-primary); }
 /* the peek, an entry beside the page: the sidebar's ground, its rule on
    the side that faces the page */
 .sb-peek { padding: 0; border-right: 0 !important; border-left: 1px solid var(--q-border); }
+/* never wider than the window: Quasar sets the drawer's 440px inline, and at
+   375 it put every line's first 65px off-screen (the design critique, 2026-11-07).
+   NiceGUI puts .sb-peek on the drawer's content; the width is on the aside */
+.q-drawer:has(> .sb-peek) { max-width: 100%; }
 .sb-peek-inner { display: flex; flex-direction: column; gap: 12px; padding: 8px 20px 32px;
                  width: 100%; box-sizing: border-box; }
 .sb-note-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
@@ -473,6 +573,14 @@ a.sb-tag:hover { color: var(--q-primary); }
    the second */
 .sb-note-by { display: flex; align-items: center; gap: 10px; margin-left: auto;
               white-space: nowrap; }
+/* a board box's arrows and its mover begin the foot's last row, its id at the right */
+.sb-move-break { flex-basis: 100%; height: 0; }
+.sb-move { display: flex; align-items: center; gap: 2px; margin-left: -4px; flex: none; }
+/* basis 0: the line keeps the id beside it, and a narrow card cuts it short */
+.sb-moved { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Quasar's !important held a disabled button at .7 over a rule here (measured
+   in Chrome, 2026-11-07): dim its glyph instead */
+.sb-move .q-btn.disabled .q-icon { opacity: .35; }
 /* a chip and the button that reads its file: one unit at a wrap. Apart, the
    button began the next line, beside the chip after it (2026-10-16) */
 .sb-pair { display: flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; }
@@ -488,10 +596,11 @@ a.sb-tag:hover { color: var(--q-primary); }
 /* its buttons as quiet as the field beside them: Quasar draws an outline in
    the text's colour, and emph and notable drew both at full strength (the
    user, 2026-10-16: "quite a bit brighter than the rest of the page") */
-.sb-answer .q-btn { color: var(--q-body); }
-.sb-answer .q-btn--outline::before { border-color: var(--q-dim); }
-.sb-answer .q-btn:hover { color: var(--q-primary); }
-.sb-answer .q-btn--outline:hover::before { border-color: currentColor; }
+.sb-answer .q-btn, .sb-composer .q-btn--outline { color: var(--q-body); }
+.sb-answer .q-btn--outline::before, .sb-composer .q-btn--outline::before { border-color: var(--q-dim); }
+.sb-answer .q-btn:hover, .sb-composer .q-btn--outline:hover { color: var(--q-primary); }
+.sb-answer .q-btn--outline:hover::before,
+.sb-composer .q-btn--outline:hover::before { border-color: currentColor; }
 /* where an amendment joined the body: a thin rule in the kind's colour,
    who added it and when at its end, quieter than the text around it. Its
    words are `muted`: `dim` read 3.6:1, under text's 4.5:1 (2026-10-16) */
@@ -517,9 +626,10 @@ a.sb-id:hover { color: var(--q-primary); }
 .q-btn.sb-copy { color: var(--q-muted); margin-left: -6px; opacity: 0; transition: opacity .15s; }
 .sb-note:hover .sb-copy, .sb-note:focus-within .sb-copy { opacity: 1; }
 .q-btn.sb-copy:hover { color: var(--q-emph); }
-/* a clipped body: the link to the whole note */
+/* a clipped body: the link to the whole note. Its words keep their colour on
+   hover, which the card's border marks: paragraphs flashed accent as a
+   pointer crossed a list (the design critique, 2026-11-07) */
 a.sb-note-open { display: block; }
-a.sb-note-open:hover .sb-note-text { color: var(--q-primary); }
 /* a card the search box's text filters out, and a board left with none */
 .sb-filtered { display: none !important; }
 /* a row past a board's first few, drawn for the filter, shown only by it */
@@ -531,6 +641,9 @@ body:not(.sb-sifting) .sb-past, body.sb-sifting .sb-docs-more { display: none; }
 .q-btn.sb-resolve { width: 22px; height: 22px; min-width: 22px; min-height: 22px; padding: 0;
                     margin-top: 1px; border: 1.5px solid var(--q-dim); flex: none; }
 .q-btn.sb-resolve .q-icon { font-size: 14px; }
+/* drawn at 22, it takes taps at 24 (WCAG 2.2, 2.5.8): the card's open link
+   runs under it, so the space around cannot make up the size */
+.q-btn.sb-resolve::after { content: ""; position: absolute; inset: -2.5px; }
 .q-btn.sb-resolve:hover, .q-btn.sb-resolve:focus-visible { border-color: var(--q-good); }
 /* a done box on an arc's checklist: ticked, and its row steps back */
 .q-btn.sb-resolve.sb-resolved { border-color: var(--q-good);
@@ -552,6 +665,15 @@ body:not(.sb-sifting) .sb-past, body.sb-sifting .sb-docs-more { display: none; }
 .sb-box .q-btn.sb-resolve, .sb-box .sb-actions { top: 50%; transform: translateY(-50%); }
 .sb-starred .sb-actions { opacity: 1; }
 @media (hover: none) { .sb-actions, .q-btn.sb-copy { opacity: 1; } }
+/* motion off where the system asks, Quasar's 0.3s too (the design critique,
+   2026-11-07). A near-zero time, not 0, so a transition still ends and fires
+   its end event for whatever waits on it */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: .01ms !important;
+                           animation-duration: .01ms !important;
+                           animation-iteration-count: 1 !important;
+                           scroll-behavior: auto !important; }
+}
 
 /* the corner mark: the bend (::before) and the run with its trail (::after) */
 .sb-note[class*="sb-kind-"]::before, .sb-note[class*="sb-kind-"]::after {
@@ -633,13 +755,15 @@ body:not(.sb-sifting) .sb-past, body.sb-sifting .sb-docs-more { display: none; }
    ran 1216px across a 1280px page (2026-10-06). 80ch holds a sha and a
    72-char commit subject on one line; a long path or URL breaks inside it. */
 .q-tooltip { background: var(--q-panel) !important; color: var(--q-emph) !important;
-             border: 1px solid var(--q-border); font-family: var(--mono); font-size: 11px;
+             border: 1px solid var(--q-border); font-family: var(--mono); font-size: 12px;
              white-space: pre-line; overflow-wrap: anywhere;
              max-width: min(80ch, calc(100vw - 32px)) !important; }
-/* a card's tooltip (chrome._TIPS_JS): one element, styled as the others */
+/* a card's tooltip (chrome._TIPS_JS): one element, styled as the others.
+   12px, a card's meta size: at 11 a tip of an entry's words read very small
+   (the user, 2026-11-07) */
 .sb-tip { position: fixed; z-index: 9000; pointer-events: none; padding: 6px 10px;
           border-radius: 4px; background: var(--q-panel); color: var(--q-emph);
-          border: 1px solid var(--q-border); font-family: var(--mono); font-size: 11px;
+          border: 1px solid var(--q-border); font-family: var(--mono); font-size: 12px;
           white-space: pre-line; overflow-wrap: anywhere;
           max-width: min(80ch, calc(100vw - 32px)); }
 /* a sidebar kind's: its name and properties over what it is for (chrome._kind_item) */
@@ -652,6 +776,9 @@ body:not(.sb-sifting) .sb-past, body.sb-sifting .sb-docs-more { display: none; }
 /* the title takes the bar first and the search what is left: shrinking
    alike, "Arcs" got 30px at 901 with the sidebar open (2026-10-01) */
 .sb-search { flex: 10 1 0; min-width: 120px; max-width: 340px; }
+/* the demo's line stays one line: squeezed, it wrapped to two beside a long
+   title (the design critique, 2026-11-07) */
+.sb-demo { white-space: nowrap; }
 .sb-search .q-field__control { background: var(--q-panel); }
 .sb-snippet mark, .sb-palette mark { background: transparent; color: var(--q-notable);
                                      box-shadow: inset 0 -1px var(--q-notable); }
@@ -672,7 +799,7 @@ body:not(.sb-sifting) .sb-past, body.sb-sifting .sb-docs-more { display: none; }
 .sb-pal-box input::placeholder { color: var(--q-emph); opacity: .7; }
 .sb-pal-list { overflow-y: auto; padding: 4px 8px 8px; }
 .sb-pal-head { display: flex; align-items: baseline; gap: 8px; padding: 14px 10px 4px; }
-.sb-pal-head:first-child { padding-top: 10px; }
+.sb-pal-group:first-child > .sb-pal-head { padding-top: 10px; }
 .sb-pal-head .sb-nav-head { padding: 0; }
 .sb-pal-aside, .sb-pal-none { font-family: var(--mono); font-size: 11px; color: var(--q-muted); }
 .sb-pal-none { padding: 12px 10px; font-size: 12px; }
@@ -755,6 +882,9 @@ body:not(.sb-sifting) .sb-past, body.sb-sifting .sb-docs-more { display: none; }
      no key to press `/` with */
   .sb-search .sb-chip, .sb-who-top .sb-avatar { display: none; }
   .sb-main { padding: 4px 16px 56px; }
+  /* NiceGUI's own 16px under .sb-main's put a card 32px in, past the top
+     bar's 16, and gave its words 277 of 375px (the GUI review, 2026-11-07) */
+  .nicegui-content { padding: 0; }
   /* two lines: where you are and who writes, then the buttons and the
      search. On one, the title got 30px at 390 and the search 0 (2026-10-01).
      The ::after is a full-width item: it ends the first line. */
@@ -825,11 +955,6 @@ def kind_css(kinds) -> str:
                    for k, s in kinds.items() if s.color)
 
 
-def _mix(a: str, b: str, t: float) -> str:
-    return "#" + "".join(f"{round(int(a[i:i + 2], 16) * (1 - t) + int(b[i:i + 2], 16) * t):02x}"
-                         for i in (1, 3, 5))
-
-
 def _contrast(a: str, b: str) -> float:
     """WCAG 2 contrast ratio of two #rrggbb colours."""
     def lum(h):
@@ -840,10 +965,46 @@ def _contrast(a: str, b: str) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
+def oklch(h: str) -> tuple[float, float, float]:
+    """#rrggbb as OKLCH: lightness, chroma, hue in degrees (Björn Ottosson's OKLab)."""
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    r, g, b = (c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in (r, g, b))
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s
+    b_ = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
+    return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s, hypot(a, b_),
+            degrees(atan2(b_, a)) % 360)
+
+
+def _hex(L: float, C: float, H: float) -> str:
+    a, b = C * cos(radians(H)), C * sin(radians(H))
+    l, m, s = ((L + x * a + y * b) ** 3 for x, y in ((0.3963377774, 0.2158037573),
+                                                     (-0.1055613458, -0.0638541728),
+                                                     (-0.0894841775, -1.2914855480)))
+    rgb = (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+           -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+           -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+    enc = (12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055 for c in rgb)
+    return "#" + "".join(f"{round(min(1.0, max(0.0, c)) * 255):02x}" for c in enc)
+
+
+def _toward(lo: str, hi: str, t: float) -> str:
+    """hi's hue and chroma at a lightness a part t of the way from lo's to hi's.
+    A mix in sRGB turned a grey-to-yellow ramp khaki and olive (the design
+    critique, 2026-11-07); one in OKLCH that also mixed chroma kept the hue but
+    left the low steps olive; and a hue path from blue-grey to yellow crosses red."""
+    if t >= 1:
+        return hi
+    l0, (l1, c, h) = oklch(lo)[0], oklch(hi)
+    return _hex(l0 + (l1 - l0) * t, c, h)
+
+
 def _ramp(lo: str, hi: str, text: str, steps: int = 5) -> tuple[str, ...]:
     """Steps from lo to hi, from the first mix `text` reads on at 4.5:1."""
-    t0 = next(i / 100 for i in range(101) if _contrast(_mix(lo, hi, i / 100), text) >= 4.5)
-    return tuple(_mix(lo, hi, t0 + (1 - t0) * k / (steps - 1)) for k in range(steps))
+    t0 = next(i / 100 for i in range(101) if _contrast(_toward(lo, hi, i / 100), text) >= 4.5)
+    return tuple(_toward(lo, hi, t0 + (1 - t0) * k / (steps - 1)) for k in range(steps))
 
 
 # The map's tiles (the spec, 2026-10-29). A tile with nothing to show takes

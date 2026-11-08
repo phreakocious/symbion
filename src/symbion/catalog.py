@@ -350,6 +350,7 @@ def match(cfg, target_type: str, query: str, candidates, earlier=()) -> str:
 
     A closed catalog refuses the miss instead. A read of a name the store
     holds never gets here (gitref.canon_name takes it first)."""
+    whole = cfg                           # a doc's config drops [repos]: repo_files reads them
     cfg = cfg.for_type(target_type)       # its notes ask the repo the name is in
     if resolver(cfg, target_type):
         return resolve_with(cfg, target_type, query, candidates)
@@ -359,7 +360,8 @@ def match(cfg, target_type: str, query: str, candidates, earlier=()) -> str:
         b = gitref.only_on_default_branch(cfg, got)
         where = (f"; it is on {b}, not in this worktree" if b else
                  "; it is a gitignored file in this worktree" if gitref.ignored_here(cfg, got) else
-                 f"; it is in {w}" if (w := gitref.other_worktree(cfg, got)) else "")
+                 f"; it is in {w}" if (w := gitref.other_worktree(cfg, got)) else
+                 repo_files(whole, got) if target_type == "doc" else "")
         guess = did_you_mean(got, candidates)
         if cfg.resolvers.get(target_type) == CLOSED:
             raise CatalogError(f"{got!r} matches nothing in the {target_type} catalog, which is "
@@ -375,6 +377,21 @@ def match(cfg, target_type: str, query: str, candidates, earlier=()) -> str:
             f" in the {target_type} catalog"
         print(f"note: {query!r} resolved to {got!r} ({how}{src})", file=sys.stderr)
     return got
+
+
+def repo_files(cfg, name: str) -> str:
+    """`; the repo has file:docs/x.py, …` for a doc miss that names a repo
+    file: a script at the repo's docs/scripts/, named `doc:`, minted a doc
+    target that holds nothing (2026-11-05). The repo types are each of
+    [repos], else `file`. A catalog that fails gives no hint: the miss note
+    still prints."""
+    types = [t for t in cfg.repos if not cfg.missing(t)] or \
+        (["file"] if "file" in cfg.catalogs else [])
+    try:
+        hits = across(name, {t: names(cfg, t, allow_empty=True) for t in types})
+    except CatalogError:
+        return ""
+    return f"; the repo has {listed(hits)}, and doc: names only the store's docs/" if hits else ""
 
 
 def did_you_mean(query: str, candidates) -> str:

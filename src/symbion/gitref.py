@@ -883,8 +883,11 @@ def since_base(cfg, path, oldest, blob) -> tuple[str, bool]:
 
 def diff_text(cfg, *args) -> str | None:
     """`git diff ARGS`, None when git fails: a commit against the work tree
-    (`BASE -- PATH`), or two commits."""
-    r = _git(cfg, "diff", *_DIFF, *args, errors="replace", keep=False)
+    (`BASE -- PATH`), or two commits. Against the work tree it is `diff-index`:
+    a porcelain `diff` there rewrites the index when stat data is stale, even
+    with GIT_OPTIONAL_LOCKS=0, and a `git add` beside it refuses (2026-11-07)."""
+    verb = ("diff-index", "-p") if "--" in args else ("diff",)
+    r = _git(cfg, *verb, *_DIFF, *args, errors="replace", keep=False)
     return r.stdout if r.returncode == 0 else None
 
 
@@ -1200,13 +1203,16 @@ def committed(store_dir) -> str:
     that named only the rows (2026-10-02, 2026-10-05); `arcs.jsonl` went in
     unnamed, though the dry run listed it (2026-10-15). `-z`: a name git
     would quote prints as written."""
-    rows = _git(store_dir, "log", "-1", "--format=%(trailers:key=Rows,valueonly)").stdout.strip()
+    rows, _, arcs = _git(store_dir, "log", "-1", "--no-show-signature",
+                         "--format=%(trailers:key=Rows,valueonly)%x00"
+                         "%(trailers:key=Arcs,valueonly)", errors="replace").stdout.partition("\0")
+    rows, arcs = rows.strip(), arcs.strip()
     paths = [p for p in _git(store_dir, "show", "-z", "--name-only", "--format=", "HEAD")
              .stdout.split("\0") if p.strip()]
     if not paths:                                 # a wrap with nothing pending
         return "committed: the message alone, no entries or files"
     files = [p for p in paths if p != store.NOTES_FILE]
-    said = [f"entries {rows}"] if rows else []
+    said = ([f"entries {rows}"] if rows else []) + ([f"arc changes {arcs}"] if arcs else [])
     if files:
         more = f", +{len(files) - 3} more" if len(files) > 3 else ""
         said.append(f"{len(files)} file{'' if len(files) == 1 else 's'}: "

@@ -307,6 +307,17 @@ def test_a_doc_resolves_from_outside_every_repo(ws, monkeypatch, capsys):
     assert [n.refs[0].name for n in _heads(ws)] == ["plan.md"] * 2
 
 
+def test_a_doc_miss_names_the_listed_repo_file_it_matches(ws, sym):
+    """With [repos] there is no `file` catalog: a doc miss looks in each
+    listed repo, and names the hit by its repo's type."""
+    (ws / "work-notes" / "docs" / "plan.md").write_text("# plan\n")
+    rc, out, err = sym("add", "note", "--target", "item:x", "--ref", "doc:site.yml",
+                       "--body", "x")
+    assert rc == 0, err
+    assert ("taken as typed; the repo has ansible:site.yml, and doc: names only the "
+            "store's docs/\n") in err, err
+
+
 def test_a_path_into_a_linked_worktree_names_its_repo(ws, sym):
     wt = ws / "app-wt"
     _git(ws / "tf-app", "worktree", "add", "-q", "-b", "feature", str(wt))

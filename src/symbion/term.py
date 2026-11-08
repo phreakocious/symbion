@@ -199,7 +199,7 @@ def _state(n, state, successor=None) -> tuple[str, str]:
 
 
 def _head(n, *, status, state, due, subject, head, width, gui, since=None,
-          successor=None, side=None) -> tuple[Text, int]:
+          successor=None, side=None, phase=None, arc=None) -> tuple[Text, int]:
     """The row's first line, and the column its target starts at. With a
     `width`, a line too long for it gives up the refs count first, then the
     end of its tags, then the end of its target. With `gui`, a running
@@ -238,8 +238,10 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None,
         post.append("  " + summ.due_phrase(due), ink(ROLE[summ.due_role(past, days)]))
     if head is not None:
         post.append(f"  superseded → {head.id[-ID_TAIL:]}", FADED)
-    if side:
-        post.append(f"  side {side}", ink(META))
+    where = Text()                       # the arc label: the id is what commands take
+    if arc is not None:
+        where.append(f"  arc {arc.id}" + (f" · {phase}" if phase else ""), ink(META))
+    after = Text(f"  side {side}", ink(META)) if side else Text()
 
     tags = Text("  " + " ".join(f"#{t}" for t in n.tags), ink(META)) if n.tags else Text()
     refs = Text()
@@ -247,7 +249,10 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None,
         refs = Text("  " + summ._count(len(n.refs), "ref"), ink(META))
     tail = tags + refs
     if width is not None:
-        room = width - indent - post.cell_len
+        # the arc label gives way before the target is cut
+        if target.cell_len > width - indent - (post + where + after).cell_len:
+            where = Text()
+        room = width - indent - (post + where + after).cell_len
         if target.cell_len + tail.cell_len > room:
             tail = tags
         if target.cell_len + tail.cell_len > room:
@@ -255,7 +260,7 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None,
             tail.truncate(keep if keep >= MIN_TAGS else 0, overflow="ellipsis")
         if target.cell_len + tail.cell_len > room:
             target.truncate(max(1, room - tail.cell_len), overflow="ellipsis")
-    return line + target + post + tail, indent
+    return line + target + post + where + after + tail, indent
 
 
 def _teaser(n, faded: bool, indent: int, width: int) -> Text | None:
@@ -308,19 +313,21 @@ def _details(n, head, state, written=None) -> list[Text]:
 
 
 def print_note(n, *, status, state, due, subject, head, full, gui=None, since=None,
-               seams=(), links=(), written=None, successor=None, side=None) -> None:
+               seams=(), links=(), written=None, successor=None, side=None, phase=None,
+               arc=None) -> None:
     """`status` is the chain head's, `state` api.verdict_state's pair and
     `due` store.due_state's pair for an open row, all computed by the caller
     the same way for the pipe line. `gui` is the URL of a serve on the row's
     store; `seams` summary.seams' for the body; `links` summary.links';
     `successor` gitref.successor's for a `rewritten` state; `side` the side
     of a row the reader's side did not raise, which the short view names
-    (the full one names it with its author)."""
+    (the full one names it with its author). `arc` is the Arc of a box, `phase`
+    its column on a phased one."""
     con = Console(highlight=False, markup=False, emoji=False, theme=MARKDOWN)
     width = None if full else con.width
     line, indent = _head(n, status=status, state=state, due=due, subject=subject,
                          head=head, width=width, gui=gui, since=since, successor=successor,
-                         side=None if full else side)
+                         side=None if full else side, phase=phase, arc=arc)
     if not full:
         con.print(_fitted(line), no_wrap=True, overflow="ellipsis", crop=True)
         teaser = _teaser(n, status == "resolved" or head is not None, indent, width)

@@ -12,6 +12,40 @@ import re
 import sys
 
 
+def nosymbion(cmd):
+    """The command less its symbion commands and their heredoc bodies, as
+    gotchas.sh cuts them: writing about a file is no use of it. A variable
+    set to symbion, or a path to it, is symbion where it is called."""
+    for name in re.findall(r"""(?:^|[\s;&|(])([A-Za-z_]\w*)=["']?(?:[^\s"';&|]*/)?symbion(?=[\s"';&|]|$)""",
+                           cmd):
+        cmd = re.sub(r"\$(?:%s|\{%s\}) " % (name, name), "symbion ", cmd)
+    out, rest = [], cmd
+    while (m := re.search(r"symbion ", rest)):
+        pre, rest = rest[:m.start()], rest[m.end() - 1:]
+        word = re.split(r'[;&|("\n]', pre)[-1].lstrip(" ")
+        if " " in word or (word and not word.endswith("/")):
+            out.append(pre + "symbion")
+            continue
+        seg = re.split(r"[;&|\n]", rest, maxsplit=1)[0]
+        rest = rest[len(seg):]
+        if "<<" in seg:                             # its body runs to the delimiter's line
+            d = seg.split("<<", 1)[1].lstrip("-").lstrip(" ")
+            d = d[1:].split(d[0], 1)[0] if d[:1] in ("'", '"') else re.match(r"\w*", d).group()
+            i = rest.find("\n" + d)
+            rest = rest[i + 1 + len(d):] if i >= 0 else ""
+        out.append(pre)
+    return "".join(out) + rest
+
+
+def strings(x):
+    """Every string in a tool's arguments, nested or not."""
+    if isinstance(x, str):
+        yield x
+    elif isinstance(x, (list, dict)):
+        for v in x.values() if isinstance(x, dict) else x:
+            yield from strings(v)
+
+
 def main():
     event = json.load(sys.stdin)
     sid = event.get("session_id", "")
@@ -34,7 +68,14 @@ def main():
         edit = True
         call = args.get("file_path", args.get("notebook_path", ""))
     else:
-        call = json.dumps(args, ensure_ascii=False)
+        if isinstance(args, dict) and "command" in args:
+            c = args["command"]
+            c = nosymbion(c) if isinstance(c, str) else [
+                nosymbion(x) if isinstance(x, str) else x for x in c] if isinstance(c, list) else c
+            args = {**args, "command": c}
+        # The strings themselves: in JSON text a newline read `/n` and a quote
+        # `/"` once backslashes became slashes, and a name beside one never matched.
+        call = "\n".join(strings(args))
     call = call.replace("\\\\", "/").replace("\\", "/")
     # Codex subagents share the parent's session_id. Their transcript path
     # distinguishes readers; rebuilding the list after compaction resets them.
@@ -47,7 +88,7 @@ def main():
     seen = set(gate.read_text(encoding="utf-8").splitlines()) if gate.exists() else set()
     output = []
     for row in listing.read_text(encoding="utf-8").splitlines():
-        ident, name, text, root = row.split("\t")
+        ident, name, text, root = row.split("\t")[:4]    # a field added to the list is dropped here
         if ident in seen:
             continue
         # Same root/path boundary rule as gotchas.sh: README.md must not

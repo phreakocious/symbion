@@ -662,3 +662,74 @@ def test_a_gotcha_line_fired_by_a_ref_names_the_ref_and_counts_its_file(git_repo
     said = line("serve.py", "s2")
     assert re.search(r"is on file:serve\.py \(written [^;)]+\): shared trap", said), \
         "the target's own line: no ref named, and serve.py has not changed"
+
+
+def test_a_gotcha_fires_on_a_path_never_on_a_name(git_repo, tmp_path):
+    """A gotcha reached through a name that is no path (a service, a host) fired on
+    any call that named it, most often a call that had nothing to do with its
+    trap (2026-11-06). The hook matches paths only: a file, a repo's file, or a
+    catalog name with a `/`."""
+    toml = ('[catalogs]\nfile = "git ls-files"\nservice = "printf \'lynx\\\\nheron\\\\n\'"\n'
+            'server = "printf \'/etc/edge.conf\\\\nedge\\\\n\'"\n')
+    bash = _gotcha_session(git_repo, tmp_path, toml, [
+        ({"type": "service", "name": "lynx"}, [], "lynx trap"),
+        ({"type": "file", "name": "scan.py"}, [{"type": "service", "name": "lynx"}], "scan trap"),
+        ({"type": "server", "name": "edge"}, [], "edge trap"),
+        ({"type": "server", "name": "/etc/edge.conf"}, [], "conf trap")])
+    for cmd in ("deploy lynx -- python3 record.py", "ssh edge uptime", "python3 plot.py --label lynx"):
+        assert bash(cmd) == "", cmd
+    said = bash("sed -n 1p scan.py")
+    assert re.search(r"is on file:scan\.py \(written [^)]+\): scan trap", said), said
+    assert "conf trap" in bash("cat /etc/edge.conf")
+
+
+def _gotcha_session(git_repo, tmp_path, toml, rows):
+    """A store holding `rows` (target, refs, body), every one a #gotcha, and a
+    Bash call into the gotcha hook; each session id starts its session first."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    if toml:
+        (s / "symbion.toml").write_text(toml)
+    for target, refs, body in rows:
+        store.add(s, kind="note", target=target, author="ann", tags=["gotcha"], refs=refs,
+                  body=body)
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
+    started = set()
+
+    def bash(cmd, sid="s1"):
+        if sid not in started:
+            r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
+                               env=env, input=json.dumps({"session_id": sid,
+                                                          "hook_event_name": "SessionStart"}))
+            assert r.returncode == 0, r
+            started.add(sid)
+        return _touch(env, {"session_id": sid, "tool_name": "Bash", "tool_input": {"command": cmd}})
+    return bash
+
+
+def test_a_symbion_command_that_names_a_file_neither_fires_nor_spends_its_gotcha(git_repo,
+                                                                                tmp_path):
+    """A write about a file, or a read of its entries, is no use of it, and
+    `context` prints the gotcha anyway. A symbion command that only named the
+    object spent its line before the first real use (2026-11-05)."""
+    bash = _gotcha_session(git_repo, tmp_path, None,
+                           [({"type": "file", "name": "src/serve.py"}, [], "serve trap")])
+    for cmd in ("symbion add note --target file:src/serve.py --body x",
+                ".venv/bin/symbion context --target file:src/serve.py 2>&1 | head -5",
+                "cd /work && symbion add task --target project --body-file - <<'EOF' 2>&1\n"
+                "see src/serve.py\nEOF",
+                'symbion add note --body-file - <<"END"\nsrc/serve.py\nEND',
+                'S="symbion --dir /n"; $S add note --body-file - <<\'EOF\'\nsee src/serve.py\nEOF',
+                "S=.venv/bin/symbion\n${S} context --target file:src/serve.py"):
+        assert bash(cmd) == "", cmd
+    assert "serve trap" in bash("sed -n 1,5p src/serve.py; symbion add note --target "
+                                "file:src/serve.py --body y"), "unspent, and the sed uses it"
+    for i, cmd in enumerate(("cd /x/symbion && sed -n 1p src/serve.py",
+                             "symbion add note --body-file - <<'EOF'\nsrc/serve.py\nEOF\n"
+                             "cat src/serve.py",
+                             "python3 - <<'EOF'\nopen('src/serve.py')\nEOF",
+                             f"cat /x/symbion-notes/{git_repo.name}/src/serve.py",
+                             "S='symbion --dir /n'; P=python3; $P - <<'EOF'\nopen('src/serve.py')\nEOF",
+                             "git log --grep=symbion src/serve.py",
+                             "cd /work\nsrc/serve.py --help")):
+        assert "serve trap" in bash(cmd, sid=f"s{i + 2}"), cmd

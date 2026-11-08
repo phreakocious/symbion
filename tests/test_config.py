@@ -265,6 +265,8 @@ def test_load_refuses_a_command_or_timeout_of_the_wrong_type(repo, tmp_path, tom
     assert says in str(e.value) and str(store / "symbion.toml") in str(e.value)
 
 
+
+
 def test_load_refuses_a_resolver_on_a_builtin_type(repo, tmp_path):
     """A `[resolvers]` key on a built-in type (`commit`, `item`, `project`,
     `arc`) loads silently today and never runs: `canonical` returns before

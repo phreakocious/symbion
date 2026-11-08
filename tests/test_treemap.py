@@ -245,6 +245,15 @@ def test_a_tooltip_names_no_path_the_chart_has_it(repo, tmp_path):
     assert "treePathInfo" in fmt and "&#${c.charCodeAt(0)};" in fmt
 
 
+def test_the_chart_is_an_image_named_by_its_view(repo, tmp_path):
+    """The canvas said nothing to a screen reader (the design critique,
+    2026-11-07). An entry counts once in the label, as in a tile's words."""
+    _add(_ctx(tmp_path), "task", "file", "a.py", refs=[{"type": "file", "name": "b.py"}])
+    aria = _options(tmp_path, View(by=("target", "kind")))[0]["aria"]
+    assert aria == {"enabled": True, "description": "A treemap of 1 entry by target then kind. "
+                    "The map tiles toolbar after it names each tile."}
+
+
 def test_a_pasted_id_maps_its_entry_and_a_superseded_one_its_head(repo, tmp_path):
     """As /notes reads the box: an id is not text the pattern reads."""
     ctx = _ctx(tmp_path)

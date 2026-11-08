@@ -106,6 +106,21 @@ def test_an_id_or_its_printed_tail_is_a_hit():
         assert not filters.id_hit(nid, q), q
 
 
+def test_title_says_the_filters_in_words():
+    """A title read `author=claude · kind=task · status=open`: the query
+    string, in a heading and a tab (the GUI review, 2026-11-07)."""
+    t = filters.title
+    assert t({}) == "All entries"
+    assert t({"kind": "task", "status": "open", "author": "claude"}) == "Open tasks by claude"
+    assert t({"kind": "query", "tag": "ci"}) == "Queries tagged #ci"      # summary's plural
+    assert t({"status": "resolved"}) == "Resolved entries"
+    assert t({"target_type": "file", "target_name": "a.py"}) == "Entries on file: a.py"
+    assert t({"target_type": "file", "arc_id": "rig"}) == "Entries on file in arc rig"
+    kw = filters.from_params({"q": "a  b", "kind": "bug"})
+    assert t(kw, "a  b") == "Bugs matching “a b”"
+    assert t({"id": "x"}) == filters.describe({"id": "x"}), "one entry's page is not a list"
+
+
 def test_describe_names_a_search_by_what_was_typed():
     """Unwrapped: quotes around words read as a phrase search."""
     kw = filters.from_params({"q": "a  b", "kind": "bug"})

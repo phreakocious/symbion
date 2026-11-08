@@ -445,3 +445,12 @@ def test_reapply_keeps_once_a_line_both_sides_rewrote_alike():
     said = []
     assert merge.reapply([x1], [x2], [x2], {}, dropped=said) == ([x2], [])
     assert said == []
+
+
+def test_a_shared_merge_keeps_the_upstream_placement_and_names_the_drop():
+    p = lambda i: [{"id": i, "phase": "next"}]
+    lines, dropped = merge.merge_arcs([arc("a")], [arc("a", placement=p("x"))],
+                                      [arc("a", placement=p("y"))])
+    assert arcs_of(lines)["a"]["placement"] == p("y")
+    (msg,) = dropped
+    assert "placement" in msg

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -26,13 +27,28 @@ def _groups(ctx, q):
     return {g["head"]: g for g in palette.rows(ctx, "ada", q)}
 
 
+_STORES: dict = {}                  # a recorded serve's url -> its store
+_REAL_ASK = palette._ask            # before `_asks_in_process` stands in for it
+
+
 def _serving(store_dir, url, pid=None):
-    """A serve's record. Its pid must be alive: the parent's is, and ours."""
+    """A serve's record. Its pid must be alive: the parent's is, and ours.
+    Nothing listens at `url`: `_asks_in_process` answers for it."""
     pid = pid or os.getppid()
     d = servers._dir()
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{pid}.json").write_text(json.dumps(
         {"pid": pid, "url": url, "store": str(store_dir.resolve()), "started": time.time()}))
+    _STORES[url.rstrip("/")] = store_dir
+
+
+@pytest.fixture(autouse=True)
+def _asks_in_process(monkeypatch):
+    """Another serve's answer, made here as that serve makes it (`answer`):
+    tests/test_gui_serve.py asks two real serves."""
+    _STORES.clear()
+    monkeypatch.setattr(palette, "_ask", lambda url, q: palette.answer(
+        api.resolve(str(_STORES[url])), q) if url in _STORES else None)
 
 
 def test_at_rest_the_actions_are_the_ones_the_top_bar_would_show(repo, tmp_path):
@@ -156,6 +172,45 @@ def test_other_running_stores_are_counted_and_link_to_their_own_search(repo, tmp
     assert _groups(ctx, "nowhere") == {}
     assert [(r["text"], r["meta"]) for r in _groups(ctx, "")["other stores"]["rows"]] == \
         [("far", "1 entry")]
+
+
+def test_the_palette_reads_no_store_but_its_own(repo, tmp_path, monkeypatch):
+    """Every serve whose palette opened parsed every running store and kept
+    it for its life, so one palette grew its serve by every store's size (the
+    GUI review, 2026-11-07). Each other store's serve answers for it."""
+    ctx = api.resolve(str(tmp_path))
+    _add(ctx, "note", "release close by")
+    far = tmp_path / "far-notes"
+    store.ensure_store(far)
+    _add(api.resolve(str(far)), "note", "release far away")
+    _serving(far, "http://127.0.0.1:20001/")
+    asked, loaded, load = [], [], store.load
+    monkeypatch.setattr(palette, "_ask", lambda url, q: asked.append((url, q)) or
+                        {"entries": 7, "say": 2, "by_id": []})
+    monkeypatch.setattr(store, "load", lambda s: loaded.append(Path(s).resolve()) or load(s))
+    palette._HEADS.clear()
+    g = _groups(ctx, "release")
+    assert set(loaded) == {Path(ctx.store_dir).resolve()}, loaded
+    assert asked == [("http://127.0.0.1:20001", "release")]
+    assert [(r["text"], r["meta"]) for r in g["other stores"]["rows"]] == [("far", "2 entries")]
+    assert [r["meta"] for r in _groups(ctx, "")["other stores"]["rows"]] == ["7 entries"]
+
+
+def test_a_serve_that_gives_no_answer_is_said_not_counted_as_none(repo, tmp_path,
+                                                                  monkeypatch):
+    """A serve stopped, busy, or older than `/palette/here` answers nothing
+    in palette.ASK_SECONDS: the box says so, and counts it with no store."""
+    assert _REAL_ASK("http://127.0.0.1:9", "x") is None, "a real ask of a port no one holds"
+    ctx = api.resolve(str(tmp_path))
+    _add(ctx, "note", "release close by")
+    far = tmp_path / "far-notes"
+    store.ensure_store(far)
+    _serving(far, "http://127.0.0.1:20001/")
+    monkeypatch.setattr(palette, "_ask", lambda url, q: None)
+    assert [(r["text"], r["meta"]) for r in _groups(ctx, "")["other stores"]["rows"]] == \
+        [("far", "no answer")]
+    assert _groups(ctx, "release")["other stores"] == \
+        {"head": "other stores", "aside": "1 no answer", "rows": []}
 
 
 def test_a_read_only_serve_lists_no_other_store(repo, tmp_path, monkeypatch):

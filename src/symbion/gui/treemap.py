@@ -287,7 +287,12 @@ def options(root: Tile, view: View, *, kind_hex, palette, ramps, now: datetime) 
 
     data = [node(k) for k in root.kids.values()]
     level = lambda c, w, g: {"itemStyle": {"borderColor": c, "borderWidth": w, "gapWidth": g}}  # noqa: E731
+    by = " then ".join(AXES[a] for a in view.by)
     return {
+        # role="img", and this as its label: ECharts' own reads ten tiles' values
+        "aria": {"enabled": True,
+                 "description": f"A treemap of {summ._count(len(entries(root)), 'entry')} by {by}. "
+                                "The map tiles toolbar after it names each tile."},
         "tooltip": {"backgroundColor": palette.bg_page, "borderColor": palette.border_hi,
                     "textStyle": {"color": palette.text_emph},
                     ":formatter": "p => p.data && p.data.tip && p.treePathInfo.slice(1).map(x => "

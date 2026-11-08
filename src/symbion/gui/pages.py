@@ -19,11 +19,11 @@ from .. import term as T
 from .. import store as S
 from .. import summary as summ
 from . import arcs, diffview, filters, palette, servers, treemap
-from .chrome import ABOUT, SOURCE, shell, source_href, store_name
-from .notes import (NoteMarkdown, ago, commit_meta, demo_says, file_buttons, forge_buttons,
-                    history, link_ids,
+from .chrome import ABOUT, SOURCE, own_write, shell, source_href, store_name
+from .notes import (NoteMarkdown, ago, commit_meta, demo_says, edit_dialog, file_buttons,
+                    forge_buttons, heading, history, link_ids,
                     kind_class, read_only_refused, reading, refusal_shown, render_note,
-                    target_href, view_button)
+                    short_id, target_href, view_button)
 from .theme import (FAVICON, FONTS_DIR, FONTS_URL, MAP_EMPTY, MAP_NEW, MAP_OPEN, MAP_TEXT,
                     PALETTE)
 
@@ -61,6 +61,10 @@ RECENT_DAYS = 14
 # busy store and as much again in the browser (the user, 2026-10-09). The
 # rest are a count in the heading, linked to the view that lists them all.
 BOARD_ROWS = 10
+# A "recent <kind>" board on `/` shows this many of its runs, the rest a count
+# linked to the kind's list: at BOARD_ROWS, two such boards took more than half
+# the page (the design critique, 2026-11-07).
+RECORD_ROWS = 3
 
 # The map's panel lists this many of a tile's entries, then links to a page
 # that lists them all, where one does.
@@ -73,19 +77,23 @@ PANEL_ROWS = 60
 # finds the group by them if it is still there. `sbMapChart` is set beside it.
 _MAP_JS = """<script>
 function sbMapTree(c) { return c.getModel().getSeriesByIndex(0).getData().tree; }
-function sbMapClick(e) {
-  const c = getElement(sbMapChart).chart, tree = sbMapTree(c);
-  let node;
-  if (e.data && e.data.children) {
-    c.dispatchAction({type: 'treemapRootToNode', targetNodeId: String(e.data.id)});
-    node = tree.getNodeById(String(e.data.id));
-  } else if (e.selfType === 'breadcrumb') node = tree.getNodeByDataIndex(e.nodeData.dataIndex);
-  else return;
+function sbMapPush(node) {
   const to = [];
   for (; node.parentNode; node = node.parentNode) to.unshift(node.name);
   const at = (history.state && history.state.sbMap) || [];
   if (JSON.stringify(to) !== JSON.stringify(at)) history.pushState({sbMap: to}, '');
 }
+function sbMapGo(node) {
+  getElement(sbMapChart).chart.dispatchAction({type: 'treemapRootToNode', targetNode: node});
+  sbMapPush(node);
+}
+function sbMapClick(e) {
+  const tree = sbMapTree(getElement(sbMapChart).chart);
+  if (e.data && e.data.children) sbMapGo(tree.getNodeById(String(e.data.id)));
+  else if (e.selfType === 'breadcrumb') sbMapPush(tree.getNodeByDataIndex(e.nodeData.dataIndex));
+}
+// The panel lists a tile's entries, or says what a click does for the whole map.
+function sbMapTile(node) { emitEvent('sbMapTile', node.parentNode ? Number(node.getId()) : null); }
 function sbMapShow() {
   const c = getElement(sbMapChart).chart, tree = sbMapTree(c);
   let node = tree.root;
@@ -93,12 +101,48 @@ function sbMapShow() {
     node = (node && node.children.find(n => n.name === name)) || null;
   node = node || tree.root;
   c.dispatchAction({type: 'treemapRootToNode', targetNode: node});
-  emitEvent('sbMapBack', node.parentNode ? Number(node.getId()) : null);
+  sbMapTile(node);
+}
+// The canvas takes no keyboard and says nothing to a screen reader (the design
+// critique, 2026-11-07), so the tiles in view are buttons too, redrawn on every
+// change of focus: a press acts as a click on the tile, and "up" as the breadcrumb.
+// One tab stop, arrows within, as a toolbar: a group can hold hundreds of tiles.
+function sbMapList() {
+  const box = document.querySelector('.sb-map-tiles');
+  const root = getElement(sbMapChart).chart.getModel().getSeriesByIndex(0).getViewRoot();
+  const item = (text, go) => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = text; b.onclick = go; b.tabIndex = -1; return b;
+  };
+  const items = root.children.map(n => item(`${n.name}: ${n.getModel().get('tip')}`, () => {
+    if (n.children.length) sbMapGo(n);
+    sbMapTile(n);
+  }));
+  const up = root.parentNode;
+  if (up) items.unshift(item(`up to ${up.parentNode ? up.name : 'the whole map'}`,
+                             () => { sbMapGo(up); sbMapTile(up); }));
+  if (items.length) items[0].tabIndex = 0;
+  const had = box.contains(document.activeElement);
+  box.replaceChildren(...items);
+  if (had && items.length) items[0].focus();
+}
+function sbMapKey(e) {
+  const bs = [...e.currentTarget.children], i = bs.indexOf(document.activeElement);
+  const j = {ArrowRight: i + 1, ArrowDown: i + 1, ArrowLeft: i - 1, ArrowUp: i - 1,
+             Home: 0, End: bs.length - 1}[e.key];
+  if (j === undefined || i < 0) return;
+  e.preventDefault();
+  const b = bs[Math.max(0, Math.min(bs.length - 1, j))];
+  bs[i].tabIndex = -1; b.tabIndex = 0; b.focus();
 }
 let sbMapDrawn = false;
 function sbMapLoad() {
   if (sbMapDrawn) return;
   sbMapDrawn = true;
+  const c = getElement(sbMapChart).chart;
+  c.on('treemaproottonode', sbMapList);
+  document.querySelector('.sb-map-tiles').addEventListener('keydown', sbMapKey);
+  sbMapList();
   if (history.state && history.state.sbMap && history.state.sbMap.length) sbMapShow();
 }
 addEventListener('popstate', sbMapShow);
@@ -125,8 +169,8 @@ def _board(ctx, title, rows, author, *, aside: str = "", more: str = "", tip: st
     with ui.element("section").classes("sb-board" + ("" if rows else " sb-board-empty")) \
             .mark("board"):
         with ui.element("div").classes("sb-board-head"):
-            (ui.link(title, to) if to else ui.label(title)).classes("sb-board-title") \
-                .mark("board-title")
+            with heading(2, "" if to else title) as h:
+                (ui.link(title, to) if to else h).classes("sb-board-title").mark("board-title")
             ui.label(str(len(shown))).classes("sb-count").mark("board-count")
             if aside:
                 # A board with no page of its own: a link to "" reloaded this one.
@@ -190,7 +234,9 @@ def _commit_card(ctx, sha: str, loaded, every: bool = False) -> None:
                 n_open = sum(map(treemap.live, rows))
                 with ui.element("div").classes("sb-docs-row").mark("commit-file"):
                     ui.icon("description")
-                    ui.link(path, target_href(ftype, path)).classes("sb-docs-name")
+                    # the whole path, as a tip, where an ellipsis cuts it (375 px)
+                    ui.link(path, target_href(ftype, path)).classes("sb-docs-name") \
+                        ._props["data-tip-cut"] = path
                     ui.html(diffview.counts(added, deleted), sanitize=False)
                     with ui.element("span").classes("sb-docs-n").mark("commit-file-entries"):
                         if rows:
@@ -210,7 +256,7 @@ def _docs_board(ctx, title: str, docs, on, mark: str, all: str, aside: str = "")
     with ui.element("section").classes("sb-board" + ("" if docs else " sb-board-empty")) \
             .mark(mark):
         with ui.element("div").classes("sb-board-head"):
-            ui.label(title).classes("sb-board-title")
+            heading(2, title).classes("sb-board-title")
             ui.label(str(len(docs))).classes("sb-count")
             if aside:
                 ui.label(aside).classes("sb-board-aside")
@@ -224,8 +270,11 @@ def _docs_board(ctx, title: str, docs, on, mark: str, all: str, aside: str = "")
                 with ui.element("div").classes("sb-docs-row sb-filterable" +
                                                (" sb-past" if past else "")).mark("doc-row"):
                     ui.icon("article")
-                    ui.link(name if typ in ("file", "doc") else f"{typ}: {name}",
-                            target_href(typ, name)).classes("sb-docs-name").mark("doc-link")
+                    shown = name if typ in ("file", "doc") else f"{typ}: {name}"
+                    # the whole name, as a tip, where an ellipsis cuts it (the
+                    # design critique, 2026-11-07: long names were cut at 375 px)
+                    ui.link(shown, target_href(typ, name)).classes("sb-docs-name") \
+                        .mark("doc-link")._props["data-tip-cut"] = shown
                     with ui.element("span").classes("sb-docs-n").mark("doc-count"):
                         ui.label(f"{len(rows)} ·" if n_open else summ._count(len(rows), "entry"))
                         if n_open:
@@ -241,7 +290,7 @@ def _wrap_board(ctx, wrap: dict) -> None:
     before any row: what the last session did, and what it left next."""
     with ui.element("section").classes("sb-board").mark("board"):
         with ui.element("div").classes("sb-board-head"):
-            ui.label("last wrap").classes("sb-board-title").mark("board-title")
+            heading(2, "last wrap").classes("sb-board-title").mark("board-title")
             ui.label(ago(wrap["at"])).classes("sb-count").tooltip(S.shown(wrap["at"]))
             if wrap["commits_since"] is not None:
                 ui.label(f"· {summ._count(wrap['commits_since'], 'commit')} since") \
@@ -372,6 +421,11 @@ def build_page(ctx, *, author: str) -> None:
     def palette_rows(q: str = ""):
         return JSONResponse(palette.rows(ctx, author, q))
 
+    # What another serve's palette asks of this store: each serve reads its own.
+    @app.get("/palette/here")
+    def palette_here(q: str = ""):
+        return JSONResponse(palette.answer(ctx, q))
+
     @ui.page("/")
     @gitref.heads_once()           # each repo's HEAD once a page
     def home():
@@ -404,18 +458,20 @@ def build_page(ctx, *, author: str) -> None:
             if S.read_only():
                 # A visitor from a social post lands here before the README, and
                 # most left from this page alone: it says what symbion is and what
-                # this store is, with no click (the user, 2026-11-05).
-                with ui.card().classes("bg-panel w-full gap-3").mark("demo-intro"):
+                # this store is, with no click (the user, 2026-11-05). Its link is
+                # in prose: a filled button beside New entry made two (the user,
+                # 2026-11-07).
+                with ui.card().classes("bg-panel w-full gap-3 sb-demo-intro").mark("demo-intro"):
                     ui.label(f"{ABOUT} Each new agent session starts with what is open, "
                              f"from plain JSONL in a git repo beside yours.") \
                         .classes("text-emph")
-                    ui.label(f"This is {store_name(ctx)}'s store, as its agents and owner "
-                             f"keep it. You see what its owner sees; nothing you click "
-                             f"here writes.").classes("text-body")
-                    ui.button("symbion on GitHub", icon="open_in_new") \
-                        .props(f'unelevated dense no-caps color=primary '
-                               f'href="{source_href("intro")}" target=_blank') \
-                        .classes("px-3 self-start").mark("demo-intro-link")
+                    with ui.element("div").classes("text-body"):
+                        ui.label(f"This is {store_name(ctx)}'s store, as its agents and owner "
+                                 f"keep it. You see what its owner sees; nothing you click "
+                                 f"here writes. Source, install and docs: ").classes("inline")
+                        ui.link("symbion on GitHub", source_href("intro"), new_tab=True) \
+                            .mark("demo-intro-link")
+                        ui.label(".").classes("inline")
             # Read-only, the page is public: the store's name, not its path there.
             where = store_name(ctx) if S.read_only() else ctx.store_dir
             ui.label(f"{summ._count(len(heads), 'entry')} · {where}") \
@@ -425,8 +481,9 @@ def build_page(ctx, *, author: str) -> None:
                 ui.label(f"⚠ {len(bad)} malformed line(s) skipped — "
                          f"first at line {bad[0][0]}").classes("text-notable")
             if waiting:
-                _board(ctx, "waiting on you", waiting, author, git_head=git_head, since=since,
-                       seen=rd)
+                # Read-only, the reader is a visitor, not the owner it waits on
+                _board(ctx, "waiting on the owner" if S.read_only() else "waiting on you",
+                       waiting, author, git_head=git_head, since=since, seen=rd)
             if wrap := gitref.last_wrap(ctx.store_dir, ctx.cfg, side):
                 _wrap_board(ctx, wrap)
             if due:
@@ -444,17 +501,23 @@ def build_page(ctx, *, author: str) -> None:
             _board(ctx, "priority", rows, author, aside=aside,
                    more=filters.href(tag="priority"), git_head=git_head, since=since, seen=rd)
             young = S.now_shown() - timedelta(days=RECENT_DAYS)
-            for label, k in ctx.kinds.items():
-                if k.verdict:
-                    every = [n for n in newest if n.kind == label]
-                    rows = [n for n in every if _recent(ctx, n, young, git_head)][:BOARD_ROWS]
-                    left = len(every) - len(rows)
-                    _board(ctx, f"recent {label}", rows, author,
-                           aside=f"· {left} more" if left else "",
-                           more=filters.href(kind=label),
-                           tip=f"every {label}: this board holds the last {RECENT_DAYS} days "
-                               f"and any still current at HEAD", git_head=git_head,
-                           since=since, seen=rd)
+            runs = [label for label, k in ctx.kinds.items() if k.verdict]
+            if runs:
+                # A rule between the boards to act on and the records of runs:
+                # one weight for both left the work's end unmarked (the design
+                # critique, 2026-11-07). A rule, not a "records" head: the
+                # sidebar's records are the kinds with no status.
+                ui.element("hr").classes("sb-boards-rule").mark("runs-rule")
+            for label in runs:
+                every = [n for n in newest if n.kind == label]
+                rows = [n for n in every if _recent(ctx, n, young, git_head)][:RECORD_ROWS]
+                left = len(every) - len(rows)
+                _board(ctx, f"recent {label}", rows, author,
+                       aside=f"· {left} more" if left else "",
+                       more=filters.href(kind=label),
+                       tip=f"every {label}: this board holds the last {RECENT_DAYS} days "
+                           f"and any still current at HEAD", git_head=git_head,
+                       since=since, seen=rd)
 
     @ui.page("/notes")
     @gitref.heads_once()           # each repo's HEAD once a page
@@ -509,7 +572,17 @@ def build_page(ctx, *, author: str) -> None:
             rows += [n for n in rest if n.id not in got and n.id in tips]
         rows = S.newest_first(rows)
         git_head = gitref.head_sha(ctx.cfg)
-        shell(ctx, author, [(filters.describe(kwargs, q), None)], q=q,
+        # One entry's page names the entry: its title and tab read `id=…`,
+        # alike for every entry, over "1 entry" (the GUI review, 2026-11-07).
+        one = rows[0] if "id" in kwargs and len(rows) == 1 else None
+        # An id no version has, whole or as a tail, read "id=nope · 0 entries"
+        # (the design critique, 2026-11-07)
+        unknown = bool(old) and not hits and not S.query(every, id=old)
+        crumb = f"{one.kind} {short_id(one.id)}" if one else f"no entry {old}" if unknown else None
+        shell(ctx, author, [("All entries", "/notes"), (crumb, None)]
+              if crumb else [(filters.title(kwargs, q), None)],
+              tab=f"{one.kind} · {summ.clip(one.body or one.checked or one.result or '', 60)}"
+              if one else None, q=q,
               keep=base, here="" if base or old else "/notes", kind=kwargs.get("kind"))
         with ui.column().classes("sb-main gap-4"):
             if len(hits) > 1:
@@ -525,11 +598,24 @@ def build_page(ctx, *, author: str) -> None:
                          f"searched body, target, checked, result, refs and tags of current "
                          f"entries, and every version's id").classes("sb-subtitle") \
                     .mark("result-count")
-            else:
+            elif unknown:
+                ui.label(f"No entry has an id that is or ends in “{old}”.") \
+                    .classes("sb-subtitle").mark("no-such-id")
+            elif not one:
                 ui.label(summ._count(len(rows), "entry") + cut).classes("sb-subtitle") \
                     .mark("result-count")
-            if kwargs:
-                ui.link("clear filters", "/notes").classes("text-body")
+            if base:
+                # Each filter a chip whose × takes off that one: "clear filters"
+                # took all of them at once (the GUI review, 2026-11-07).
+                with ui.row().classes("items-center gap-2").mark("filter-chips"):
+                    for k, v in base.items():
+                        with ui.link(target=filters.href(**{**base, k: None})) \
+                                .classes("sb-chip sb-filter-chip").mark("filter-chip") as chip:
+                            ui.label(f"{'search' if k == 'q' else k} {v}")
+                            ui.icon("close").classes("sb-filter-x")
+                        # set, not parsed: the value comes from the URL
+                        chip._props["aria-label"] = f"take off the filter {k} {v}"
+                    ui.link("clear all", "/notes").classes("sb-board-aside").mark("clear-filters")
             since = gitref.commits_since(ctx.cfg, shown, git_head)
             by_id = rd.by_id
             for n in shown:
@@ -702,8 +788,9 @@ def build_page(ctx, *, author: str) -> None:
                         .classes("sb-subtitle")
                     return
                 rows = treemap.entries(tile)
-                ui.label(f"{' › '.join(s[2] for s in tile.steps)}: "
-                         f"{summ._count(len(rows), 'entry')}, open first").classes("sb-board-title")
+                heading(2, f"{' › '.join(s[2] for s in tile.steps)}: "
+                           f"{summ._count(len(rows), 'entry')}, open first") \
+                    .classes("sb-board-title")
                 with ui.element("div").classes("sb-map-rows"):
                     for n in rows[:PANEL_ROWS]:
                         with ui.link(target=filters.href(id=n.id)).classes("sb-map-row").mark("map-row"):
@@ -738,8 +825,11 @@ def build_page(ctx, *, author: str) -> None:
             chart.on("componentClick", pick,
                      js_handler="(e) => { sbMapClick(e); emit(e.data ? e.data.id : null) }")
             chart.on("chart:finished", js_handler="() => sbMapLoad()")
-            # back: the focus it returns to lists its entries, as its click did
-            ui.on("sbMapBack", lambda e: panel.refresh(tile(e.args)))
+            # back, or a press in the tile list: the tile lists its entries, as a click does
+            ui.on("sbMapTile", lambda e: panel.refresh(tile(e.args)))
+            # _MAP_JS fills it; out of sight until a keyboard reaches it
+            ui.element("div").classes("sb-map-tiles") \
+                .props('role=toolbar aria-label="map tiles"').mark("map-tiles")
             with ui.element("section").classes("sb-board w-full").mark("map-panel"):
                 panel()
 
@@ -758,7 +848,9 @@ def build_page(ctx, *, author: str) -> None:
         if name not in S.stored_names(rd.loaded, type):
             with refusal_shown():
                 type, name = gitref.read_target(ctx.cfg, type, name, rd.loaded)
-        shell(ctx, author, [(f"{type}: {name}", None)],
+        # A commit by its short sha, as Targets names it: the whole sha left the
+        # top bar's search 120px (the design critique, 2026-11-07).
+        shell(ctx, author, [(f"{type}: {name[:7] if type == 'commit' else name}", None)],
               new=(type, name, None))
         # Open work first, then the newest; a resolved row is history and
         # reads clipped (one file's page held 50 rows in full, 2026-09-27).
@@ -810,6 +902,37 @@ def build_page(ctx, *, author: str) -> None:
             return
 
         with ui.column().classes("sb-main gap-4"):
+            # List or Board, kept per arc in this tab. The page opens on List and
+            # takes the tab's Board when the page script says the window is
+            # wider than NARROW (`sbArcWide`): the server cannot see the width,
+            # and a row of phase columns does not fit a phone.
+            view, key, slot = {"board": False, "edit": False}, f"sb-arc-view:{id}", ui.context.slot
+            header = {}                             # body's count and bar, which a drop updates
+
+            def _progress() -> None:
+                done, total = S.arc_progress(reading(ctx).loaded, id)
+                header["count"].set_text(f"{done}/{total}")
+                header["bar"].set_value(done / total if total else 0.0)
+
+            def _view(board: bool) -> None:
+                with slot:                          # the tab is the page's (chrome's _DRAFT)
+                    app.storage.tab[key] = "board" if board else "list"
+                view["board"] = board
+                body.refresh()
+
+            def _edit() -> None:
+                # Shown in place: a refresh redrew every box to show one form
+                view["edit"] = not view["edit"]
+                header["form"].set_visibility(view["edit"] or header["archived"])
+                header["edit"].props(f"aria-expanded={str(view['edit']).lower()}")
+
+            def _wide(_) -> None:
+                with slot:
+                    board = app.storage.tab.get(key) == "board"
+                if board and not view["board"]:
+                    view["board"] = True
+                    body.refresh()
+
             @ui.refreshable
             def body():
                 a = next((x for x in S.load_arcs(ctx.store_dir) if x.id == id), None)
@@ -820,11 +943,32 @@ def build_page(ctx, *, author: str) -> None:
                 done, total = S.arc_progress(rd.loaded, id)
                 with ui.row().classes("items-baseline gap-3 w-full"):
                     ui.label(a.target_scope).classes("sb-chip sb-target")
-                    ui.label(f"{done}/{total}").classes("sb-count")
-                ui.linear_progress(value=(done / total if total else 0.0),
-                                   show_value=False).props("rounded")
+                    header["count"] = ui.label(f"{done}/{total}").classes("sb-count") \
+                        .mark("arc-count")
+                    ui.space()
+                    # The arc's own settings behind one quiet button: they came
+                    # before every box, and a visit is to read and move boxes
+                    # (the design critique, 2026-11-07).
+                    header["edit"] = ui.button("Edit arc", icon="edit", color=None, on_click=_edit) \
+                        .props(f"flat dense no-caps aria-expanded={str(view['edit']).lower()}") \
+                        .classes("self-center text-body").mark("arc-edit")
+                    # The diff dialog's toggle, drawn as Quasar's button toggle
+                    # draws it: one unelevated group, the pick filled. Labels
+                    # lower case, as that toggle's.
+                    with ui.button_group().props("unelevated").classes("self-center sb-seg") \
+                            .mark("arc-view"):
+                        for word in ("list", "board"):
+                            on = view["board"] == (word == "board")
+                            ui.button(word, on_click=lambda w=word: _view(w == "board"),
+                                      color="primary" if on else None) \
+                                .props(f"unelevated dense no-caps aria-pressed={str(on).lower()}") \
+                                .mark(f"arc-view-{word}")
+                header["bar"] = ui.linear_progress(value=(done / total if total else 0.0),
+                                                   show_value=False).props("rounded") \
+                    .mark("arc-progress")
 
-                with ui.row().classes("items-center gap-2 w-full sb-card"):
+                # Shown by Edit arc, and always for an archived arc: Unarchive is in it.
+                with ui.row().classes("items-center gap-2 w-full sb-card").mark("arc-form") as form:
                     rename = ui.input("rename", value=a.name).props("dense outlined")
 
                     def _rename():
@@ -844,7 +988,8 @@ def build_page(ctx, *, author: str) -> None:
                         if demo_says("describes the arc"):
                             return
                         with refusal_shown():
-                            api.describe_arc(ctx, id, desc.value or "")
+                            with own_write(ctx, author):
+                                api.describe_arc(ctx, id, desc.value or "")
                             body.refresh()
 
                     ui.button("Save", on_click=_describe).props("flat dense").mark("arc-describe")
@@ -861,7 +1006,9 @@ def build_page(ctx, *, author: str) -> None:
                         if demo_says("unarchives the arc"):
                             return
                         with refusal_shown():
-                            api.unarchive_arc(ctx, id)
+                            with own_write(ctx, author):
+                                api.unarchive_arc(ctx, id)
+                            view["edit"] = True         # the form stays under the hand
                             body.refresh()
 
                     if a.archived:
@@ -869,8 +1016,9 @@ def build_page(ctx, *, author: str) -> None:
                         ui.button("Unarchive", icon="unarchive", on_click=_unarchive) \
                             .props("flat dense").mark("arc-unarchive")
                     else:
-                        ui.button("Archive", icon="archive", on_click=_archive) \
-                            .props("flat dense color=warning").mark("arc-archive")
+                        # Quiet: notable means "look here", not "this one destroys"
+                        ui.button("Archive", icon="archive", on_click=_archive, color=None) \
+                            .props("flat dense").classes("text-body").mark("arc-archive")
 
                     if a.target_scope in arcs.seed_all_scopes(ctx) and arcs.seedable(ctx):
                         def _seed():
@@ -879,7 +1027,10 @@ def build_page(ctx, *, author: str) -> None:
                             try:
                                 # No names: a sweep. The catalog verbatim, no
                                 # resolver; api.seed raises for an empty one.
-                                made = api.seed(ctx, id, a.target_scope, None, author=author)
+                                made_ids = []           # filled inside: own_write reads it on exit
+                                with own_write(ctx, author, made_ids):
+                                    made = api.seed(ctx, id, a.target_scope, None, author=author)
+                                    made_ids.extend(n.id for n in made)
                             except (ValueError, RuntimeError) as e:
                                 ui.notify(str(e), type="negative")
                                 return
@@ -889,15 +1040,41 @@ def build_page(ctx, *, author: str) -> None:
                         ui.button(f"Seed all {a.target_scope}s", icon="playlist_add",
                                   on_click=_seed).props("flat dense").mark("arc-seed")
 
-                left = arcs.checklist(ctx, id, body.refresh, author=author, seen=rd,
-                                      limit=None if all and not S.read_only() else _page_rows())
-                _not_shown(left, "entry", target_href("arc", id))
+                    # A row of its own, so the description takes the rest of
+                    # the first: beside it, phases squeezed it to a few words.
+                    with ui.row(wrap=False).classes("items-center gap-2 w-full"):
+                        ph = ui.input("phases, comma-separated", value=", ".join(a.phases or ())) \
+                            .props("dense outlined").classes("col").mark("arc-phases")
+
+                        def _phases():
+                            if demo_says("sets the arc's phases"):
+                                return
+                            with refusal_shown():
+                                # a name keeps its inner spaces; set_phases refuses an empty one
+                                names = [x.strip() for x in (ph.value or "").split(",")] \
+                                    if (ph.value or "").strip() else []
+                                with own_write(ctx, author):
+                                    api.set_phases(ctx, id, names)
+                                body.refresh()
+
+                        ui.button("Save", on_click=_phases).props("flat dense") \
+                            .mark("arc-phases-save")
+                header["form"], header["archived"] = form, bool(a.archived)
+                form.set_visibility(view["edit"] or header["archived"])
+
+                limit = None if all and not S.read_only() else _page_rows()
+                if view["board"]:
+                    arcs.board(ctx, a, body.refresh, author=author, seen=rd, limit=limit)
+                else:
+                    left = arcs.checklist(ctx, a, body.refresh, author=author, seen=rd,
+                                          limit=limit)
+                    _not_shown(left, "entry", target_href("arc", id))
 
                 # Notes ABOUT the arc (its target or a ref), not its boxes:
                 # the page showed only the checklist (the gui spec).
                 about = S.heads_for(ctx.store_dir, "arc", id, loaded=rd.loaded)
                 if about:
-                    ui.label("entries about this arc").classes("sb-board-title")
+                    heading(2, "entries about this arc").classes("sb-board-title")
                     git_head = gitref.head_sha(ctx.cfg)
                     since = gitref.commits_since(ctx.cfg, about, git_head)
                     for n in about:
@@ -905,3 +1082,47 @@ def build_page(ctx, *, author: str) -> None:
                                     since=since[n.id], seen=rd)
 
             body()
+
+            def _moved(e) -> None:
+                """A card dropped on the board (chrome's _BOARD_JS): {id, phase,
+                before} or {id, phase, after}. The card has moved in the browser,
+                so a write redraws that card alone, and the count and bar; a
+                refusal says why and redraws the board as the store has it, as
+                the demo's drop does."""
+                if demo_says("moves the box"):
+                    body.refresh()
+                    return
+                d = e.args if isinstance(e.args, dict) else {}
+                nid, phase = d.get("id"), d.get("phase")
+                a = next((x for x in S.load_arcs(ctx.store_dir) if x.id == id), None)
+                fu = next((n for n in S.arc_items(S.load(ctx.store_dir), id) if n.id == nid), None)
+                with refusal_shown():
+                    if a is None or fu is None:
+                        raise ValueError(f"{nid} is no longer a box of this arc")
+                    done = S.read_status(fu) == "resolved"
+                    if phase == S.DONE:
+                        if done:                    # within done: nothing to write
+                            return
+                        if fu.spec.verdict:
+                            # A pre-registration closes with its verdict, as
+                            # the checklist's tick: the card goes back to its
+                            # column until the dialog saves.
+                            body.refresh()
+                            edit_dialog(ctx, fu, body.refresh, author=author, resolving=True)
+                            return
+                        with own_write(ctx, author, [nid]):
+                            api.supersede(ctx, nid, author=author, status="resolved")
+                    else:
+                        to = {"phase": phase if a.phases else None,
+                              "before": d.get("before"), "after": d.get("after")}
+                        with own_write(ctx, author, [nid]):
+                            (api.reopen_and_place if done else api.move_box)(
+                                ctx, nid, author=author, **to)
+                    arcs.redraw_box(ctx, id, nid, body.refresh, author=author)
+                    _progress()
+                    return
+                body.refresh()
+
+            ui.on("sbMove", _moved)
+            ui.on("sbArcWide", _wide)
+            ui.run_javascript("sbArcWide()")

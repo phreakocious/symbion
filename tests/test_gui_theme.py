@@ -434,7 +434,44 @@ def test_every_map_tile_colour_reads_under_its_text():
                 if _ratio(h, Th.MAP_TEXT) < 4.5]
 
 
-def test_a_map_row_shows_keyboard_focus():
-    """A panel row is `display: contents`, which draws no focus ring of its own."""
+def test_a_cards_words_keep_their_colour_on_hover_and_a_body_keeps_a_measure():
+    """Paragraphs flashed accent as a pointer crossed a list, and an entry's
+    page ran 99 characters a line (the design critique, 2026-11-07)."""
+    import re
+
     from symbion.gui.theme import DARK_CSS
-    assert "a.sb-map-row:focus-visible > *" in DARK_CSS
+    assert not re.search(r":hover[^{,]*\.sb-note-text\s*\{[^}]*q-primary", DARK_CSS)
+    cap = re.search(r"\.sb-note \.nicegui-markdown :is\(([^)]*)\) \{ max-width: (\d+)ch; \}", DARK_CSS)
+    assert cap and {"p", "li"} <= set(map(str.strip, cap[1].split(","))) and int(cap[2]) <= 75
+
+
+def test_a_map_ramp_is_one_hue_at_its_targets_chroma():
+    """Mixed in sRGB, the open ramp's low steps were grey-brown and khaki (hue
+    62 and 77 against yellow's 86, chroma 0.011: the design critique,
+    2026-11-07). Each step holds its target's hue and chroma, and only its
+    lightness rises."""
+    from symbion.gui import theme as Th
+    for ramp, hi in ((Th.MAP_OPEN, Th.PALETTE.notable), (Th.MAP_NEW, Th.PALETTE.good)):
+        _, c, h = Th.oklch(hi)
+        got = [Th.oklch(x) for x in ramp]
+        assert all(abs(x[2] - h) < 3 and abs(x[1] - c) < 0.005 for x in got), got
+        assert [x[0] for x in got] == sorted(x[0] for x in got)
+
+
+def test_a_map_row_takes_keyboard_focus():
+    """Chrome focuses no `display: contents` link, so Tab skipped every panel
+    row (2026-11-07): a row is a subgrid box of its own, and draws the ring."""
+    from symbion.gui.theme import DARK_CSS
+    row = DARK_CSS.split("a.sb-map-row {", 1)[1].split("}", 1)[0]
+    assert "display: grid" in row and "subgrid" in row and "contents" not in row
+
+
+def test_a_phone_page_gutter_is_the_top_bars_16px():
+    """NiceGUI pads its content 16px, and `.sb-main` 16 more on a phone: a
+    card sat 32px in, past the top bar's 16, its words 277 of 375px (the GUI
+    review, 2026-11-07). The tokens give the phone one gutter, pad-card-x."""
+    from symbion.gui.theme import DARK_CSS
+    (phone,) = re.findall(r"@media \(max-width: 600px\) \{(.*?)\n\}", DARK_CSS, re.S)
+    assert re.search(r"\.nicegui-content \{ padding: 0; \}", phone), phone[:300]
+    assert re.search(r"\.sb-main \{ padding: 4px 16px 56px; \}", phone)
+    assert re.search(r"\.sb-topbar \{[^}]*padding: 8px 16px", phone)

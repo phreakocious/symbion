@@ -87,7 +87,8 @@ the summary below reads the local store`).
    parked, then `; N open in arcs` when arcs hold any, and `; N parked` when
    any open entry is parked. A parked entry and an entry in an arc are not
    in the per-kind counts, so each says so in its brackets (`[idea,
-   parked]`, `[task, arc release]`).
+   parked]`, `[task, arc release]`). `arc todo` on a phased arc labels a box with
+   its phase, `[task, doing]`.
 2. `repos in <store>:`, in a store over several repos: where you stand,
    each other repo's path from here, and `(not on this machine)` where no
    repo is there.
@@ -198,7 +199,8 @@ that, until the next session start. `add`, `resolve` and `supersede` say when
 the text they write runs past 500 characters: in an agent session, once until
 the next session start. A pre-registration's body does not count. Each write
 ends with the count of entries not yet committed; an arc write with none
-pending says `arcs.jsonl not committed`.
+pending says `arcs.jsonl not committed`. Where some are another session's, it
+says how old the newest of those is: an old one suggests that session has ended.
 
 In a shared store, `add`, `resolve` and `supersede` also say `origin has N new
 store commits: symbion pull` when origin holds commits this clone lacks. They fetch
@@ -231,7 +233,10 @@ another project's tree (`--dir` from outside the store's project) it takes no
 file but the new docs those entries name, and names each file it left. An edit
 of another session's uncommitted entry brings that entry into your commit: a
 commit never holds an edit without the version it edits. Its
-commit message ends with a `Rows: claude 3` trailer naming them by author.
+commit message ends with a `Rows: claude 3` trailer naming them by author. When
+arcs.jsonl changed, an `Arcs: ada 1, unknown 1` trailer follows: a new arc
+counts for its author, a moved box for its mover, and any other arc change,
+which records no writer, as `unknown`.
 `commit --wrap -m MSG` adds `Wrap: <author>`: that message is the handoff
 `summary` prints as `last wrap by`. With nothing pending, a wrap commits the
 message alone, where a plain `commit` exits 1. The store's git log is the

@@ -13,6 +13,7 @@ import re
 from urllib.parse import urlencode
 
 from .. import store
+from .. import summary as summ
 
 # URL name -> store.query kwarg. `type`/`name` are shortened in the URL because
 # they are the pair a human types; the rest match store.query exactly.
@@ -84,3 +85,22 @@ def describe(kwargs: dict, q: str = "") -> str:
     parts += [f"{_KWARG_TO_URL.get(k, k)}={v}" for k, v in sorted(kwargs.items())
               if k != "grep"]
     return " · ".join(parts) or "All entries"
+
+
+def title(kwargs: dict, q: str = "") -> str:
+    """The filtered view's title in words, "Open tasks by claude": the query
+    string read as code in a title and a tab (the GUI review, 2026-11-07).
+    One entry's page keeps `describe`'s form: it is not a filtered list."""
+    if "id" in kwargs:
+        return describe(kwargs, q)
+    if not q.strip() and not any(k != "grep" for k in kwargs):
+        return "All entries"
+    kind, typ, name = (kwargs.get(k) for k in ("kind", "target_type", "target_name"))
+    words = " ".join(filter(None, [kwargs.get("status"),
+                                   summ._count(2, kind).split(" ", 1)[1] if kind else "entries"]))
+    words += "".join(f" {lead} {v}" for lead, v in (
+        ("by", kwargs.get("author")), ("tagged", kwargs.get("tag") and f"#{kwargs['tag']}"),
+        ("on", f"{typ}: {name}" if typ and name else typ or name),
+        ("in arc", kwargs.get("arc_id")),
+        ("matching", q.strip() and f"“{' '.join(q.split())}”")) if v)
+    return words[0].upper() + words[1:]

@@ -96,7 +96,8 @@ supersede and resolve it by that id, or a unique tail: cite the 10-character tai
 `show` lists each cited entry with its state, and each entry that cites this one.
 
 `supersede <id> --body TEXT` rewrites an entry; with `--append` or `--prepend`,
-TEXT goes below or above. Tags, refs, the target and the due date change alike.
+TEXT goes below or above; `--replace OLD NEW` swaps one span. Tags, refs, the
+target and the due date change alike.
 `resolve <id>` closes a status entry, and its `--body` goes below. A committed
 entry is never deleted, and `list --all` shows its earlier versions. `undo <id>`
 takes back this session's last write while no commit has run since.
@@ -161,8 +162,8 @@ under the store's `docs/`; the entry names it by its path there
 
 A trap, such as a test that passes alone and fails in its file's run or a step
 that must come before an edit, goes on its file tagged `gotcha`: in Claude Code,
-Codex and Pi, the first call in each session or subagent that names the file prints
-its first 200 characters, and its first edit of the file prints them again, so
+Codex and Pi, the first non-symbion call in each session or subagent that names
+the file prints its first 200 characters, and its first edit prints them again, so
 the trap and its fix fit in them. One trap is one entry; a how-to is a plain note.
 
 A `check` reaches no open view, so a running job also needs a `task` due at
@@ -187,10 +188,10 @@ goes in `--body-file -` with a quoted heredoc (`<<'EOF'`) after the last flag.
 
 An arc is a checklist across many objects. `arc create --name NAME` prints its
 id. Each unparked status entry filed with `--arc-id ID` is a box, open until
-resolved; `arc todo ID` lists the open ones, and the session-start summary
-shows each arc's progress. Archiving a finished arc is the user's: until then
-the summary shows it done. `arc -h` lists the rest. Before `arc seed`, `arc
-reconcile`, or a change to `[catalogs]` or `[resolvers]`, read `catalogs.md`
+resolved; `arc todo ID` lists the open ones in board order. `arc phases ID
+NAME…` gives an arc phases, and `arc move` moves a box. The summary shows each
+arc's progress. Archiving a finished arc is the user's. `arc -h` lists the rest.
+Before `arc seed`, `arc reconcile`, or a change to `[catalogs]` or `[resolvers]`, read `catalogs.md`
 (`symbion skill catalogs`).
 
 ## Session end

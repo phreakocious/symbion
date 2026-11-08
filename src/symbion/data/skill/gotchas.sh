@@ -41,6 +41,59 @@ case "$tool" in
     gate=$mark.edit
     call=${call#*'_path"'}; call=${call#*'"'}; call=${call%%'"'*} ;;
 esac
+# The call less its symbion commands and their heredoc bodies: a write about a
+# file, or a read of its entries, is no use of it, and spent the line before
+# the first use (2026-11-05). A symbion command's word is `symbion` or a path
+# to it, first in its segment.
+# A variable set to symbion, or a path to it, is symbion where it is called:
+# `S="symbion --dir D"; $S add` wrote about a file and spent its gotcha
+# (2026-11-06).
+# ponytail: a separator inside a quoted argument ends its segment early, and
+# an env prefix (`X=1 symbion`) hides the command: both still fire, as before.
+nosymbion() {
+  rest=$1 out= r=$1
+  while :; do
+    case "$r" in *symbion*) ;; *) break ;; esac
+    pre=${r%%symbion*}; r=${r#"$pre"symbion}
+    case "$r" in ' '*|\\\"*|\'*|';'*|'&'*|'|'*|\\n*|'') ;; *) continue ;; esac
+    w=${pre##*[ ;\&\|\(:]}; w=${w##*\\n}; w=${w#\"}      # NAME=, NAME=\" or NAME='
+    n=${w%%=*} v=${w#*=}; v=${v#\\\"}; v=${v#\'}
+    case "$w" in *=*) ;; *) continue ;; esac
+    case "$n" in ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac
+    case "$v" in ''|*/) ;; *) continue ;; esac            # or a path to it
+    for f in "\$$n " "\${$n} "; do
+      while :; do
+        case "$rest" in *"$f"*) rest=${rest%%"$f"*}"symbion "${rest#*"$f"} ;; *) break ;; esac
+      done
+    done
+  done
+  while :; do
+    case "$rest" in *'symbion '*) ;; *) break ;; esac
+    pre=${rest%%'symbion '*}
+    rest=${rest#"$pre"symbion}
+    w=${pre##*[;\&\|\(\"]}; w=${w##*\\n}; w=${w#"${w%%[! ]*}"}
+    case "$w" in
+      *' '*) out=$out${pre}symbion; continue ;;
+      ''|*/) ;;
+      *) out=$out${pre}symbion; continue ;;
+    esac
+    seg=${rest%%[;\&\|]*}; seg=${seg%%\\n*}
+    rest=${rest#"$seg"}
+    case "$seg" in
+      *'<<'*)                                   # its body runs to the delimiter's line
+        d=${seg#*<<}; d=${d#-}; d=${d#"${d%%[! ]*}"}
+        case "$d" in
+          \'*) d=${d#\'}; d=${d%%\'*} ;;
+          \\\"*) d=${d#\\\"}; d=${d%%\\\"*} ;;
+          *) d=${d%%[!A-Za-z0-9_]*} ;;
+        esac
+        case "$rest" in *"\\n$d"*) rest=${rest#*"\\n$d"} ;; *) rest= ;; esac ;;
+    esac
+    out=$out$pre
+  done
+  printf '%s' "$out$rest"
+}
+case "$call" in *symbion*) call=$(nosymbion "$call") ;; esac
 # Windows sends C:\\proj\\src\\x.py; a row names src/x.py.
 case "$call" in *'\\'*) call=$(printf '%s' "$call" | sed 's#\\\\#/#g') ;; esac
 # Whether the call names file $2 of a repo whose root dir is named $3: at a
@@ -60,7 +113,8 @@ names() {
     rest=${rest#*"$2"}
     lead=${2#"${2%?}"}
     case "$rest" in [A-Za-z0-9._~/-]*) continue ;; esac
-    case "$pre" in ''|*[!A-Za-z0-9._~/@+-]|*[!A-Za-z0-9._~/@+-]./) return 0 ;; esac
+    # A line's start too: `\n` is JSON's newline, and its `n` no path's.
+    case "$pre" in ''|*[!A-Za-z0-9._~/@+-]|*[!A-Za-z0-9._~/@+-]./|*\\[nrt]|*\\[nrt]./) return 0 ;; esac
     # No root (a list from before roots, or a repo not on this machine): any
     # dir, as before.
     case "$pre" in */"$3"/) return 0 ;; */) [ -z "$3" ] && return 0 ;; *) continue ;; esac

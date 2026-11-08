@@ -161,6 +161,46 @@ async def _until(cond, seconds: float = 3.0) -> None:
     assert cond()
 
 
+async def test_a_page_has_one_h1_its_boards_h2_and_a_skip_link_first(user: User,
+                                                                      ctx_with_notes):
+    """A screen reader moves through a page by its headings, and every title
+    was a div; dozens of stops came before the first card (the GUI review,
+    2026-11-07). The look stays the classes'."""
+    for path, title in (("/", "Summary"), ("/notes?kind=note", "Notes"), ("/docs", "Docs")):
+        await user.open(path)
+        with user:
+            heads = [e.tag for e in ElementFilter(kind=ui.element) if e.tag in ("h1", "h2")]
+        (h1,) = user.find(marker="page-title").elements
+        assert (h1.tag, h1.text, heads.count("h1")) == ("h1", title, 1), (path, heads)
+    await user.open("/")
+    boards = user.find(marker="board-title").elements
+    assert boards, "the Summary of ctx_with_notes has boards"
+    for b in boards:
+        assert "h2" in (b.tag, b.parent_slot.parent.tag), (b.tag, b.text)
+    (skip,) = user.find(marker="skip-link").elements
+    (target,) = user.find(marker="skip-target").elements
+    assert (skip.props["href"], target.props["id"]) == ("#sb-start", "sb-start")
+
+
+async def test_a_hidden_tab_polls_each_minute_and_reads_on_its_return(user: User, ctx_with_notes,
+                                                                      monkeypatch):
+    """A hidden tab read the store's git every 5 s, as a shown one did (the
+    GUI review, 2026-11-07). It reads each minute instead, not never: the
+    installed app's badge is set from this tick. Shown again, it reads now."""
+    from symbion.gui import chrome
+    await user.open("/")
+    (timer,) = user.find(marker="git-poll").elements
+    assert timer.interval == chrome._GIT_EVERY
+    reads, real = [], chrome.git_state
+    monkeypatch.setattr(chrome, "git_state", lambda *a: reads.append(1) or real(*a))
+    trigger = UserInteraction(user, {user.client.layout}, None).trigger
+    trigger("sbHidden", True)                  # what the page's visibilitychange sends
+    await _until(lambda: timer.interval == chrome._HIDDEN_EVERY == 60)
+    assert reads == []
+    trigger("sbHidden", False)
+    await _until(lambda: timer.interval == chrome._GIT_EVERY and reads == [1])
+
+
 async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_notes, tmp_path,
                                                        monkeypatch):
     """A page drew the store once: an entry an agent wrote showed only after
@@ -174,15 +214,27 @@ async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_note
             return [[e.text for e in b.default_slot.children]
                     for b in ElementFilter(marker="stale-button")]
 
+    def said():                          # Reload's words for a screen reader
+        with user:
+            return [e.text for e in ElementFilter(marker="stale-said")]
+
     await user.open("/notes?tag=red")
     await asyncio.sleep(0.3)                                    # a few ticks
-    assert words() == []
+    assert (words(), said()) == ([], [""])
     api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
                              "body": "gamma"}, author="sam")      # as at a terminal
     await _until(lambda: words() == [["1", "new"]])
+    assert said() == ["1 new entry since this page was drawn: reload"]
     beta = next(n for n in store.load(tmp_path) if n.body == "beta body")
     api.supersede(ctx_with_notes, beta.id, author="sam", body="beta revised")
     await _until(lambda: words() == [["2", "new or changed"]])
+    # Its tip names each entry, who wrote it and what they did, newest first.
+    gamma = next(n for n in store.load(tmp_path) if n.body == "gamma")
+    assert await _hover(user, "stale-button") == "\n".join([
+        "since this page was drawn:",
+        f"sam · edited · bug {beta.id[-10:]} · beta revised",
+        f"sam · new · note {gamma.id[-10:]} · gamma",
+        "click to list them"])
     user.find(marker="stale-button").click()
     with user.scope(marker="peek"):
         await user.should_see("1 new entry and 1 changed entry since this page was drawn")
@@ -193,6 +245,155 @@ async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_note
     user.find(marker="drift-reload").click()
     await asyncio.sleep(0.3)
     await user.should_not_see(marker="stale-button")
+
+
+async def _arc_board(user, ctx, monkeypatch):
+    """An arc of three boxes in two phases, its page on the board, polled fast."""
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    act = api.create_arc(ctx, "camp", "d", "item", author="ada")
+    api.seed(ctx, act.id, "item", ["one", "two", "three"], author="ada")
+    api.set_phases(ctx, act.id, ["todo", "doing"])
+    ids = {n.target.name: n.id for n in store.arc_items(store.load(ctx.store_dir), act.id)}
+    await user.open(f"/arc?id={act.id}")
+    user.find(marker="arc-view-board").click()
+    await user.should_see(marker="board-column")
+    return act, ids
+
+
+def _stale(user) -> list:
+    with user:
+        return [[e.text for e in b.default_slot.children]
+                for b in ElementFilter(marker="stale-button")]
+
+
+def _drop(user, **args) -> None:
+    UserInteraction(user, {user.client.layout}, None).trigger("sbMove", args)
+
+
+async def test_an_agents_move_offers_a_reload(user: User, ctx_with_notes, monkeypatch):
+    """The poll stamped notes.jsonl only: a move, which writes arcs.jsonl, left an open
+    board as it was and said nothing."""
+    act, ids = await _arc_board(user, ctx_with_notes, monkeypatch)
+    await asyncio.sleep(0.3)                                    # a few ticks
+    assert _stale(user) == []
+    store.move_box(ctx_with_notes.store_dir, ids["one"], phase="doing", author="sam")
+    # The count is of entries: it read "1 arcs changed".
+    await _until(lambda: _stale(user) == [["arcs changed"]])
+    api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
+                             "body": "gamma"}, author="sam")
+    await _until(lambda: _stale(user) == [["1", "new · arcs"]])
+    user.find(marker="stale-button").click()
+    with user.scope(marker="peek"):
+        await user.should_see("arcs changed since this page was drawn")
+
+
+async def test_the_pages_own_moves_light_nothing(user: User, ctx_with_notes, monkeypatch):
+    """A drop, a resolve into done, a reopen out of it and a phase menu each write
+    from this page: none is news to it."""
+    ctx = ctx_with_notes
+    act, ids = await _arc_board(user, ctx, monkeypatch)
+    _drop(user, id=ids["one"], phase="doing", before=None)      # arcs only
+    _drop(user, id=ids["two"], phase="done", before=None)       # resolves: a note too
+    await asyncio.sleep(0.1)
+    assert store.arc_progress(store.load(ctx.store_dir), act.id)[0] == 1
+    _drop(user, id=ids["two"], phase="todo", before=None)       # reopens and places
+    await asyncio.sleep(0.4)
+    assert store.arc_progress(store.load(ctx.store_dir), act.id)[0] == 0
+    user.find(marker="arc-view-list").click()                   # the list's own writes
+    await user.should_see(marker="checklist-row")
+    (box,) = [c for c in cards(user) if c._props["data-id"] == ids["three"]]
+    from _cards import _emit
+    _emit(user, box, "move", "phase", "doing")                  # the chip menu
+    part(user, "note-resolve", card=box).click()                # the tick
+    user.find(marker="arc-edit").click()                        # the form opens
+    user.find(marker="arc-phases").elements.pop().set_value("todo, doing, review")
+    user.find(marker="arc-phases-save").click()                 # the phases editor
+    await asyncio.sleep(0.4)
+    assert store.load_arcs(ctx.store_dir)[0].phases == ("todo", "doing", "review")
+    assert store.arc_progress(store.load(ctx.store_dir), act.id)[0] == 1
+    assert _stale(user) == []
+
+
+async def test_the_arc_pages_describe_and_star_light_nothing(user: User, ctx_with_notes,
+                                                             monkeypatch):
+    """Describe writes arcs.jsonl and a star writes a note, both from this page."""
+    act, ids = await _arc_board(user, ctx_with_notes, monkeypatch)
+    user.find(marker="arc-view-list").click()
+    await user.should_see(marker="checklist-row")
+    user.find(marker="arc-edit").click()
+    user.find(marker="arc-description").elements.pop().set_value("a new line")
+    user.find(marker="arc-describe").click()
+    (box,) = [c for c in cards(user) if c._props["data-id"] == ids["one"]]
+    from _cards import _emit
+    _emit(user, box, "star")
+    await asyncio.sleep(0.4)
+    assert store.load_arcs(ctx_with_notes.store_dir)[0].description == "a new line"
+    assert any("priority" in n.tags for n in store.load(ctx_with_notes.store_dir) if n.arc_id == act.id)
+    assert _stale(user) == []
+
+
+async def test_the_arc_pages_unarchive_and_seed_light_nothing(user: User, repo, tmp_path,
+                                                              monkeypatch):
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    store.ensure_store(tmp_path)
+    (tmp_path / "symbion.toml").write_text('[catalogs]\nthing = "echo a"\n')
+    ctx = api.resolve(str(tmp_path))
+    act = api.create_arc(ctx, "camp", "d", "thing", author="ada")
+    build_page(ctx, author="ada")
+    await user.open(f"/arc?id={act.id}")
+    user.find(marker="arc-edit").click()
+    user.find(marker="arc-seed").click()
+    await user.should_see("seeded 1 new target(s)")
+    await asyncio.sleep(0.4)
+    assert _stale(user) == []
+    api.archive_arc(ctx, act.id)
+    await _until(lambda: _stale(user) != [])
+    await user.open(f"/arc?id={act.id}")                        # a fresh page, nothing stale
+    await asyncio.sleep(0.2)
+    user.find(marker="arc-unarchive").click()
+    await asyncio.sleep(0.4)
+    assert not store.load_arcs(ctx.store_dir)[0].archived
+    assert _stale(user) == []
+
+
+async def test_the_pages_move_keeps_an_agents_unseen_move_offered(user: User, ctx_with_notes,
+                                                                  monkeypatch):
+    """The page's own drop must not take an agent's arc change with it: the poll
+    had not yet seen it, and the board redraws one card only."""
+    act, ids = await _arc_board(user, ctx_with_notes, monkeypatch)
+    await asyncio.sleep(0.1)
+    # both writes in one loop turn: no tick between them
+    store.move_box(ctx_with_notes.store_dir, ids["one"], phase="doing", author="sam")
+    _drop(user, id=ids["two"], phase="doing", before=None)
+    await _until(lambda: _stale(user) == [["arcs changed"]])
+
+
+async def test_resolving_a_pre_registration_in_the_dialog_lights_nothing(
+        user: User, repo, tmp_path, monkeypatch):
+    """The dialog's save is the page's own write, whether it came from a tick or a
+    drop."""
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    store.ensure_store(tmp_path)
+    (tmp_path / "symbion.toml").write_text(
+        '[kinds]\nprediction = { status = true, verdict = true }\n')
+    ctx = api.resolve(str(tmp_path))
+    act = api.create_arc(ctx, "camp", "d", "item", author="ada")
+    p = api.add(ctx, {"kind": "prediction", "target": {"type": "item", "name": "sweep"},
+                      "arc_id": act.id}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open(f"/arc?id={act.id}")
+    user.find(marker="arc-view-board").click()
+    await user.should_see(marker="board-column")
+    _drop(user, id=p.id, phase="done", before=None)
+    await user.should_see(marker="edit-result")
+    user.find(marker="edit-result").elements.pop().set_value("FIRED")
+    user.find(marker="edit-save").click()
+    await asyncio.sleep(0.4)
+    assert store.arc_progress(store.load(tmp_path), act.id) == (1, 1)
+    assert _stale(user) == []
 
 
 async def test_the_app_badge_counts_other_writers_entries_since_a_page_was_drawn(
@@ -248,6 +449,65 @@ async def test_the_commit_button_commits_only_its_authors_rows(user: User, ctx_w
     user.find(marker="commit-button").click()
     await user.should_see("committed: entries ada 1", retries=40)
     assert [r["author"] for r in store.pending_rows(tmp_path)] == ["sam"]
+
+
+async def _hover(user, marker: str) -> str:
+    """The tip a hover asks the server for (chrome._tip_on_hover)."""
+    (el,) = user.find(marker=marker).elements
+    el._props.pop("data-tip", None)
+    user.find(marker=marker).trigger("mouseenter")
+    await _until(lambda: "data-tip" in el._props)
+    return el._props["data-tip"]
+
+
+async def test_the_commit_buttons_tip_names_each_entry_and_what_was_done(
+        user: User, ctx_with_notes, tmp_path):
+    """Its tip said whose entries it commits, not which (the user, 2026-11-07).
+    An entry is new until a commit holds it, however often it was edited."""
+    ctx = ctx_with_notes
+    alpha = next(n for n in store.load(tmp_path) if n.body == "alpha body")
+    await user.open("/notes")
+    assert await _hover(user, "commit-button") == "\n".join([
+        "commit your 1 entry:", f"new · note {alpha.id[-10:]} · alpha body",
+        "left for their writers: 1 entry"])
+    api.commit(ctx, "first", author="ada")
+    bug = api.add(ctx, {"kind": "bug", "target": {"type": "item", "name": "w"},
+                        "body": "broken"}, author="ada")
+    api.supersede(ctx, bug.id, author="ada", body="broken twice")    # new, edited: new
+    api.supersede(ctx, alpha.id, author="ada", tags=["red", "priority"])
+    await user.open("/notes")
+    assert await _hover(user, "commit-button") == "\n".join([
+        "commit your 2 entries:", f"starred it · note {alpha.id[-10:]} · alpha body",
+        f"new · bug {bug.id[-10:]} · broken twice", "left for their writers: 1 entry"])  # newest first
+    api.commit(ctx, "second", author="ada")
+    api.supersede(ctx, bug.id, author="ada", status="resolved")
+    api.supersede(ctx, alpha.id, author="ada", body="alpha, rewritten")
+    api.supersede(ctx, alpha.id, author="ada", body="alpha, rewritten again")
+    await user.open("/notes")
+    assert await _hover(user, "commit-button") == "\n".join([
+        "commit your 2 entries:", f"edited · note {alpha.id[-10:]} · alpha, rewritten again",
+        f"resolved · bug {bug.id[-10:]} · broken twice",
+        "left for their writers: 1 entry"])
+
+
+async def test_the_commit_tip_names_an_entry_by_its_id_under_anothers_edit(
+        user: User, ctx_with_notes, tmp_path):
+    """sam edited ada's pending entry: ada's commit takes her version, which
+    the edit saved under a new id, and the tip named that id (seen
+    2026-11-07)."""
+    alpha = next(n for n in store.load(tmp_path) if n.body == "alpha body")
+    api.supersede(ctx_with_notes, alpha.id, author="sam", body="alpha, by sam")
+    await user.open("/notes")
+    assert await _hover(user, "commit-button") == "\n".join([
+        "commit your 1 entry:", f"new · note {alpha.id[-10:]} · alpha body",
+        "left for their writers: 2 entries"])
+
+
+def test_a_long_tip_names_how_many_it_left_out():
+    from symbion.gui import chrome
+    lines = [f"line {i}" for i in range(chrome._TIP_LINES + 3)]
+    assert chrome._capped(lines) == [*lines[:chrome._TIP_LINES - 1], "+4 more"]
+    assert chrome._capped(lines[:chrome._TIP_LINES]) == lines[:chrome._TIP_LINES]
 
 
 async def test_the_push_button_shows_gits_refusal(user: User, ctx_with_notes, tmp_path,
@@ -336,7 +596,7 @@ async def test_a_cited_tail_opens_its_row(user: User, ctx_with_notes):
     old = next(n.id for n in store.load(ctx_with_notes.store_dir) if n.body == "beta body")
     await user.open(f"/notes?id={old.split('-', 2)[2]}")
     await user.should_see("beta body")
-    assert _count(user) == "1 entry"
+    assert user.find(marker="page-title").elements.pop().text == f"bug {old.split('-', 2)[2]}"
     kept = api.supersede(ctx_with_notes, old, author="ada", body="beta revised").supersedes
     await user.open(f"/notes?id={old.split('-', 2)[2]}")
     await user.should_see("beta revised")                # an edit keeps the row's id
@@ -471,7 +731,7 @@ async def test_a_search_result_shows_and_marks_a_hit_past_the_clip(user: User, r
 async def test_the_header_search_keeps_the_filters_in_view(user: User, ctx_with_notes):
     await user.open("/notes?kind=bug")
     user.find(marker="search").type("widget").trigger("keydown.enter")
-    await user.should_see("search: widget · kind=bug")
+    await user.should_see("Bugs matching “widget”")
     assert _count(user).startswith("1 of 1 entry match")
 
 
@@ -505,9 +765,9 @@ async def test_tab_title_leads_with_the_project_name(user: User, ctx_with_notes)
     search's text in it ends no script. `_client`: see the first test."""
     await user.open("/notes?q=a</script>b")
     assert user.client.resolve_title() == \
-        f"{ctx_with_notes.cfg.project_root.name} · search: a</script>b · symbion"
+        f"{ctx_with_notes.cfg.project_root.name} · Entries matching “a</script>b” · symbion"
     assert 'if (matchMedia("(display-mode: tabbed)").matches) ' \
-        'document.title = "search: a\\u003c/script>b"</script>' in user._client.head_html
+        'document.title = "Entries matching \\u201ca\\u003c/script>b\\u201d"</script>' in user._client.head_html
 
 
 async def test_header_brand_names_the_project(user: User, ctx_with_notes):
@@ -613,8 +873,10 @@ async def test_a_board_past_its_cap_keeps_the_newest_and_every_due_row(
     (aside,) = user.find(marker="board-aside").elements
     assert (aside.text, aside.props["href"]) == ("· 1 more · 4 entries",
                                                  "/object?type=item&name=widget")
-    (count,) = [e for e in user.find(marker="board-count").elements
-                if e.parent_slot.parent.default_slot.children[0].text == "item: widget"]
+    (count,) = [e for e in user.find(marker="board-count").elements   # title: an h2, or its link
+                if "item: widget" in {getattr(d, "text", None)
+                                      for d in e.parent_slot.parent.default_slot.children[0]
+                                      .descendants(include_self=True)}]
     assert count.text == "3"
 
 
@@ -952,6 +1214,31 @@ async def test_every_key_and_palette_action_presses_a_drawn_element(
     assert not missing, missing
 
 
+async def test_the_peek_lives_in_the_url(user: User, ctx_with_notes, monkeypatch):
+    """The peek opened and closed beside history: a phone's Back left the
+    page under it, a reload lost it, and its "open its page" was a button a
+    middle click could not open (the GUI review, 2026-11-07). The history
+    steps run in the client (checked in a browser); here, what the page asks."""
+    from nicegui.outbox import Outbox
+    sent, emit = [], Outbox._emit
+
+    async def record(self, message):
+        if message[1] == "run_javascript" and "sbPeek" in message[2]["code"]:
+            sent.append(message[2]["code"])
+        await emit(self, message)
+
+    monkeypatch.setattr(Outbox, "_emit", record)
+    bug = next(n.id for n in store.heads(store.load(ctx_with_notes.store_dir)) if n.kind == "bug")
+    await user.open("/")
+    await _until(lambda: "sbPeekFromHash()" in sent)     # on connect: a #peek= link opens it
+    _peek(user, bug)
+    await _until(lambda: f'sbPeekHash("{bug}")' in sent)  # the outbox sends it a turn later
+    (page,) = user.find(marker="peek-page").elements
+    assert page.props["href"] == f"/notes?id={bug}"       # a link: a middle click opens a tab
+    user.find(marker="peek-close").click()
+    await _until(lambda: "sbPeekUnhash()" in sent)
+
+
 async def test_a_write_in_the_peek_reloads_the_page_and_peeks_again(user: User, ctx_with_notes,
                                                                     tmp_path):
     """The user, 2026-10-16: a question answered in the peek stayed on the
@@ -1012,6 +1299,7 @@ async def test_arc_page_renders_the_seed_button_on_a_default_store(user: User, r
     build_page(ctx, author="ada")
     await user.open(f"/arc?id={act.id}")
     await user.should_see("camp")
+    user.find(marker="arc-edit").click()
     assert user.find(marker="arc-seed").elements
 
 
@@ -1052,6 +1340,60 @@ async def test_a_chip_in_a_filtered_view_narrows_it(user: User, ctx_with_notes):
     assert _hrefs(user, "tag-blue") == {"/notes?tag=blue"}
 
 
+async def test_a_page_has_one_filled_button(user: User, ctx_with_notes):
+    """The design system: one filled primary per surface. /arcs had two, New
+    entry and Create arc (the GUI review, 2026-11-07)."""
+    for path in ("/", "/notes", "/targets", "/tags", "/arcs", "/docs", "/map"):
+        await user.open(path)
+        with user:
+            filled = [b.text for b in ElementFilter(kind=ui.button) if b.props.get("unelevated")]
+        assert len(filled) == 1, (path, filled)
+
+
+async def test_enter_that_ends_an_ime_word_acts_on_nothing(user: User, ctx_with_notes):
+    """An IME's Enter ends a word, and the answer field and the search box
+    acted on it: a half-typed answer was written (the GUI review, 2026-11-07).
+    Each acts only on an Enter that ends no word; Safari sends that one after
+    compositionend, as keyCode 229. The guards run in the client: a real IME
+    is a person's check. The drop's name field: tests/test_gui_drop.py."""
+    from symbion.gui.chrome import _ENTER
+    assert _ENTER == "!e.isComposing && e.keyCode !== 229"
+    t = template()
+    assert '@keydown.enter="answer"' in t
+    assert 'if (!e.isComposing && e.keyCode !== 229) this.act("answer", this.typed)' in t
+    await user.open("/")
+    (box,) = user.find(marker="search").elements
+    assert [l.js_handler for l in box._event_listeners.values() if "keydown" in l.type.lower()] \
+        == [f"(e) => {{ if ({_ENTER}) emit(e.target.value) }}"]
+
+
+async def test_an_entrys_page_is_named_for_the_entry(user: User, ctx_with_notes):
+    """Its title and tab read `id=…`, alike for every entry in tabs, history
+    and bookmarks, over "1 entry" (the GUI review, 2026-11-07). The crumbs
+    say where it sits, and the tab leads with its kind and first words."""
+    bug = store.query(store.load(ctx_with_notes.store_dir), kind="bug")[0]
+    await user.open(f"/notes?id={bug.id}")
+    (h1,) = user.find(marker="page-title").elements
+    assert h1.text == f"bug {bug.id.split('-', 2)[2]}"
+    assert _crumbs(user) == ["All entries", "›", h1.text]
+    # the separator is a mark, so no word a screen reader reads (the design critique, 2026-11-07)
+    (row,) = user.find(marker="crumbs").elements
+    assert row.default_slot.children[1].props["aria-hidden"] == "true"
+    assert user.client.resolve_title() == \
+        f"{ctx_with_notes.cfg.project_root.name} · bug · beta body · symbion"
+    await user.should_not_see(marker="result-count")
+    await user.open(f"/notes?id={bug.id[-3:]}")         # a tail, as rows cite one
+    assert user.find(marker="page-title").elements.pop().text == h1.text
+    await user.open("/notes?id=no-such")
+    assert user.find(marker="page-title").elements.pop().text == "no entry no-such"
+    await user.should_see("No entry has an id that is or ends in “no-such”.")
+    await user.should_not_see(marker="result-count")
+    # an id that is there, under a filter it fails, is no unknown id
+    await user.open(f"/notes?id={bug.id}&kind=note")
+    assert user.find(marker="page-title").elements.pop().text.startswith("id=")
+    await user.should_not_see(marker="no-such-id")
+
+
 async def test_a_chip_or_a_search_on_a_notes_own_page_starts_a_filter(
         user: User, ctx_with_notes):
     """One note's page is `?id=`: its chips and the search kept the id, so
@@ -1061,8 +1403,31 @@ async def test_a_chip_or_a_search_on_a_notes_own_page_starts_a_filter(
     assert _hrefs(user, "note-kind") == {"/notes?kind=bug"}
     assert _hrefs(user, "tag-blue") == {"/notes?tag=blue"}
     user.find(marker="search").type("alpha").trigger("keydown.enter")
-    await user.should_see("search: alpha")       # the new page; then the whole title
-    assert {e.text for e in user.find(marker="page-title").elements} == {"search: alpha"}
+    await user.should_see("Entries matching “alpha”")   # the new page; then the whole title
+    assert {e.text for e in user.find(marker="page-title").elements} == {"Entries matching “alpha”"}
+
+
+async def test_each_filter_comes_off_by_its_own_chip(user: User, ctx_with_notes):
+    """"clear filters" took every filter at once, and an active filter's chip
+    on a card linked to the page it was on (the GUI review, 2026-11-07). Each
+    filter is a chip whose × takes off that one; on a card, its chip is a
+    label; the title says it in words."""
+    await user.open("/notes?kind=bug&tag=blue&q=beta")
+    chips = {e.default_slot.children[0].text: e.props["href"]
+             for e in user.find(marker="filter-chip").elements}
+    assert chips == {"kind bug": "/notes?tag=blue&q=beta", "tag blue": "/notes?kind=bug&q=beta",
+                     "search beta": "/notes?kind=bug&tag=blue"}, chips
+    (clear,) = user.find(marker="clear-filters").elements
+    assert clear.props["href"] == "/notes"
+    assert _hrefs(user, "note-kind") == {None}, "the view's own kind: a label"
+    assert _hrefs(user, "tag-blue") == {None}
+    (foot,) = [e._props["card"]["foot"] for e in cards(user)]
+    assert next(c["h"] for c in foot if c["t"] == "open") == \
+        "/notes?kind=bug&tag=blue&q=beta&status=open", "a filter it lacks still narrows"
+    (h1,) = user.find(marker="page-title").elements
+    assert h1.text == "Bugs tagged #blue matching “beta”"
+    await user.open("/notes")
+    await user.should_not_see(marker="filter-chips")
 
 
 async def test_a_note_under_an_arc_links_to_it_and_the_arc_page_lists_its_notes(
@@ -1126,6 +1491,36 @@ async def test_a_commit_ref_chip_is_a_short_sha(user: User, repo, tmp_path):
     assert len(texts) == 1 and len(texts.pop().split(":", 1)[1]) == 7, texts
 
 
+async def test_a_new_arc_is_mixed_as_the_cli_makes_one(user: User, repo, tmp_path):
+    """The form picked `item`, the CLI `mixed` (the design critique,
+    2026-11-07). A scope only names what an arc's boxes are on."""
+    ctx = api.resolve(str(tmp_path))
+    build_page(ctx, author="ada")
+    await user.open("/arcs")
+    user.find(marker="new-arc-name").type("camp")
+    user.find(marker="new-arc-create").click()
+    (act,) = store.load_arcs(tmp_path)
+    assert (act.name, act.target_scope) == ("camp", "mixed")
+
+
+async def test_a_finished_arc_steps_back_on_the_index(user: User, repo, tmp_path):
+    """A finished arc's count read as an active one's did (the design critique,
+    2026-11-07): a finished one says done, in `good`, and steps back."""
+    ctx = api.resolve(str(tmp_path))
+    done = api.create_arc(ctx, "done", "", "item", author="ada")
+    api.seed(ctx, done.id, "item", ["a"], author="ada")
+    live = api.create_arc(ctx, "live", "", "item", author="ada")
+    api.seed(ctx, live.id, "item", ["b"], author="ada")
+    (box,) = store.arc_items(store.load(tmp_path), done.id)
+    api.supersede(ctx, box.id, author="ada", status="resolved")
+    build_page(ctx, author="ada")
+    await user.open("/arcs")
+    cards = sorted(user.find(marker="arc-card").elements, key=lambda e: e.id)
+    counts = sorted(user.find(marker="arc-count").elements, key=lambda e: e.id)
+    assert {(n.text, "sb-done" in c.classes) for c, n in zip(cards, counts)} == \
+        {("1/1 done", True), ("0/1", False)}
+
+
 async def test_an_archived_arc_says_so_and_is_reachable(user: User, repo, tmp_path):
     """Its page offered `archive` and never said it was archived, and the
     index listed archived arcs as labels, not links."""
@@ -1155,6 +1550,64 @@ async def test_an_arc_page_unarchives_and_describes_its_arc(user: User, repo, tm
     user.find(marker="arc-describe").click()
     await user.should_see(marker="arc-archive")
     assert store.load_arcs(tmp_path)[0].description == "second"
+
+
+async def test_an_arc_page_opens_on_its_boxes_with_its_form_behind_edit_arc(user: User, repo,
+                                                                           tmp_path):
+    """The design critique, 2026-11-07: rename, description, phases and
+    Archive came before every box, Archive drawn in "look here". They wait
+    behind Edit arc, and Archive carries no colour of its own."""
+    ctx = api.resolve(str(tmp_path))
+    aid = api.create_arc(ctx, "camp", "d", "mixed", author="ada").id
+    build_page(ctx, author="ada")
+    await user.open(f"/arc?id={aid}")
+    await user.should_see(marker="arc-edit")
+    await user.should_not_see(marker="arc-rename")
+    user.find(marker="arc-edit").click()
+    await user.should_see(marker="arc-rename")
+    (archive,) = user.find(marker="arc-archive").elements
+    assert "color" not in archive._props, archive._props
+
+
+async def test_a_list_card_names_six_measurements_and_the_page_all(user: User, repo, tmp_path):
+    """One card printed dozens of counters, most of them 0 (the design critique,
+    2026-11-07): a list's card names the first six and how many more; the
+    entry's page names every one."""
+    ctx = api.resolve(str(tmp_path))
+    nid = api.add(ctx, {"kind": "measurement", "target": {"type": "item", "name": "w"},
+                        "checked": "a run", "result": "counted",
+                        "measurements": {f"k{i}": i for i in range(9)}}, author="ada").id
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    (meas,) = parts(user, "measurements")
+    assert meas.d["items"] == [f"k{i}: {i}" for i in range(6)] + ["+3 more"]
+    await user.open(f"/notes?id={nid}")
+    (meas,) = parts(user, "measurements")
+    assert meas.d["items"] == [f"k{i}: {i}" for i in range(9)]
+
+
+async def test_the_summarys_run_boards_show_three_under_a_rule(user: User, repo, tmp_path):
+    """Two "recent" boards took more than half the Summary (the design
+    critique, 2026-11-07): each shows its three newest runs, under a rule
+    that ends the boards to act on, and counts the rest."""
+    ctx = api.resolve(str(tmp_path))
+    ids = [api.add(ctx, {"kind": "check", "target": {"type": "item", "name": "w"},
+                         "checked": f"run {i}", "result": "ok"}, author="ada").id
+           for i in range(5)]
+    build_page(ctx, author="ada")
+    await user.open("/")
+    assert _board_ids(user)["recent check"] == ids[::-1][:3]
+    await user.should_see(marker="runs-rule")
+    await user.should_see("· 2 more")
+
+
+async def test_a_read_only_summary_waits_on_the_owner(user: User, ctx_with_notes, monkeypatch):
+    """A demo visitor read "waiting on you" about the store's owner (the
+    design critique, 2026-11-07)."""
+    nid = _q(ctx_with_notes, "Keep it?")
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")            # after the write: it refuses one
+    await user.open("/")
+    assert _board_ids(user)["waiting on the owner"] == [nid]
 
 
 async def test_an_object_page_leads_with_open_rows_and_clips_resolved_ones(
@@ -1251,6 +1704,21 @@ async def test_a_read_only_page_that_fails_names_only_the_exceptions_type(
     assert "RuntimeError" in r.text
     assert "/srv/private/store" not in r.text
     assert "/srv/private/store" in caplog.text
+    caplog.clear()
+
+
+async def test_a_read_only_refusal_names_no_path(user: User, ctx_with_notes, caplog,
+                                                 monkeypatch):
+    """A typed path outside the project is refused in words that name the
+    resolved path and the project root, both on the serving machine (the
+    security review, 2026-11-07). The demo's visitor sees neither; the log
+    keeps them."""
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    root = str(ctx_with_notes.cfg.work_root)
+    await user.open("/object?type=file&name=/etc/passwd")
+    assert user.notify.contains("Read-only demo: refused"), user.notify.messages
+    assert not any(root in str(m) for m in user.notify.messages)
+    assert root in caplog.text
     caplog.clear()
 
 
@@ -1417,6 +1885,15 @@ async def test_the_top_bar_names_the_writer_while_the_sidebar_hides(user: User, 
     assert "sb-narrow" in name.parent_slot.parent.classes
 
 
+async def test_the_sidebar_opens_by_width_without_asking_the_browser(user: User, ctx_with_notes):
+    """A drawer of value=None asks each new client whether it is open, and logs
+    a traceback when no answer comes in 1 s: the visitor left, or the tab slept."""
+    await user.open("/")
+    (side,) = user.find(ui.left_drawer).elements
+    assert side.value is False
+    assert side.props["show-if-above"] is True
+
+
 async def test_the_fonts_ship_in_the_package_and_load_from_the_gui(user: User, ctx_with_notes):
     """From Google Fonts, every page load reached a third party."""
     import re
@@ -1447,7 +1924,7 @@ async def test_the_top_bar_ends_in_the_pages_title(user: User, ctx_with_notes):
     for path, title in (("/", "Summary"), ("/tags", "Tags"), ("/arcs", "Arcs"), ("/docs", "Docs"),
                         ("/map", "Map"),
                         ("/object?type=item&name=widget", "item: widget"),
-                        ("/notes?kind=bug", "kind=bug")):
+                        ("/notes?kind=bug", "Bugs")):
         await user.open(path)
         (here,) = user.find(marker="page-title").elements
         assert here.text == title, path
@@ -1493,12 +1970,18 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
             counts = sorted(user.find(marker="doc-count").elements, key=lambda e: e.id)
             got[board] = [(a.text, " ".join(c.text for c in n.default_slot.children))
                           for a, n in zip(links, counts)]
+            # an ellipsis cuts a long name at 375 px: each name is its tip there
+            assert all(a.props["data-tip-cut"] == a.text for a in links)
             got[board + " read"] = len(user.find(marker="file-open").elements)
     assert got == {"docs-repo": [("item: README.md", "2 · 1 open"), ("item: gone.md", "1 · 1 open"),
                                  ("sub/Guide.MD", "0 entries")],
                    "docs-repo read": 2,
                    "docs-store": [("plan.md", "1 entry"), ("loose.md", "0 entries")],
                    "docs-store read": 2}
+    # Each icon is named for the file it reads: all were "read" (the GUI review, 2026-11-07).
+    names = sorted(b.props.get("aria-label", "") for b in user.find(marker="file-open").elements)
+    assert names and all(n.startswith("read ") and n != "read " for n in names), names
+    assert any("plan.md" in n for n in names), names
     monkeypatch.setitem(build_page.__globals__, "BOARD_ROWS", 2)
     for i in range(2):
         api.add(ctx, {"kind": "note", "target": {"type": "doc", "name": f"d{i}.md"},
@@ -1632,7 +2115,7 @@ async def test_the_help_icon_opens_how_symbion_works(user: User, repo, tmp_path)
     build_page(ctx, author="ada")
     await user.open("/")
     user.find(marker="help-open").click()
-    await user.should_see(marker="file-view")
+    await user.should_see(marker="file-view", retries=40)
     (view,) = user.find(marker="file-view").elements
     assert view.content.startswith("# How symbion works")
     assert "This store's kinds:\n\n- **note** (record)\n" in view.content
@@ -1792,8 +2275,13 @@ async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
     chips = [c for e in cards(user) for c in e._props["card"]["foot"] if c.get("view")]
     assert all(c["pair"] and "sb-chip" in c["c"] for c in chips), chips
     assert '<span v-if="c.pair" class="sb-pair">' in template()
+    # Named for the file it reads: every read button on a Summary was named
+    # "read", the file only in a tip no keyboard reached (the GUI review, 2026-11-07).
+    assert all(c["view"]["tip"].startswith("read README.md") for c in chips), chips
+    (read,) = re.findall(r'<q-btn v-if="c\.view".*?/>', template())    # `=>` holds a `>`
+    assert ':aria-label="c.view.tip"' in read, read
     parts(user, "file-open")[0].click()
-    await user.should_see(marker="file-view")
+    await user.should_see(marker="file-view", retries=40)
     (view,) = user.find(marker="file-view").elements
     assert "the *whole* file" in view.content
     # a diagram, drawn in mermaid's dark theme (the user, 2026-10-27); the
@@ -1827,7 +2315,7 @@ async def test_a_file_only_the_default_branch_holds_opens_from_there(user: User,
     build_page(ctx, author="ada")
     await user.open("/notes")
     part(user, "file-open").click()
-    await user.should_see(marker="file-view")
+    await user.should_see(marker="file-view", retries=40)
     (view,) = user.find(marker="file-view").elements
     assert "aws_instance" in view.props["innerHTML"]
     await user.should_see("infra/main.tf, as on main")
@@ -1856,7 +2344,7 @@ async def test_a_code_target_opens_coloured_in_a_dialog(user: User, repo, tmp_pa
     build_page(ctx, author="ada")
     await user.open("/object?type=item&name=x.py")
     user.find(marker="file-open").click()
-    await user.should_see(marker="file-view")
+    await user.should_see(marker="file-view", retries=40)
     (view,) = user.find(marker="file-view").elements
     html = view.props["innerHTML"]
     assert html.count('<pre class="codehilite">') == 1, html
@@ -1918,7 +2406,7 @@ async def test_the_viewer_card_takes_the_focus_so_page_keys_scroll_it(user: User
     build_page(ctx, author="ada")
     await user.open("/object?type=item&name=x.py")
     user.find(marker="file-open").click()
-    await user.should_see(marker="file-view")
+    await user.should_see(marker="file-view", retries=40)
     (view,) = user.find(marker="file-view").elements
     card = view.parent_slot.parent
     assert "sb-md-card" in card.classes
@@ -1981,7 +2469,7 @@ async def test_a_commit_shows_its_diff_and_links_its_forge(user: User, repo, tmp
     (prs,) = user.find(marker="forge-prs").elements
     assert prs.props["href"] == f"https://github.com/o/r/pulls?q=is%3Apr+{sha}"
     user.find("read the diff").click()
-    await user.should_see(marker="diff-view")
+    await user.should_see(marker="diff-view", retries=40)
     await user.should_see("add g")
     await user.should_see("Why g exists, said below the subject.")
     await user.should_see(f"{sha[:12]} · Ada Lovelace · ")
@@ -2004,7 +2492,8 @@ async def test_a_typed_name_reads_as_context_reads_it(user: User, repo, tmp_path
     build_page(ctx, author="ada")
     await user.open(f"/object?type=commit&name={sha[:7]}")
     await user.should_see("about it")
-    await user.should_see(f"commit: {sha}")
+    # titled short, as Targets names it: the whole sha left the search 120px
+    assert [e.text for e in user.find(marker="page-title").elements] == [f"commit: {sha[:7]}"]
     await user.open("/object?type=thing&name=x")
     await user.should_see("matches 2")
     await user.should_see("thing: x")
@@ -2046,7 +2535,7 @@ async def test_a_diff_reads_unified_or_side_by_side_and_keeps_the_pick(user: Use
     build_page(api.resolve(str(tmp_path)), author="ada")
     await user.open(f"/object?type=commit&name={sha}")
     user.find("read the diff").click()
-    await user.should_see(marker="diff-view")
+    await user.should_see(marker="diff-view", retries=40)
     view = _newest(user, "diff-view")
     assert "sb-diff-unified" in view.content and "sb-diff-split" not in view.content
     assert "y = 2" in view.content
@@ -2075,7 +2564,7 @@ async def test_a_diff_parses_and_renders_off_the_event_loop(user: User, repo, tm
                             ran.append((name, threading.get_ident())) or real(*a))
     await user.open(f"/object?type=commit&name={sha}")
     user.find("read the diff").click()
-    await user.should_see(marker="diff-view")
+    await user.should_see(marker="diff-view", retries=40)
     _newest(user, "diff-mode").set_value("split")
     await asyncio.sleep(0.1)
     assert [n for n, _ in ran] == ["parse", "render", "render", "render"]
@@ -2099,7 +2588,7 @@ async def test_a_merge_reads_as_what_it_brought_onto_its_branch(user: User, repo
     await user.open(f"/object?type=commit&name={sha}")
     await user.should_see("1 file · +1 −0 · the entries on each")
     user.find("read the diff").click()
-    await user.should_see(marker="diff-view")
+    await user.should_see(marker="diff-view", retries=40)
     await user.should_see(marker="commit-merge")
     assert "two from side" in _newest(user, "diff-view").content
 
@@ -2147,16 +2636,55 @@ async def test_a_since_chip_opens_the_commits_and_the_files_diff_since_the_entry
     await user.open("/object?type=file&name=f")
     await user.should_see("2 commits since")
     part(user, "note-since").click()
-    await user.should_see(marker="commit-list")
+    await user.should_see(marker="commit-list", retries=40)
     assert len(user.find(marker="commit-row").elements) == 2
     await user.should_see("shout two")
     await user.should_see("f, as this entry saw it, against the file now")
     view = _newest(user, "diff-view")
     assert '<span class="sb-dx">two</span>' in view.content and "three" in view.content
     user.find(marker="since-was").click()
-    await user.should_see(marker="file-view")
+    await user.should_see(marker="file-view", retries=40)
     was = _newest(user, "file-view").content
     assert "value = two" in was and "TWO" not in was
+
+
+async def test_the_git_behind_a_diff_runs_off_the_event_loop(user: User, repo, tmp_path,
+                                                             monkeypatch):
+    """The 2026-11-02 audit moved a diff's parse to a worker thread, and the
+    git that made its text stayed in the click's handler: a large `git show`
+    held every page's loop (the GUI review, 2026-11-07). A commit's diff, a
+    file's since-diff and its earlier text all read git on a worker now."""
+    import threading
+    ctx = _since_repo(repo, tmp_path)
+    api.add(ctx, {"kind": "bug", "target": {"type": "file", "name": "f"}, "body": "on f"},
+            author="ada")
+    (repo / "f").write_text("one\nvalue = TWO\n")
+    _commit_all(repo, "shout two")
+    sha = _git(repo, "rev-parse", "HEAD")
+    build_page(ctx, author="ada")
+    ran = []
+    for name in ("commit_show", "diff_text", "changed_since", "since_base", "commit_rows",
+                 "blob_text"):
+        real = getattr(gitref, name)
+        monkeypatch.setattr(gitref, name, lambda *a, real=real, name=name, **k:
+                            ran.append((name, threading.get_ident())) or real(*a, **k))
+    await user.open(f"/object?type=commit&name={sha}")
+    ran.clear()                                      # the page's own build reads git too
+    user.find("read the diff").click()
+    await user.should_see(marker="diff-view", retries=40)
+    clicked = list(ran)
+    await user.open("/object?type=file&name=f")
+    await user.should_see("1 commit since")
+    ran.clear()
+    part(user, "note-since").click()
+    await user.should_see(marker="commit-list", retries=40)
+    user.find(marker="since-was").click()
+    await user.should_see(marker="file-view", retries=40)
+    clicked += ran
+    assert {n for n, _ in clicked} == {"commit_show", "diff_text", "changed_since",
+                                       "since_base", "commit_rows", "blob_text"}, clicked
+    assert threading.get_ident() not in {t for _, t in clicked}, \
+        [n for n, t in clicked if t == threading.get_ident()]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a file name cannot hold a double quote")
@@ -2175,7 +2703,7 @@ async def test_a_quoted_file_name_is_one_prop_in_the_since_dialog(user: User, re
     build_page(ctx, author="ada")
     await user.open("/object?" + urlencode({"type": "file", "name": evil}))
     part(user, "note-since").click()
-    await user.should_see(marker="since-was")
+    await user.should_see(marker="since-was", retries=40)
     (b,) = user.find(marker="since-was").elements
     assert b._props["aria-label"] == f"read {evil} as this entry saw it" \
         and ":title" not in b._props
@@ -2195,11 +2723,11 @@ async def test_a_since_diff_from_edits_no_commit_holds_reads_the_nearest_commit(
     await user.open("/object?type=file&name=f")
     part(user, "note-since").click()
     await user.should_see(f"f, as of {before[:7]}, the nearest commit: the entry saw edits "
-                          f"no commit holds, against the file now")
+                          f"no commit holds, against the file now", retries=40)
 
 
 async def test_a_checks_behind_chip_opens_the_commits_and_what_they_changed(
-        user: User, repo, tmp_path):
+        user: User, repo, tmp_path, monkeypatch):
     ctx = api.resolve(str(tmp_path))
     api.add(ctx, {"kind": "check", "target": {"type": "item", "name": "w"},
                   "checked": "run", "result": "ok"}, author="ada")
@@ -2215,10 +2743,18 @@ async def test_a_checks_behind_chip_opens_the_commits_and_what_they_changed(
     with pytest.raises(AssertionError, match="takes no click"):
         current.click()
     await user.open("/object?type=item&name=w")
+    import threading
+    ran = []                     # its git on a worker thread (the GUI review, 2026-11-07)
+    for name in ("stamp_cfg", "commit_rows", "diff_text"):
+        real = getattr(gitref, name)
+        monkeypatch.setattr(gitref, name, lambda *a, real=real, name=name, **k:
+                            ran.append((name, threading.get_ident())) or real(*a, **k))
     part(user, "check-state", content="behind 1").click()
-    await user.should_see(marker="commit-list")
+    await user.should_see(marker="commit-list", retries=40)
     await user.should_see("after the run")
     assert "changed after the run" in _newest(user, "diff-view").content
+    assert {n for n, _ in ran} == {"stamp_cfg", "commit_rows", "diff_text"}, ran
+    assert threading.get_ident() not in {t for _, t in ran}, ran
 
 
 def test_the_reveal_command_selects_the_file_and_never_opens_it(monkeypatch, tmp_path):
@@ -2845,6 +3381,7 @@ async def test_an_arc_write_the_store_refuses_is_told(user: User, shared, monkey
     act = api.create_arc(shared, "camp", "d", "item", author="ada")
     monkeypatch.setattr(api, write, refuse)
     await user.open(f"/arc?id={act.id}")
+    user.find(marker="arc-edit").click()
     user.find(marker=click).click()
     await user.should_see("the store refuses this")
 
@@ -3007,16 +3544,19 @@ async def test_a_map_click_lists_the_tiles_entries_and_a_link_to_all(user: User,
         assert [r.props["href"] for r in rows()] == first, stale
 
 
-async def test_back_on_the_map_lists_the_focus_it_returns_to(user: User, repo, tmp_path):
-    """Back to a focus sends its tile's id (`_MAP_JS`), and the panel lists
-    that tile's entries, as a click did; back to the whole map sends null, and
-    the panel says what a click does. The history itself runs only in a browser."""
+async def test_back_or_a_tile_button_lists_the_tile_it_names(user: User, repo, tmp_path):
+    """Back to a focus, or a press in the tile list, sends its tile's id
+    (`_MAP_JS`), and the panel lists that tile's entries, as a click did; the
+    whole map sends null, and the panel says what a click does. The history
+    and the list's buttons run only in a browser; the list is there for them."""
     ctx = _map_store(tmp_path)
     api.add(ctx, {"kind": "task", "target": {"type": "file", "name": "a.py"}, "body": "on a"},
             author="ada")
     build_page(ctx, author="ada")
     await user.open("/map")
-    back = lambda arg: UserInteraction(user, {user.client.layout}, None).trigger("sbMapBack", arg)  # noqa: E731
+    (tiles,) = user.find(marker="map-tiles").elements
+    assert (tiles.props["role"], tiles.props["aria-label"]) == ("toolbar", "map tiles")
+    back = lambda arg: UserInteraction(user, {user.client.layout}, None).trigger("sbMapTile", arg)  # noqa: E731
     back(_map_nodes(user)["file/a.py"]["id"])
     await user.should_see(marker="map-row")
     for whole in (None, 9999, "x"):

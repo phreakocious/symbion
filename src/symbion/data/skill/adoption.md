@@ -149,6 +149,8 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
    services), `[resolvers] TYPE = "closed"` refuses a name it does not list,
    so a typo never becomes a second target. Leave `file` open: a closed `file`
    refuses an entry on a file not yet made.
+   A gotcha on a host or a service never fires on its name: put the trap on the
+   file where it bites (`catalogs.md`).
 
    When the list's names change by plan (a migration renames every metric),
    `[renames] TYPE` maps old to new, and reconcile follows them.

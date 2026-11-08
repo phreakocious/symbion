@@ -55,8 +55,10 @@
   tagged `gotcha` on a file reaches the agent the first time it reads or edits
   that file, with its age and how many commits have changed the file since.
 - **Checklists across a codebase.** An arc is a named line of work with one
-  box per item: a file, a test, a host. `symbion arc reconcile` reports the
-  boxes whose file was renamed or deleted.
+  box per item: a file, a test, a host. Give it phases (`symbion arc phases ID
+  todo doing review`) and it is a board too: `arc move` moves a box, and in the
+  browser you drag it. `symbion arc reconcile` reports the boxes whose file was
+  renamed or deleted.
 - **Plain files you own.** The entries are JSONL in a git repo beside the
   project. There is no server, account or database. Checking out an old
   branch does not change your tickets.

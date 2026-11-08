@@ -5,7 +5,8 @@ runs on. Typed, it lists entries whose id ends so, here then in the other
 stores; places, arcs, targets and tags whose name holds every word (after
 a type and a colon, `item:`, that type's targets whose name does); the
 entries here that say it, open first; and how many entries say it in each
-other store, each a link to that store's search.
+other store, each a link to that store's search. Each other store's serve
+answers for it (`answer`, at `/palette/here`): this one reads only its own.
 
 A row is a dict. What it shows: `icon` or `kind` (a dot), `text` or `html`
 (escaped, with the words in <mark>), and `key`, `meta`, `kind_name`, `id`,
@@ -13,8 +14,12 @@ A row is a dict. What it shows: `icon` or `kind` (a dot), `text` or `html`
 peek) or `click` (a top-bar button, pressed)."""
 from __future__ import annotations
 
+import json
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 from .. import store as S
 from .. import summary as summ
@@ -42,15 +47,16 @@ _ACTIONS = (("add", "New entry", ".sb-new", "n"),
             ("help_outline", "How symbion works", ".sb-help", ""))
 _LIVE = {".sb-commit", ".sb-push", ".sb-undo"}
 
-# store dir -> ((mtime_ns, size), heads). ponytail: one entry per store a
-# serve has run on since this one started, never dropped.
+# store dir -> ((mtime_ns, size), heads): this serve's own store, which the
+# palette reads at each pause in the typing.
 _HEADS: dict = {}
+
+# How long the palette waits on another serve's answer (`_ask`).
+ASK_SECONDS = 1.0
 
 
 def heads(store) -> list:
-    """A store's heads, parsed again only when its file changed. A cold read
-    of the running stores took about 0.2 s, 90% of it parsing (2026-10-16),
-    and the palette reads every running store at each pause in the typing."""
+    """A store's heads, parsed again only when its file changed."""
     try:
         st = S.notes_path(store).stat()
     except OSError:
@@ -62,6 +68,41 @@ def heads(store) -> list:
     return got[1]
 
 
+def answer(ctx, q: str) -> dict:
+    """What this serve tells another serve's palette (`/palette/here`): its
+    store's entry count, and for a typed `q`, how many entries say it and
+    the entries whose id ends so. Each serve reads only its own store: one
+    that read every running store held each parse for its life, so one
+    palette grew its serve by every store's size (the GUI review, 2026-11-07)."""
+    here = heads(ctx.store_dir)
+    q = q.strip()
+    if not q:
+        return {"entries": len(here)}
+    tail = [S.id_tail(q)]
+    return {"entries": len(here), "say": len(S.query(here, grep=search_pattern(q))),
+            "by_id": [{k: v for k, v in _entry(n, (), tail).items() if k != "peek"}
+                      for n in here if id_hit(n.id, q)]}
+
+
+def _ask(url: str, q: str) -> dict | None:
+    """Another serve's `answer`, or None when it gives none in ASK_SECONDS:
+    stopped, busy, or older than `/palette/here`."""
+    try:
+        with urlopen(f"{url}/palette/here?{urlencode({'q': q})}", timeout=ASK_SECONDS) as r:
+            return json.load(r)
+    except (OSError, ValueError):
+        return None
+
+
+def _asked(others: list, q: str) -> dict:
+    """{url: answer or None}, every serve asked at once."""
+    if not others:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(others)) as pool:
+        return dict(zip((_url(r) for r in others),
+                        pool.map(lambda r: _ask(_url(r), q), others)))
+
+
 def rows(ctx, author: str, q: str) -> list[dict]:
     """The palette's groups, `{"head", "aside", "rows"}`, for what is typed."""
     q = q.strip()
@@ -70,6 +111,9 @@ def rows(ctx, author: str, q: str) -> list[dict]:
     # A read-only serve names no other store a serve runs for its user.
     others = [] if S.read_only() else sorted((r for r in servers.running() if r["store"] != me),
                                              key=lambda r: servers.name(r["store"]))
+    told = _asked(others, q)                    # each other store, by its own serve
+    heard = [(r, told[_url(r)]) for r in others if told.get(_url(r)) is not None]
+    mute = len(others) - len(heard)
     if not q:
         active = sum(not a.archived for a in S.load_arcs(ctx.store_dir))
         meta = {"/notes": str(len(here)), "/arcs": f"{active} active" if active else ""}
@@ -77,8 +121,9 @@ def rows(ctx, author: str, q: str) -> list[dict]:
             _group("go to", [{"icon": icon, "text": label, "href": path, "meta": meta.get(path, "")}
                              for label, path, icon in _PLACES]),
             _group("do", _actions(ctx, author, lambda _: True)),
-            _group("other stores", [_store(r, summ._count(len(heads(r["store"])), "entry"),
-                                           r["url"]) for r in others])) if g["rows"]]
+            _group("other stores", [_store(r, summ._count(told[_url(r)]["entries"], "entry")
+                                           if told.get(_url(r)) else "no answer", r["url"])
+                                    for r in others])) if g["rows"]]
 
     words = q.split()
     low = [w.lower() for w in words]
@@ -91,7 +136,8 @@ def rows(ctx, author: str, q: str) -> list[dict]:
     # an agent's entry reaches the person.
     tail = [S.id_tail(q)]
     by_id = [_entry(n, (), tail) for n in here if id_hit(n.id, q)] + \
-        [_entry(n, (), tail, r) for r in others for n in heads(r["store"]) if id_hit(n.id, q)]
+        [row | {"store": servers.name(r["store"]), "href": _url(r) + row["href"]}
+         for r, a in heard for row in a.get("by_id", ())]
     if by_id:
         groups.append(_group("entries by id", by_id, "here first, then other stores"))
 
@@ -135,8 +181,7 @@ def rows(ctx, author: str, q: str) -> list[dict]:
 
     grep = search_pattern(q)
     hits = S.query(here, grep=grep)
-    say = [(r, len(S.query(heads(r["store"]), grep=grep))) for r in others]
-    say = sorted(((r, c) for r, c in say if c), key=lambda rc: -rc[1])
+    say = sorted(((r, a["say"]) for r, a in heard if a.get("say")), key=lambda rc: -rc[1])
     if hits:
         # Open first, then entries with no status, then closed: newest first in each.
         rank = {"open": 0, None: 1}
@@ -156,10 +201,13 @@ def rows(ctx, author: str, q: str) -> list[dict]:
     # one of them it read as a contradiction, and alone the box says nothing
     # matched.
     if say or (hits and others):
+        # Of the serves that answered: a silent one is said, not counted as none.
+        aside = f"{len(say)} of {len(heard)} say it" if say else \
+            f"none of {len(heard)} say it" if heard else ""
         groups.append(_group(
             "other stores",
             [_store(r, summ._count(c, "entry"), f"{_url(r)}{href(q=q)}") for r, c in say],
-            f"{len(say)} of {len(others)} say it" if say else f"none of {len(others)} say it"))
+            " · ".join(filter(None, (aside, f"{mute} no answer" if mute else "")))))
     return groups
 
 
@@ -196,15 +244,10 @@ def _actions(ctx, author: str, has) -> list[dict]:
             for shown, meta in [state.get(button, (True, ""))] if shown]
 
 
-def _entry(n, words, tail=(), r: dict | None = None) -> dict:
-    """An entry: here, `peek` shows it beside the page; in another store `r`,
-    its page there opens. Its id's tail is marked when the id was typed."""
-    row = {"kind": kind_class(n.kind), "kind_name": n.kind,
-           "html": marked(snippet(n.body or n.checked or n.result or "", words, _CHARS), words),
-           "id": marked(n.id[-10:], [t for t in tail if t and n.id.endswith(t)]),
-           "done": S.read_status(n) == "resolved", "href": href(id=n.id)}
-    if r is None:
-        row["peek"] = n.id
-    else:
-        row.update(store=servers.name(r["store"]), href=_url(r) + row["href"])
-    return row
+def _entry(n, words, tail=()) -> dict:
+    """An entry here, which `peek` shows beside the page; `answer` sends it to
+    another serve without. Its id's tail is marked when the id was typed."""
+    return {"kind": kind_class(n.kind), "kind_name": n.kind,
+            "html": marked(snippet(n.body or n.checked or n.result or "", words, _CHARS), words),
+            "id": marked(n.id[-10:], [t for t in tail if t and n.id.endswith(t)]),
+            "done": S.read_status(n) == "resolved", "href": href(id=n.id), "peek": n.id}

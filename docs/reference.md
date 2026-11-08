@@ -167,8 +167,9 @@ where two separate adds would store both.
   gives each other repo's path from the cwd, and marks a repo not on this
   machine. `file:PATH` is read from
   where you stand; `REPO:PATH` from that repo's root.
-- **Files:** `notes.jsonl` (the entries and their versions), `arcs.jsonl`,
-  `symbion.toml`, and the
+- **Files:** `notes.jsonl` (the entries and their versions), `arcs.jsonl`
+  (an arc's row, which may add `phases`, its column names in order, and `placement`,
+  one `{id, phase, by, at}` per box moved, with `from`, the phase it left, when the move changed it, or `{id, phase}` when only its order is kept), `symbion.toml`, and the
   `README.md` and `.gitignore` that `init` writes. `archive/` holds files
   copied in to keep (`adoption.md`); `commit` names any path there git ignores.
   An edit keeps a field this symbion does not know, such as a newer release's,

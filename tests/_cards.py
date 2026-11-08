@@ -81,6 +81,11 @@ def _parts_of(user, card) -> list:
         out.append((ch, Part(user, card, ch, field=i, act=("view", i) if ch.get("open") else None)))
         if v := ch.get("view"):
             out.append((v, Part(user, card, v, act=("view", i))))
+    if mv := c.get("move"):         # a board box's last line: arrows, then its mover
+        for a in mv["arrows"]:      # a disabled arrow takes no click
+            out.append((a, Part(user, card, a, act=("move", a["k"], a["p"]) if a["ok"] else None)))
+        if mv["moved"]:
+            out.append((mv["moved"], Part(user, card, mv["moved"])))
     if c["star"] is not None:
         star = {"m": "note-star", "icon": "star" if c["star"] else "star_outline",
                 "color": "warning" if c["star"] else None}

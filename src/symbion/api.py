@@ -358,7 +358,10 @@ def canonicalize_rows(ctx: Ctx, rows) -> list[dict]:
                 r["target"] = one(r["target"])
             if r.get("refs"):
                 try:
-                    r["refs"] = [one(x) for x in r["refs"]]
+                    # After the name rule, so two spellings of one name keep one:
+                    # `--ref X --ref X` stored X twice (2026-11-06).
+                    r["refs"] = list({(x["type"], x["name"]): x
+                                      for x in map(one, r["refs"])}.values())
                 except catalog.AmbiguousName as e:
                     e.args = (f"ref {e}",) + e.args[1:]
                     raise
@@ -953,7 +956,8 @@ def kind_losses(n: store.Note, kind: str, spec) -> list[str]:
 
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
               add_refs=None, prepend_body: str | None = None, add_measurements=None,
-              keep_refs: bool = False, external: bool = False, **fields) -> store.Note:
+              keep_refs: bool = False, external: bool = False, replace_body=None,
+              **fields) -> store.Note:
     """Target, provenance and target_blob are INHERITED from the superseded row
     and never re-resolved (a tag added later is no re-reading of the file), so
     an edit that names no target needs no canonicalization -- a departed
@@ -1023,6 +1027,7 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
         return f
     return store.supersede(ctx.store_dir, note_id, author=author, append_body=append_body,
                            add_refs=add_refs, prepend_body=prepend_body,
+                           replace_body=replace_body,
                            add_measurements=add_measurements, canonicalize=canonicalize,
                            target_types=ctx.target_types, keep_refs=keep_refs, **fields)
 
@@ -1076,6 +1081,23 @@ def unarchive_arc(ctx: Ctx, arc_id: str) -> store.Arc:
 
 def describe_arc(ctx: Ctx, arc_id: str, description: str) -> store.Arc:
     return store.describe_arc(ctx.store_dir, arc_id, description)
+
+
+def set_phases(ctx: Ctx, arc_id: str, names: list[str]) -> tuple[store.Arc, int]:
+    return store.set_phases(ctx.store_dir, arc_id, names)
+
+
+def move_box(ctx: Ctx, entry_id: str, *, phase=None, before=None, after=None, top=False,
+             author: str) -> store.Arc:
+    return store.move_box(ctx.store_dir, entry_id, phase=phase, before=before, after=after,
+                          top=top, author=author)
+
+
+def reopen_and_place(ctx: Ctx, entry_id: str, *, phase=None, before=None, after=None,
+                     top=False, author: str) -> tuple[store.Note, store.Arc]:
+    """The GUI's only caller: a card dragged out of done."""
+    return store.reopen_and_place(ctx.store_dir, entry_id, phase=phase, before=before,
+                                  after=after, top=top, author=author)
 
 
 def own_rows(ctx: Ctx):

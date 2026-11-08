@@ -11,6 +11,7 @@ import subprocess
 import sys
 import sysconfig
 import time
+import urllib.parse
 import urllib.request
 from importlib.metadata import version
 from pathlib import Path
@@ -209,6 +210,8 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     # the color-scheme meta its detector reads first; shell() adds its lock.
     assert re.search(r'name="color-scheme"\s+content="dark"', page), page[:2000]
     assert '<meta name="darkreader-lock">' in page, page[:2000]
+    # A screen reader read the page in a guessed language (the GUI review, 2026-11-07).
+    assert '<html lang="en-US">' in page, page[:200]
     # ...and takes off the fallback style Dark Reader adds before it reads the lock
     assert 'querySelectorAll(".darkreader--fallback").forEach(e => e.remove())' in page, page[:2000]
 
@@ -239,6 +242,48 @@ def test_ctrl_c_stops_a_serve_quietly(tmp_path, stop):
     assert status == 200, out
     assert "Traceback" not in out and p.returncode == 0, (p.returncode, out)
     assert not list((tmp_path / "cache" / "symbion" / "serve").glob("*.json"))
+
+
+def test_a_palette_asks_each_other_serve_for_its_own_store(tmp_path):
+    """Every serve whose palette opened parsed every running store and kept
+    it, so one palette grew its serve by every store's size (the GUI review,
+    2026-11-07). Each serve answers for its own store at /palette/here, and
+    a palette asks the others. Two real serves on one cache dir, so each
+    finds the other."""
+    from symbion import api
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
+    env["XDG_CACHE_HOME"] = str(tmp_path / "cache")
+    serves = []
+    try:
+        for name, body in (("a", "release here"), ("b", "release there, by id")):
+            d = tmp_path / f"{name}-notes"
+            store.ensure_store(d)
+            nid = api.add(api.resolve(str(d)), {"kind": "note", "body": body,
+                                               "target": {"type": "project", "name": None}},
+                          author="ada").id
+            port = _free_port()
+            p = subprocess.Popen(
+                [SYMBION, "--dir", str(d), "serve", "--no-browser", "--port", str(port),
+                 "--author", "t"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                **GROUP)
+            serves.append((p, port, nid))
+            assert _get_page(p, port)[0] == 200, name
+
+        def palette(q):
+            url = f"http://127.0.0.1:{serves[0][1]}/palette?" + urllib.parse.urlencode({"q": q})
+            with urllib.request.urlopen(url, timeout=10) as r:
+                return {g["head"]: g for g in json.load(r)}
+        g = palette("release")
+        assert [(r["text"], r["meta"]) for r in g["other stores"]["rows"]] == [("b", "1 entry")]
+        assert g["other stores"]["aside"] == "1 of 1 say it"
+        b_id = serves[1][2]
+        (row,) = palette(b_id[-10:])["entries by id"]["rows"]
+        assert (row["store"], row["href"]) == \
+            ("b", f"http://127.0.0.1:{serves[1][1]}/notes?id={b_id}")
+    finally:
+        for p, _, _ in serves:
+            _kill(p)
+            p.communicate()
 
 
 def _command(pid) -> list[str]:

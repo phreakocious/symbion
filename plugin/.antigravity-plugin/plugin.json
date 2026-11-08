@@ -1,6 +1,6 @@
 {
   "name": "symbion",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "description": "A ticket queue your coding agent keeps: each new Antigravity session starts with the open bugs, tasks and questions. Plain JSONL in a git repo beside yours. No server, no MCP.",
   "author": {"name": "phreakocious"},
   "homepage": "https://github.com/phreakocious/symbion",

@@ -40,7 +40,8 @@ above the open entries.
 
 3. **Commit.** `symbion commit --dry-run`, in a call of its own, shows what
    goes in, and `symbion list --since wrap --limit 0` what was written since
-   the last wrap, each entry with its state and result. Then:
+   this session's start or its last wrap, each entry with its state and
+   result, by every writer, another session included. Then:
 
    ```bash
    symbion commit --wrap -m - <<'EOF'

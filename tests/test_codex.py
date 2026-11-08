@@ -169,6 +169,40 @@ def test_codex_gotchas_before_read_and_patch(tmp_path, monkeypatch):
     assert call("Bash", {"command": "cat README.md"}, session_id="../bad") == ""
 
 
+def test_codex_gotchas_skip_symbion_commands_and_names(tmp_path, monkeypatch):
+    """gotchas.sh's two rules, in the Codex handler: a symbion command neither
+    fires nor spends a gotcha, and a name that is no path never fires one."""
+    notes = tmp_path / "notes"
+    assert cli.main(["--dir", str(notes), "init", "--agent", "codex", "--yes"]) == 0
+    toml = notes / "symbion.toml"                  # init wrote a [catalogs] table already
+    toml.write_text(toml.read_text().replace("[catalogs]\n", '[catalogs]\nservice = "echo lynx"\n', 1))
+    store.add(notes, kind="note", target={"type": "file", "name": "README.md"},
+              author="human", tags=["gotcha"], body="readme trap")
+    store.add(notes, kind="note", target={"type": "service", "name": "lynx"},
+              author="human", tags=["gotcha"], body="lynx trap")
+    payload = json.dumps({"session_id": "codex-session", "hook_event_name": "SessionStart"})
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload.encode())))
+    assert cli.main(["--dir", str(notes), "summary", "--hook"]) == 0
+    handler = json.loads((Path.home() / ".codex/hooks.json").read_text())[
+        "hooks"]["PreToolUse"][0]["hooks"][0]
+
+    def call(args):
+        r = subprocess.run(handler["command"], shell=True, capture_output=True, text=True,
+                           input=json.dumps({"session_id": "codex-session", "tool_name": "Bash",
+                                             "hook_event_name": "PreToolUse", "tool_input": args}))
+        assert r.returncode == 0 and not r.stderr, r
+        return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout else ""
+
+    for cmd in ("symbion add note --target file:README.md --body x",
+                ["bash", "-lc", "cd /w && symbion add task --body-file - <<'EOF'\nREADME.md\nEOF"],
+                'S="symbion --dir /n"; $S add note --body-file - <<\'EOF\'\nsee README.md here\nEOF'):
+        assert call({"command": cmd}) == "", cmd
+    assert "readme trap" in call({"command": "symbion show x <<'EOF'\nx\nEOF\n"
+                                             "S=.venv/bin/symbion; P=cat; $P README.md"})
+    for cmd in ("python3 plot.py --label lynx", "deploy lynx -- record"):
+        assert call({"command": cmd}) == "", cmd
+
+
 def test_codex_existing_hooks_get_gotcha_merge(tmp_path):
     settings = Path.home() / ".codex/hooks.json"
     settings.parent.mkdir()
@@ -182,3 +216,26 @@ def test_codex_existing_hooks_get_gotcha_merge(tmp_path):
     before = settings.read_bytes()
     assert cli.main(args) == 0
     assert settings.read_bytes() == before
+
+
+def test_codex_gotchas_match_a_name_beside_a_newline_or_a_quote(tmp_path, monkeypatch):
+    """The handler matched the call's JSON text with each backslash made a
+    slash, so a newline read `/n` and a quote `/"`: a name that began or ended
+    a line, or ended a quoted argument, never fired."""
+    notes = tmp_path / "notes"
+    assert cli.main(["--dir", str(notes), "init", "--agent", "codex", "--yes"]) == 0
+    store.add(notes, kind="note", target={"type": "file", "name": "README.md"},
+              author="human", tags=["gotcha"], body="readme trap")
+    handler = json.loads((Path.home() / ".codex/hooks.json").read_text())[
+        "hooks"]["PreToolUse"][0]["hooks"][0]
+    for i, cmd in enumerate(('cat "README.md"', "cat README.md\necho ok", "cd /w\nREADME.md --x",
+                             ["bash", "-lc", "wc -l README.md\nls"])):
+        sid = f"codex-{i}"                         # each its own session: a fire spends the row
+        payload = json.dumps({"session_id": sid, "hook_event_name": "SessionStart"})
+        monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload.encode())))
+        assert cli.main(["--dir", str(notes), "summary", "--hook"]) == 0
+        r = subprocess.run(handler["command"], shell=True, capture_output=True, text=True,
+                           input=json.dumps({"session_id": sid, "tool_name": "Bash",
+                                             "hook_event_name": "PreToolUse",
+                                             "tool_input": {"command": cmd}}))
+        assert r.returncode == 0 and "readme trap" in r.stdout, cmd

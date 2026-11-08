@@ -120,6 +120,13 @@ holds, and `supersede` keeps a target it does not rename, so entries on a
 host the catalog dropped stay readable and editable. `file:./x` and a new file
 in a `[repos]` repo meet the closed catalog too.
 
+A gotcha fires only on a path: a file, a `[repos]` repo's file, or a catalog
+name with a `/` in it, such as `/etc/nginx.conf`. A name that is no path, such
+as a service or a host, never fires one, as a target or as a ref. Put a trap on
+the file where it bites; a trap with no such file is a note that `context
+--target` finds. A symbion command never fires a gotcha, or spends one: writing
+about an object is no use of it.
+
 A piped catalog must fail when its producer fails, or a failed producer reads
 as an empty catalog, and with a resolver every name mints as new. dash refuses
 `set -o pipefail`, so the examples check the producer with `out=$(…) &&`.

@@ -140,6 +140,11 @@ async def test_long_text_is_offered_to_docs_and_saved_as_a_ref(user: User, ctx, 
     await user.open("/")
     _drop(user, "notes.md", LONG)
     assert _one(user, "drop-doc-name").value == "notes.md"
+    # Not the Enter that ends an IME word: it saved a half-typed name (the GUI
+    # review, 2026-11-07). The client runs the guard; a real IME is a person's check.
+    from symbion.gui.chrome import _ENTER
+    assert [l.js_handler for l in _one(user, "drop-doc-name")._event_listeners.values()
+            if "keydown" in l.type.lower()] == [f"(e) => {{ if ({_ENTER}) emit() }}"]
     user.find(marker="drop-save").click()
     assert (tmp_path / "docs" / "notes.md").read_text() == LONG
     assert _one(user, "note-refs").value == ["doc:notes.md"]

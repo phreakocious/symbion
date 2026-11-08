@@ -11,6 +11,7 @@ import functools
 import hashlib
 import html
 import itertools
+import logging
 import os
 import re
 import subprocess
@@ -26,6 +27,7 @@ from fastapi.responses import PlainTextResponse
 from markdown_it.token import Token
 from nicegui import app, run, ui
 from nicegui.element import Element
+from nicegui.elements.mixins.text_element import TextElement
 from nicegui.elements.mixins.value_element import ValueElement
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
@@ -107,8 +109,20 @@ def _linkify(state) -> None:
         block.children = out
 
 
+def _titles_as_tips(state) -> None:
+    """A link's title as the GUI's own tip (`data-tip`, chrome's _TIPS_JS): the
+    browser's waited about a second and drew in the system's small font (the
+    user, 2026-11-07). `aria-description` keeps it for a screen reader."""
+    for block in state.tokens:
+        for tok in block.children or ():
+            if tok.type == "link_open" and (tip := tok.attrs.pop("title", None)):
+                tok.attrSet("data-tip", tip)
+                tok.attrSet("aria-description", tip)
+
+
 _BODY_MD = term.body_parser(_highlight)
 _BODY_MD.core.ruler.push("sb_linkify", _linkify)
+_BODY_MD.core.ruler.push("sb_tips", _titles_as_tips)
 
 
 @functools.lru_cache(maxsize=1000)
@@ -241,19 +255,45 @@ def _closed(store_dir: str, _stamp) -> frozenset:
     return frozenset(out)
 
 
+# A cited id's title: an id says nothing until it is clicked, and a handoff
+# cites several (the design critique, 2026-11-07).
+TIP_CHARS = 60
+# The measurements a compact card names before "+N more".
+MEAS_SHOWN = 6
+
+
+@functools.lru_cache(maxsize=8)
+def _tips(store_dir: str, _stamp) -> dict:
+    """Each version's id to its entry's title as a link: the newest version's
+    kind, status where it has one, and first words. `_stamp` as `_tails`'s."""
+    loaded = S.load(store_dir)
+    by_id = {n.id: n for n in loaded}
+    out = {}
+    for n in S.heads(loaded):
+        tip = " · ".join(filter(None, (n.kind, S.read_status(n),
+                                       summ.clip(n.body, TIP_CHARS))))
+        while n and n.id not in out:              # a looped chain ends here
+            out[n.id] = tip
+            n = by_id.get(n.supersedes)
+    return out
+
+
 def link_ids(body: str, store_dir) -> str:
     """Each full note id in `body`, and each tail of a row in this store, as
     a markdown link to that note, except inside code, where a link would
     print as literal brackets. A tail of no row here stays text: rows cite
     other stores' rows too. A link to a resolved entry is struck through,
-    as a done item is, and its title says so (the user, 2026-10-16)."""
+    as a done item is, and its tip says so (the user, 2026-10-16): every
+    link's markdown title, which `_titles_as_tips` makes its tip, is its
+    entry's kind, status and first words."""
     def link(m):
         nid = m[1] if len(m[1]) > 17 else tails().get(m[1])
         if not nid:
             return m[1]
-        if nid in _closed(str(store_dir), stamp()):
-            return f'[~~{m[1]}~~](/notes?id={nid} "resolved")'
-        return f"[{m[1]}](/notes?id={nid})"
+        tip = _tips(str(store_dir), stamp()).get(nid, "").replace("\\", "\\\\") \
+            .replace('"', '\\"')
+        text = f"~~{m[1]}~~" if nid in _closed(str(store_dir), stamp()) else m[1]
+        return f'[{text}](/notes?id={nid} "{tip}")'
 
     def stamp():
         st = S.notes_path(store_dir).stat()
@@ -446,6 +486,13 @@ def marked(text: str, words) -> str:
                    for i, p in enumerate(rx.split(text)))
 
 
+def heading(level: int, text: str = "") -> TextElement:
+    """An `h1` or `h2` that looks as its classes say. A screen reader moves
+    through a page by its headings, and every title was a div (the GUI
+    review, 2026-11-07). `sb-h` takes off the browser's and Quasar's look."""
+    return TextElement(tag=f"h{level}", text=text).classes("sb-h")
+
+
 def ago(stamp: str, now: datetime | None = None) -> str:
     """How long ago, in the one unit that reads at a glance: `17m`, `4h`,
     `3d`; a stamp older than two months is its date. The full stamp is the
@@ -547,11 +594,17 @@ def refusal_shown():
     """A write the store refuses, with the words that name its fix (a shared
     store's clone with no user.name is one): shown, as the add form shows it.
     Raised out of a click handler it only reached NiceGUI's log, and the click
-    did nothing. The rest of the block is skipped."""
+    did nothing. The rest of the block is skipped. Under `serve --read-only`
+    the text can name a path on the serving machine: the log keeps it."""
     try:
         yield
     except (ValueError, catalog.CatalogError) as e:
-        ui.notify(str(e), type="negative")
+        if S.read_only():
+            logging.getLogger(__name__).warning("refused a visitor: %s", e)
+            ui.notify("Read-only demo: refused. The reason stays in the server's log.",
+                      type="negative")
+        else:
+            ui.notify(str(e), type="negative")
 
 
 class Reading(NamedTuple):
@@ -741,9 +794,13 @@ def _commit_viewable(ctx, sha):
     if not sha:
         return None
 
-    def click(shift: bool):
-        cfg = gitref.commit_cfg(ctx.cfg, sha)
-        got = gitref.commit_show(cfg, sha)
+    async def click(shift: bool):
+        # git on a worker thread, as the diff's parse is: a large commit's
+        # `git show` held every page's loop (the GUI review, 2026-11-07).
+        def read():
+            cfg = gitref.commit_cfg(ctx.cfg, sha)
+            return cfg, gitref.commit_show(cfg, sha)
+        cfg, got = await run.io_bound(read)
         if got is None:
             ui.notify(f"no commit {sha[:12]} in this checkout", type="warning")
             return
@@ -752,8 +809,8 @@ def _commit_viewable(ctx, sha):
 
         def lead():
             commit_meta(sha, author, date, parents, body)
-        return diff_dialog(subject or f"commit {sha[:12]}", diff, lead=lead,
-                           head=lambda: forge_buttons(cfg, sha), mono=False)
+        return await diff_dialog(subject or f"commit {sha[:12]}", diff, lead=lead,
+                                 head=lambda: forge_buttons(cfg, sha), mono=False)
 
     return "difference", f"read commit {sha[:7]}", click
 
@@ -822,7 +879,7 @@ async def diff_dialog(title: str, text: str, *, lead=None, head=None,
         if files:
             ui.toggle(diffview.MODES, value=mode, on_change=pick) \
                 .props("dense no-caps unelevated toggle-color=primary") \
-                .classes("sb-diff-mode").mark("diff-mode")
+                .classes("sb-diff-mode sb-seg").mark("diff-mode")
         if head:
             head()
 
@@ -855,29 +912,37 @@ def commit_list(ctx, cfg, rows, total: int) -> None:
         ui.label(f"+{total - len(rows)} more").classes("sb-subtitle").mark("commit-more")
 
 
-def since_dialog(ctx, n):
+async def since_dialog(ctx, n):
     """A file entry's `N commits since`, opened: the commits, then the file's
     diff from what the entry saw to the file now, uncommitted edits
     included, which is what the count compares (gitref.changed_since).
-    Returns diff_dialog's coroutine, for the click's handler."""
-    shas = gitref.changed_since(ctx.cfg, [n])[n.id] or []
-    if not shas:
+    A coroutine, for the click's handler; git runs on a worker thread."""
+    cfg, path = ctx.cfg.for_type(n.target.type), n.target.name
+
+    def read():
+        shas = gitref.changed_since(ctx.cfg, [n])[n.id] or []
+        if not shas:
+            return None
+        base, exact = gitref.since_base(cfg, path, shas[-1], n.target_blob)
+        return (shas, base, exact, gitref.commit_rows(cfg, shas, LIST_COMMITS, walk=False),
+                gitref.diff_text(cfg, base, "--", f":(literal){path}"))
+    got = await run.io_bound(read)
+    if got is None:
         ui.notify(f"no commit has changed {n.target.name} since this entry")
         return
-    cfg, path = ctx.cfg.for_type(n.target.type), n.target.name
-    base, exact = gitref.since_base(cfg, path, shas[-1], n.target_blob)
+    shas, base, exact, rows, text = got
     saw = "as this entry saw it" if exact else \
         f"as of {base[:7]}, the nearest commit: the entry saw edits no commit holds"
 
     def lead() -> None:
         ui.label(f"changed in {summ._count(len(shas), 'commit')} since this entry, "
                  f"newest first").classes("sb-subtitle")
-        commit_list(ctx, cfg, gitref.commit_rows(cfg, shas, LIST_COMMITS, walk=False), len(shas))
+        commit_list(ctx, cfg, rows, len(shas))
         ui.label(f"{path}, {saw}, against the file now").classes("sb-subtitle") \
             .mark("since-base")
 
-    def was() -> None:
-        text = gitref.blob_text(cfg, base, path)
+    async def was() -> None:
+        text = await run.io_bound(gitref.blob_text, cfg, base, path)
         if text is None:
             ui.notify(f"cannot read {path} at {base[:7]}", type="warning")
             return
@@ -895,19 +960,20 @@ def since_dialog(ctx, n):
             .props("flat dense round size=sm color=muted") \
             .tooltip(f"read {path} {saw}").mark("since-was")
         b._props["aria-label"] = f"read {path} {saw}"   # set, not parsed: a file name may hold a quote
-    return diff_dialog(f"{path} since this entry",
-                       gitref.diff_text(cfg, base, "--", f":(literal){path}") or "",
-                       lead=lead, head=head)
+    return await diff_dialog(f"{path} since this entry", text or "", lead=lead, head=head)
 
 
-def check_dialog(ctx, n, state: str, distance: int):
+async def check_dialog(ctx, n, state: str, distance: int):
     """A check's `behind N` or `ahead N`, opened: the commits between its
     stamp and HEAD, and for `behind`, what they changed, the whole tree.
-    `behind` returns diff_dialog's coroutine, for the click's handler."""
+    A coroutine, for the click's handler; git runs on a worker thread."""
     sha = S.stamp_sha(n.provenance)
-    cfg = gitref.stamp_cfg(ctx.cfg, n.provenance)
-    rows = gitref.commit_rows(cfg, [f"{sha}..HEAD" if state == "behind" else f"HEAD..{sha}"],
-                              LIST_COMMITS)
+    def read():
+        cfg = gitref.stamp_cfg(ctx.cfg, n.provenance)
+        rows = gitref.commit_rows(cfg, [f"{sha}..HEAD" if state == "behind" else f"HEAD..{sha}"],
+                                  LIST_COMMITS)
+        return cfg, rows, gitref.diff_text(cfg, sha, "HEAD") if state == "behind" else None
+    cfg, rows, text = await run.io_bound(read)
 
     def lead() -> None:
         ui.label(f"stamped at {sha[:7]}; " +
@@ -919,8 +985,7 @@ def check_dialog(ctx, n, state: str, distance: int):
     if state == "ahead":
         viewer(f"commits since HEAD, to {sha[:7]}", lead, mono=True)
         return
-    return diff_dialog(f"since this run, at {sha[:7]}", gitref.diff_text(cfg, sha, "HEAD") or "",
-                       lead=lead)
+    return await diff_dialog(f"since this run, at {sha[:7]}", text or "", lead=lead)
 
 
 def view_button(ctx, name, label: str = "", ttype=None):
@@ -928,11 +993,15 @@ def view_button(ctx, name, label: str = "", ttype=None):
     if (v := viewable(ctx, name, ttype)) is None:
         return None
     icon, tip, click = v
-    return ui.button(label, icon=icon) \
+    b = ui.button(label, icon=icon) \
         .on("click", lambda e: click(bool((e.args or {}).get("shiftKey"))), ["shiftKey"]) \
-        .props("flat dense no-caps color=muted aria-label=read"
-               + ("" if label else " round size=xs")) \
+        .props("flat dense no-caps color=muted" + ("" if label else " round size=xs")) \
         .tooltip(tip).mark("file-open")
+    # An icon alone is named for what it reads; each was "read" (the GUI
+    # review, 2026-11-07). Words on it are its name, as a person reads it.
+    if not label:
+        b._props["aria-label"] = tip            # set, not parsed: a file name may hold a quote
+    return b
 
 
 def _waits_on_you(n, author, rd: Reading) -> bool:
@@ -999,6 +1068,10 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     page gives none. The card is one `Card`, drawn by card.js from the data
     built here (the user, 2026-10-29)."""
     def narrow(**kv):
+        # A filter the view has already: its chip linked to the page it was on,
+        # a click that did nothing (the GUI review, 2026-11-07). None: a label.
+        if base and all(base.get(k) == v for k, v in kv.items()):
+            return None
         return href(**{**(base or {}), **kv})
 
     status = S.read_status(n)
@@ -1029,7 +1102,7 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     foot, hover, views = _card_foot(ctx, n, status, narrow, show_target, git_head, since)
     card = {"main": main, "foot": foot, "by": {"t": n.author, "h": narrow(author=n.author)},
             "age": {"t": ago(n.created_at), "tip": S.shown(n.created_at)},
-            "sid": {"t": short_id(n.id), "h": href(id=n.id), "tip": f"{n.id}\nthis entry alone"},
+            "sid": {"t": short_id(n.id), "h": href(id=n.id), "tip": f"{n.id}\nopen this entry on its own page"},
             # On the right, after the text: on the left it pushed an open row's
             # text in past a closed row's (the user, 2026-10-01).
             "resolve": bool(resolvable), "star": has_pri if actions else None}
@@ -1205,8 +1278,12 @@ def _card_main(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
             start = at
         md(n.body[start:])   # sanitized in the browser, as ui.markdown: DOMPurify
     if n.measurements:
-        main.append({"k": "meas", "m": "measurements",
-                     "items": [f"{k}: {v}" for k, v in n.measurements.items()]})
+        items = [f"{k}: {v}" for k, v in n.measurements.items()]
+        # A list's card names the first few; the entry's page names them all.
+        # One card printed dozens, most of them 0 (the design critique, 2026-11-07).
+        if compact and len(items) > MEAS_SHOWN:
+            items = items[:MEAS_SHOWN] + [f"+{len(items) - MEAS_SHOWN} more"]
+        main.append({"k": "meas", "m": "measurements", "items": items})
     return main, sources
 
 
@@ -1380,12 +1457,21 @@ def undo_dialog(ctx, author: str) -> None:
     dialog.open()
 
 
+_EDITS = "sb-edit-drafts"       # app.storage.tab: an edit closed unsaved, by entry id
+
+
 def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> None:
     """Supersede with edits. `resolving=True` is the resolve path for a
     status+verdict row: the result is required and the row closes on save."""
-    with ui.dialog() as dialog, ui.card().classes("bg-panel"):
-        ui.label("resolve — the result is the verdict" if resolving
-                 else "edit — its earlier version is kept").classes("sb-stat-label")
+    tab = app.storage.tab           # read here: the close handler runs in no page slot
+    kept = (tab.get(_EDITS) or {}).get(n.id)
+    with ui.dialog().mark("edit-dialog") as dialog, ui.card().classes("bg-panel"):
+        # A label, as every dialog's head is, and the sentence under it: set
+        # as one uppercase label it shouted (the design critique, 2026-11-07)
+        with ui.column().classes("gap-0"):
+            ui.label("resolve" if resolving else "edit").classes("sb-stat-label")
+            ui.label("The result is the verdict." if resolving else "Its earlier version is kept.") \
+                .classes("sb-subtitle").mark("edit-what")
         # What the entry is on, picked as the new-entry form's header picks
         # it: the dialog could change neither (a tester, 2026-10-15). An
         # untouched target is not sent, so a departed one never resolves again.
@@ -1404,6 +1490,17 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
         more = ui.textarea("add after the body").props(
             "outlined autogrow" + ("" if resolving else " autofocus")) \
             .classes("w-full").mark("edit-append")
+        # A click outside, or Esc, closed the dialog and dropped what was
+        # typed (the GUI review, 2026-11-07). It is kept per tab and entry,
+        # as the composer keeps its draft, until a save or a discard.
+        stale = bool(kept) and "base" in kept and kept["base"] != n.body
+        with ui.row().classes("items-center gap-1 -mt-2").mark("edit-kept") as kept_row:
+            ui.label("kept from your last try" + (
+                "; the body has changed since, so a save refuses your edit of it: "
+                "copy it, then discard" if stale else "")).classes("text-muted text-xs")
+            ui.button("discard", on_click=lambda: discard(), color=None) \
+                .props("flat dense no-caps size=sm").classes("text-body").mark("edit-discard")
+        kept_row.set_visibility(bool(kept))
         # The star beside the tags, so an edit and a star are one write, not
         # two (the user, 2026-10-02). The switch holds `priority`; the field
         # the rest, and a `priority` typed there still counts. So with
@@ -1420,6 +1517,11 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                 close = ui.switch("retired", value="retired" in n.tags).mark("edit-retired")
             elif S.read_status(n) == "open" and not resolving:
                 close = ui.switch("resolve").mark("edit-resolve")
+            elif S.read_status(n) == "resolved" and not n.spec.verdict:
+                # Only an arc's box reopened, and undo reaches the last write
+                # alone (the GUI review, 2026-11-07). A verdict closes with its
+                # result: a prediction reopened would hold one.
+                close = ui.switch("reopen").mark("edit-reopen")
         # Attaching an EXISTING note to an arc has no other route: seeding
         # mints new tasks, and target/provenance are the only two fields
         # supersede refuses. This is the one.
@@ -1462,8 +1564,47 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             res = ui.input("result", value=n.result or "") \
                 .props("dense outlined").classes("w-full").mark("edit-result")
 
+        texts = {k: f for k, f in (("body", body), ("more", more), ("checked", checked),
+                                   ("result", res)) if f is not None}
+        opened = {k: f.value for k, f in texts.items()}
+        # The body a kept edit of it started from: a save checks the entry
+        # against it, so a body changed since is refused, never written over.
+        base = [n.body]
+        if kept:
+            for k, v in kept["fields"].items():
+                if k in texts:
+                    texts[k].set_value(v)
+            base[0] = kept.get("base", n.body)
+        saved = []
+
+        def forget():
+            d = dict(tab.get(_EDITS) or {})
+            if d.pop(n.id, None) is not None:
+                tab[_EDITS] = d
+
+        def discard():
+            for k, f in texts.items():
+                f.set_value(opened[k])
+            base[0] = n.body
+            kept_row.set_visibility(False)
+            forget()
+
+        def closed(e):
+            if e.value:
+                return
+            forget()
+            now = {k: f.value for k, f in texts.items() if f.value != opened[k]}
+            if now and not saved:
+                d = dict(tab.get(_EDITS) or {})
+                d[n.id] = {"fields": now} | ({"base": base[0]} if "body" in now else {})
+                tab[_EDITS] = d
+            dialog.delete()             # one per click: each closed one stayed in the page
+        dialog.on_value_change(closed)
+
         def _save():
-            resolve = resolving or bool(n.spec.status and close is not None and close.value)
+            reopen = S.read_status(n) == "resolved" and close is not None and close.value
+            resolve = resolving or bool(n.spec.status and close is not None and close.value
+                                        and not reopen)
             if resolve and n.spec.verdict and not (res.value or "").strip():
                 ui.notify("a result is required to resolve this kind", type="warning")
                 return
@@ -1476,8 +1617,8 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             # 2026-10-16). Only a body both changed cannot merge.
             # ponytail: the tip is read outside the lock, as `retag` reads it.
             tip = S.chain_tip(S.load(ctx.store_dir), n.id)
-            edited = body.value != n.body
-            if edited and tip.body != n.body:
+            edited = body.value != base[0]
+            if edited and tip.body != base[0]:
                 ui.notify(f"{short_id(n.id)} changed since this dialog opened ({tip.author} "
                           f"wrote to it): copy your text, then reopen the entry to edit its "
                           f"newest version", type="warning", multi_line=True)
@@ -1507,7 +1648,7 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             verdict = {k: v for k, v, was in (("checked", checked.value or None, n.checked),
                                                ("result", res.value or None, n.result))
                        if v != was} if checked is not None else {}
-            closing = {"status": "resolved"} if resolve else {}
+            closing = {"status": "resolved"} if resolve else {"status": "open"} if reopen else {}
             retired = ["retired"] if not n.spec.status and close.value else []
             due_v = (due.value or "").strip() or None if due is not None else n.due
             dated = {"due": due_v} if due_v != n.due else {}
@@ -1521,14 +1662,17 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                 kinded["options"] = None            # named under the select
             if demo_says("saves the edit"):
                 return
+            from .chrome import own_write       # chrome imports this module
             try:
-                api.supersede(ctx, n.id, author=author, **text,
-                              tags=kept + [t for t in final if t not in n.tags and t not in kept],
-                              arc_id=arc_v if arc_v != n.arc_id else tip.arc_id,
-                              **verdict, **closing, **dated, **on, **kinded)
+                with own_write(ctx, author, [n.id]):
+                    api.supersede(ctx, n.id, author=author, **text,
+                                  tags=kept + [t for t in final if t not in n.tags and t not in kept],
+                                  arc_id=arc_v if arc_v != n.arc_id else tip.arc_id,
+                                  **verdict, **closing, **dated, **on, **kinded)
             except (ValueError, catalog.CatalogError) as e:    # a closed catalog's refusal
                 ui.notify(str(e), type="negative")
                 return
+            saved.append(True)
             dialog.close()
             refresh()
 

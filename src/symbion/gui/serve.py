@@ -270,7 +270,10 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
             # All of symbion: watching gui/ alone served an api.py edit stale.
             uvicorn_reload_dirs=str(Path(__file__).resolve().parent.parent),
             uvicorn_reload_includes="*.py",
-            title="symbion", dark=True, show_welcome_message=False, favicon=FAVICON,
+            # `<html lang>`: a screen reader guessed the page's language
+            # (the GUI review, 2026-11-07).
+            title="symbion", language="en-US", dark=True, show_welcome_message=False,
+            favicon=FAVICON,
             reconnect_timeout=30.0,
         )
     except KeyboardInterrupt:

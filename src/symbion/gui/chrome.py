@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from importlib import metadata
 from pathlib import Path
 
@@ -16,8 +17,9 @@ from .. import store as S
 from .. import summary as summ
 from . import servers
 from .filters import href
-from .notes import (FILE_MD_EXTRAS, add_form, ago, demo_says, fenced, kind_class, peek_entry,
-                    reading, render_note, say_after_reload, show_said, undo_dialog, viewer)
+from .notes import (FILE_MD_EXTRAS, add_form, ago, demo_says, fenced, heading, kind_class,
+                    peek_entry, reading, render_note, say_after_reload, short_id, show_said,
+                    undo_dialog, viewer)
 from .theme import (DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, kind_css, quasar_colors,
                     root_vars_css)
 
@@ -168,8 +170,9 @@ if (matchMedia('(display-mode: standalone), (display-mode: tabbed)').matches) {
 _TIPS_JS = """<script>
 const sbTip = Object.assign(document.createElement('div'), {className: 'sb-tip', hidden: true});
 let sbTipAt = null, sbTipWatch = null;
+// data-tip-cut: a tip only while an ellipsis cuts the words it holds
 function sbTipPlace() {
-  const text = sbTipAt && sbTipAt.dataset.tip;
+  const a = sbTipAt, text = a && (a.dataset.tip || a.scrollWidth > a.clientWidth && a.dataset.tipCut);
   if (!text) { sbTip.hidden = true; return; }
   if (!sbTip.isConnected) document.body.append(sbTip);
   sbTip.textContent = text;
@@ -186,9 +189,13 @@ function sbTipTo(el) {
   if (el) sbTipWatch.observe(el, {attributes: true, attributeFilter: ['data-tip']});
   sbTipPlace();
 }
-document.addEventListener('mouseover', e =>
-  sbTipTo(e.target.closest ? e.target.closest('[data-tip], [data-tip-key]') : null));
+const sbTipOf = e => e.target.closest ? e.target.closest('[data-tip], [data-tip-key], [data-tip-cut]') : null;
+document.addEventListener('mouseover', e => sbTipTo(sbTipOf(e)));
 document.addEventListener('mouseout', e => { if (!e.relatedTarget) sbTipTo(null); });
+// Focus shows a tip as a hover does: a tip held facts no keyboard reached
+// (the GUI review, 2026-11-07). A key hides it first, so Tab moves it.
+document.addEventListener('focusin', e => sbTipTo(sbTipOf(e)));
+document.addEventListener('focusout', e => { if (!e.relatedTarget) sbTipTo(null); });
 for (const ev of ['scroll', 'mousedown', 'keydown'])
   document.addEventListener(ev, () => sbTipTo(null), true);
 </script>"""
@@ -226,6 +233,32 @@ document.addEventListener('click', e => {
   e.preventDefault();
   sbPeek(card);
 });
+// The peek in the URL as #peek=<id>: it opened and closed beside history,
+// so a phone's Back left the page under it, and a reload or a shared link
+// lost it (the GUI review, 2026-11-07). Opening pushes one entry, j and k
+// replace it, so one Back closes the peek; a close by its button goes back.
+function sbPeekHash(id) {
+  const h = '#peek=' + encodeURIComponent(id);
+  if (location.hash === h) return;
+  if (history.state && history.state.sbPeek) history.replaceState({sbPeek: 1}, '', h);
+  else history.pushState({sbPeek: 1}, '', h);
+}
+function sbPeekUnhash() {
+  if (!location.hash.startsWith('#peek=')) return;
+  if (history.state && history.state.sbPeek) history.back();
+  else history.replaceState(history.state, '', location.pathname + location.search);
+}
+function sbPeekFromHash() {
+  const m = location.hash.match(/^#peek=(.+)$/);
+  if (!m) return;
+  const id = decodeURIComponent(m[1]);
+  const card = sbCards().find(c => c.dataset.id === id);
+  if (card) sbPeek(card); else emitEvent('sbPeek', {id});
+}
+addEventListener('popstate', () => {
+  if (location.hash.startsWith('#peek=')) sbPeekFromHash();
+  else if (sbPeekOpen()) document.querySelector('.sb-peek-close')?.click();
+});
 const sbPeekKeys = {x: '.sb-resolve', s: '.sb-star', e: '.sb-edit', o: '.sb-peek-page',
                     a: '.sb-answer-field input', Escape: '.sb-peek-close'};
 document.addEventListener('keydown', e => {
@@ -248,6 +281,120 @@ document.addEventListener('keydown', e => {
   if (e.key === 'a') el.focus(); else el.click();
 });
 </script>"""
+
+# An arc's board (arcs.board): a card dragged to a column moves there in the
+# page at once, and the page writes it from one `sbMove` event, {id, phase,
+# before}; at a column's end, {id, phase, after} its last card, since a
+# column capped at a page of rows ends short of the store's. A redraw after
+# each move would flicker and lose the board's scroll place (the phases
+# design, 2026-11-05): the page redraws the cards of the column the card left
+# and the one it entered, and a refused write redraws the board as the store
+# has it. A drag that starts from a
+# finger is dropped: a phone moves a box with its phase chip, and HTML5 drag
+# is unreliable on iPhone Safari. The data is a type of its own, so a card
+# dropped on a field types nothing and _DROP_JS, which takes `Files`, lets it
+# be. `sbArcWide` answers the arc page: its tab's Board only where phase
+# columns fit, a width the server cannot see.
+# The arc's List drags an open row by its grip and drops it above or below
+# the open row nearest the pointer, in that row's phase, so either end of a
+# phase can be reached; the same `sbMove` writes it, and the page redraws the
+# list. A drop there never resolves: the tick does.
+_BOARD_JS = """<script>
+let sbDragged = null, sbTouch = false;
+const sbBox = 'application/x-symbion-box';
+const sbMarks = ['sb-dropping', 'sb-drop-above', 'sb-drop-below'];
+const sbUnmark = () => {
+  for (const c of document.querySelectorAll(sbMarks.map(m => '.' + m).join(','))) c.classList.remove(...sbMarks);
+};
+document.addEventListener('pointerdown', e => { sbTouch = e.pointerType === 'touch'; }, true);
+// a card's own drag only: one redrawn mid-drag never sends dragend here
+const sbOurs = e => sbDragged && [...e.dataTransfer.types].includes(sbBox) && e.target.closest;
+const sbColumn = e => sbOurs(e) && e.target.closest('.sb-board [data-phase]');
+const sbRow = e => {
+  const list = sbOurs(e) && e.target.closest('.sb-list');
+  if (!list || !list.contains(sbDragged)) return null;
+  let row = null, gap = Infinity;
+  for (const r of list.querySelectorAll('.sb-note[data-phase]')) {
+    const b = r.getBoundingClientRect(), d = Math.max(b.top - e.clientY, e.clientY - b.bottom, 0);
+    if (d < gap) { gap = d; row = r; }
+  }
+  if (!row) return null;
+  const b = row.getBoundingClientRect();
+  return {row, below: e.clientY > b.top + b.height / 2};
+};
+document.addEventListener('dragstart', e => {
+  const grip = e.target.closest && e.target.closest('.sb-list .sb-grip');
+  const card = grip ? grip.closest('.sb-note')
+    : e.target.closest && e.target.closest('.sb-board [data-phase] .sb-note[draggable="true"]');
+  if (!card) return;
+  if (sbTouch) { e.preventDefault(); return; }
+  sbDragged = card;
+  const r = card.getBoundingClientRect();
+  e.dataTransfer.setDragImage(card, e.clientX - r.left, e.clientY - r.top);   // a link's own drag shows the link
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.clearData();                      // a link's URL, which a field would paste
+  e.dataTransfer.setData(sbBox, card.dataset.id);
+});
+document.addEventListener('dragover', e => {
+  const hit = sbRow(e), col = !hit && sbColumn(e);
+  if (!sbDragged) return;
+  sbUnmark();
+  if (!hit && !col) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  if (col) col.classList.add('sb-dropping');
+  else if (hit.row !== sbDragged) hit.row.classList.add(hit.below ? 'sb-drop-below' : 'sb-drop-above');
+});
+document.addEventListener('dragend', () => {
+  sbDragged = null;
+  sbUnmark();
+});
+document.addEventListener('drop', e => {
+  const hit = sbRow(e), col = !hit && sbColumn(e), card = sbDragged;
+  if (hit) {
+    e.preventDefault();
+    sbDragged = null;
+    sbUnmark();
+    const {row, below} = hit;
+    if (row === card || !card.isConnected) return;
+    if (row.dataset.phase === card.dataset.phase
+        && (below ? row.nextElementSibling : row.previousElementSibling) === card) return;   // where it was
+    row.parentElement.insertBefore(card, below ? row.nextElementSibling : row);
+    emitEvent('sbMove', {id: card.dataset.id, phase: row.dataset.phase,
+                         before: below ? null : row.dataset.id, after: below ? row.dataset.id : null});
+    return;
+  }
+  if (!col) return;
+  e.preventDefault();
+  sbDragged = null;
+  if (!card.isConnected) return;
+  const from = card.closest('[data-phase]'), list = col.querySelector('.sb-phase-cards');
+  const done = col.dataset.phase === '@DONE@';
+  if (from === col && done) return;                     // done keeps its order: newest first
+  const others = [...list.children].filter(c => c !== card);
+  const next = done ? others[0] : others.find(c => {
+    const r = c.getBoundingClientRect();
+    return e.clientY < r.top + r.height / 2;
+  });
+  if (from === col && others[[...list.children].indexOf(card)] === next) return;   // where it was
+  list.insertBefore(card, next || null);
+  const last = others.at(-1);
+  emitEvent('sbMove', {id: card.dataset.id, phase: col.dataset.phase,
+                       before: next ? next.dataset.id : null,
+                       after: !next && last ? last.dataset.id : null});
+});
+function sbArcWide() { if (matchMedia('(min-width: @WIDE@px)').matches) emitEvent('sbArcWide'); }
+// After a move pick: the arc's redraw lands first, then the card's menu chip takes focus.
+function sbFocusMove(id, ...parts) {      // the first part the card has takes focus
+  requestAnimationFrame(() => {
+    for (const part of parts.length ? parts : ['.sb-chip-opens']) {
+      const el = document.querySelector(['.sb-board', '.sb-list']
+        .map(s => `${s} .sb-note[data-id="${id}"] ${part}`).join(','));
+      if (el) return el.focus();
+    }
+  });
+}
+</script>""".replace("@DONE@", S.DONE).replace("@WIDE@", str(NARROW + 1))
 
 # The palette (the user, 2026-10-16): Cmd or Ctrl K, from anywhere but an open dialog,
 # opens one box for the places, the top bar's actions and the entries here
@@ -297,13 +444,18 @@ function sbPalBuild() {
   sbPal.setAttribute('aria-label', 'go to, run or find');
   const label = sbEl('label', 'sb-pal-box'), box = sbEl('input');
   box.placeholder = "Go to, run or find · an id's tail works";
-  box.setAttribute('aria-label', 'go to, run or find');
-  box.setAttribute('aria-controls', 'sb-pal-list');
+  // A combobox and its listbox: the pick moved with nothing said, since
+  // aria-activedescendant means nothing on a bare input (the design critique, 2026-11-07).
+  for (const [k, v] of [['role', 'combobox'], ['aria-label', 'go to, run or find'],
+                        ['aria-controls', 'sb-pal-list'], ['aria-expanded', 'true'],
+                        ['aria-autocomplete', 'list']]) box.setAttribute(k, v);
   box.autocomplete = 'off';
   box.spellcheck = false;
   label.append(sbIcon('search'), box, sbEl('span', 'sb-chip sb-mono', 'esc'));
   const list = sbEl('div', 'sb-pal-list');
   list.id = 'sb-pal-list';
+  list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-label', 'results');
   const foot = sbEl('div', 'sb-pal-foot');
   foot.append(sbEl('span', '', '↑↓ move'), sbEl('span', 'sb-pal-enter', '↵ go'),
               sbEl('span', 'sb-pal-tab', sbMod + '↵ in a new tab'), sbEl('span', '', 'esc close'));
@@ -361,21 +513,30 @@ async function sbPalAsk() {
 function sbPalDraw(groups, q) {
   const list = sbPal.querySelector('.sb-pal-list'), here = location.pathname + location.search;
   list.replaceChildren();
+  sbPal.querySelector('input').removeAttribute('aria-activedescendant');
   sbPalRows = [];
   sbPalShown = q;
   if (!q) sbPalRest = groups;
-  for (const g of groups) {
+  for (const [gi, g] of groups.entries()) {
     // A button the read named can be gone since: the top bar redraws on its own tick.
     const rows = g.rows.filter(r => !r.click || document.querySelector(r.click));
     if (g.rows.length && !rows.length) continue;
-    const head = sbEl('div', 'sb-pal-head');
+    const group = sbEl('div', 'sb-pal-group'), head = sbEl('div', 'sb-pal-head');
+    group.setAttribute('role', 'group');
+    head.id = 'sb-pal-g' + gi;
+    group.setAttribute('aria-labelledby', head.id);
     head.append(sbEl('span', 'sb-nav-head', g.head));
     if (g.aside) head.append(sbEl('span', 'sb-pal-aside', g.aside));
-    list.append(head);
-    for (const r of rows) list.append(sbPalRow(r, here));
+    group.append(head);
+    for (const r of rows) group.append(sbPalRow(r, here));
+    list.append(group);
   }
-  if (!list.childElementCount)
-    list.append(sbEl('div', 'sb-pal-none', `nothing here or in another running store says “${q}”`));
+  if (!list.childElementCount) {
+    const none = sbEl('div', 'sb-pal-none', `nothing here or in another running store says “${q}”`);
+    none.setAttribute('role', 'option');                 // what a listbox may hold
+    none.setAttribute('aria-disabled', 'true');
+    list.append(none);
+  }
   sbPalPick(0);
 }
 function sbPalRow(r, here) {
@@ -384,6 +545,8 @@ function sbPalRow(r, here) {
   if (r.href) row.href = r.href; else row.type = 'button';
   row.id = 'sb-pal-' + sbPalRows.length;
   row.tabIndex = -1;
+  row.setAttribute('role', 'option');
+  row.setAttribute('aria-selected', 'false');
   row.append(r.icon ? sbIcon(r.icon) : sbEl('span', 'sb-dot'));
   const text = sbEl('span', 'sb-pal-text' + (r.mono ? ' sb-mono' : ''));
   if (r.html != null) text.innerHTML = r.html;   // escaped by the server: <mark> is its only markup
@@ -422,9 +585,11 @@ function sbPalRow(r, here) {
 function sbPalPick(i) {
   if (!sbPalRows.length) return;
   sbPalRows[sbPalAt]?.classList.remove('sb-pal-on');
+  sbPalRows[sbPalAt]?.setAttribute('aria-selected', 'false');
   sbPalAt = Math.max(0, Math.min(sbPalRows.length - 1, i));
   const row = sbPalRows[sbPalAt], r = row.sbRow;
   row.classList.add('sb-pal-on');
+  row.setAttribute('aria-selected', 'true');
   row.scrollIntoView({block: 'nearest'});
   sbPal.querySelector('input').setAttribute('aria-activedescendant', row.id);
   sbPal.querySelector('.sb-pal-enter').textContent = r.click ? '↵ run' : r.peek ? '↵ peek' : '↵ go';
@@ -439,6 +604,8 @@ function sbBadge(n) {
   if (!navigator.setAppBadge) return;
   (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
 }
+// A hidden tab slows the page's git poll, which the badge rides on (_git_buttons).
+document.addEventListener('visibilitychange', () => emitEvent('sbHidden', document.hidden));
 </script>"""
 
 # What `?` lists. The kinds are the store's, read at render.
@@ -464,7 +631,7 @@ def store_name(ctx) -> str:
 
 def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
           here: str = "", new=("project", None, None), kind: str | None = None,
-          cards: bool = True, search=None) -> None:
+          cards: bool = True, search=None, tab: str | None = None) -> None:
     """`crumbs` end in the page's title, which the top bar shows: a title of
     its own under the bar left a band of nothing above it (the user,
     2026-10-01). A parent comes before it only on a page one level down (an
@@ -484,7 +651,8 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     # and names it, so there the tab is the page alone (the user, 2026-10-15).
     # symbion last, where the strip cuts first: a shared link's preview read
     # the store's name and no description (the user, 2026-10-28).
-    page = crumbs[-1][0]
+    # `tab` where the title alone would not tell tabs apart: one entry's page.
+    page = tab or crumbs[-1][0]
     ui.page_title(f"{name} · {page} · symbion")
     ui.add_head_html(f'<meta name="description" content="{ABOUT}">'
                      f'<meta property="og:description" content="{ABOUT}">')
@@ -527,6 +695,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     ui.add_head_html(_BADGE_JS)
     ui.add_head_html(_TIPS_JS)
     ui.add_head_html(_PEEK_JS)
+    ui.add_head_html(_BOARD_JS)
     ui.add_head_html(_PALETTE_JS)
     # Scripts off, as a blocker leaves a page: nothing is drawn, and NiceGUI's
     # notice says only that the page needs JavaScript. This one also says what
@@ -543,12 +712,18 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                      '<code>symbion</code> command, not this page. Source, install and docs: '
                      f'<a href="{source_href("noscript")}">{SOURCE}</a></p></div></div>')
     heads = S.heads(S.load(ctx.store_dir))
-    # value=None: open beside the page on a wide window, a slide-over behind
+    # show-if-above: open beside the page on a wide window, a slide-over behind
     # the menu button on a narrow one (open by default, it covered a phone).
-    with ui.left_drawer(value=None, fixed=True, bordered=False) \
-            .props(f"width=248 breakpoint={NARROW}").classes("sb-side") as drawer:
+    # Not value=None: its open-state probe waits 1 s on each connect and logs a
+    # traceback when the visitor has left or the tab sleeps. Quasar reads
+    # show-if-above at mount and sends "open" itself when wide.
+    with ui.left_drawer(value=False, fixed=True, bordered=False) \
+            .props(f"show-if-above width=248 breakpoint={NARROW}").classes("sb-side") as drawer:
         _sidebar(ctx, author, name, heads, here)
     with ui.header(elevated=False).classes("sb-header"):
+        # Dozens of stops came before the first card on every page (the GUI
+        # review, 2026-11-07): this one, first, goes past them.
+        ui.link("skip to entries · j k move", "#sb-start").classes("sb-skip").mark("skip-link")
         with ui.row(wrap=False).classes("items-center gap-3 w-full sb-topbar") \
                 .style("min-height:56px"):
             ui.button(icon="menu", on_click=drawer.toggle, color=None) \
@@ -557,9 +732,14 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
             with ui.row(wrap=False).classes("items-center gap-2 sb-crumbs").mark("crumbs"):
                 for i, (label, to) in enumerate(crumbs):
                     if i:
-                        ui.label("›").classes("sb-sep")
-                    last = ui.link(label, to) if to else ui.label(label)
-                last.classes("sb-here").mark("page-title")
+                        # a mark (3.84:1, past the 3:1 a mark needs), so out of a
+                        # screen reader's text, which would hold it to 4.5:1
+                        ui.label("›").classes("sb-sep").props('aria-hidden="true"')
+                    if i < len(crumbs) - 1:
+                        ui.link(label, to) if to else ui.label(label)
+                        continue
+                    with heading(1, "" if to else label).classes("sb-here") as last:
+                        (ui.link(label, to) if to else last).mark("page-title")
             ui.space()
             if S.read_only():
                 # The public demo: a visitor from a link learns what they see,
@@ -592,11 +772,18 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     # was gone (the user, 2026-10-16). The card keeps `sb-picked`, j/k's
     # place; every way to close the peek sets the drawer's value.
     layout = ui.context.client.layout
-    peek.on_value_change(lambda e: layout.classes(add="sb-peeking") if e.value
-                         else layout.classes(remove="sb-peeking"))
+    def peeking(e) -> None:
+        if e.value:
+            layout.classes(add="sb-peeking")
+        else:
+            layout.classes(remove="sb-peeking")
+            ui.run_javascript("sbPeekUnhash()")     # the URL drops #peek=, and Back is the page's
+    peek.on_value_change(peeking)
     # The sidebar runs the full height; the top bar sits beside it. After
     # all three: creating a header or drawer rewrites the layout's view.
     ui.context.client.layout.props('view="lHh LpR lFf"')
+    # Where the skip link lands: before the page's own content, out of its gaps.
+    ui.element("div").props('id=sb-start tabindex=-1').classes("sb-start").mark("skip-target")
     show_said()
 
 
@@ -605,13 +792,13 @@ PEEK_WIDTH = 440
 PEEK_WIDE = 1280
 
 
-def _drift_list(ctx, author: str, drawn: dict) -> None:
+def _drift_list(ctx, author: str, drawn: dict, arcs: bool) -> None:
     """What the stale button counts, newest first, as compact cards: a click
     on one peeks it."""
     now = S.heads(S.load(ctx.store_dir))
-    new, changed, _ = _drift(drawn, now)
+    new, changed = _drift(drawn, now)
     with ui.row(wrap=False).classes("items-center w-full"):
-        ui.label(f"{_what(new, changed) or 'nothing new'} since this page was drawn") \
+        ui.label(f"{_what(new, changed, arcs) or 'nothing new'} since this page was drawn") \
             .classes("text-body").mark("drift-head")
         ui.space()
         ui.button("reload page", icon="refresh", on_click=lambda: ui.navigate.reload()) \
@@ -631,6 +818,7 @@ def _peek_panel(ctx, author: str, drawer, heads):
     answered question on the board (the user, 2026-10-16). Returns what opens
     it on `_drift_list` of `heads`, the entries the page drew."""
     shown = [None]
+    key = (str(ctx.store_dir), author)
     drawn = {n.id: n for n in heads}
 
     def wrote() -> None:
@@ -640,19 +828,19 @@ def _peek_panel(ctx, author: str, drawer, heads):
     @ui.refreshable
     def body():
         if shown[0] is _DRIFT:
-            _drift_list(ctx, author, drawn)
+            _drift_list(ctx, author, _DRAWN.get(key, drawn),
+                        key in _ARCS and _arcs_stamp(ctx.store_dir) != _ARCS[key]["stamp"])
         elif shown[0]:
             peek_entry(ctx, shown[0], author, wrote)
 
     with ui.element("div").classes("sb-peek-inner").mark("peek"):
         with ui.row(wrap=False).classes("items-center w-full sb-peek-head"):
             ui.space()
-            # `o` clicks it hidden too
-            page = ui.button(icon="open_in_new", color=None,
-                             on_click=lambda: shown[0] not in (None, _DRIFT)
-                             and ui.navigate.to(href(id=shown[0]))) \
+            # `o` clicks it hidden too. A link (Quasar's href): a button that
+            # navigated opened nothing on a middle click (the GUI review, 2026-11-07).
+            page = ui.button(icon="open_in_new", color=None) \
                 .props('flat dense round aria-label="open its page"').classes("sb-peek-page") \
-                .tooltip("open its page (o)")
+                .tooltip("open its page (o)").mark("peek-page")
             ui.button(icon="close", color=None, on_click=drawer.hide) \
                 .props('flat dense round aria-label="close the peek"').classes("sb-peek-close") \
                 .tooltip("close (Esc)").mark("peek-close")
@@ -661,6 +849,10 @@ def _peek_panel(ctx, author: str, drawer, heads):
     def show(nid) -> None:
         shown[0] = nid
         page.set_visibility(nid is not _DRIFT)
+        if nid is not _DRIFT and isinstance(nid, str):
+            page._props["href"] = href(id=nid)          # set, not parsed: the id is the URL's
+            page.update()
+            ui.run_javascript(f"sbPeekHash({json.dumps(nid)})")
         body.refresh()
         drawer.show()
     ui.on("sbPeek", lambda e: show((e.args or {}).get("id")))
@@ -674,6 +866,8 @@ def _peek_panel(ctx, author: str, drawer, heads):
                 ui.run_javascript(f"sbCards().find(c => c.dataset.id === {json.dumps(nid)})"
                                   "?.classList.add('sb-picked')")
                 show(nid)
+            else:
+                ui.run_javascript("sbPeekFromHash()")   # a reload, or a link with #peek=
     client.on_connect(again)
     return lambda: show(_DRIFT)
 
@@ -770,7 +964,7 @@ def _offer_doc(ctx, name: str, text: str, use_body, made: dict, open_form) -> No
             offer.close()
             open_form()
             made["form"].add_ref(f"doc:{saved}")
-        field.on("keydown.enter", save)
+        field.on("keydown.enter", save, js_handler=f"(e) => {{ if ({_ENTER}) emit() }}")
 
         def as_body():
             offer.close()
@@ -1048,7 +1242,7 @@ def _search_box(q: str, keep: dict, *, cards: bool = True, to=None) -> None:
         box.on("update:value", _expand, js_handler="(v) => sbFilter(v, emit)")
     elif not narrows:
         box.on("update:value", js_handler="(v) => sbFilter(v)")
-    box.on("keydown.enter", _go, js_handler="(e) => emit(e.target.value)")
+    box.on("keydown.enter", _go, js_handler=f"(e) => {{ if ({_ENTER}) emit(e.target.value) }}")
     words = ('every word, in any case, in body, target, checked, result, refs or tags; '
              'a "quoted phrase" as one word')
     box.tooltip(f"Enter narrows this page to the entries that hold {words}" if narrows else
@@ -1057,24 +1251,139 @@ def _search_box(q: str, keep: dict, *, cards: bool = True, to=None) -> None:
                 f"; Enter searches the store: {words}; or an entry id")
 
 
-# Seconds between reads of the store's git state for the two buttons.
+# An Enter that acts, in a field's js_handler: not the one that ends an IME
+# word, which sent a half-typed search or name (the GUI review, 2026-11-07).
+# Safari sends that Enter after compositionend, as keyCode 229.
+_ENTER = "!e.isComposing && e.keyCode !== 229"
+
+# Seconds between reads of the store's git state for the two buttons; while
+# the tab is hidden, the slower one.
 _GIT_EVERY = 5
+_HIDDEN_EVERY = 60
 
 # (store, writer) -> {id: entry} of the entries the writer's latest page
 # drew. The app badge counts what others wrote since. ponytail: one serve's
 # memory; after a restart it counts from the next page drawn.
 _DRAWN: dict = {}
+# The same key -> {"stamp": arcs.jsonl's (mtime_ns, size) as the page drew it}.
+_ARCS: dict = {}
 
 
-def _drift(drawn: dict, now) -> tuple[int, int, list]:
-    """(new, changed, by) between the entries a page drew, {id: entry}, and
-    the heads `now`: entries it lacks, entries edited or taken back since,
-    and who wrote them. Whole entries compare: an edit and an undo each keep
-    the id."""
-    new = [n for n in now if n.id not in drawn]
-    changed = [n for n in now if n.id in drawn and drawn[n.id] != n]
-    gone = len(drawn.keys() - {n.id for n in now})
-    return len(new), len(changed) + gone, sorted({n.author for n in new + changed})
+def _arcs_stamp(store_dir):
+    try:
+        st = S.arcs_path(store_dir).stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+@contextmanager
+def own_write(ctx, author: str, ids=()):
+    """Wrap the page's own write: it is no news to the page, so the stale
+    button lights for others' writes only. The arcs stamp is adopted only if
+    arcs.jsonl was as the page last recorded it before the write; otherwise
+    an arc change the poll has not seen stays offered. The entries `ids`
+    count as drawn. ponytail: only the writer's latest page records, so a
+    second tab of the same writer lights for the first's writes; an entry in
+    `ids` another writer changed in the same instant counts as drawn."""
+    key = (str(ctx.store_dir), author)
+    before = _arcs_stamp(ctx.store_dir)
+    yield
+    if key in _ARCS and before == _ARCS[key]["stamp"]:
+        _ARCS[key]["stamp"] = _arcs_stamp(ctx.store_dir)
+    if ids and key in _DRAWN:
+        _DRAWN[key].update({n.id: n for n in S.heads(S.load(ctx.store_dir)) if n.id in ids})
+
+
+def _drift(drawn: dict, now) -> tuple[int, int]:
+    """(new, changed) between the entries a page drew, {id: entry}, and the
+    heads `now`: entries it lacks, and entries edited or taken back since.
+    Whole entries compare: an edit and an undo each keep the id."""
+    new = sum(n.id not in drawn for n in now)
+    changed = sum(n.id in drawn and drawn[n.id] != n for n in now)
+    return new, changed + len(drawn.keys() - {n.id for n in now})
+
+
+# A top-bar tip lists entries, a line each: a page of them was more than a glance.
+_TIP_LINES = 8
+_TIP_WORDS = 40
+
+
+def _did(prev, n) -> str:
+    """What turned `prev`, an earlier version of entry `n` (None: there was
+    none), into `n`, as a tip says it."""
+    if prev is None:
+        return "new"
+    was, now = S.read_status(prev), S.read_status(n)
+    if was != now:
+        return {"resolved": "resolved", "open": "reopened"}.get(now, f"now {now}")
+    if n.body != prev.body:
+        return "edited"
+    return summ.change_words(prev, n) or "changed"
+
+
+def _tip_line(n, did: str, who: str | None = None, eid: str | None = None) -> str:
+    """`eid`, the entry's id where `n` is an earlier version of it."""
+    return " · ".join([*([who] if who else []), did, f"{n.kind} {short_id(eid or n.id)}",
+                       summ.clip(n.body, _TIP_WORDS)])
+
+
+def _capped(lines: list[str]) -> list[str]:
+    cut = lines if len(lines) <= _TIP_LINES else lines[:_TIP_LINES - 1]
+    return cut + ([f"+{len(lines) - len(cut)} more"] if len(cut) < len(lines) else [])
+
+
+def _drift_tip(drawn: dict, now, arcs: bool) -> str:
+    """The stale button's tip: each entry written since the page was drawn,
+    who wrote it and what they did, newest first. Its count alone said
+    little: we know what changed (the user, 2026-11-07)."""
+    lines = [_tip_line(n, _did(drawn.get(n.id), n), n.author)
+             for n in S.newest_first([n for n in now if drawn.get(n.id) != n])]
+    lines += [_tip_line(drawn[i], "taken back") for i in drawn.keys() - {n.id for n in now}]
+    return "\n".join(["since this page was drawn:", *_capped(lines),
+                      *(["arcs changed"] if arcs else []), "click to list them"])
+
+
+def _commit_tip(ctx, author: str) -> str:
+    """The commit button's tip: each entry it would commit and what the
+    writer did to it since the store's last commit. An entry is new when its
+    oldest pending version supersedes nothing: a version an edit kept is
+    pending only when the text it holds was (store.added_rows)."""
+    rows = S.pending_rows(ctx.store_dir)
+    keep = S.with_bases(rows, lambda r: r.get("author") == author)
+    mine = [r for r in rows if keep(r)]
+    pend = {r["id"]: r for r in mine if r.get("id")}
+    loaded = S.load(ctx.store_dir)
+    by_id, tip = {n.id: n for n in loaded}, S.chain_tips(loaded)
+    did = {}
+    for r in S.entries(mine):
+        if (n := by_id.get(r.get("id"))) is None:
+            continue                    # a line that did not parse: commit takes it as it is
+        base = r
+        while base.get("supersedes") in pend:
+            base = pend[base["supersedes"]]
+        did[n.id] = _did(by_id.get(base.get("supersedes")), n)
+    # Another writer's later version leaves the commit an earlier one, whose
+    # saved id no one knows the entry by.
+    lines = [_tip_line(n, did[n.id], eid=tip(n.id).id)
+             for n in S.newest_first(by_id[i] for i in did)]
+    others = len(S.entries([r for r in rows if not keep(r)]))
+    arcs = gitref.registry_modified(ctx.store_dir)
+    head = f"commit your {summ._count(len(lines), 'entry')}:" if lines else "commit the arcs' changes"
+    return "\n".join([head, *_capped(lines), *(["and the arcs' changes"] if lines and arcs else []),
+                      *([f"left for their writers: {summ._count(others, 'entry')}"] if others else []),
+                      *(["then pull from origin and push"] if S.shared(ctx.store_dir) else [])])
+
+
+def _tip_on_hover(el, text) -> None:
+    """`el`'s tip, made by `text()` when the pointer or focus reaches it, so it
+    is current then and costs no poll a read (chrome._TIPS_JS shows it)."""
+    el._props["data-tip-key"] = "hover"
+
+    async def fill() -> None:
+        el._props["data-tip"] = await run.io_bound(text)
+        el.update()
+    el.on("mouseenter", fill).on("focus", fill)
 
 
 def git_state(ctx, author: str) -> tuple:
@@ -1105,6 +1414,7 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
     key = (str(ctx.store_dir), author)
     _DRAWN[key] = drawn
     seen = {"stamp": None, "heads": heads}
+    arcs = _ARCS[key] = {"stamp": _arcs_stamp(ctx.store_dir)}
 
     def store_state():
         # The file is parsed again only when it changed: every page ticks.
@@ -1117,15 +1427,16 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
             seen["stamp"], seen["heads"] = stamp, S.heads(S.load(ctx.store_dir))
         now, latest = seen["heads"], _DRAWN.get(key, drawn)
         badge = sum(n.author != author and latest.get(n.id) != n for n in now)
-        return _drift(drawn, now), badge
+        return (*_drift(drawn, now), _arcs_stamp(ctx.store_dir) != arcs["stamp"]), badge
 
     def read():
         return (*git_state(ctx, author), *store_state())
 
     @ui.refreshable
     def buttons(state):
-        if state[5][:2] != (0, 0):
-            _stale_button(*state[5], on_stale)
+        if any(state[5]):
+            _stale_button(*state[5], on_stale,
+                          lambda: _drift_tip(drawn, seen["heads"], state[5][2]))
         if state[4]:
             # No label to compute: the dialog says what the undo takes back.
             ui.button(icon="undo", on_click=lambda: undo_dialog(ctx, author)) \
@@ -1145,6 +1456,9 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
 
     shown = [read()]
     buttons(shown[0])
+    # Reload appeared with no word to a screen reader (the GUI review,
+    # 2026-11-07): this says what it says, where no one sees it.
+    said = ui.label().classes("sb-sr").props("role=status").mark("stale-said")
     sent = [None]                             # the first tick sends the badge
 
     async def tick():
@@ -1153,32 +1467,47 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
             return
         if state[:6] != shown[0][:6]:
             buttons.refresh(state)
+            new, changed, arcs = state[5]
+            said.set_text(f"{_what(new, changed, arcs)} since this page was drawn: reload"
+                          if new + changed or arcs else "")
         shown[0] = state
         if state[6] != sent[0]:
             sent[0] = state[6]
             ui.run_javascript(f"sbBadge({state[6]})")
     if not S.read_only():           # nothing changes there: only anonymous load
-        ui.timer(_GIT_EVERY, tick, immediate=False).mark("git-poll")    # the page has just read it
+        timer = ui.timer(_GIT_EVERY, tick, immediate=False).mark("git-poll")  # the page has just read it
+
+        # A hidden tab polled as often as a shown one (the GUI review,
+        # 2026-11-07). It slows, never stops: the installed app's badge is set
+        # from this tick, and a hidden window is when it counts.
+        async def hidden(e) -> None:
+            timer.interval = _HIDDEN_EVERY if e.args else _GIT_EVERY
+            if not e.args:
+                await tick()                # shown again: the bar is read now
+        ui.on("sbHidden", hidden)
 
 
-def _what(new: int, changed: int) -> str:
+def _what(new: int, changed: int, arcs: bool = False) -> str:
     return " and ".join([*([summ._count(new, "new entry")] if new else []),
-                         *([summ._count(changed, "changed entry")] if changed else [])])
+                         *([summ._count(changed, "changed entry")] if changed else []),
+                         *(["arcs changed"] if arcs else [])])
 
 
-def _stale_button(new: int, changed: int, by: list, on_click) -> None:
+def _stale_button(new: int, changed: int, arcs: bool, on_click, tip) -> None:
     """The store changed since this page drew it: another writer, a terminal,
     another tab. The page does not redraw by itself: the cards would move
     under the reader. A click lists those entries in the peek, with the
     reload at its top: a reload redraws only what the page filters for, so
-    on an arc or a search it showed none of them (the user, 2026-10-27)."""
+    on an arc or a search it showed none of them (the user, 2026-10-27).
+    The count is of entries: a changed arcs file read "1 arcs changed"."""
+    word = "changed" if not new else "new or changed" if changed else "new"
     with ui.button(icon="refresh", on_click=on_click) \
             .props("flat dense no-caps color=notable").classes("px-2 sb-stale") \
-            .mark("stale-button") \
-            .tooltip(f"what changed: {_what(new, changed)} since this page was drawn"
-                     + (f", by {', '.join(by)}" if by else "")):
-        ui.label(str(new + changed))
-        ui.label("changed" if not new else "new or changed" if changed else "new") \
+            .mark("stale-button") as b:
+        _tip_on_hover(b, tip)
+        if new + changed:
+            ui.label(str(new + changed))
+        ui.label(f"{word} · arcs" if arcs and new + changed else "arcs changed" if arcs else word) \
             .classes("sb-btn-word")
 
 
@@ -1233,10 +1562,8 @@ def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> Non
 
     # On a phone the word goes and the count stays: the icon says commit.
     with ui.button(icon="save", on_click=_do).props("outline dense no-caps color=notable") \
-            .classes("px-2 sb-commit").mark("commit-button") \
-            .tooltip(f"git commit {author}'s entries" + (
-                f"; {summ._count(others, 'entry')} by other writers stay pending for them"
-                if others else "") + ("; then pull from origin and push" if shared else "")):
+            .classes("px-2 sb-commit").mark("commit-button") as b:
+        _tip_on_hover(b, lambda: _commit_tip(ctx, author))
         ui.label("commit").classes("sb-btn-word")
         ui.label(str(n) if n else "registry")
 

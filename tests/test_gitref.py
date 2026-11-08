@@ -853,6 +853,7 @@ def test_the_reads_never_rewrite_an_index(tmp_path, repo):
     assert gitref.uncommitted(s) == (0, False)
     assert cli._ignored_paths(s, "archive") == []
     assert gitref._dirty_paths(Config(project_root=repo)) == []
+    assert gitref.diff_text(Config(project_root=repo), "HEAD~1", "--", "f0") == ""
     for r, st in before.items():
         now = os.stat(r / ".git" / "index")
         assert (now.st_ino, now.st_mtime_ns) == (st.st_ino, st.st_mtime_ns), r.name

@@ -837,7 +837,8 @@ def _list_gotchas(ctx, sid: str, deadline: float) -> None:
     side = store.read_side(ctx.store_dir)
     loaded = summ.seen_from(store.load(ctx.store_dir), side)
     by_id = {n.id: n for n in loaded}
-    rows = [n for n in store.heads(loaded) if _hook_targets(n)]
+    paths = _path_types(ctx.cfg)
+    rows = [n for n in store.heads(loaded) if _hook_targets(n, paths)]
     # A gotcha has no status, so a stale one read as true at every touch (the
     # user, 2026-10-14). A count cannot say stale: every file gotcha in one
     # store had changed since, by one commit to hundreds. The agent, in the file at
@@ -847,7 +848,7 @@ def _list_gotchas(ctx, sid: str, deadline: float) -> None:
     # starts at the row's first write.
     asked = {(n.id, t): n if t == n.target else
              replace(n, id=f"{n.id}\t{t.name}", target=t, target_blob=None)
-             for n in rows for t in _hook_targets(n)}
+             for n in rows for t in _hook_targets(n, paths)}
     since = gitref.commits_since(ctx.cfg, list(asked.values()), timeout=left) if left > 0 else {}
     for n in rows:
         tail = n.id[-10:]
@@ -860,7 +861,7 @@ def _list_gotchas(ctx, sid: str, deadline: float) -> None:
         body = summ.clip(n.body or "", summ.GOTCHA_CHARS)
         more = f"`{sym} show {tail}` prints all of it; " if _gotcha_len(n) > summ.GOTCHA_CHARS \
             else ""
-        for t in _hook_targets(n):
+        for t in _hook_targets(n, paths):
             # A call that named a ref read "is on <target>" alone, as if misfiled (2026-10-30).
             ref = "" if t == n.target else f" and refers to {t.type}:{t.name}"
             age = written
@@ -874,23 +875,29 @@ def _list_gotchas(ctx, sid: str, deadline: float) -> None:
             # row on README.md does not fire on src/README.md.
             root = ctx.cfg.for_type(t.type).work_root
             leaf = Path(root).name if root and not re.search(_UNSAFE, Path(root).name) else ""
-            lines.append(f"{n.id}\t{t.name}\t{json.dumps(text, ensure_ascii=False)[1:-1]}"
-                         f"\t{leaf}\n")
+            lines.append(f"{n.id}\t{t.name}\t{json.dumps(text, ensure_ascii=False)[1:-1]}\t{leaf}\n")
     store._replace_atomically(d / sid, "".join(lines))
 
 
 _UNSAFE = r"[\t\n\r\"\\]"           # what a field of gotchas.sh's list cannot hold
 
 
-def _hook_targets(n) -> list:
+def _path_types(cfg) -> set:
+    """The target types whose names are paths: `file`, `doc` and each repo's."""
+    return {"file", "doc", *cfg.repos}
+
+
+def _hook_targets(n, paths) -> list:
     """The objects gotchas.sh matches a tool call against for this row: a
-    live #gotcha's target and refs of a catalog type. An item or project
-    gotcha has none, and the hook never prints it."""
+    live #gotcha's target and refs that are paths, of a type in `paths` or a
+    catalog name with a `/`. A name that is no path (a service, a host) fired on
+    calls that only named it, most of them unrelated to its trap (2026-11-06).
+    A gotcha with no path has none, and the hook never prints it."""
     if "gotcha" not in n.tags or "retired" in n.tags or n.status == "resolved":
         return []
     return [t for t in (n.target, *n.refs)
             if t.type not in store.BUILTIN_TARGET_TYPES and t.name and len(t.name) >= 4
-            and not re.search(_UNSAFE, t.name)]
+            and (t.type in paths or "/" in t.name) and not re.search(_UNSAFE, t.name)]
 
 
 def _gotcha_len(n, lead=False) -> int:
@@ -902,25 +909,27 @@ def _gotcha_len(n, lead=False) -> int:
     return len(summ.clip(s, len(s) + 1))
 
 
-def _echo_gotcha_notes(written, input_types) -> None:
+def _echo_gotcha_notes(written, ctx) -> None:
     """A live gotcha with no name the hook can match is never printed, and
     a store held several on an item or the project, written in silence
-    (2026-10-14): say so, with a ref type this store has. The hook gives a
+    (2026-10-14): say so, with a path type this store has. The hook gives a
     session a gotcha's first GOTCHA_CHARS, and every gotcha written in its
     first days ran longer, the median three times as long (2026-10-14). The
     trap and its fix go in a first paragraph that fits; evidence may follow
     below it (the user, 2026-10-14). Show the writer the cut whenever a write
     leaves a longer first paragraph."""
-    hookable = sorted(set(input_types) - store.BUILTIN_TARGET_TYPES)
-    ref = ("`--ref file:PATH`" if "file" in hookable else
-           f"`--ref TYPE:NAME`, a type of this store's catalogs ({', '.join(hookable)}),")
+    paths = _path_types(ctx.cfg)
+    # A store with [repos] takes `file:` too, for the repo that holds the name; `doc`
+    # is a path type, but a trap belongs where its code is, not in the store's docs.
+    reach = ("and this entry has none it can match; `--ref file:PATH` gives it one"
+             if "file" in ctx.input_types else "and this store has no file type")
     for n in written:
         if "gotcha" in n.tags and "retired" not in n.tags and n.status != "resolved" \
-                and not _hook_targets(n):
+                and not _hook_targets(n, paths):
             print(f"note: {n.id} is tagged gotcha, but the hook never prints it: it prints an "
-                  "entry when a tool call names the entry's file, and this entry has none it "
-                  f"can match; {ref} gives it one", file=sys.stderr)
-    long = [n for n in written if _hook_targets(n) and _gotcha_len(n, lead=True) > summ.GOTCHA_CHARS]
+                  f"entry when a tool call names the entry's file, {reach}", file=sys.stderr)
+    long = [n for n in written if _hook_targets(n, paths)
+            and _gotcha_len(n, lead=True) > summ.GOTCHA_CHARS]
     if not long:
         return
     print(f"note: the gotcha hook shows a session an entry's first {summ.GOTCHA_CHARS} chars; "
@@ -1026,9 +1035,16 @@ def _other_side(by_id, n, side) -> str | None:
     return None if summ.on_side(by_id, n, side) else summ.side_of(by_id, n)
 
 
+def _phase_of(arcs, n) -> str | None:
+    """The board column of a box on a phased arc, else None. `arcs` is by id."""
+    act = arcs.get(n.arc_id)
+    return (store.box_phase(act, n)
+            if act and act.phases and n.spec.status and not n.spec.parked else None)
+
+
 def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
                 since=None, added=None, seams=(), links=(), written=None,
-                successor=None, side=None) -> None:
+                successor=None, side=None, phase=None, arc=None) -> None:
     """`state` is api.verdict_state's pair for a verdict row, computed by the
     caller (batched per-listing where it needs a subject lookup); `subject`
     is the commit's subject line for a commit-target note, degrading to the
@@ -1043,7 +1059,8 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
     printed below the body. `written` is summary.written's parts.
     `successor` is gitref.successor's for a `rewritten` state. `side` is the
     side of a shared store's row the reader's side did not raise: the line's
-    last field."""
+    last field. A box prints its `arc=`, and `phase=` when `phase` names its
+    column on a phased arc; `arc` is its Arc, for the person's line."""
     # A superseded row's own status is history: printed first, `[open]`
     # read as live beside a resolved head (2026-09-28). The head's decides.
     status = store.read_status(head if head is not None else n)
@@ -1057,7 +1074,8 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
         from . import term
         term.print_note(n, status=status, state=state, due=due, subject=subject,
                         head=head, full=full, gui=gui, since=since, seams=seams,
-                        links=links, written=written, successor=successor, side=side)
+                        links=links, written=written, successor=successor, side=side,
+                        phase=phase, arc=arc)
         return
     tgt = n.target.name or ""          # `project:`, the form --target takes
     if n.target.type == "commit" and subject:
@@ -1084,6 +1102,8 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
         extra += f" commits_since={since}"
     if n.due:
         extra += f" due={store.shown(n.due)}" + (f" ({summ.due_phrase(due)})" if due else "")
+    if n.arc_id:
+        extra += f" arc={n.arc_id}" + (f" phase={phase}" if phase else "")
     if n.refs:
         extra += " refs=" + ",".join(summ.ref_label(r) for r in n.refs)
     if n.tags:
@@ -1194,6 +1214,11 @@ def _body_fields(args, append=False) -> dict:
     prepend = getattr(args, "prepend", False)
     if args.append and prepend:     # --append-file beside --prepend, past argparse's groups
         raise SystemExit("--append and --prepend: pick one")
+    if getattr(args, "replace", None):
+        if args.append or prepend:
+            raise SystemExit("--replace changes the body in place, and --append and --prepend "
+                             "add to it: pick one")
+        return {"replace_body": [tuple(p) for p in args.replace]}
     if args.body is None:
         if args.append or prepend:
             flag = "--append" if args.append else "--prepend"
@@ -1509,6 +1534,53 @@ class _Parser(argparse.ArgumentParser):
             self.error(f"unrecognized arguments: {' '.join(extras)}"
                        + "".join(f"; {h}" for h in hints))
         return ns, extras
+
+    def refuse_a_verb_flag_first(self, rest, typed) -> None:
+        """`symbion --author ada arc list`: a verb's flag before its verb made
+        its value the verb, and the refusal named `ada` as one; `--json list`
+        and `--kind task list` misled too (2026-11-07). `typed` is the command
+        as typed, so the fix keeps the `--dir` that `rest` lacks."""
+        def sub(p):
+            return next((a.choices for a in p._actions
+                         if isinstance(a, argparse._SubParsersAction)), None)
+
+        def walk(p):
+            yield p
+            for q in (sub(p) or {}).values():
+                yield from walk(q)
+
+        def width(tok, act):     # the tokens a flag takes, itself included
+            # shortcut: `+` reads as one value; count them if a flag of that shape misplaces
+            return 1 if "=" in tok else 1 + (act.nargs if isinstance(act.nargs, int) else 1)
+
+        def stray(argv):         # the parser a command reaches, and its first unknown token
+            p, i = self, 0
+            while (verbs := sub(p)) is not None:
+                while i < len(argv) and argv[i] not in verbs:
+                    if (own := p._option_string_actions.get(argv[i].split("=", 1)[0])) is None:
+                        return p, i
+                    i += width(argv[i], own)
+                if i >= len(argv):
+                    break
+                p, i = verbs[argv[i]], i + 1
+            return p, None
+
+        p, i = stray(rest)
+        if i is None or not rest[i].startswith("-"):
+            return                                   # argparse's own refusal names it
+        flag = rest[i].split("=", 1)[0]
+        act = next((q._option_string_actions[flag] for q in walk(p)
+                    if flag in q._option_string_actions), None)
+        if act is None:
+            return
+        pair = rest[i:i + width(rest[i], act)]
+        leaf, left = stray(rest[:i] + rest[i + len(pair):] + pair)
+        k = next((k for k in range(len(typed)) if typed[k:k + len(pair)] == pair), None)
+        if k is not None and left is None and flag in leaf._option_string_actions:
+            fixed = typed[:k] + typed[k + len(pair):] + pair
+            self.error(f"{flag} goes after the verb: `{shlex.join([self.prog, *fixed])}`")
+        self.error(f"{flag} is a verb's flag, and goes after the verb: "
+                   f"`{self.prog} VERB -h` lists each verb's flags")
 
     def _add_gaps(self, ns):
         """What `add` would refuse on the next run, named in this one: the
@@ -1880,9 +1952,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                          "with --status open, what is still owed by then")
     li.add_argument("--since", default=None, metavar="WHEN", type=_since,
                     help="only entries written since WHEN: 30m, 2h, 3d, 1w, a date or an "
-                         "ISO datetime, UTC unless TZ is set, or `wrap`, the last wrap's "
-                         "commit, else this agent session's start (a revision counts as "
-                         "written when it was)")
+                         "ISO datetime, UTC unless TZ is set, or `wrap`: this agent "
+                         "session's last wrap, else its start; with --side or outside a "
+                         "session, the last wrap's commit (a revision counts as written "
+                         "when it was)")
     li.add_argument("--all", action="store_true", help="include superseded entries")
     li.add_argument("--author", metavar="NAME",
                     help="only entries whose newest version NAME wrote")
@@ -1951,6 +2024,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     for mode in ("append", "prepend"):
         sb.add_argument(f"--{mode}-file", action=_ModeFile, const=mode, metavar="PATH",
                         help=f"--{mode} --body-file PATH")
+    sb.add_argument("--replace", nargs=2, action="append", default=None, metavar=("OLD", "NEW"),
+                    help="swap OLD, which must occur exactly once in the body, for NEW; the "
+                         "rest stays byte-identical (repeatable, applied in order)")
     spa = sp.add_mutually_exclusive_group()
     spa.add_argument("--append", action="store_true",
                      help="add the --body/--body-file text after the current body, which "
@@ -2151,6 +2227,22 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     adesc.add_argument("id")
     adesc.add_argument("description")
 
+    says = ("set the columns of an arc's board, left to right; each open box sits in one "
+            "(arc move); done is reserved")
+    aph = asub.add_parser("phases", help=says, description=says + ". No NAME clears them")
+    aph.add_argument("id")
+    aph.add_argument("names", nargs="*", metavar="NAME")
+
+    says = "place an open box: in a phase, at the top, or before or after another box"
+    amv = asub.add_parser("move", help=says, description=says)
+    amv.add_argument("entry", help="the box's id, or its tail")
+    amv.add_argument("--phase", default=None, help="the column to move it to (default: its own)")
+    pos = amv.add_mutually_exclusive_group()
+    pos.add_argument("--before", default=None, metavar="ENTRY", help="just above this box")
+    pos.add_argument("--after", default=None, metavar="ENTRY", help="just below this box")
+    pos.add_argument("--top", action="store_true", help="first in the column")
+    amv.add_argument("--author", default=None, help=_AUTHOR_HELP)
+
     asd = asub.add_parser("seed", help="add one task per --name, or per entry of a "
                                        "configured catalog")
     asd.add_argument("id", nargs="?", default=None,
@@ -2170,7 +2262,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
 
     atd = asub.add_parser(
         "todo",
-        help="an arc's open items, one per line: kind, target, body, id")
+        help="an arc's open boxes in board order, one per line: kind, target, body, id",
+        description="List an arc's open boxes in board order. On a phased arc each line "
+                    "carries its phase in the brackets, [task, doing]. --json's position "
+                    "counts from 1 within the phase.")
     atd.add_argument("id")
     atd.add_argument("--json", action="store_true")
 
@@ -2348,7 +2443,9 @@ def _name_unmerged_fixes(cfg, store_dir, written) -> None:
     cannot reach. A fix on an unmerged branch read as done, and an agent on
     main that searched `--status open` filed the bug again (demo run,
     2026-10-10). It holds the other way too: a branch cut before a fix on
-    main. Narrow on purpose: every resolved row would be noise."""
+    main. Narrow on purpose: every resolved row would be noise. Once a
+    session per row: while the branch lived, every add on its target
+    repeated the same note (dogfood, 2026-11-07)."""
     new = {n.id for n in written}
     heads = store.heads(store.load(store_dir))
     done = [h for t in dict.fromkeys(n.target for n in written if n.target.type != "project")
@@ -2358,7 +2455,8 @@ def _name_unmerged_fixes(cfg, store_dir, written) -> None:
                                  if r.type == "commit" and r.name])
     for h in done:
         sha = next((r.name for r in h.refs if r.type == "commit" and r.name in away), None)
-        if sha:
+        if sha and _first_in_session("unmerged",
+                                     json.dumps([str(Path(store_dir).resolve()), h.id])):
             print(f"note: {h.id} on {h.target.type}:{h.target.name or ''} was resolved at "
                   f"{sha[:7]}, which {away[sha]} holds and this branch lacks: if this entry is "
                   f"the same fault, its fix is there\n  {summ.clip(h.body or '', 80)}".rstrip(),
@@ -2634,8 +2732,10 @@ def _mark_read(ctx, sid: str, at: str) -> None:
     """When this session's start summary read the store: `_say_news` takes
     no row from before it as news. The open-row lists start over
     (`_first_listing`): a compacted session has lost them."""
-    store._replace_atomically(_session_cache() / f"{sid}.read",
-                              f"{Path(ctx.store_dir).resolve()}\t{at}\n")
+    mark = f"{Path(ctx.store_dir).resolve()}\t{at}\n"
+    store._replace_atomically(_session_cache() / f"{sid}.read", mark)
+    if not (start := _session_cache() / f"{sid}.start").exists():   # a compaction is no start
+        store._replace_atomically(start, mark)
     for said in ("open", "alt", "clip", "note"):   # and the notes heard once
         (_session_cache() / f"{sid}.{said}").unlink(missing_ok=True)
 
@@ -2781,6 +2881,15 @@ def _others() -> str:
     return "other sessions" if store.session_key() else "other writers"
 
 
+def _newest(rows) -> str:
+    """`, the newest written 2h ago`: the one clue to whether the session that
+    left `rows` has ended. A session read the write's note without it again
+    and again, then committed a live session's rows with `--all`
+    (2026-11-06)."""
+    newest = max((r.get("created_at") or "" for r in rows), default="")
+    return f", the newest written {summ.when_added(newest)}" if newest else ""
+
+
 _ELSEWHERE = "as the store is another project's"   # why a commit left its files (api.elsewhere)
 
 
@@ -2847,7 +2956,8 @@ def _say_pulled(ctx, p, quiet=False, cap=None) -> int:
             keep = store.with_bases(rows, api.own_rows(ctx))
             others = not all(map(keep, rows))
             say = ["to merge by hand, commit the pending entries"
-                   + (" (the other sessions' with --all, once their session has ended)"
+                   + (" (the other sessions' with --all, once their session has ended"
+                      f"{_newest([r for r in rows if not keep(r)])})"
                       if others else "") + ", merge, fix each file git names, and commit:",
                    *([f"{me} commit"] if any(map(keep, rows)) else []),
                    *([f"{me} commit --all"] if others else []),
@@ -2984,7 +3094,7 @@ def _commit_hint(ctx, rows=None) -> str:
     rows = store.pending_rows(ctx.store_dir) if rows is None else rows
     keep = store.with_bases(rows, api.own_rows(ctx))
     if rows and not any(keep(r) for r in rows):
-        return f"{cmd} --all once their session has ended"
+        return f"{cmd} --all once their session has ended{_newest(rows)}"
     return cmd
 
 
@@ -3001,14 +3111,15 @@ def _say_pending(ctx) -> None:
     cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit"]))
     if mine:
         more = (f"; it leaves {summ._count(len(store.entries(left)), 'entry')} of {_others()} "
-                f"({store.rows_by_author(left)})" if left else "")
+                f"({store.rows_by_author(left)}){_newest(left)}" if left else "")
         print(f"note: {summ._count(len(store.entries(mine)), 'entry')} not committed "
               f"({store.rows_by_author(mine)}): {cmd}{more}", file=sys.stderr)
         return
     arcs = gitref.registry_modified(ctx.store_dir)
     if rows:
         print(f"note: {summ._count(len(store.entries(rows)), 'entry')} not committed "
-              f"({store.rows_by_author(rows)}), none of them yours: {cmd} --all takes them"
+              f"({store.rows_by_author(rows)}){_newest(rows)}, none of them yours: "
+              f"{cmd} --all takes them"
               + (f"; arcs.jsonl changed too: {cmd} takes it" if arcs else ""),
               file=sys.stderr)
     elif arcs:
@@ -3400,7 +3511,7 @@ def _dispatch(args, ctx) -> int:
         if len(written) > 1:
             _name_catalog_misses(ctx.cfg, fields, written)
         _echo_clipped_heads(store_dir, written)
-        _echo_gotcha_notes(written, ctx.input_types)
+        _echo_gotcha_notes(written, ctx)
         # A registration's body is the contract its resolve is scored on: it
         # cannot move to docs/, so the note fired on every one (2026-10-30).
         _name_long_text([(n.id, len((n.body or "").strip())) for n in written
@@ -3476,8 +3587,13 @@ def _dispatch(args, ctx) -> int:
         ttype = (*cfg.repos, "file") if args.type == "file" and cfg.repos else args.type
         if args.since and args.since[1] is None:
             # A wrap writes its handoff from this: what the session did, as
-            # the store holds it (wrap.md, step 3).
-            if w := gitref.last_wrap(store_dir, cfg, side):
+            # the store holds it (wrap.md, step 3). A sibling session's wrap
+            # opened it mid-session and hid this one's earlier rows
+            # (2026-11-08). --side counts from the side's wrap, as summary does.
+            if args.side is None and (own := _session_read(ctx, "wrap")
+                                      or _session_read(ctx, "start")):
+                args.since = (args.since[0], own)
+            elif w := gitref.last_wrap(store_dir, cfg, side):
                 args.since = (args.since[0], store.written_at(None, w["at"]))
             elif start := _session_read(ctx):
                 # A store's first wrap read exit 2 here (the user chose this
@@ -3509,8 +3625,8 @@ def _dispatch(args, ctx) -> int:
             got = {n.id for n in notes}
             notes += [n for n in store.query(base, status=args.status, **(filt | {"grep": None}))
                       if n.id in want and n.id not in got]
-        if args.note_id and (missing := [i for i in args.note_id
-                                         if i not in {n.id for n in notes}]):
+        missing = [i for i in args.note_id or () if i not in {n.id for n in notes}]
+        if missing and not notes:
             # An empty listing reads the same as "this row exists and matched
             # nothing else". You named an exact row; say it is not there.
             for i in missing:
@@ -3659,6 +3775,7 @@ def _dispatch(args, ctx) -> int:
                    if n.target.type == "commit" and n.target.name}
             subjects = gitref.subjects(cfg, shas) if shas else {}
             gui = _gui(store_dir)
+            arcs = {a.id: a for a in store.load_arcs(store_dir)}
             # The reader as summary has it: at a terminal the person, who
             # has no one else's line to be shown.
             reader = None if sys.stdout.isatty() else api.author_default()
@@ -3678,13 +3795,18 @@ def _dispatch(args, ctx) -> int:
                             seams=summ.seams(by_id, n) if args.full or args.note_id else (),
                             links=summ.links(every, n) if args.note_id else (),
                             written=summ.written(by_id, n) if args.full or args.note_id else None,
-                            side=_other_side(by_id, n, side))
+                            side=_other_side(by_id, n, side), arc=arcs.get(n.arc_id),
+                            phase=_phase_of(arcs, heads_of.get(n.id, n)))
             if len(notes) < total:
                 # Where the eye stops: a 10-of-33 page read as the whole answer
                 # (an adopter, 2026-09-26), the header notwithstanding.
                 print("  " + paint(f"+{total - len(notes)} more not shown (--limit 0 for all)",
                                    "meta"))
-        return 0
+        # One mistyped id among several hid the rows that exist, and the call
+        # was re-run whole (2026-11-06). Exit 1 still tells a script.
+        for i in missing:
+            _no_note(i, store_dir)
+        return 1 if missing else 0
 
     if args.cmd == "resolve":
         # resolve is supersede with a fixed status; the body and tag merge are
@@ -3763,7 +3885,8 @@ def _dispatch(args, ctx) -> int:
         if args.tags is not None:                      # --tag: replace
             fields["tags"] = args.tags
         elif (args.add_tags or args.rm_tags) and args.refs is None and not args.add_refs \
-                and args.body is None and args.status is None and args.kind is None \
+                and args.body is None and not args.replace \
+                and args.status is None and args.kind is None \
                 and args.arc_id is None and args.checked is None and args.target is None \
                 and args.result is None and args.due is None and not measures \
                 and opts is None:
@@ -3777,7 +3900,7 @@ def _dispatch(args, ctx) -> int:
             args.wrote.add(note.id)
             _say_dropped(tip, note)
             _name_near_tags(store_dir, [note])
-            _echo_gotcha_notes([note], ctx.input_types)
+            _echo_gotcha_notes([note], ctx)
             return 0
         elif args.add_tags or args.rm_tags:
             # combined with another field: merge inline against the tip, then
@@ -3822,7 +3945,7 @@ def _dispatch(args, ctx) -> int:
         args.wrote.add(note.id)
         if args.arc_id:
             _name_archived_arcs(store_dir, [note])
-        _name_unknown_ids(store_dir, [args.body])
+        _name_unknown_ids(store_dir, [args.body, *(now for _, now in args.replace or ())])
         _name_near_tags(store_dir, [note])
         _name_new_items(store_dir, [note], tip.refs if tip else ())
         _say_dropped(tip, note)
@@ -3831,12 +3954,14 @@ def _dispatch(args, ctx) -> int:
             _say_body_dropped(store_dir, by_id, tip, note)
         # --append keeps the lead it adds after, so the note asked about text
         # the write did not touch (3 times, 2026-10-01). Unless there was none.
-        if args.body is not None and not (args.append and tip is not None and tip.body):
+        if args.replace or args.body is not None \
+                and not (args.append and tip is not None and tip.body):
             _echo_clipped_heads(store_dir, [note])
-        _echo_gotcha_notes([note], ctx.input_types)
-        if args.body:
+        _echo_gotcha_notes([note], ctx)
+        if args.body or args.replace:
             _name_long_text([(note.id, _text_added(tip.body or "", note.body or "")
-                              if replacing and tip else len(args.body.strip()))])
+                              if (replacing or args.replace) and tip
+                              else len(args.body.strip()))])
         return 0
 
     if args.cmd == "commit" and args.dry_run:
@@ -3851,7 +3976,9 @@ def _dispatch(args, ctx) -> int:
             for r in rows:
                 print(f"  {(r.get('id') or '?')[-10:]}  {r.get('author') or '?'}  "
                       f"{r.get('kind') or '?'}  {summ.clip(r.get('body') or '', 60)}".rstrip())
+        arcs = store.arcs_by_writer(store_dir)
         said = ([f"entries {store.rows_by_author(mine)}"] if mine else []) + \
+            ([f"arc changes {arcs}"] if arcs else []) + \
             ([f"{summ._count(len(files), 'file')}"] if files else [])
         print("would commit: " + "; ".join(said) if said else "nothing to commit")
         listed(store.entries(mine))
@@ -3890,10 +4017,8 @@ def _dispatch(args, ctx) -> int:
         left = store.pending_rows(store_dir)
         cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit", "--all"]))
         if left:
-            newest = max(r.get("created_at") or "" for r in left)
             print(f"left pending, {_others()}': entries {store.rows_by_author(left)}"
-                  + (f", the newest written {summ.when_added(newest)}" if newest else "")
-                  + f": {cmd} takes them")
+                  f"{_newest(left)}: {cmd} takes them")
         away = _commit_files(ctx, True)[0] if not args.everyone and api.elsewhere(ctx) else []
         if away:
             more = f", +{len(away) - 3} more" if len(away) > 3 else ""
@@ -3902,7 +4027,9 @@ def _dispatch(args, ctx) -> int:
         _say_ignored_archive(store_dir)
         if news:
             _print_news(*news, file=sys.stdout)
-        if (mark := _session_mark("commit")) is not None:
+        for said in ("commit", "wrap") if ok and args.wrap else ("commit",):
+            if (mark := _session_mark(said)) is None:
+                continue
             try:
                 mark.parent.mkdir(parents=True, exist_ok=True)
                 store._replace_atomically(mark, f"{Path(ctx.store_dir).resolve()}\t{store._now_iso()}\n")
@@ -4145,9 +4272,11 @@ def _dispatch(args, ctx) -> int:
                     head += f"; +{summ._count(other, 'other entry')} (list)"
             print(_painter(ctx.kinds)(head, "meta"))
             gui = _gui(store_dir)
+            arcs = {a.id: a for a in store.load_arcs(store_dir)}
             for d in data["notes"]:
                 row = by_id.get(d["id"])
-                _print_note(store.note_from_dict(d, kinds=ctx.kinds), gui=gui,
+                box = store.note_from_dict(d, kinds=ctx.kinds)
+                _print_note(box, gui=gui, phase=_phase_of(arcs, box), arc=arcs.get(box.arc_id),
                             since=d["commits_since"],
                             state=(d["state"], d["distance"]) if "state" in d else None,
                             written=summ.written(by_id, row) if row else None,
@@ -4179,7 +4308,7 @@ def _dispatch_arc(args, ctx) -> int:
 
     if args.acmd == "list":
         notes = store.load(store_dir)
-        rows, hidden = [], 0
+        rows, hidden, counts = [], 0, {}
         for a in store.load_arcs(store_dir):
             if a.archived and not args.all:
                 hidden += 1
@@ -4187,6 +4316,7 @@ def _dispatch_arc(args, ctx) -> int:
             done, total = store.arc_progress(notes, a.id)
             # The arc whole: --json dropped its dates, scope and author (2026-10-28).
             rows.append(store.arc_to_dict(a) | {"done": done, "total": total})
+            counts[a.id] = summ.phase_counts(notes, a) if a.phases else None
         if args.json:
             print(json.dumps(rows))
         else:
@@ -4202,7 +4332,8 @@ def _dispatch_arc(args, ctx) -> int:
                 when = f" {r['archived_at'][:10]}" if r.get("archived_at") else ""
                 gone = paint(f"  (archived{when})", "meta") if r["archived"] else ""
                 print(f"{paint(r['id'].ljust(w), 'text')} {prog}  "
-                      f"{paint(r['name'], 'body')}{gone}{desc}")
+                      f"{paint(r['name'], 'body')}{summ.phases_text(paint, counts[r['id']])}"
+                      f"{gone}{desc}")
             if hidden:
                 print(paint(f"+{hidden} archived (arc list --all)", "meta"))
         return 0
@@ -4219,6 +4350,43 @@ def _dispatch_arc(args, ctx) -> int:
         if was.name == args.new_name:
             print(f"note: {args.id} is named {args.new_name!r} already; nothing changed",
                   file=sys.stderr)
+        return 0
+
+    if args.acmd == "phases":
+        try:
+            _, dropped = api.set_phases(ctx, args.id, args.names)
+        except KeyError:
+            _no_arc(store_dir, args.id)
+            return 1
+        except ValueError as e:
+            print(f"arc phases: {e}", file=sys.stderr)
+            return 1
+        print(args.id)
+        if dropped:
+            print(f"note: dropped {summ._count(dropped, 'placement')} of resolved boxes",
+                  file=sys.stderr)
+        return 0
+
+    if args.acmd == "move":
+        given = [x for x in (args.entry, args.before, args.after) if x]
+        full = {x: _expand_id(store_dir, x) for x in given}
+        if None in full.values():                 # _expand_id named the ambiguity
+            return 1
+        entry, before, after = (full.get(x) for x in (args.entry, args.before, args.after))
+        try:
+            act = api.move_box(ctx, entry, phase=args.phase, before=before, after=after,
+                               top=args.top, author=_resolved_author(args))
+        except KeyError as e:
+            print(f"arc move: no entry {e.args[0]}", file=sys.stderr)
+            return 1
+        except ValueError as e:
+            print(f"arc move: {e}", file=sys.stderr)
+            return 1
+        for name, col in store.arc_board(store.load(store_dir), act):
+            if (k := next((i for i, n in enumerate(col) if n.id == entry), None)) is not None:
+                break
+        print(f"{entry} phase {name} position {k + 1}" if act.phases
+              else f"{entry} position {k + 1}")
         return 0
 
     if args.acmd == "archive":
@@ -4305,24 +4473,32 @@ def _dispatch_arc(args, ctx) -> int:
         return 0
 
     if args.acmd == "todo":
-        if not any(a.id == args.id for a in store.load_arcs(store_dir)):
+        act = next((a for a in store.load_arcs(store_dir) if a.id == args.id), None)
+        if act is None:
             _no_arc(store_dir, args.id)
             return 1
         notes = store.load(store_dir)
         items = store.arc_items(notes, args.id)
-        open_items = [n for n in items if store.read_status(n) == "open"]
         resolved = sum(1 for n in items if store.read_status(n) == "resolved")
-        # Insertion order: a hand-written checklist keeps its step order, and a
-        # seeded one keeps its catalog's order, which was already sorted.
-        rows = sorted(open_items, key=store.written_at)
+        # Board order: placed boxes first, the rest as written. A hand-written
+        # checklist keeps its step order, and a seeded one keeps its catalog's
+        # order, which was already sorted.
+        cols = [(ph, [n for n in col if store.read_status(n) == "open"])
+                for ph, col in store.arc_board(notes, act)[:-1]]
+        rows = [n for _, col in cols for n in col]
+        where = {n.id: (ph, i) for ph, col in cols for i, n in enumerate(col, 1)}
+        placed = {p["id"]: p for p in act.placement or ()}
         if args.json:
             # Same shape as `list --json`; a consumer written against one
             # must not KeyError on the other. `reconcile --json` stays flat
             # because its rows are a report, not notes.
             since = gitref.commits_since(cfg, rows)
             by_id = {n.id: n for n in notes}
-            print(json.dumps([summ.json_row(n, by_id, since[n.id], st)
-                              for n, st in summ.verdict_states(cfg, rows)]))
+            print(json.dumps([
+                summ.json_row(n, by_id, since[n.id], st)
+                | {"phase": where[n.id][0], "position": where[n.id][1],
+                   "by": placed.get(n.id, {}).get("by"), "at": placed.get(n.id, {}).get("at")}
+                for n, st in summ.verdict_states(cfg, rows)]))
         else:
             # A finished arc printed nothing at exit 0, the same as one nobody
             # had started (2026-09-22). Count with denominator; the hidden set
@@ -4338,7 +4514,8 @@ def _dispatch_arc(args, ctx) -> int:
                 print(summ.row_line(
                     paint, n.kind,
                     f"{n.target.type}:{summ.clip(n.target.name, summ.NAME_CHARS)}",
-                    summ.clip(n.body, summ.HEAD_CHARS), n.id))
+                    summ.clip(n.body, summ.HEAD_CHARS), n.id,
+                    label=f"{n.kind}, {where[n.id][0]}" if act.phases else ""))
         return 0
 
     if args.acmd == "reconcile":
@@ -4602,6 +4779,7 @@ def _main(argv) -> int:
             if len(flags) < len(ids) and set(flags) <= {"--json", "--all", "--full"}:
                 # `show --json ID`, the flag first, read as `list --id --json ID`.
                 rest = ["list", *flags, "--id", *(a for a in ids if a not in flags)]
+        parser.refuse_a_verb_flag_first(rest, argv)
         # grep's -i carried over: --grep is case-insensitive already, and
         # `--grep -i PATTERN` read -i as a flag and refused (seen
         # repeatedly, 2026-10-14).
@@ -4645,7 +4823,8 @@ def _main(argv) -> int:
         row_write = args.cmd in ("add", "resolve", "supersede") or \
             args.cmd == "arc" and args.acmd == "seed" and bool(args.wrote)
         write = row_write or args.cmd == "rename" or args.cmd == "arc" and (
-            args.acmd in ("create", "rename", "archive", "unarchive", "describe")
+            args.acmd in ("create", "rename", "archive", "unarchive", "describe",
+                         "phases", "move")
             or args.acmd == "reconcile" and (args.apply or args.resolve_stale))
         if rc == 0 and write:
             _say_pending(ctx)

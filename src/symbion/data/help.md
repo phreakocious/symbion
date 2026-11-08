@@ -97,11 +97,11 @@ A target has a type and a name:
   diff is what it brought onto its branch. Once a remote branch holds the
   commit, its page and that dialog link to it on GitHub, GitLab, Codeberg,
   Bitbucket or sourcehut, and on GitHub to the pull requests that hold it.
+- `project` is the project as a whole, for an entry with nothing narrower
+  to be about.
 
 A diff reads unified or side by side: the switch at its top picks, and this
 browser keeps the pick. A window too narrow for two sides reads unified.
-- `project` is the project as a whole, for an entry with nothing narrower
-  to be about.
 
 A store can add types of its own, each with a list of names, such as hosts
 or tests. A list can give each name a short description, which the name
@@ -142,6 +142,13 @@ of a kind that is open until resolved: a task, a bug, a question, on any
 target. Pick the arc in the new-entry form, or in an entry's edit dialog.
 The Arcs page shows each arc's progress, and an arc is done when every box
 is resolved.
+
+An arc's page shows it as a **list** or a **board**, by the toggle at its
+top. The board has a column for each of the arc's **phases**, then done.
+Drag a box to another column or along one, or use its arrows. A drop on
+done resolves the box, and a drag out of done reopens it. **Edit arc** sets
+the phases, comma-separated; with none, the board has one open column and
+done.
 
 An arc's **scope** says what it is mostly about, such as `item` or `file`.
 The scope does not limit it: a file task, a project bug and an item question

@@ -92,6 +92,10 @@ class Arc:
     archived: bool = False
     archived_at: str | None = None
     side: str | None = None            # a shared store: the side that created the arc
+    phases: tuple | None = None        # board columns, left to right; None: no phases
+    # One {id, phase, by?, at?} per placed box; list order is the order within a phase.
+    # ponytail: a shared store merges it as one field, so the upstream's whole order wins; merge per box if two writers reorder one arc
+    placement: tuple | None = None
     extra: dict | None = None          # a newer symbion's fields, written back as read
 
 
@@ -1228,7 +1232,7 @@ def chain_tips(notes):
 
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
-                        prepend_body: str | None = None,
+                        prepend_body: str | None = None, replace_body=None,
                         add_measurements=None, *, side, pending=None, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
@@ -1262,12 +1266,17 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     `append_body` adds to the TIP's body, read here under the caller's lock,
     so a revision that landed after the caller read the row is kept.
     `prepend_body` goes above it, the same way, as a new lead; a
-    pre-registration refuses it, since its registered text stays on top."""
+    pre-registration refuses it, since its registered text stays on top.
+    `replace_body`, (old, new) pairs, swaps each old span of it, in order,
+    and refuses one that does not occur exactly once: changing one phrase
+    took a read, a script and a whole new body (2026-11-04)."""
+    sources = [s for s in (append_body, prepend_body, replace_body) if s is not None]
+    if len(sources) > 1 or (sources and "body" in fields):
+        raise ValueError("body, append_body, prepend_body and replace_body are sources "
+                         "for one field")
     for added in (append_body, prepend_body):
         if added is None:
             continue
-        if "body" in fields or (append_body is not None and prepend_body is not None):
-            raise ValueError("body, append_body and prepend_body are sources for one field")
         if not added.strip():
             raise ValueError("nothing to add: the text is empty")
     # Fast-forward past any supersede that already landed while this call
@@ -1283,6 +1292,8 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         base["body"] = appended(old.body, append_body)
     if prepend_body is not None:
         base["body"] = appended(prepend_body, old.body) if old.body else prepend_body
+    if replace_body is not None:
+        base["body"] = _replaced(old, replace_body)
     if add_refs:
         # Onto the TIP's refs, as append_body is onto its body; the
         # inherited ones are never re-resolved.
@@ -1390,10 +1401,31 @@ class RefsDropped(ValueError):
         self.dropped = dropped
 
 
+def _replaced(old: Note, pairs) -> str:
+    """`old`'s body with each (was, now) swapped in turn. `was` must occur
+    once: find twice, so an overlapping second match counts too."""
+    body, tail = old.body or "", old.id[-10:]
+    for was, now in pairs:
+        first = body.find(was) if was else -1
+        if first >= 0 and body.find(was, first + 1) < 0:
+            body = body[:first] + now + body[first + len(was):]
+            continue
+        shown = was if len(was) <= 60 else was[:57] + "..."
+        if first >= 0:
+            why = (f"occurs more than once in {tail}'s body, and a replace swaps text that "
+                   f"occurs exactly once: give more of it")
+        elif was:
+            why = f"is not in {tail}'s body: `symbion show {tail}` prints it as it is now"
+        else:
+            why = "is empty: give the text to swap"
+        raise ValueError(f"replace: {shown!r} {why}; nothing was written")
+    return body
+
+
 def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
               append_body: str | None = None, add_refs=None,
               prepend_body: str | None = None, add_measurements=None, target_types=None,
-              keep_refs: bool = False, **fields) -> Note:
+              keep_refs: bool = False, replace_body=None, **fields) -> Note:
     """Append a correction superseding old_id -- the single-row public entry
     point. One outer `_lock` spans load -> fast-forward -> mint -> write; see
     `_supersede_unlocked` for what happens inside it.
@@ -1433,7 +1465,7 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
                 raise RefsDropped(gone)
         return _supersede_unlocked(store, notes, old_id, author=author, side=side,
                                    append_body=append_body, add_refs=add_refs,
-                                   prepend_body=prepend_body,
+                                   prepend_body=prepend_body, replace_body=replace_body,
                                    add_measurements=add_measurements, **fields)
 
 
@@ -1925,6 +1957,48 @@ def rows_by_author(rows) -> str:
     return ", ".join(f"{a} {n}" for a, n in sorted(by.items()))
 
 
+def arcs_by_writer(store, staged: bool = False) -> str:
+    """`ada 1, unknown 1`: the commit's `Arcs:` trailer, each change to
+    arcs.jsonl since HEAD by its writer, in the index (`staged`, what a
+    commit took) or the work tree (what it would take). A new arc counts for
+    its author and a moved box for its mover (`by`); any other change
+    records no writer and counts as `unknown`. A commit took the user's GUI
+    move under a message that named only its rows (2026-11-06)."""
+    def arcs(text):
+        out = {}
+        for ln in jsonl_lines(text):
+            with suppress(ValueError):
+                if isinstance(d := json.loads(ln), dict):
+                    out[d.get("id")] = d
+        return out
+
+    def shown(rev):
+        r = subprocess.run(["git", "-C", str(store), "show", rev], capture_output=True,
+                           text=True, encoding="utf-8")
+        return r.stdout if r.returncode == 0 else ""
+
+    def placed(a):
+        return [p for p in a.get("placement") or () if isinstance(p, dict)]
+
+    def rest(a):
+        return {k: v for k, v in a.items() if k != "placement"}
+    path = arcs_path(store)
+    was = arcs(shown(f"HEAD:{ARCS_FILE}"))
+    now = arcs(shown(f":{ARCS_FILE}") if staged else _read_utf8(path) if path.exists() else "")
+    by = Counter(unknown=len(was.keys() - now.keys()))
+    for i, a in now.items():
+        if (w := was.get(i)) is None:
+            by[a.get("author") or "unknown"] += 1
+            continue
+        seen = {(p.get("id"), p.get("by"), p.get("at")) for p in placed(w)}
+        moves = [p["by"] for p in placed(a)
+                 if p.get("by") and (p.get("id"), p["by"], p.get("at")) not in seen]
+        by.update(moves)
+        if rest(a) != rest(w) or (not moves and placed(a) != placed(w)):
+            by["unknown"] += 1
+    return ", ".join(f"{a} {n}" for a, n in sorted(by.items()) if n)
+
+
 def pending_rows(store) -> list[dict]:
     """What `commit` would take from notes.jsonl: the rows added or
     rewritten since HEAD, or every row before the first commit. Plumbing:
@@ -1997,7 +2071,9 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
                 diff = subprocess.run([*git, "diff", "--cached", "-U0", "--", NOTES_FILE],
                                       capture_output=True, text=True, encoding="utf-8").stdout
                 rows = rows_by_author(added_rows(diff))
-                trailers = ([f"Rows: {rows}"] if rows else []) + ([f"Wrap: {wrap}"] if wrap else [])
+                arcs = arcs_by_writer(store, staged=True)
+                trailers = ([f"Rows: {rows}"] if rows else []) + \
+                    ([f"Arcs: {arcs}"] if arcs else []) + ([f"Wrap: {wrap}"] if wrap else [])
                 if wrap and side:
                     trailers.append(f"Side: {side}")
                 # In UTC by the one clock, as the rows are: git's own read the
@@ -2392,6 +2468,12 @@ def arc_from_dict(d: dict, legal_scopes=None) -> Arc:
         raise ValueError(f"retired scope 'global': {_VOCAB_HINT}; rename it in arcs.jsonl")
     if legal_scopes is not None and d["target_scope"] not in legal_scopes:
         raise ValueError(f"unknown scope: {d['target_scope']!r}")
+    ph, pl = d.get("phases"), d.get("placement")
+    if ph is not None and not (isinstance(ph, list) and all(isinstance(x, str) for x in ph)):
+        raise ValueError("phases is not a list of names")
+    if pl is not None and not (isinstance(pl, list) and all(
+            isinstance(x, dict) and isinstance(x.get("id"), str) for x in pl)):
+        raise ValueError("placement is not a list of objects with an id")
     return Arc(
         id=d["id"], name=d["name"], description=d.get("description", ""),
         target_scope=d["target_scope"], created_at=d["created_at"],
@@ -2399,6 +2481,8 @@ def arc_from_dict(d: dict, legal_scopes=None) -> Arc:
         archived=bool(d.get("archived", False)),
         archived_at=d.get("archived_at"),
         side=d.get("side"),
+        phases=tuple(d["phases"]) if d.get("phases") is not None else None,
+        placement=tuple(d["placement"]) if d.get("placement") is not None else None,
         extra={k: v for k, v in d.items() if k not in _ARC_KEYS} or None,
     )
 
@@ -2409,7 +2493,10 @@ def arc_to_dict(act: Arc) -> dict:
         "target_scope": act.target_scope, "created_at": act.created_at,
         "author": act.author, "archived": act.archived,
         "archived_at": act.archived_at,
-        **({"side": act.side} if act.side is not None else {}), **(act.extra or {}),
+        **({"side": act.side} if act.side is not None else {}),
+        **({"phases": list(act.phases)} if act.phases is not None else {}),
+        **({"placement": list(act.placement)} if act.placement is not None else {}),
+        **(act.extra or {}),
     }
 
 
@@ -2536,6 +2623,182 @@ def arc_progress(notes, arc_id):
     items = arc_items(notes, arc_id)
     done = sum(1 for n in items if n.status == "resolved")
     return done, len(items)
+
+
+DONE = "done"  # the board's last column; reserved as a phase name
+
+
+def box_phase(act: Arc, note) -> str | None:
+    """The board column a box sits in: DONE once resolved; None for an open box
+    on an arc without phases; else its placed phase, where a null phase, a
+    phase no longer in `act.phases` or no placement reads as the first."""
+    if note.status == "resolved":
+        return DONE
+    if not act.phases:
+        return None
+    phase = next((p.get("phase") for p in act.placement or () if p["id"] == note.id), None)
+    return phase if phase in act.phases else act.phases[0]
+
+
+def arc_board(notes, act: Arc) -> list[tuple[str | None, list]]:
+    """The arc's columns in board order, each (name, boxes): one per phase, or one
+    unnamed column without phases, then DONE. An open column holds its placed
+    boxes in `placement` order, then the rest in write order; DONE, newest first.
+    A placement for an entry that is not a box of the arc is ignored."""
+    boxes = arc_items(notes, act.id)
+    names = list(act.phases or (None,))
+    cols: dict = {n: [] for n in names}
+    done = []
+    for b in boxes:
+        ph = box_phase(act, b)
+        (done if ph == DONE else cols[ph]).append(b)
+    rank = {p["id"]: i for i, p in enumerate(act.placement or ())
+            if p.get("phase") is None or p["phase"] in (act.phases or ())}
+    for rows in cols.values():
+        rows.sort(key=lambda n: (n.id not in rank, rank.get(n.id, 0), written_at(n), n.id))
+    return [*cols.items(), (DONE, newest_first(done))]
+
+
+def _box_of(acts, notes, entry_id):
+    """(entry, its live arc) for a box a placement may name; KeyError for an
+    unknown entry, ValueError saying why any other entry is no box."""
+    entry = next((n for n in heads(notes) if n.id == entry_id), None)
+    if entry is None:
+        raise KeyError(entry_id)
+    act = next((a for a in acts if a.id == entry.arc_id), None)
+    if act is None:
+        raise ValueError(f"{entry_id} is in no arc: put it in one with `supersede "
+                         f"{entry_id} --arc ID`")
+    if entry.spec.parked or not entry.spec.status:
+        raise ValueError(f"{entry_id} is {'an' if entry.kind[0] in 'aeiou' else 'a'} {entry.kind}, which is never a box on a board: "
+                         f"only a kind with the status bit that is not parked is")
+    if act.archived:
+        raise ValueError(f"arc {act.id} is archived: `arc unarchive {act.id}` first")
+    return entry, act
+
+
+def _place(act: Arc, notes, entry, phase, before, after, top, author, now) -> Arc:
+    """`act` with `entry` placed in column `phase` (else the one it reads in) at
+    the top, before or after a box of it, else at the end. No lock, no I/O: the
+    caller writes. Only the column prefix ahead of the insertion point gains
+    order-only placements, so a move writes one per box ahead of it."""
+    if sum((before is not None, after is not None, top)) > 1:
+        raise ValueError("give one of --before, --after and --top")
+    if phase is not None:
+        if phase.casefold() == DONE:
+            raise ValueError(f"{DONE} is the board's last column, reached by "
+                             f"`resolve {entry.id}`")
+        if not act.phases:
+            raise ValueError(f"arc {act.id} has no phases: `arc phases {act.id} NAME...` "
+                             f"sets them")
+        if phase not in act.phases:
+            raise ValueError(f"no phase {phase!r} in arc {act.id}: its phases are "
+                             f"{', '.join(act.phases)}")
+    target = phase if phase is not None else box_phase(act, replace(entry, status="open"))
+    col = [b.id for b in dict(arc_board(notes, act))[target] if b.id != entry.id]
+    anchor = before if before is not None else after
+    if anchor is not None and anchor not in col:
+        raise ValueError(f"{anchor} is not an open box in phase {target!r} of arc {act.id}: "
+                         f"`arc todo {act.id}` shows the open boxes")
+    k = 0 if top else len(col) if anchor is None else col.index(anchor) + (after is not None)
+    held = {p["id"]: p for p in act.placement or ()}
+    ahead = [{**held[i], "phase": target} if i in held else {"id": i, "phase": target}
+             for i in col[:k]]
+    behind = [held[i] for i in col[k:] if i in held and held[i].get("phase") in (None, target)]
+    mine = {"id": entry.id, "phase": target, "by": author, "at": now}
+    if (was := box_phase(act, replace(entry, status="open"))) not in (None, target):
+        mine["from"] = was          # the board's foot names it; a reorder keeps none
+    gone = {*col, entry.id}
+    rest = [p for p in act.placement or () if p["id"] not in gone]
+    return replace(act, placement=tuple(rest + ahead + [mine] + behind))
+
+
+def set_phases(store, arc_id: str, names: list[str]) -> tuple[Arc, int]:
+    """The arc with its phases `names` (none clears them), and how many resolved
+    boxes' placements that dropped. Refused: a bad name, or dropping a phase an
+    open box is placed in."""
+    for i, name in enumerate(names):
+        if not name or name != name.strip():
+            raise ValueError(f"phase name {name!r} is empty or has a leading or trailing "
+                             f"space: a name is text with none at its ends")
+        if "," in name:
+            raise ValueError(f"phase name {name!r} has a comma: the GUI editor splits names "
+                             f"on commas")
+        if name.casefold() == DONE:
+            raise ValueError(f"{name!r} is reserved: {DONE} is the board's last column, "
+                             f"in any case")
+        if name in names[:i]:
+            raise ValueError(f"phase name {name!r} is given twice: names are unique")
+    require_store(store)
+    with _lock(store):
+        acts = load_arcs(store)
+        act = next((a for a in acts if a.id == arc_id), None)
+        if act is None:
+            raise KeyError(arc_id)
+        notes = load(store)
+        items = {n.id: n for n in arc_items(notes, arc_id)}
+        placed = tuple(act.placement or ())
+        if not names and not act.phases:
+            return act, 0                   # nothing to clear: no write, no undo level
+        if not names:
+            held = {p["id"]: p for p in placed}
+            opened = [b.id for _, rows in arc_board(notes, act)[:-1] for b in rows]
+            rest = [p for p in placed if p["id"] not in opened]
+            new = replace(act, phases=None, placement=tuple(
+                {**held.get(i, {"id": i}), "phase": None} for i in opened)
+                + tuple({**p, "phase": None} for p in rest) or None)
+            dropped = 0
+        else:
+            held = sorted((p["phase"], p["id"][-10:]) for p in placed if p.get("phase") not in names
+                          and p.get("phase") in (act.phases or ())
+                          and p["id"] in items and items[p["id"]].status != "resolved")
+            if held:
+                raise ValueError(f"phase {held[0][0]!r} holds open boxes: "
+                                 f"{', '.join(i for _, i in held)}: move each "
+                                 f"out with `arc move ENTRY --phase NAME` first")
+            gone = set(act.phases or ()) - set(names)
+            keep = tuple(p for p in placed if not (
+                p.get("phase") in gone and p["id"] in items and items[p["id"]].status == "resolved"))
+            dropped = len(placed) - len(keep)
+            new = replace(act, phases=tuple(names), placement=keep or None)
+        if new != act:
+            _write_arcs_unlocked(store, [new if a.id == arc_id else a for a in acts])
+    return new, dropped
+
+
+def move_box(store, entry_id: str, *, phase: str | None = None, before: str | None = None,
+             after: str | None = None, top: bool = False, author: str) -> Arc:
+    """Place an open box of a live arc: in `phase` (else where it is), at the top,
+    before or after another open box of that column, else at its end."""
+    require_store(store)
+    with _lock(store):
+        acts, notes = load_arcs(store), load(store)
+        entry, act = _box_of(acts, notes, entry_id)
+        if entry.status == "resolved":
+            raise ValueError(f"{entry_id} is resolved, so it sits in {DONE}: "
+                             f"`supersede {entry_id} --status open` reopens it")
+        new = _place(act, notes, entry, phase, before, after, top, author, _now_iso())
+        _write_arcs_unlocked(store, [new if a.id == act.id else a for a in acts])
+    return new
+
+
+def reopen_and_place(store, entry_id: str, *, phase: str | None = None,
+                     before: str | None = None, after: str | None = None,
+                     top: bool = False, author: str) -> tuple[Note, Arc]:
+    """Reopen a resolved box and place it, as one write under one lock: a
+    placement that is refused leaves the box resolved."""
+    require_store(store)
+    side = shared_side(store)
+    with _lock(store):
+        acts, notes = load_arcs(store), load(store)
+        entry, act = _box_of(acts, notes, entry_id)
+        if entry.status != "resolved":
+            raise ValueError(f"{entry_id} is open already: `arc move {entry_id}` places it")
+        new = _place(act, notes, entry, phase, before, after, top, author, _now_iso())
+        note = _supersede_unlocked(store, notes, entry_id, author=author, side=side,
+                                   status="open")
+        _write_arcs_unlocked(store, [new if a.id == act.id else a for a in acts])
+    return note, new
 
 
 def _mint_unique(used: set, _gen=None) -> str:

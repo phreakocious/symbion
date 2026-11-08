@@ -417,6 +417,29 @@ def test_a_pull_that_stops_on_a_conflict_restores_every_file(sides, capsys):
                           capture_output=True).returncode != 0
 
 
+def test_a_pull_that_stops_says_how_old_other_sessions_entries_are(sides, capsys, monkeypatch):
+    """The steps to merge by hand name `--all` for another session's entries
+    once that session has ended, and how old the newest is: the one clue to
+    whether it has (2026-11-06)."""
+    a, b = sides
+    publish(a, "from A")
+    (a / "symbion.toml").write_text("shared = true\n# from A\n", encoding="utf-8")
+    git(a, "commit", "-qam", "toml from A")
+    git(a, "push", "-q")
+    (b / "symbion.toml").write_text("shared = true\n# from B\n", encoding="utf-8")
+    git(b, "commit", "-qam", "toml from B")
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T10:00:00Z")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "S2")
+    add(b, "theirs")
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:00:00Z")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "S1")
+    capsys.readouterr()
+    assert sym(b, "pull") == 1
+    err = capsys.readouterr().err
+    assert ("(the other sessions' with --all, once their session has ended, the newest "
+            "written 2h ago)") in err, err
+
+
 def test_a_pull_that_changes_symbion_toml_names_the_commit(sides, capsys):
     a, b = sides
     (a / "symbion.toml").write_text("shared = true\n# from A\n", encoding="utf-8")
@@ -1812,6 +1835,26 @@ def test_list_since_wrap_is_the_readers_sides_wrap(sides, capsys, monkeypatch):
     capsys.readouterr()
     assert sym(a, "list", "--since", "wrap", "--json") == 0
     assert mine in {r["id"] for r in json.loads(capsys.readouterr().out)}
+
+
+def test_list_side_since_wrap_in_a_session_counts_from_the_sides_wrap(sides, capsys,
+                                                                      monkeypatch):
+    """The summary's other-side line counts from your side's last wrap and
+    names `list --side NAME --since wrap`: a session's start must not narrow it."""
+    a, b = sides
+    wrap_at(a, "2026-01-10T12:00:00+00:00", monkeypatch)
+    assert sym(b, "pull") == 0
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-11T12:00:00+00:00")
+    theirs = add(b, "b's, before a's session")
+    assert sym(b, "commit") == 0
+    assert sym(a, "pull") == 0
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-12T12:00:00+00:00")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"session_id": "s1"}')))
+    assert sym(a, "summary", "--hook") == 0
+    capsys.readouterr()
+    assert sym(a, "list", "--side", "B", "--since", "wrap", "--json") == 0
+    assert theirs in {r["id"] for r in json.loads(capsys.readouterr().out)}
 
 
 def test_the_nudges_command_lists_the_rows_it_counted(sides, capsys, monkeypatch):

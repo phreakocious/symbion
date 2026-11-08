@@ -461,6 +461,16 @@ def on_side(by_id, n, side) -> bool:
     return side is None or side_of(by_id, n) in (None, side)
 
 
+def phases_text(paint, counts) -> str:
+    """`  doing 1, review 2`, or nothing."""
+    return "  " + paint(", ".join(f"{p} {n}" for p, n in counts), "meta") if counts else ""
+
+
+def phase_counts(notes, act) -> list[list]:
+    """[name, open boxes] for each phase past the first that holds one."""
+    return [[p, len(rows)] for p, rows in S.arc_board(notes, act)[1:-1] if rows]
+
+
 def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
             pending=None) -> dict:
     """`side` is the reader's in a shared store, else None: session start
@@ -572,6 +582,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
     rows, in_arcs = [], 0
     for a in acts:
         done, total = S.arc_progress(notes, a.id)
+        scope = notes
         in_arcs += total - done             # the reader's side's open boxes, in either side's arc
         if side is not None:
             # Another side's arc lists while a box of the reader's in it is open: the
@@ -580,11 +591,13 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
                 continue
             # Both sides' boxes: an arc is its creator's checklist, and either side files in it.
             done, total = S.arc_progress(every, a.id)
+            scope = every
         # Age, because `0/10` on a 31-minute-old arc read as stalled and a
         # dead one reads the same (measured 2026-09-20).
         rows.append({"id": a.id, "done": done, "total": total,
                      "name": clip(a.name, NAME_CHARS), "open": total - done,
-                     "created_at": a.created_at, "age_days": age_days(a.created_at, _now)})
+                     "created_at": a.created_at, "age_days": age_days(a.created_at, _now)}
+                    | ({"phases": phase_counts(scope, a)} if a.phases else {}))
     rows.sort(key=lambda r: (-r["open"], r["id"]))
 
     a_cap = len(rows) if full else ARC_CAP
@@ -980,14 +993,20 @@ def changed(by_id, n) -> dict:
     prev = by_id.get(n.supersedes) if n.supersedes else None
     if prev is None or n.body != prev.body:
         return {}
+    what = change_words(prev, n)
+    return {"changed": what, "changed_by": n.author, "changed_at": n.created_at} if what else {}
+
+
+def change_words(prev, n) -> str:
+    """`starred it`, or `changed its tags, due date`: what turned `prev` into
+    `n` past the body, "" for nothing. The GUI's top-bar tips say it too."""
     fields = [f for f in _CHANGED if getattr(n, f) != getattr(prev, f)]
     if not fields:
-        return {}
+        return ""
     star = fields == ["tags"] and set(n.tags) - set(prev.tags) == {"priority"} \
         and set(prev.tags) <= set(n.tags)
-    what = "starred it" if star else \
+    return "starred it" if star else \
         "changed its " + ", ".join("due date" if f == "due" else f for f in fields)
-    return {"changed": what, "changed_by": n.author, "changed_at": n.created_at}
 
 
 def added_lines(a) -> list[dict]:
@@ -1133,7 +1152,8 @@ def render_summary(d: dict, paint=plain, person: bool = False) -> str:
         age = f"{r['age_days']}d" if "age_days" in r else ""
         out.append(f"  {paint(r['id'].ljust(w), 'text')} "
                    f"{paint(prog.ljust(pw), 'good' if r['done'] == r['total'] else 'meta')}  "
-                   f"{paint(age.rjust(4), 'meta')}  {paint(r['name'], 'body')}")
+                   f"{paint(age.rjust(4), 'meta')}  {paint(r['name'], 'body')}"
+                   + phases_text(paint, r.get("phases")))
     # Each elided line names the flag that lifts it, as list's header does
     # with `(--all)`: a bare `+21 more open` sent a reader off to
     # `list --status open --json` and back (reported 2026-09-22).

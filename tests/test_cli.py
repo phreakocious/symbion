@@ -18,7 +18,7 @@ from symbion import summary as summ
 
 
 _WRITES = {"add", "resolve", "supersede", "commit", "rename"}
-_ARC_WRITES = {("arc", v) for v in ("create", "seed", "rename", "archive", "unarchive", "describe")}
+_ARC_WRITES = {("arc", v) for v in ("create", "seed", "rename", "archive", "unarchive", "describe", "phases", "move")}
 
 
 def _commit(store_dir, capsys):
@@ -660,7 +660,7 @@ def test_a_gotcha_no_hook_can_print_says_so(tmp_path, capsys):
     """`add --tag gotcha` on an item or the project wrote a row no hook ever
     prints, and said nothing (dogfood, 2026-10-14). The
     write says so and names the ref that puts it in reach."""
-    _declare(tmp_path, '[catalogs]\nfile = "echo deploy.sh"\n')
+    _declare(tmp_path, '[catalogs]\nfile = "echo deploy.sh"\nservice = "echo lynx"\n')
     never = "is tagged gotcha, but the hook never prints it"
     for target in ("item:deploy", "project"):
         assert run("add", "note", "--target", target, "--tag", "gotcha", "--body", "t",
@@ -670,19 +670,30 @@ def test_a_gotcha_no_hook_can_print_says_so(tmp_path, capsys):
     nid = _add(tmp_path, capsys, "note", "--target", "item:deploy", "--body", "t")
     assert run("supersede", nid, "--add-tag", "gotcha", store_dir=tmp_path) == 0
     assert never in capsys.readouterr().err, "a tag added later"
+    assert run("add", "note", "--target", "item:deploy", "--ref", "service:lynx",
+               "--tag", "gotcha", "--body", "t2", store_dir=tmp_path) == 0
+    assert never in capsys.readouterr().err, "a name is no path: the hook never matches it"
     assert run("add", "note", "--target", "item:deploy", "--ref", "file:deploy.sh",
-               "--tag", "gotcha", "--body", "t", store_dir=tmp_path) == 0
+               "--tag", "gotcha", "--body", "t3", store_dir=tmp_path) == 0
     assert never not in capsys.readouterr().err, "a file ref puts it in reach"
 
 
-def test_the_gotcha_hint_names_the_stores_own_types(tmp_path, capsys):
+def test_the_gotcha_hint_offers_only_a_path_type(tmp_path, capsys):
     """In a store with no `file` type, the `--ref file:PATH` the hint named
-    was refused (2026-10-25). Any catalog type reaches the hook."""
-    _declare(tmp_path, '[catalogs]\ndevice = "echo d1"\n')
+    was refused (2026-10-25). The hook matches paths only (2026-11-06), so the
+    hint names `file`, which a store with [repos] takes too, never a name type, or
+    says the store has none."""
+    _declare(tmp_path / "a-notes", '[catalogs]\ndevice = "echo dev1"\n')
     assert run("add", "note", "--target", "item:x", "--tag", "gotcha", "--body", "t",
-               store_dir=tmp_path) == 0
+               store_dir=tmp_path / "a-notes") == 0
     err = capsys.readouterr().err
-    assert "file:PATH" not in err and "of this store's catalogs (device, doc)" in err, err
+    assert "--ref" not in err and "this store has no file type" in err, err
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path / "net")], check=True)
+    _declare(tmp_path / "work-notes", '[repos]\nnet = "../net"\n')
+    assert run("add", "note", "--target", "item:x", "--tag", "gotcha", "--body", "t",
+               store_dir=tmp_path / "work-notes") == 0
+    err = capsys.readouterr().err
+    assert "`--ref file:PATH` gives it one" in err, err
 
 
 def test_list_shows_no_status_the_kind_no_longer_holds(tmp_path, capsys):
@@ -2549,7 +2560,9 @@ def test_arc_todo_json_is_the_same_shape_as_list_json(tmp_path, capsys):
     todo = json.loads(capsys.readouterr().out)
     run("list", "--json", store_dir=tmp_path)
     listed = json.loads(capsys.readouterr().out)
-    assert todo == listed
+    extra = ("phase", "position", "by", "at")        # todo's own place-on-the-board keys
+    assert [{k: v for k, v in r.items() if k not in extra} for r in todo] == listed
+    assert all(k in todo[0] for k in extra)
     assert todo[0]["target"] == {"type": "item", "name": "t"}
     assert "target_type" not in todo[0]
 
@@ -2931,6 +2944,25 @@ def test_resolve_ref_adds_to_the_inherited_refs(tmp_path, capsys):
     assert run("supersede", head.id, "--add-ref", "itm:c", store_dir=tmp_path) == 1
     assert "itm" in capsys.readouterr().err
     assert len(store.load(tmp_path)) == 2
+
+
+def test_a_ref_given_twice_is_stored_once(tmp_path, capsys):
+    """`add --ref X --ref X` stored X twice, and `show` printed it twice
+    (2026-11-06). A repeat drops after the name rule, so two spellings of one
+    catalog name keep one; the first keeps its place."""
+    _declare(tmp_path, '[catalogs]\nfile = "printf \'live.py\\\\n\'"\n')
+    refs = lambda: [(r.type, r.name) for r in store.heads(store.load(tmp_path))[0].refs]
+    assert run("add", "--kind", "note", "--type", "item", "--name", "x", "--ref", "item:a",
+               "--ref", "file:live", "--ref", "item:a", "--ref", "file:live.py",
+               store_dir=tmp_path) == 0
+    nid = capsys.readouterr().out.strip()
+    assert refs() == [("item", "a"), ("file", "live.py")]
+    assert run("supersede", nid, "--add-ref", "item:b", "--add-ref", "item:b",
+               store_dir=tmp_path) == 0
+    assert refs() == [("item", "a"), ("file", "live.py"), ("item", "b")]
+    assert run("supersede", nid, "--ref", "item:c", "--ref", "item:c", "--ref", "item:a",
+               "--ref", "file:live.py", "--ref", "item:b", store_dir=tmp_path) == 0
+    assert refs() == [("item", "c"), ("item", "a"), ("file", "live.py"), ("item", "b")]
 
 
 def test_supersede_ref_empty_clears_the_refs(tmp_path, capsys):
@@ -3684,6 +3716,40 @@ def test_prepend_puts_a_new_lead_above_the_body_but_never_a_pre_registrations(
     assert len(store.load(tmp_path)) == 3, "the task's two versions and the prediction"
 
 
+def test_replace_swaps_a_span_that_occurs_once_and_keeps_the_rest(repo, tmp_path, capsys):
+    """Changing one phrase took `show --json`, a script and `--body-file`
+    (dogfood, 2026-11-04). `--replace OLD NEW` swaps a span that occurs
+    exactly once, pairs in order, beside `--add-tag` in one row."""
+    run("add", "task", "--target", "item:t", "--body", "see `a.py:105`\n\nthen b, then c",
+        store_dir=tmp_path)
+    tid = capsys.readouterr().out.strip()
+    assert run("supersede", tid, "--replace", "a.py:105", "a.py:120", "--replace", "then c",
+               "then d", "--add-tag", "moved", store_dir=tmp_path) == 0
+    head = store.heads(store.load(tmp_path))[0]
+    assert (head.body, set(head.tags)) == ("see `a.py:120`\n\nthen b, then d", {"moved"})
+    for pair, why in ((["then", "x"], "occurs more than once"), (["gone", "x"], "is not in"),
+                      (["", "x"], "is empty")):
+        capsys.readouterr()
+        assert run("supersede", tid, "--replace", *pair, store_dir=tmp_path) == 1, pair
+        assert why in capsys.readouterr().err
+    assert run("supersede", tid, "--append", "--replace", "b,", "B,", store_dir=tmp_path) != 0
+    assert len(store.load(tmp_path)) == 2, "one edit, and no refused one written"
+    # An earlier version's id edits the tip, read under the lock, as --append does.
+    store.supersede(tmp_path, _earlier(tmp_path, capsys, tid), author="x",
+                    replace_body=[("then b", "then B")])
+    assert store.heads(store.load(tmp_path))[0].body == "see `a.py:120`\n\nthen B, then d"
+
+
+def test_replace_keeps_a_pre_registrations_registered_text(repo, tmp_path, capsys):
+    run("add", "prediction", "--target", "item:p", "--checked", "run x",
+        "--body", "x rises by 3", store_dir=tmp_path)
+    pid = capsys.readouterr().out.strip()
+    run("commit", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("supersede", pid, "--replace", "rises", "falls", store_dir=tmp_path) == 1
+    assert "pre-registration" in capsys.readouterr().err
+
+
 def test_a_pre_registrations_registered_text_and_run_take_no_rewrite(repo, tmp_path, capsys):
     """`--prepend` refused, but `--body` replaced a committed prediction's
     text at exit 0, and `show` printed `registered at <sha>:` above the new
@@ -3919,6 +3985,12 @@ def test_show_takes_several_ids(tmp_path, capsys):
     assert run("show", ids[0], "nope", store_dir=tmp_path) == 1
     out, err = capsys.readouterr()
     assert "no entry found: nope" in err and "list" not in err.split("(")[0]
+    # The rows that exist print beside the miss: one typo hid them all (2026-11-06).
+    assert ids[0] in out, out
+    assert run("show", ids[2], "nope", ids[0], "--json", store_dir=tmp_path) == 1
+    out, err = capsys.readouterr()
+    assert [r["id"] for r in json.loads(out)] == [ids[2], ids[0]]
+    assert "no entry found: nope" in err
 
 
 def test_show_names_who_added_each_amendment_and_when(tmp_path, capsys, tty):
@@ -4311,6 +4383,9 @@ def test_supersede_takes_append_file_and_prepend_file(tmp_path, capsys, monkeypa
     # a verb typed as a flag printed 60 lines of help, none naming it (2026-10-13)
     (["--init"], "--init is no flag; did you mean `symbion init`?"),
     (["arc", "--create"], "--create is no flag; did you mean `symbion arc create`?"),
+    # a verb's flag with no verb, or before a verb that lacks it (2026-11-07)
+    (["--author", "ada"], "--author is a verb's flag, and goes after the verb: `symbion VERB -h`"),
+    (["--author", "ada", "arc", "list"], "--author is a verb's flag, and goes after the verb"),
     # each named a flag the verb lacks, or none (dogfood, 2026-10-14)
     (["add", "note", "--target", "project", "-F", "x"], "-F: use --body-file"),
     (["commit", "-F", "msg.txt"], '-F: use -m "$(cat FILE)"'),
@@ -4337,6 +4412,24 @@ def test_a_first_guess_that_fails_names_the_command_that_works(tmp_path, capsys,
     assert run(*argv, store_dir=tmp_path) == 2
     err = capsys.readouterr().err
     assert says in err, err
+
+
+@pytest.mark.parametrize("argv, fixed", [
+    (["--author", "ada", "arc", "create", "--name", "x"], "arc create --name x --author ada"),
+    (["--json", "list"], "list --json"),
+    (["--kind", "task", "list"], "list --kind task"),
+    (["arc", "--json", "list"], "arc list --json"),
+    (["--replace", "a", "b", "supersede", "x"], "supersede x --replace a b"),
+])
+def test_a_verb_flag_before_the_verb_is_moved_after_it(tmp_path, capsys, argv, fixed):
+    """`symbion --dir D --author ada arc list` named `ada` as the bad verb
+    (2026-11-07). The fix keeps `--dir`, which the parser never sees. A
+    flag the verb lacks gets the general hint (the first-guess cases)."""
+    assert run(*argv, store_dir=tmp_path) == 2
+    flag = next(a for a in argv if a.startswith("--"))
+    want = f"error: {flag} goes after the verb: `symbion --dir {shlex.quote(str(tmp_path))} {fixed}`\n"
+    err = capsys.readouterr().err
+    assert want in err, err
 
 
 def test_a_stray_word_beside_a_body_file_names_no_body(tmp_path, capsys):
@@ -5732,10 +5825,58 @@ def test_list_since_wrap_with_no_wrap_yet_lists_this_sessions_rows(tmp_path, cap
     assert run("list", "--since", "wrap", store_dir=tmp_path) == 0
     out, err = capsys.readouterr()
     assert "this session's task" in out and "before the session" not in out, out
+    assert "note: --since wrap" not in err, err
+    (cli._session_cache() / "s1.start").unlink()     # a session begun before the start mark
+    assert run("list", "--since", "wrap", store_dir=tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert "this session's task" in out and "before the session" not in out, out
     assert "no wrap in this store yet; listing since this session's start" in err, err
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
     assert run("list", "--since", "wrap", store_dir=tmp_path) == 2
     assert "give a time instead" in capsys.readouterr().err
+
+
+def test_list_since_wrap_opens_at_this_sessions_start_not_a_siblings_wrap(tmp_path, capsys,
+                                                                          monkeypatch):
+    """A sibling session's wrap opened the window mid-session, and this
+    session's wrap missed its own earlier rows (2026-11-08). The window opens at
+    this session's last wrap, else its start; a compaction's summary is no start."""
+    def at(m):
+        monkeypatch.setenv("SYMBION_NOW", f"2026-01-10T10:{m:02d}:00+00:00")
+
+    def in_session(sid):
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+    def hook(sid):
+        monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(
+            json.dumps({"session_id": sid}).encode())))
+        run("summary", "--hook", store_dir=tmp_path)
+
+    def task(body):
+        assert run("add", "task", "--target", "project", "--body", body, store_dir=tmp_path) == 0
+
+    at(0), task("before the session")
+    in_session("s1")
+    at(1), hook("s1")
+    at(2), task("s1 before its compaction")
+    at(3), hook("s1")                                  # the summary a compaction prints
+    at(4), task("s1 after its compaction")
+    at(5), run("commit", "-m", "s1's rows", store_dir=tmp_path)
+    in_session("s2")
+    at(6), run("commit", "--wrap", "-m", "s2's gist\n\ns2's day", store_dir=tmp_path)
+    in_session("s1")
+    capsys.readouterr()
+    at(7)
+    assert run("list", "--since", "wrap", store_dir=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "s1 before its compaction" in out and "s1 after its compaction" in out, out
+    assert "before the session" not in out, out
+    run("commit", "--wrap", "-m", "s1's gist\n\ns1's day", store_dir=tmp_path)
+    at(8), task("s1 after its own wrap")
+    capsys.readouterr()
+    assert run("list", "--since", "wrap", store_dir=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "s1 after its own wrap" in out and "after its compaction" not in out, out
 
 
 def test_an_arc_line_symbion_cannot_read_survives_every_arc_write(tmp_path, capsys):
@@ -6320,9 +6461,9 @@ def test_commit_names_arcs_jsonl_as_its_dry_run_does(tmp_path, capsys, monkeypat
     run("arc", "create", "--name", "a", "--scope", "item", store_dir=tmp_path)
     capsys.readouterr()
     assert run("commit", "--dry-run", store_dir=tmp_path) == 0
-    assert capsys.readouterr().out == "would commit: 1 file\n  arcs.jsonl\n"
+    assert capsys.readouterr().out == "would commit: arc changes user 1; 1 file\n  arcs.jsonl\n"
     assert run("commit", store_dir=tmp_path) == 0
-    assert capsys.readouterr().out.startswith("committed: 1 file: arcs.jsonl\n")
+    assert capsys.readouterr().out.startswith("committed: arc changes user 1; 1 file: arcs.jsonl\n")
 
 def test_commit_dry_run_lists_what_commit_would_take_and_takes_nothing(tmp_path, capsys, monkeypatch):
     """A careful commit read `git diff` by hand first, since `commit` took
@@ -6466,7 +6607,8 @@ def test_commit_takes_this_sessions_rows_and_names_the_ones_it_leaves(
     run("add", "--kind", "idea", "--type", "project", "--body", "as ada", "--author", "ada",
         store_dir=tmp_path)
     assert re.search(r"note: 2 entries not committed \(ada 1, claude 1\): symbion --dir \S+ "
-                     r"commit; it leaves 1 entry of other sessions \(claude 1\)\n",
+                     r"commit; it leaves 1 entry of other sessions \(claude 1\), the newest "
+                     r"written just now\n",
                      capsys.readouterr().err)
     (tmp_path / "plan.md").write_text("plan\n")
     assert run("commit", "--dry-run", store_dir=tmp_path) == 0
@@ -6484,11 +6626,66 @@ def test_commit_takes_this_sessions_rows_and_names_the_ones_it_leaves(
     # commits none of them (2026-10-12).
     run("summary", store_dir=tmp_path)
     assert re.search(r"1 entry not yet in the store's git \(symbion --dir \S+ commit --all once "
-                     r"their session has ended\)\n", capsys.readouterr().out)
+                     r"their session has ended, the newest written just now\)\n",
+                     capsys.readouterr().out)
     assert run("commit", store_dir=tmp_path) == 1
     assert capsys.readouterr().out.startswith("nothing to commit\nleft pending")
     assert run("commit", "--all", store_dir=tmp_path) == 0
     assert store.pending_rows(tmp_path) == []
+
+
+def test_every_line_that_names_other_sessions_entries_says_how_old_the_newest_is(
+        tmp_path, capsys, monkeypatch):
+    """Only a plain `commit` said how old the left entries were. A session
+    read `it leaves N entries of other sessions` and `--all once their
+    session has ended` again and again, never ran a plain `commit`, and took
+    a live session's entries with `commit --all` (2026-11-06)."""
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T10:00:00Z")    # far from any real today
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
+    run("add", "note", "--target", "project", "--body", "theirs", store_dir=tmp_path)
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:00:00Z")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    capsys.readouterr()
+    run("add", "note", "--target", "project", "--body", "mine", store_dir=tmp_path)
+    assert re.search(r"it leaves 1 entry of other sessions \(user 1\), the newest written 2h "
+                     r"ago\n", capsys.readouterr().err)
+    run("commit", store_dir=tmp_path)
+    assert ", the newest written 2h ago: " in capsys.readouterr().out
+    run("summary", store_dir=tmp_path)
+    assert re.search(r"commit --all once their session has ended, the newest written 2h ago\)\n",
+                     capsys.readouterr().out)
+    run("arc", "create", "--name", "a", store_dir=tmp_path)
+    assert re.search(r"\(user 1\), the newest written 2h ago, none of them yours: ",
+                     capsys.readouterr().err)
+
+
+def test_a_commit_names_each_arc_change_by_its_writer(tmp_path, capsys):
+    """A commit took the user's arc move from the GUI under a `Rows:` trailer
+    of its own rows, and named only the file (2026-11-06). An `Arcs:` trailer
+    names each change: a new arc by its author, a move by its mover, and a
+    change that records no writer (phases, rename, archive) as unknown. A
+    box a later move shifts keeps its mover, and counts once."""
+    aid, (a, b) = _phased_arc(tmp_path, capsys, "one", "two")
+    _commit(tmp_path, capsys)
+    run("arc", "move", b, "--phase", "later", "--author", "human", store_dir=tmp_path)
+    run("arc", "move", a, "--phase", "later", "--after", b, store_dir=tmp_path)
+    run("arc", "phases", aid, "next", "later", "soon", store_dir=tmp_path)
+    run("arc", "create", "--name", "second", "--author", "ada", store_dir=tmp_path)
+    run("add", "note", "--target", "project", "--body", "a row", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("commit", "--dry-run", store_dir=tmp_path) == 0
+    said = "arc changes ada 1, human 1, unknown 1, user 1"
+    assert capsys.readouterr().out.startswith(f"would commit: entries user 1; {said}; 1 file\n")
+    assert run("commit", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out.startswith(
+        f"committed: entries user 1; {said}; 1 file: arcs.jsonl\n")
+    msg = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%B"],
+                         capture_output=True, text=True).stdout
+    assert msg.strip() == "update entries\n\nRows: user 1\nArcs: ada 1, human 1, unknown 1, user 1"
+    run("add", "note", "--target", "project", "--body", "another row", store_dir=tmp_path)
+    capsys.readouterr()
+    run("commit", store_dir=tmp_path)
+    assert capsys.readouterr().out.startswith("committed: entries user 1\n"), "no arc change"
 
 
 def test_a_commit_from_another_projects_tree_leaves_the_stores_files(tmp_path, capsys, monkeypatch):
@@ -7565,11 +7762,13 @@ def test_list_overdue_is_open_and_past_due_only(repo, tmp_path, capsys):
     assert "due=2000-01-01 (overdue " in text
 
 
-def test_add_names_a_row_resolved_at_a_commit_this_branch_lacks(repo, tmp_path, capsys):
+def test_add_names_a_row_resolved_at_a_commit_this_branch_lacks(repo, tmp_path, capsys,
+                                                                monkeypatch):
     """A fix on an unmerged branch read as done: an agent on main searched
     `--status open` and filed the bug again (demo run, 2026-10-10). A row
     resolved at a commit HEAD reaches stays quiet, as does one no branch
-    holds (a squash merge), and this one once its branch merges."""
+    holds (a squash merge), and this one once its branch merges. In an agent
+    session the note comes once per row: it repeated on every add there."""
     git = lambda *a: _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", *a)
     c0 = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
                         capture_output=True).stdout.strip()
@@ -7597,6 +7796,13 @@ def test_add_names_a_row_resolved_at_a_commit_this_branch_lacks(repo, tmp_path, 
             f"this branch lacks: if this entry is the same fault, its fix is there\n  ruff fails"
             ) in err, err
     assert old not in err and gone not in err, err
+    with monkeypatch.context() as m:
+        for sid, body, says in (("s1", "first in s1", True), ("s1", "again in s1", False),
+                                ("s2", "first in s2", True)):
+            m.setenv("CLAUDE_CODE_SESSION_ID", sid)
+            assert run("add", "bug", "--target", "item:lint", "--body", body,
+                       store_dir=tmp_path) == 0
+            assert (f"note: {fixed} on item:lint" in capsys.readouterr().err) is says, body
     git("merge", "-q", "fix")
     run("add", "bug", "--target", "item:lint", "--body", "again", store_dir=tmp_path)
     assert "this branch lacks" not in capsys.readouterr().err
@@ -7666,7 +7872,7 @@ def _doc_flags(text):
     verbs = {"init", "add", "list", "show", "resolve", "supersede", "commit", "rename",
              "tags", "summary", "schema", "context", "arc", "skill"}
     arcverbs = {"create", "seed", "list", "todo", "rename", "archive", "unarchive", "describe",
-                "reconcile"}
+                "reconcile", "phases", "move"}
     lines = [ln for f in re.findall(r"```.*?```", text, re.S) for ln in f.strip("`").splitlines()]
     for para in re.split(r"\n\s*\n", re.sub(r"```.*?```", "\n\n", text, flags=re.S)):
         rows = [ln for ln in para.splitlines() if ln.lstrip().startswith("|")]
@@ -8073,6 +8279,31 @@ def test_a_catalogs_doc_entry_replaces_the_built_in(repo, tmp_path, capsys):
     assert store.load(store_dir)[0].target.name == "wiki/a"
     run("schema", store_dir=store_dir)
     assert "built in" not in capsys.readouterr().out.split("\n  doc", 1)[1].splitlines()[0]
+
+
+def test_a_doc_miss_names_the_repo_file_it_matches(repo, tmp_path, capsys):
+    """`--ref doc:scripts/search.py`, for a script at the repo's
+    docs/scripts/, minted a doc target that holds nothing, and the note said
+    only `taken as typed` (2026-11-05). A doc miss names each repo file the
+    name matches, as `file:` would resolve it; a miss in both stays bare."""
+    store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
+    (store_dir / "symbion.toml").write_text(    # init's: untracked files too
+        '[catalogs]\nfile = "git ls-files --cached --others --exclude-standard"\n')
+    (store_dir / "docs" / "plan.md").write_text("# plan\n")
+    (repo / "docs" / "scripts").mkdir(parents=True)
+    (repo / "docs" / "scripts" / "search.py").write_text("x\n")
+    for name in ("scripts/search.py", "docs/scripts/search.py"):
+        assert run("add", "note", "--target", "item:x", "--ref", f"doc:{name}",
+                   "--body", name, store_dir=store_dir) == 0
+        err = capsys.readouterr().err
+        assert ("'scripts/search.py' matches nothing in the doc catalog; taken as typed; "
+                "the repo has file:docs/scripts/search.py, and doc: names only the "
+                "store's docs/\n") in err, err
+    assert run("add", "note", "--target", "item:x", "--ref", "doc:nowhere.md",
+               "--body", "c", store_dir=store_dir) == 0
+    assert "'nowhere.md' matches nothing in the doc catalog; taken as typed\n" in \
+        capsys.readouterr().err
 
 
 def test_a_body_rewrite_that_drops_added_below_text_says_so(tmp_path, capsys):
@@ -8536,3 +8767,181 @@ def test_list_all_prints_an_amendment_under_the_head_alone(tmp_path, capsys):
     assert run("list", "--all", store_dir=tmp_path) == 0
     out = capsys.readouterr().out
     assert out.count("human added") == 1, out
+
+
+def _phased_arc(tmp_path, capsys, *bodies):
+    """An arc with phases next and later, and one task per body in it; (arc, ids)."""
+    run("arc", "create", "--name", "board", "--scope", "item", store_dir=tmp_path)
+    aid = capsys.readouterr().out.strip()
+    run("arc", "phases", aid, "next", "later", store_dir=tmp_path)
+    capsys.readouterr()
+    ids = []
+    for b in bodies:
+        run("add", "task", "--target", "project", "--arc", aid, "--body", b,
+            store_dir=tmp_path)
+        ids.append(capsys.readouterr().out.strip().splitlines()[0])
+    capsys.readouterr()
+    return aid, ids
+
+
+def test_arc_phases_sets_and_clears(tmp_path, capsys):
+    aid, (a,) = _phased_arc(tmp_path, capsys, "phase one")
+    assert store.load_arcs(tmp_path)[0].phases == ("next", "later")
+    assert run("arc", "phases", aid, store_dir=tmp_path) == 0
+    cap = capsys.readouterr()
+    assert cap.out.strip() == aid
+    assert store.load_arcs(tmp_path)[0].phases is None
+    assert run("arc", "phases", "nope", "x", store_dir=tmp_path) == 1
+    assert run("arc", "phases", aid, "Done", store_dir=tmp_path) == 1
+    assert "reserved" in capsys.readouterr().err
+
+
+def test_arc_move_takes_an_id_tail_and_prints_the_placement(tmp_path, capsys):
+    aid, (a, b) = _phased_arc(tmp_path, capsys, "move one", "move two")
+    assert run("arc", "move", b.split("-")[-1], "--phase", "later", store_dir=tmp_path) == 0
+    cap = capsys.readouterr()
+    assert cap.out.strip() == f"{b} phase later position 1"
+    assert "not committed" in cap.err
+    assert run("arc", "move", b, "--phase", "next", "--before", a.split("-")[-1],
+               store_dir=tmp_path) == 0
+    assert capsys.readouterr().out.strip() == f"{b} phase next position 1"
+    run("arc", "phases", aid, store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("arc", "move", a, "--top", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out.strip() == f"{a} position 1"
+    assert run("arc", "move", "nosuch", store_dir=tmp_path) == 1
+
+
+def test_arc_move_of_a_resolved_box_names_supersede(tmp_path, capsys):
+    aid, (a,) = _phased_arc(tmp_path, capsys, "to finish")
+    run("resolve", a, "--body", "finished", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("arc", "move", a, store_dir=tmp_path) == 1
+    # "resolved" alone would match: the way out is the reopen command
+    assert f"supersede {a} --status open" in capsys.readouterr().err
+
+
+def test_arc_move_before_after_top_are_exclusive(tmp_path, capsys):
+    aid, (a, b) = _phased_arc(tmp_path, capsys, "excl one", "excl two")
+    assert run("arc", "move", a, "--top", "--before", b, store_dir=tmp_path) == 2
+
+
+def test_arc_phases_help_says_what_phases_are(tmp_path, capsys):
+    assert run("arc", "phases", "-h", store_dir=tmp_path) == 0
+    assert "columns of an arc's board, left to right" in capsys.readouterr().out
+
+
+def test_arc_todo_help_says_board_order_phase_and_position(tmp_path, capsys):
+    assert run("arc", "todo", "-h", store_dir=tmp_path) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "in board order" in out and "[task, doing]" in out and "from 1 within the phase" in out
+
+
+def test_arc_move_to_done_refuses_and_names_resolve(tmp_path, capsys):
+    aid, (a,) = _phased_arc(tmp_path, capsys, "to done")
+    for name in ("done", "DONE"):
+        assert run("arc", "move", a, "--phase", name, store_dir=tmp_path) == 1
+        assert f"resolve {a}" in capsys.readouterr().err
+
+
+def test_arc_phases_names_the_resolved_placements_it_drops(tmp_path, capsys):
+    aid, (a,) = _phased_arc(tmp_path, capsys, "placed then done")
+    run("arc", "move", a, "--phase", "later", store_dir=tmp_path)
+    run("resolve", a, "--body", "finished", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("arc", "phases", aid, "next", store_dir=tmp_path) == 0
+    assert "dropped 1 placement of resolved boxes" in capsys.readouterr().err
+
+
+def test_todo_reads_in_board_order_with_phases(tmp_path, capsys):
+    aid, (a, b, c) = _phased_arc(tmp_path, capsys, "todo one", "todo two", "todo three")
+    run("arc", "move", a, "--phase", "later", store_dir=tmp_path)
+    run("arc", "move", c, "--top", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("arc", "todo", aid, store_dir=tmp_path) == 0
+    lines = capsys.readouterr().out.splitlines()[1:]
+    assert [l.split()[-1] for l in lines] == [c, b, a]
+    assert lines[0].startswith("[task, next] ") and lines[2].startswith("[task, later] ")
+
+
+def test_todo_json_carries_phase_position_by_at(tmp_path, capsys):
+    aid, (a, b) = _phased_arc(tmp_path, capsys, "json one", "json two")
+    run("arc", "move", b, "--phase", "later", store_dir=tmp_path)
+    capsys.readouterr()
+    run("arc", "todo", aid, "--json", store_dir=tmp_path)
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["id"], r["phase"], r["position"]) for r in rows] == [(a, "next", 1), (b, "later", 1)]
+    assert rows[0]["by"] is None and rows[0]["at"] is None, "a box never placed"
+    assert rows[1]["by"] and rows[1]["at"]
+
+
+def test_todo_without_placements_keeps_write_order(tmp_path, capsys):
+    run("arc", "create", "--name", "plain", "--scope", "item", store_dir=tmp_path)
+    aid = capsys.readouterr().out.strip()
+    ids = []
+    for b in ("flat one", "flat two", "flat three"):
+        run("add", "task", "--target", "project", "--arc", aid, "--body", b, store_dir=tmp_path)
+        ids.append(capsys.readouterr().out.strip().splitlines()[0])
+    assert run("arc", "todo", aid, store_dir=tmp_path) == 0
+    lines = capsys.readouterr().out.splitlines()[1:]
+    assert [l.split()[-1] for l in lines] == ids
+    assert all(l.startswith("[task] ") for l in lines)
+    run("arc", "todo", aid, "--json", store_dir=tmp_path)
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["phase"], r["position"], r["by"], r["at"]) for r in rows] == \
+        [(None, 1, None, None), (None, 2, None, None), (None, 3, None, None)]
+
+
+def test_show_names_a_box_arc_and_phase(tmp_path, capsys):
+    aid, (a, b) = _phased_arc(tmp_path, capsys, "show one", "show two")
+    run("arc", "move", b, "--phase", "later", store_dir=tmp_path)
+    capsys.readouterr()
+    run("add", "note", "--target", "project", "--body", "no arc here", store_dir=tmp_path)
+    n = capsys.readouterr().out.strip().splitlines()[0]
+    assert run("show", b, store_dir=tmp_path) == 0
+    line = capsys.readouterr().out.splitlines()[0]
+    assert f" arc={aid} phase=later " in line + " "
+    assert run("show", n, store_dir=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "arc=" not in out and "phase=" not in out
+    # a superseded version reads its head's column, not the first
+    assert run("resolve", b, "--body", "finished", store_dir=tmp_path) == 0
+    capsys.readouterr()
+    run("list", "--all", "--limit", "0", "--arc", aid, store_dir=tmp_path)
+    old = next(l for l in capsys.readouterr().out.splitlines() if "superseded ->" in l)
+    assert "phase=done" in old
+
+
+def test_a_boxes_target_survives_its_arc_label_at_80_columns(tmp_path, capsys, tty):
+    """The person's row gave the arc's id, name and phase first and the target what
+    was left: targets cut to one letter. The label gives way, the target stays."""
+    run("arc", "create", "--name", "a campaign with a rather long name for its id",
+        "--scope", "item", store_dir=tmp_path)
+    aid = capsys.readouterr().out.strip()
+    run("arc", "phases", aid, "next", "later", store_dir=tmp_path)
+    target = "a-rather-long-target-name-of-forty-chars"
+    run("arc", "seed", aid, "--scope", "item", "--name", target,
+        store_dir=tmp_path)
+    capsys.readouterr()
+    tty()
+    assert run("list", "--arc", aid, store_dir=tmp_path) == 0
+    (row,) = [l for l in _screen(capsys.readouterr().out) if "item:" in l]
+    assert f"item:{target}" in row and len(row) <= 80, row
+    assert "arc " + aid not in row, "no room: the label gives way"
+
+
+def test_a_boxes_row_names_its_arc_id_and_phase_when_there_is_room(tmp_path, capsys, tty):
+    aid, _ = _phased_arc(tmp_path, capsys, "room one")
+    tty()
+    assert run("list", "--arc", aid, store_dir=tmp_path) == 0
+    (row,) = [l for l in _screen(capsys.readouterr().out) if "project" in l]
+    assert row.endswith(f"arc {aid} · next"), row
+
+
+def test_arc_list_names_the_phases_holding_open_boxes(tmp_path, capsys):
+    aid, (a, b, c) = _phased_arc(tmp_path, capsys, "cnt one", "cnt two", "cnt three")
+    run("arc", "move", b, "--phase", "later", store_dir=tmp_path)
+    run("arc", "move", c, "--phase", "later", store_dir=tmp_path)
+    capsys.readouterr()
+    run("arc", "list", store_dir=tmp_path)
+    assert "board  later 2" in capsys.readouterr().out
