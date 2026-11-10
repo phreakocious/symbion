@@ -57,7 +57,8 @@ esac
 # is a heredoc's body with its commands around it; read the middle with awk if
 # a gotcha named there is missed.
 if [ ${#call} -gt 16384 ]; then
-  call="$(printf '%s' "$call" | LC_ALL=C cut -b1-8192) \
+  # awk, not cut -b1-8192: OpenBSD's cut takes no list past 2048 (2026-11-10).
+  call="$(printf '%s' "$call" | LC_ALL=C awk '{ print substr($0, 1, 8192) }') \
 $(printf '%s' "$call" | LC_ALL=C tail -c 8192)"
 fi
 # The call less its symbion commands and their heredoc bodies: a write about a
