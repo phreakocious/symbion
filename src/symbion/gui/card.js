@@ -66,7 +66,7 @@ export default {
       <span class="sb-note-by">
         <a v-if="card.by && card.by.h" class="sb-note-meta" :href="card.by.h">{{ card.by.t }}</a>
         <span v-else-if="card.by" class="sb-note-meta">{{ card.by.t }}</span>
-        <div v-if="card.age" class="sb-note-meta" :data-tip="card.age.tip">{{ card.age.t }}</div>
+        <div v-if="card.age" class="sb-note-meta sb-age" :data-tip="card.age.tip">{{ card.age.t }}</div>
         <a class="sb-note-meta sb-id" :href="card.sid.h" :data-tip="card.sid.tip">{{ card.sid.t }}</a>
         <q-btn flat dense round size="xs" icon="content_copy" class="sb-copy" aria-label="copy id" data-tip="copy the full id" @click="act('copy')" />
       </span>

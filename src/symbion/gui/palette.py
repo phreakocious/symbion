@@ -14,12 +14,14 @@ A row is a dict. What it shows: `icon` or `kind` (a dot), `text` or `html`
 peek) or `click` (a top-bar button, pressed)."""
 from __future__ import annotations
 
+import html
 import json
+import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 from .. import store as S
 from .. import summary as summ
@@ -88,10 +90,33 @@ def _ask(url: str, q: str) -> dict | None:
     """Another serve's `answer`, or None when it gives none in ASK_SECONDS:
     stopped, busy, or older than `/palette/here`."""
     try:
-        with urlopen(f"{url}/palette/here?{urlencode({'q': q})}", timeout=ASK_SECONDS) as r:
-            return json.load(r)
+        # Another serve is on this machine: an HTTP proxy the environment names
+        # took what the person typed, and answered for every store (audit, 2026-11-08).
+        ask = build_opener(ProxyHandler({})).open
+        with ask(f"{url}/palette/here?{urlencode({'q': q})}", timeout=ASK_SECONDS) as r:
+            got = json.load(r)
     except (OSError, ValueError):
         return None
+    return got if isinstance(got, dict) and isinstance(got.get("entries"), int) else None
+
+
+def _foreign(row, r: dict, tail) -> dict | None:
+    """An entry another serve sent, rebuilt from named fields: its words are
+    escaped here, its link stays on that serve, and it takes no click and no
+    peek. The answer reached innerHTML as sent (audit, 2026-11-08)."""
+    if not isinstance(row, dict):
+        return None
+
+    def text(k):
+        return html.unescape(re.sub(r"<[^>]*>", "", str(row.get(k) or "")))
+    link, kind, tid = str(row.get("href") or ""), str(row.get("kind") or ""), text("id")
+    if not link.startswith("/") or link.startswith("//"):     # `@host/` read as a login
+        return None
+    return {"kind": kind if re.fullmatch(r"[\w -]*", kind) else "", "kind_name": text("kind_name"),
+            "html": marked(text("html"), ()),
+            "id": marked(tid, [t for t in tail if t and tid.endswith(t)]),
+            "done": row.get("done") is True, "href": _url(r) + link,
+            "store": servers.name(r["store"])}
 
 
 def _asked(others: list, q: str) -> dict:
@@ -136,8 +161,7 @@ def rows(ctx, author: str, q: str) -> list[dict]:
     # an agent's entry reaches the person.
     tail = [S.id_tail(q)]
     by_id = [_entry(n, (), tail) for n in here if id_hit(n.id, q)] + \
-        [row | {"store": servers.name(r["store"]), "href": _url(r) + row["href"]}
-         for r, a in heard for row in a.get("by_id", ())]
+        [f for r, a in heard for row in a.get("by_id") or () if (f := _foreign(row, r, tail))]
     if by_id:
         groups.append(_group("entries by id", by_id, "here first, then other stores"))
 
@@ -181,7 +205,8 @@ def rows(ctx, author: str, q: str) -> list[dict]:
 
     grep = search_pattern(q)
     hits = S.query(here, grep=grep)
-    say = sorted(((r, a["say"]) for r, a in heard if a.get("say")), key=lambda rc: -rc[1])
+    say = sorted(((r, a["say"]) for r, a in heard if isinstance(a.get("say"), int) and a["say"]),
+                 key=lambda rc: -rc[1])
     if hits:
         # Open first, then entries with no status, then closed: newest first in each.
         rank = {"open": 0, None: 1}
@@ -237,7 +262,7 @@ def _actions(ctx, author: str, has) -> list[dict]:
         state = {".sb-commit": (mine or registry,
                                 summ._count(mine, "entry") if mine else "registry"),
                  ".sb-push": (unpushed, f"{summ._count(unpushed or 0, 'commit')} not on its remote"),
-                 ".sb-undo": (undoable, "")}
+                 ".sb-undo": (undoable == "mine", "")}
     return [{"icon": icon, "text": label, "click": button, "key": key, "meta": meta,
              "notable": button in (".sb-commit", ".sb-push")}
             for icon, label, button, key in picked

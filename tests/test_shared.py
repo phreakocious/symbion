@@ -281,6 +281,24 @@ def test_pull_brings_the_other_sides_rows(sides, capsys):
     assert (row["id"], row["side"]) == (rid, "A")
 
 
+def test_a_pull_names_what_someone_else_wrote_in_it(sides, capsys):
+    """A pulled row keeps the stamp of its write on the other side, older than
+    the reader's own last write: an answer that came by pull was named by no
+    write, commit or session start (audit, 2026-11-08). The pull names each
+    entry someone else wrote in what it brought."""
+    a, b = sides
+    q = publish(a, "Deploy on Friday or Monday?")
+    assert sym(b, "pull") == 0
+    assert sym(b, "resolve", q, "--body", "Monday.") == 0
+    assert sym(b, "commit", "--all") == 0               # shared: it pulls, then pushes
+    capsys.readouterr()
+    assert sym(a, "pull") == 0
+    out = capsys.readouterr().out
+    head, *rows = out.split("note: written by someone else, in what the pull brought:\n")[1] \
+        .splitlines()
+    assert q[-10:] in head and "closed by" in head and not rows, out
+
+
 def test_pull_merges_concurrent_appends_without_a_conflict(sides):
     a, b = sides
     ra = publish(a, "from A")
@@ -1093,6 +1111,39 @@ def test_session_start_pulls_in_a_shared_store(sides, capsys):
     assert text.splitlines()[0].startswith("pulled 1 commit from origin/"), text
     assert "open outside arcs" in text and line.startswith("symbion") and "pulled" not in line
     assert rid in (b / "notes.jsonl").read_text(encoding="utf-8")
+
+
+def answered_on_a(a, b, body) -> str:
+    """b's task, which a pulls, resolves and pushes."""
+    rid = add(b, body)
+    assert sym(b, "commit", "--all") == 0
+    assert sym(a, "pull") == 0
+    assert sym(a, "resolve", rid, "--body", "Monday.") == 0
+    assert sym(a, "commit", "--all") == 0
+    return rid
+
+
+def test_session_start_names_a_pulled_answer_once(sides, capsys):
+    """The pull's news named each answer someone else wrote in it, and the
+    summary's closed block printed the same rows just below (2026-11-09). At
+    session start a news row is one the summary does not print."""
+    a, b = sides
+    rid = answered_on_a(a, b, "Friday or Monday?")
+    text, _ = hook(b, capsys)
+    assert text.count(rid[-10:]) == 1 and "in what the pull brought" not in text, text
+
+
+def test_session_start_names_a_pulled_answer_the_summary_cannot(sides, capsys, monkeypatch):
+    """The closed block shows answers newer than the reader's newest row. One
+    written before that row and pulled after it is the news's alone to name."""
+    a, b = sides
+    rid = answered_on_a(a, b, "Friday or Monday?")
+    time.sleep(1.1)                                  # a stamp is to the second
+    add(b, "a newer row of b's own")
+    assert commit_here(b, monkeypatch, "--all") == 0
+    text, _ = hook(b, capsys)
+    news = text.split("in what the pull brought:\n")[1].splitlines()[0]
+    assert rid[-10:] in news and text.count(rid[-10:]) == 1, text
     assert git(a, "rev-parse", "HEAD") in git(b, "log", "--format=%H").split()
 
 

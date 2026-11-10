@@ -166,8 +166,12 @@ html { scrollbar-gutter: stable; }
 .sb-skip:focus { transform: none; }
 .sb-start { position: absolute; width: 1px; height: 1px; outline: none; }
 /* read by a screen reader, drawn nowhere */
-.sb-sr { position: absolute; width: 1px; height: 1px; overflow: hidden;
+.sb-sr, .sb-age::after { position: absolute; width: 1px; height: 1px; overflow: hidden;
          clip-path: inset(50%); white-space: nowrap; }
+/* A card's age says its stamp to a screen reader. Generated, not a span: the
+   page's filter reads textContent, where a date typed matched every card of
+   that day, and find-in-page lit text no one could see. */
+.sb-age::after { content: ", " attr(data-tip); }
 /* Links set no underline of their own; a row of them read as a ransom note. */
 a { text-decoration: none; }
 
@@ -236,7 +240,7 @@ html.sb-untabbed .sb-tabhint { display: block; }
              box-shadow: none !important; min-height: 56px; padding: 0; }
 /* the bar's row lines up with the cards: the main column's width, plus the
    16px NiceGUI pads the page content with */
-.sb-topbar { max-width: 952px; margin: 0 auto; padding: 0 48px; box-sizing: border-box; }
+.sb-topbar { max-width: calc(var(--sb-main-w) + 32px); margin: 0 auto; padding: 0 48px; box-sizing: border-box; }
 .sb-crumbs { color: var(--q-muted); font-size: 13px; min-width: 0; }
 .sb-crumbs > * { flex: none; white-space: nowrap; }
 .sb-crumbs a { color: var(--q-body); }
@@ -246,8 +250,9 @@ html.sb-untabbed .sb-tabhint { display: block; }
 .sb-crumbs > .sb-here { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
                         font-size: 17px; font-weight: 600; letter-spacing: -0.01em;
                         color: var(--q-emph); }
-/* main column, cards */
-.sb-main   { width: 100%; max-width: 920px; margin: 0 auto; padding: 8px 32px 72px;
+/* main column, cards: 920px, which a board page widens (.sb-phases, below) */
+body { --sb-main-w: 920px; }
+.sb-main   { width: 100%; max-width: var(--sb-main-w); margin: 0 auto; padding: 8px 32px 72px;
              box-sizing: border-box; }
 .sb-subtitle { font-size: 13px; color: var(--q-muted); overflow-wrap: anywhere; }
 .sb-card   { background: var(--q-panel) !important; border: 1px solid var(--q-border);
@@ -277,6 +282,11 @@ body[data-sb-drop]::after { content: attr(data-sb-drop); position: fixed; inset:
 /* it takes the focus so the page keys scroll it (notes.viewer): no ring round
    the whole dialog, as Quasar's own node, focused before, had none */
 .sb-md-card:focus { outline: none; }
+/* the card scrolls, so its title row and close button stay at its top (notes.viewer).
+   Sticky stops at the card's padding: the row takes that padding over, or text
+   shows above it. */
+.sb-md-head { position: sticky; top: -1rem; z-index: 1; background: var(--q-panel);
+  padding: 1rem 0 0.5rem; margin: -1rem 0 -0.5rem; }
 /* a diff (notes.diff_dialog): room for two sides of about 80 columns. Side by
    side, the unified drawing comes too, and a window too narrow for two sides
    shows it instead, with no toggle. */
@@ -372,10 +382,25 @@ a.sb-commits-sha:hover { color: var(--q-primary); }
 .sb-board-aside { font-size: 12px; color: var(--q-muted); }
 a.sb-board-aside:hover { color: var(--q-primary); }
 .sb-board-empty .sb-board-title { color: var(--q-muted); font-weight: 500; font-size: 15px; }
-/* an arc's board (arcs.board): its phase columns side by side, four of
-   them within .sb-main (three phases and done, the user's mockup,
-   2026-11-05), the row scrolling sideways past that; the column a card is
-   dragged over is washed. Each column is a board: a head, then cards 10px
+/* A board page's main column widens to give each column about 300px where
+   the window has room, and never narrows past a list page's: in 920px, four
+   columns left a card 201px and cut its foot, and five scrolled sideways
+   beside about 750px of empty page at 1920 wide (2026-11-08). The top bar
+   follows it. 306px is a column and its gap; 46px is .sb-main's 64px of
+   padding, less the row's 12px reach and one gap. The count is the board's
+   columns, its phases and done. */
+/* ponytail: counted to 8 columns; a wider board shrinks its columns into
+   8 columns' width. CSS sibling-count(), once every browser has it. */
+body:has(.sb-phases > .sb-phase:nth-child(3)) { --sb-cols: 3; }
+body:has(.sb-phases > .sb-phase:nth-child(4)) { --sb-cols: 4; }
+body:has(.sb-phases > .sb-phase:nth-child(5)) { --sb-cols: 5; }
+body:has(.sb-phases > .sb-phase:nth-child(6)) { --sb-cols: 6; }
+body:has(.sb-phases > .sb-phase:nth-child(7)) { --sb-cols: 7; }
+body:has(.sb-phases > .sb-phase:nth-child(8)) { --sb-cols: 8; }
+body:has(.sb-phases) { --sb-main-w: max(920px, calc(var(--sb-cols, 2) * 306px + 46px)); }
+/* an arc's board (arcs.board): its phase columns side by side across
+   .sb-main, the row scrolling sideways once a column would pass its 180px
+   least; the column a card is dragged over is washed. Each column is a board: a head, then cards 10px
    apart, and columns 18px apart card to card, as two boards are; the 6px
    that washes past a column's cards is taken back at the row's ends, so
    the cards line up with the page. A phase name is a board title in the
@@ -383,13 +408,66 @@ a.sb-board-aside:hover { color: var(--q-primary); }
    capital forced). */
 .sb-board.sb-phases { flex-direction: row; align-items: flex-start; gap: 6px; overflow-x: auto;
                       width: calc(100% + 12px); margin: 0 -6px; }
+/* A column is a lane: a panel between the page's tone and a card's, its
+   edge, and a 3px strip over its top that bends down its sides and fades.
+   The strip runs a green ramp by the column's place, from the first step a
+   card shows at 3:1 (--sb-ramp-t0) to the full `good` on done (--sb-step;
+   --i below, --sb-cols above): one hue at green's chroma, only its lightness
+   rising from the border's, as the map's ramps step (_toward, --sb-ramp-lo).
+   From 20%, the first step read 2.41:1 on the page. Mixed in sRGB toward the
+   border, its first steps were teal-grey, and the grey below sat 0.058 from
+   one in OKLab under simulated deuteranopia, against 0.097 (2026-11-08). A
+   phase whose name holds the whole word blocked, waiting, stuck or hold is
+   out of the flow, and the ramp read it as nearly done: its strip is grey.
+   Phase names are the person's own: a miss costs a strip's colour, where a
+   mark on the arc would cost a stored field (the user, relaying a user's
+   request, 2026-11-08). */
 .sb-phase { flex: 1 1 200px; min-width: 180px; display: flex; flex-direction: column; gap: 10px;
-            padding: 6px; border-radius: 12px; }
+            padding: 6px; border-radius: 12px; position: relative;
+            background: color-mix(in srgb, var(--q-panel) 65%, var(--q-dark-page));
+            box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--q-border) 60%, transparent); }
+/* a column's strip and its segment in the arc's bar (.sb-phase-bar) take one colour */
+.sb-phase, .sb-phase-seg { --i: 8;
+            --sb-step: color-mix(in oklch, var(--q-good) calc(var(--sb-ramp-t0) + (100% - var(--sb-ramp-t0))
+                         * (var(--i) - 1) / (var(--sb-cols, 2) - 1)), var(--sb-ramp-lo)); }
+.sb-phase::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 30px;
+                    box-sizing: border-box; pointer-events: none; border: solid var(--sb-step);
+                    border-width: 3px 2px 0; border-radius: 12px 12px 0 0;
+                    -webkit-mask-image: linear-gradient(to bottom, black 25%, transparent);
+                    mask-image: linear-gradient(to bottom, black 25%, transparent); }
+/* ponytail: placed to 8, as --sb-cols is counted; a 9th column on takes the 8th's step */
+.sb-phases > .sb-phase:nth-child(1) { --i: 1; }
+.sb-phases > .sb-phase:nth-child(2) { --i: 2; }
+.sb-phases > .sb-phase:nth-child(3) { --i: 3; }
+.sb-phases > .sb-phase:nth-child(4) { --i: 4; }
+.sb-phases > .sb-phase:nth-child(5) { --i: 5; }
+.sb-phases > .sb-phase:nth-child(6) { --i: 6; }
+.sb-phases > .sb-phase:nth-child(7) { --i: 7; }
+.sb-phase:last-child, .sb-phase-seg[data-phase="done"] { --sb-step: var(--q-good); }
+.sb-phase:last-child .sb-count { color: var(--q-good); }
+:is(.sb-phase, .sb-phase-seg):is([data-phase~="blocked" i], [data-phase~="waiting" i],
+    [data-phase~="stuck" i], [data-phase~="hold" i]) {
+    --sb-step: color-mix(in srgb, var(--q-muted) 75%, var(--q-dark-page)); }
+/* an arc's progress (arcs.phase_bar): its boxes by phase, done first, then
+   the board's columns right to left, each as wide as its count; the ground
+   shows 2px between them, and the done/total beside it is exact. The bar
+   carries its own column count: the arcs page shows arcs of every size.
+   Done fills the bar's height, the rest are a line through its middle: all
+   at full height, an arc with nothing done read as a full bar, and one whose
+   boxes all sat in the last phase as nearly finished (2026-11-08). */
+.sb-phase-bar { display: flex; align-items: center; gap: 2px; width: 100%; height: 6px; }
+.sb-phase-bar:empty { background: linear-gradient(var(--q-border-hi), var(--q-border-hi))
+                                  center / 100% 2px no-repeat; }
+.sb-phase-seg { height: 2px; border-radius: 1px; background: var(--sb-step); min-width: 2px; }
+.sb-phase-seg[data-phase="done"] { height: 100%; border-radius: 3px; }
+/* an arc's age and last change (arcs.when_line), one line under its bar */
+.sb-arc-when { gap: 0 8px; margin-top: -4px; }
 .sb-phase-cards { display: flex; flex-direction: column; gap: 10px; min-height: 48px; }
 .sb-phase-name { font-size: 16px; font-weight: 600; color: var(--q-emph); }
-.sb-phase.sb-dropping { background: color-mix(in srgb, var(--q-primary) 7%, transparent); }
+/* over the lane's panel, so the column lightens as it washes */
+.sb-phase.sb-dropping { background: color-mix(in srgb, var(--q-primary) 7%, var(--q-panel)); }
 .sb-phases .sb-note[draggable="true"] { cursor: grab; }
-/* A board card is narrow (about 190px in four columns), and the list's
+/* A board card can be narrow (168px in a column's 180px least), and the list's
    100px corner left its words 70px, broken mid-word (2026-11-05). At rest
    its corner holds the resolve box alone: star and edit show on hover or
    focus, over the text, starred or not (a starred box keeps its #priority
@@ -576,8 +654,12 @@ a.sb-tag:hover { color: var(--q-primary); }
 /* a board box's arrows and its mover begin the foot's last row, its id at the right */
 .sb-move-break { flex-basis: 100%; height: 0; }
 .sb-move { display: flex; align-items: center; gap: 2px; margin-left: -4px; flex: none; }
-/* basis 0: the line keeps the id beside it, and a narrow card cuts it short */
-.sb-moved { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* the mover keeps its whole text: where the line cannot hold it and the id,
+   the id wraps to a line of its own, at the right. Basis 0 kept the id
+   beside it and cut "from in review · now" to 60 of its 144px on a 288px
+   card (2026-11-08). Only a card too narrow for the text alone cuts it. */
+.sb-moved { flex: 0 1 auto; min-width: 0; max-width: 100%; overflow: hidden;
+            text-overflow: ellipsis; }
 /* Quasar's !important held a disabled button at .7 over a rule here (measured
    in Chrome, 2026-11-07): dim its glyph instead */
 .sb-move .q-btn.disabled .q-icon { opacity: .35; }
@@ -895,7 +977,7 @@ body:not(.sb-sifting) .sb-past, body.sb-sifting .sb-docs-more { display: none; }
   .sb-topbar::after { content: ""; order: 3; flex-basis: 100%; margin-top: 8px; }
   .sb-topbar > .sb-new { order: 4; }
   .sb-topbar > .sb-stale, .sb-topbar > .sb-undo, .sb-topbar > .sb-commit,
-  .sb-topbar > .sb-push { order: 5; }
+  .sb-topbar > .sb-discard, .sb-topbar > .sb-push { order: 5; }
   .sb-topbar > .sb-search { order: 6; flex: 1; min-width: 0; max-width: none; }
   /* the public demo's banner, a line of its own: first, it left the title
      37px at 390 (a reviewer, 2026-10-22) */
@@ -1015,3 +1097,10 @@ MAP_EMPTY = PALETTE.border
 MAP_TEXT = PALETTE.bg_page
 MAP_OPEN = _ramp(PALETTE.border_hi, PALETTE.notable, MAP_TEXT)
 MAP_NEW = _ramp(PALETTE.border, PALETTE.good, MAP_TEXT)
+# A board column's strip and an arc's bar mix toward green at the border's
+# lightness, from the first step a card shows at 3:1 (WCAG 2, 1.4.11): a card
+# is the lightest ground either sits on.
+RAMP_T0 = next(i for i in range(101)
+               if _contrast(_toward(PALETTE.border, PALETTE.good, i / 100), PALETTE.bg_panel) >= 3)
+DARK_CSS += (f"body {{ --sb-ramp-lo: {_toward(PALETTE.border, PALETTE.good, 0)}; "
+             f"--sb-ramp-t0: {RAMP_T0}%; }}\n")

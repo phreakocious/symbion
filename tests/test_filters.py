@@ -126,3 +126,10 @@ def test_describe_names_a_search_by_what_was_typed():
     kw = filters.from_params({"q": "a  b", "kind": "bug"})
     assert filters.describe(kw, "a  b") == "search: a b · kind=bug"
     assert filters.describe({}, '"read  only"') == 'search: "read only"'
+
+
+def test_a_search_of_many_words_makes_at_most_32_lookaheads():
+    """One lookahead per word, with no dedup and no cap: a `q` of 30,000
+    one-letter words held the event loop 5 s on /notes (audit, 2026-11-08)."""
+    assert filters.search_pattern(" ".join(["a"] * 30000)).pattern.count("(?=") == 1
+    assert filters.search_pattern(" ".join(f"w{i}" for i in range(100))).pattern.count("(?=") == 32

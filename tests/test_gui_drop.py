@@ -54,6 +54,19 @@ async def test_a_known_file_opens_the_composer_on_it(user: User, ctx):
     assert _one(user, "note-body").value == ""
 
 
+async def test_a_read_only_drop_says_what_it_does_and_reads_nothing(user: User, ctx,
+                                                                   monkeypatch):
+    """On the demo a drop said whether a file the repo or docs/ holds exists,
+    tracked or not, and ran every catalog (audit, 2026-11-08)."""
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    ran = []
+    monkeypatch.setattr(api, "known_files", lambda *a: ran.append(a) or [])
+    await user.open("/")
+    _drop(user, "app.py", "print(1)\n" * 1000)
+    await user.should_see("Read-only demo: in your own store, this opens the dropped file")
+    assert ran == []
+
+
 async def test_short_text_becomes_the_body(user: User, ctx):
     await user.open("/")
     _drop(user, "scratch.md", "the station times out")
@@ -94,6 +107,14 @@ async def test_with_the_composer_open_text_goes_in_at_the_cursor(user: User, ctx
     _one(user, "note-body").value = "🙂 ab"
     _drop(user, "x.md", "XY", cursor=[3, 3])
     assert _one(user, "note-body").value == "🙂 aXYb"
+
+
+async def test_the_composer_closes_on_its_button(user: User, ctx):
+    await user.open("/")
+    user.find(marker="new-note").click()
+    assert _composer_dialog(user).value
+    user.find(marker="composer-close").click()
+    assert not _composer_dialog(user).value
 
 
 async def test_a_draft_in_a_closed_composer_is_kept(user: User, ctx):

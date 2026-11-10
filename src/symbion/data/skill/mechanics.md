@@ -29,7 +29,9 @@ session, your author's), no commit has run since, and nothing outside symbion
 changed the files. One level: an undo leaves nothing more to undo. In
 `symbion serve`, an undo icon sits in the top bar while the store's last write
 is yours and uncommitted; it shows each entry the undo removes or puts back,
-and asks first.
+and asks first. Beside commit, Discard throws away what the GUI's commit would
+take for you, and the arcs you made since the last commit, after a list: one
+write, which undo takes back. It has no CLI verb.
 
 An `add` whose every field equals an uncommitted entry's writes nothing: it
 prints that entry's id and says so, so a retried command stores one entry.
@@ -70,16 +72,20 @@ and the lines that pull printed come above the first item, in this order:
 
 - Entries a cut-off pull had set aside, now put back.
 - Each entry that both sides edited, with both ids.
-- Each arc value or in-place rewrite the merge dropped.
-- `pulled N commits from …`.
+- Each arc value or in-place rewrite the merge dropped, and each box placed in a
+  phase one side dropped.
 - A changed `symbion.toml`. Read it: it names commands symbion runs.
+- A clone that runs an older symbion.
+- `pulled N commits from …`, then each entry someone else wrote in what it
+  brought that no block below prints, under `note: written by someone else, in
+  what the pull brought:`.
 - While a pulled `symbion.toml` waits on `symbion trust`, a `note:` that says so,
   at each session start. Writes refuse until then. `trust` is the user's, at a
   terminal: show them the change and ask them to run it.
-- A clone that runs an older symbion.
 
-Past 5 of the split and dropped lines, `+N more not shown` ends them. The other
-lines always print. If the fetch failed or ran past 4 seconds, one line says so
+Past 5 of the split and dropped lines, `+N more not shown` ends them; past 5 of
+the pulled entries, `+N more: symbion list --since …`. The other lines always
+print. If the fetch failed or ran past 4 seconds, one line says so
 and that the summary reads the local store (`pull: git fetch origin failed: …;
 the summary below reads the local store`).
 
@@ -99,7 +105,9 @@ the summary below reads the local store`).
    no one until it comes due. No block below repeats them; elsewhere, such
    as in what a write prints, a line starts `waits on you`.
 4. The due block: each open entry past due or due within 7 days, and each
-   parked one from its due date on (`overdue 2d`, `due in 3d`).
+   parked one from its due date on (`overdue 2d`, `due in 3d`). Within a
+   day of a due with an hour, it counts hours or minutes (`due in 3h`,
+   `overdue 40m`).
 5. A line per arc: its id, done/total, age and name.
 6. `priority`: each unresolved entry tagged `priority` that no block above
    printed, with `starred Nd ago` from a day on.
@@ -194,8 +202,8 @@ previous commit, whichever came later.
 target, an id in the body that matches no entry, a catalog name stored as
 typed, a verdict entry with no `--checked` or stamped on a dirty tree, and a
 parked entry of yours with no `--due`. In an agent session, it lists a
-target's open entries at your first add there and gives only their count after
-that, until the next session start. `add`, `resolve` and `supersede` say when
+target's open entries at your first add there and not again until the next
+session start. `add`, `resolve` and `supersede` say when
 the text they write runs past 500 characters: in an agent session, once until
 the next session start. A pre-registration's body does not count. Each write
 ends with the count of entries not yet committed; an arc write with none
@@ -215,9 +223,13 @@ body line cut to fit. A pipe, which scripts and agents read, gets the plain
 line; in a shared store, the plain line of an entry the other side raised ends with
 `side=NAME`. Bodies are markdown: `list --full`, `show` and `context` render them at
 a terminal and print them as written on a pipe; a plain `list` page and
-`summary` flatten each to one clipped line. `list --full` and `show` mark
-where each amendment joined the body, naming who added it and when (`-- ada
-added below, 2026-10-10 04:22:11Z --`); `--json` gives the body as stored.
+`summary` flatten each to one clipped line. Under `list --grep`, an entry whose
+match no printed line shows prints the line that holds it from just before the
+match, behind `…`. `list --full` and `show` mark
+where each amendment joined the body at a line break, naming who added it and
+when (`-- ada added below, 2026-10-10 04:22:11Z --`); an amendment that went
+on with a line is unmarked. `--last N` keeps the first text and the newest N
+amendments, and a line counts the rest. `--json` gives the body as stored.
 
 `show` ends an entry with a line for each entry of this store its body cites,
 by whole id or its 10- or 17-character tail, read through that entry's head
@@ -235,8 +247,8 @@ of another session's uncommitted entry brings that entry into your commit: a
 commit never holds an edit without the version it edits. Its
 commit message ends with a `Rows: claude 3` trailer naming them by author. When
 arcs.jsonl changed, an `Arcs: ada 1, unknown 1` trailer follows: a new arc
-counts for its author, a moved box for its mover, and any other arc change,
-which records no writer, as `unknown`.
+counts for its author, a moved box for its mover, any other edit of an arc
+for its writer, and a change no writer stamped (a hand edit) as `unknown`.
 `commit --wrap -m MSG` adds `Wrap: <author>`: that message is the handoff
 `summary` prints as `last wrap by`. With nothing pending, a wrap commits the
 message alone, where a plain `commit` exits 1. The store's git log is the

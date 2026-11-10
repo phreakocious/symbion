@@ -635,6 +635,29 @@ async def test_the_id_links_to_the_note_alone(user: User, repo, tmp_path):
     assert link.props["href"] == f"/notes?id={n.id}"
 
 
+async def test_a_cards_age_says_its_stamp_to_a_keyboard_and_a_screen_reader(user: User, repo,
+                                                                            tmp_path):
+    """The GUI review, 2026-11-07: an age kept its stamp in a tip on a div,
+    which takes no focus. A keyboard reads it in the id link's tip, and a
+    screen reader in text CSS makes after the age (Chrome's accessibility
+    tree, checked in a browser), which the page's filter and find-in-page
+    leave out, where a span's matched every card of that day."""
+    from symbion.gui.theme import DARK_CSS
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                      "body": "b"}, author="ada")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    (link,), (age,) = parts(user, "note-id"), parts(user, "note-age")
+    assert f"written {age.props['tip']}\n" in link.props["tip"]
+    assert re.search(r'class="[^"]*\bsb-age\b[^"]*" :data-tip="card\.age\.tip"', template())
+    assert re.search(r'\.sb-age::after\s*\{\s*content:\s*", " attr\(data-tip\)', DARK_CSS)
+
+
 async def test_a_non_project_target_links_to_the_object_view(user: User, repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "note", "target": {"type": "item", "name": "src/x.py"},
@@ -824,7 +847,7 @@ def test_an_archived_arc_is_not_offered(repo, tmp_path):
     from symbion.gui.notes import arc_options
     act = api.create_arc(ctx, "old", "d", "project", author="ada")
     assert act.id in arc_options(ctx)
-    api.archive_arc(ctx, act.id)
+    api.archive_arc(ctx, act.id, author="user")
     assert act.id not in arc_options(ctx)
 
 
@@ -2006,3 +2029,61 @@ def test_a_read_only_viewer_asks_git_once_for_every_file(repo, tmp_path, monkeyp
     assert all(view_path(ctx, name, "file") for name in names)
     assert view_path(ctx, "d/new.md", "file") is None
     assert len(runs) == 1, runs
+
+
+@pytest.mark.parametrize("where", ["its page", "a list", "the peek"])
+async def test_a_saved_edit_draws_the_page_again(user: User, repo, tmp_path, caplog, where):
+    """The dialog's close deletes it, and the slot its save runs in: the
+    redraw after a save raised, and the card kept its old text until a
+    reload (audit, 2026-11-08). The other edit tests pass a refresh that
+    does nothing; this one saves on build_page's routes."""
+    from symbion.gui.pages import build_page
+    from _cards import _emit, cards
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                      "body": "do the thing"}, author="ada")
+    build_page(ctx, author="ada")
+    await user.open(f"/notes?id={n.id}" if where == "its page" else "/")
+    if where == "the peek":
+        UserInteraction(user, {user.client.layout}, None).trigger("sbPeek", {"id": n.id})
+        await asyncio.sleep(0.2)
+    card = [c for c in cards(user) if c.props["data-id"] == n.id][-1]    # the peek's is the later
+    _emit(user, card, "edit")
+    await user.should_see(marker="edit-append")
+    user.find(marker="edit-append").type("one more line")
+    user.find(marker="edit-save").click()
+    await asyncio.sleep(0.5)
+    assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == []
+    assert any("one more line" in b for b in bodies(user))
+
+
+@pytest.mark.parametrize("how", ["archived", "gone"])
+async def test_an_entry_in_an_arc_the_select_lacks_opens_its_edit_dialog(user: User, repo,
+                                                                         tmp_path, how):
+    """The arc select offers unarchived arcs, and NiceGUI refuses a value no
+    option holds: an entry in an archived arc, or in an arc no row has, had
+    no edit dialog (audit, 2026-11-08). Its own arc is an option, and a save
+    leaves the entry in it."""
+    ctx = api.resolve(str(tmp_path))
+    act = api.create_arc(ctx, "old campaign", "d", "item", author="ada")
+    n = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "one"},
+                      "body": "do the thing", "arc_id": act.id}, author="ada")
+    if how == "archived":
+        api.archive_arc(ctx, act.id, author="user")
+    else:
+        store.arcs_path(tmp_path).write_text("", encoding="utf-8")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    part(user, "note-edit").click()
+    await user.should_see(marker="edit-append")
+    (arc,) = user.find(marker="edit-arc").elements
+    assert (arc.value, arc.options[act.id]) == (
+        act.id, "old campaign (archived)" if how == "archived" else act.id)
+    user.find(marker="edit-append").type("more")
+    user.find(marker="edit-save").click()
+    head = store.chain_tip(store.load(tmp_path), n.id)
+    assert (head.body, head.arc_id) == ("do the thing\n\nmore", act.id)

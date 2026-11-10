@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 from datetime import date, timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import pytest
 
@@ -186,19 +186,29 @@ async def test_a_hidden_tab_polls_each_minute_and_reads_on_its_return(user: User
                                                                       monkeypatch):
     """A hidden tab read the store's git every 5 s, as a shown one did (the
     GUI review, 2026-11-07). It reads each minute instead, not never: the
-    installed app's badge is set from this tick. Shown again, it reads now."""
+    installed app's badge is set from this tick. Shown again, it reads now,
+    and at the shown pace: a timer's new interval waited out the hidden
+    one's sleep (audit, 2026-11-08)."""
+    import time
     from symbion.gui import chrome
+    assert (chrome._GIT_EVERY, chrome._HIDDEN_EVERY) == (5, 60)
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    monkeypatch.setattr(chrome, "_HIDDEN_EVERY", 1.5)
     await user.open("/")
-    (timer,) = user.find(marker="git-poll").elements
-    assert timer.interval == chrome._GIT_EVERY
     reads, real = [], chrome.git_state
     monkeypatch.setattr(chrome, "git_state", lambda *a: reads.append(1) or real(*a))
     trigger = UserInteraction(user, {user.client.layout}, None).trigger
     trigger("sbHidden", True)                  # what the page's visibilitychange sends
-    await _until(lambda: timer.interval == chrome._HIDDEN_EVERY == 60)
-    assert reads == []
+    await asyncio.sleep(0.2)                   # a read under way when it hid ends
+    reads.clear()
+    await _until(lambda: reads)                # hidden, it still reads
+    n = len(reads)
+    await asyncio.sleep(0.3)
+    assert len(reads) == n, "hidden, not at the shown pace"
+    start = time.monotonic()
     trigger("sbHidden", False)
-    await _until(lambda: timer.interval == chrome._GIT_EVERY and reads == [1])
+    await _until(lambda: len(reads) >= n + 3)
+    assert time.monotonic() - start < 1.0, "shown again, at its pace now"
 
 
 async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_notes, tmp_path,
@@ -253,7 +263,7 @@ async def _arc_board(user, ctx, monkeypatch):
     monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
     act = api.create_arc(ctx, "camp", "d", "item", author="ada")
     api.seed(ctx, act.id, "item", ["one", "two", "three"], author="ada")
-    api.set_phases(ctx, act.id, ["todo", "doing"])
+    api.set_phases(ctx, act.id, ["todo", "doing"], author="user")
     ids = {n.target.name: n.id for n in store.arc_items(store.load(ctx.store_dir), act.id)}
     await user.open(f"/arc?id={act.id}")
     user.find(marker="arc-view-board").click()
@@ -348,7 +358,7 @@ async def test_the_arc_pages_unarchive_and_seed_light_nothing(user: User, repo, 
     await user.should_see("seeded 1 new target(s)")
     await asyncio.sleep(0.4)
     assert _stale(user) == []
-    api.archive_arc(ctx, act.id)
+    api.archive_arc(ctx, act.id, author="user")
     await _until(lambda: _stale(user) != [])
     await user.open(f"/arc?id={act.id}")                        # a fresh page, nothing stale
     await asyncio.sleep(0.2)
@@ -368,6 +378,20 @@ async def test_the_pages_move_keeps_an_agents_unseen_move_offered(user: User, ct
     store.move_box(ctx_with_notes.store_dir, ids["one"], phase="doing", author="sam")
     _drop(user, id=ids["two"], phase="doing", before=None)
     await _until(lambda: _stale(user) == [["arcs changed"]])
+
+
+async def test_the_older_of_two_tabs_does_not_light_for_its_own_drop(
+        user: User, create_user, ctx_with_notes, monkeypatch):
+    """Each page's draw replaced the writer's one record, so a drop on the older
+    tab updated the newer tab's, and the older tab lit its own write as news
+    (audit, 2026-11-08). Each page keeps its own record."""
+    act, ids = await _arc_board(user, ctx_with_notes, monkeypatch)
+    tab = create_user()
+    await tab.open("/notes")                        # a second tab, drawn later
+    await asyncio.sleep(0.2)
+    _drop(user, id=ids["one"], phase="doing", before=None)
+    await asyncio.sleep(0.4)
+    assert _stale(user) == []
 
 
 async def test_resolving_a_pre_registration_in_the_dialog_lights_nothing(
@@ -1169,6 +1193,75 @@ async def test_the_pick_is_lit_only_while_the_peek_is_open(user: User, ctx_with_
     assert ".q-layout.sb-peeking" in chrome._PEEK_JS
 
 
+def test_a_click_on_the_background_closes_the_peek():
+    """The user asked that a click elsewhere close the peek (2026-11-08). The
+    `user` fixture runs no script, so this reads the rule: only while the peek
+    is open, by its own close button, and never for a click on a card, a
+    control, the peek itself or what sits over the page, nor one ending a
+    selection. A browser checked the clicks."""
+    from symbion.gui import chrome
+    stays = re.search(r"const sbPeekStays = ((?:'[^']*'\s*\+?\s*)+);", chrome._PEEK_JS)
+    kept = {s.strip() for s in "".join(re.findall(r"'([^']*)'", stays[1])).split(",")}
+    assert {".sb-peek", ".sb-note", "a", "button", "input", "textarea", ".q-dialog",
+            ".q-menu", ".sb-palette"} <= kept, kept
+    handler = chrome._PEEK_JS.split("const sbPeekStays", 1)[1]
+    assert "!sbPeekOpen()" in handler and "getSelection().toString()" in handler
+    assert "t.closest(sbPeekStays)" in handler and ".sb-peek-close')?.click()" in handler
+
+
+def test_the_pick_holds_its_place_as_the_column_changes_width():
+    """Opening the peek on a wide window narrows the column, and Chrome's
+    scroll anchoring stood still while Quasar animated the page's padding: the
+    cards above re-wrapped taller, and the pick fell below the window
+    (2026-11-09). The `user` fixture runs no script, so this reads the rule:
+    a pick, and a page built with the peek open, start the hold; a width
+    change scrolls by the held card's drift, the pick's or, with the pick out
+    of the window, that of the card at its top; a scroll records that place only
+    at a width the observer has seen, since Chrome lays out the next frame's
+    width before that event. A browser checked the open and the close."""
+    import inspect
+
+    from symbion.gui import chrome
+    js = chrome._PEEK_JS
+    pick = js.split("function sbPeek(card)", 1)[1].split("\n}", 1)[0]
+    assert pick.index("sbHold()") < pick.index("emitEvent('sbPeek'")
+    watch = js.split("const sbColWatch = new ResizeObserver", 1)[1].split("\n});", 1)[0]
+    assert "sbColW && w !== sbColW" in watch
+    assert "scrollBy({top: c.getBoundingClientRect().top - sbHeldTop" in watch
+    held = js.split("function sbPickAt()", 1)[1].split("\n}", 1)[0]
+    assert "? pick : null" in held and "y < innerHeight / 2; y += 24" in held
+    assert "elementFromPoint(m.left + m.width / 2, y)?.closest('.sb-main .sb-note')" in held
+    assert re.search(r"addEventListener\('scroll', \(\) => \{\s*if \(document\.querySelector"
+                     r"\('\.sb-main'\)\?\.offsetWidth === sbColW\) sbPickAt\(\);", js)
+    assert "?.classList.add('sb-picked'); sbHold()" in inspect.getsource(chrome._peek_panel)
+
+
+def test_closing_the_peek_keeps_the_page_where_it_is():
+    """Closing the peek goes back in history, and Chrome restored the scroll
+    the entry under the peek saved as it opened: a reader who had scrolled
+    was thrown back, and below PEEK_WIDE, where Quasar locks the body, the
+    entry held 0. Quasar's own restore at the unlock was skipped, since the
+    #peek= entry had changed the URL (2026-11-09). A reload with the peek
+    open came back at the top: the locked page's scrollY read 0, and the
+    page built with the peek open locks before DOMContentLoaded (2026-11-10).
+    The `user` fixture runs no script, so this reads the rule; a browser
+    checked Esc and Back at 1100 and 1440 px, and a reload at 1100, 1440 and
+    390 px."""
+    from symbion.gui import chrome
+    js = chrome._PEEK_JS
+    push = js.split("function sbPeekHash(id)", 1)[1].split("\n}", 1)[0]
+    assert push.index("history.scrollRestoration = 'manual'") < push.index("history.pushState") \
+        < push.index("history.scrollRestoration = 'auto'")
+    back = js.split("addEventListener('popstate'", 1)[1].split("\n});", 1)[0]
+    assert back.index("return sbPeekFromHash()") < back.index("history.scrollRestoration = 'auto'")
+    lock = js.split("addEventListener('readystatechange'", 1)[1].split("\n});", 1)[0]
+    assert "document.readyState !== 'interactive'" in lock      # before the page mounts
+    assert "q-body--prevent-scroll" in lock and "-parseFloat(b.style.top)" in lock
+    assert "b.style.top = -(y = sbKeptY)" in lock and "scrollTo({top: y" in lock
+    unload = js.split("addEventListener('beforeunload'", 1)[1].split("\n});", 1)[0]
+    assert "-parseFloat(b.style.top)" in unload and "Math.round(y)" in unload
+
+
 def _finds(roots, selector) -> bool:
     """Whether `selector`, descendant parts each a `.class` or the tag
     `input`, finds an element under `roots`: a ui.input draws its <input>
@@ -1239,11 +1332,62 @@ async def test_the_peek_lives_in_the_url(user: User, ctx_with_notes, monkeypatch
     await _until(lambda: "sbPeekUnhash()" in sent)
 
 
+async def test_a_reload_with_the_peek_open_builds_the_page_with_it_drawn(user: User,
+                                                                         ctx_with_notes,
+                                                                         monkeypatch):
+    """The user, 2026-11-09: a write in the peek repainted the page three
+    times. The reload drew the page with the peek closed; the peek opened
+    once the socket connected, so it slid in and every card wrapped again
+    (measured: layout shifts of 0.28 and 0.22, about 340 ms after the page).
+    As a page unloads with the peek open, its script names the page's URL,
+    the entry and the page's scroll in a cookie (checked in a browser), and
+    the page that request builds has the peek open and drawn. A link to
+    another URL carries the cookie too, and opens none."""
+    from nicegui.outbox import Outbox
+    from symbion.gui import chrome
+    assert "beforeunload" in chrome._PEEK_JS and f"'{chrome.PEEK_COOKIE}='" in chrome._PEEK_JS
+    sent, emit = [], Outbox._emit
+
+    async def record(self, message):
+        if message[1] == "run_javascript" and "sbPeek" in message[2]["code"]:
+            sent.append(message[2]["code"])
+        await emit(self, message)
+
+    monkeypatch.setattr(Outbox, "_emit", record)
+    bug = next(n.id for n in store.heads(store.load(ctx_with_notes.store_dir)) if n.kind == "bug")
+    user.http_client.cookies.set(chrome.PEEK_COOKIE, quote(f"/notes?kind=bug {bug} 1351", safe=""))
+    closed = (await user.http_client.get("/notes")).text          # the link away
+    built = (await user.http_client.get("/notes?kind=bug")).text  # the reload
+    assert built.count("beta body") > closed.count("beta body") > 0     # the card, and the peek
+    await user.open("/notes")
+    assert "sb-peeking" not in user.client.layout.classes
+    await _until(lambda: "sbPeekFromHash()" in sent)
+    del sent[:]
+    await user.open("/notes?kind=bug")
+    assert "sb-peeking" in user.client.layout.classes
+    (peek,) = user.find(kind=ui.right_drawer).elements
+    assert peek.value                                   # open as built: it does not slide in
+    with user.scope(marker="peek"):
+        await user.should_see("beta body")
+    (page,) = user.find(marker="peek-page").elements
+    await _until(lambda: page.props.get("href") == f"/notes?id={bug}")
+    # the URL gets #peek= where a link to this URL dropped it; nothing draws the peek again
+    await _until(lambda: any(f'sbPeekHash("{bug}")' in code for code in sent))
+    assert "sbPeekFromHash()" not in sent, sent
+    await asyncio.sleep(0.1)                # a redraw on connect would land by now
+    with user.scope(marker="peek"):
+        in_peek = user.find(marker="note-row").elements
+    # ids rise as the page builds: the peek's card came before the page's
+    assert min(user.find(marker="note-row").elements, key=lambda e: e.id) in in_peek
+
+
 async def test_a_write_in_the_peek_reloads_the_page_and_peeks_again(user: User, ctx_with_notes,
                                                                     tmp_path):
     """The user, 2026-10-16: a question answered in the peek stayed on the
     board, since a write there redrew the peek alone. It reloads the page, as
-    a card's write does, and the page opens the peek on the entry again."""
+    a card's write does, and the page comes with the peek on the entry again:
+    the cookie here is what the page's script sets as it unloads."""
+    from symbion.gui import chrome
     nid = _q(ctx_with_notes, "Keep it?", options=["keep it", "drop it"])
     await user.open("/")
     assert _board_ids(user)["waiting on you"] == [nid]
@@ -1251,6 +1395,7 @@ async def test_a_write_in_the_peek_reloads_the_page_and_peeks_again(user: User, 
     _peek(user, nid)
     with user.scope(marker="peek"):
         await see(user, "answer-option")
+        user.http_client.cookies.set(chrome.PEEK_COOKIE, quote(f"/ {nid}", safe=""))
         part(user, "answer-option", content="keep it").click()
     await _until(lambda: user.client is not first)
     assert _head(tmp_path, nid).body.rstrip().endswith("keep it")
@@ -1259,6 +1404,35 @@ async def test_a_write_in_the_peek_reloads_the_page_and_peeks_again(user: User, 
     await _until(lambda: "sb-peeking" in user.client.layout.classes)
     with user.scope(marker="peek"):
         await user.should_see("keep it")
+
+
+async def test_the_peek_takes_no_mouse_pan(user: User, ctx_with_notes):
+    """The user, 2026-11-09: a page where nothing took a click or a hover.
+    Below PEEK_WIDE the peek lies over the page, and Quasar's drawer there
+    pans with the mouse: a press that moves a few px, on the dimmed page or
+    rightward on the peek's words, is a pan, whose last event Quasar handles
+    50 ms after the release. The release is also a click, which closes the
+    peek through the server, and on a serve of your own that answer comes
+    first: the pan's last event then returns before it clears its flag, and
+    the drawer's backdrop stays over the page, clear and never hidden. With
+    no pan the flag is never set, and a drag selects the peek's words."""
+    await user.open("/")
+    (peek,) = user.find(kind=ui.right_drawer).elements
+    assert {"no-swipe-open", "no-swipe-close", "no-swipe-backdrop"} <= {
+        k for k, v in peek.props.items() if v is True}, peek.props
+
+
+async def test_two_builds_of_a_page_share_no_card_id(user: User, ctx_with_notes):
+    """Chrome restores a reload's scroll by the DOM id of the element at the
+    window's top, and NiceGUI numbers a page's elements as it builds them.
+    After a write that moved a card or added a button, that id was another
+    card's, and the page jumped to it, with the old top
+    card's id on another entry (a browser, 2026-11-09). No two builds number
+    their elements alike, so Chrome finds no such id and restores the offset."""
+    await user.open("/notes")
+    first = {e.id for e in user.find(marker="note-row").elements}
+    await user.open("/notes")
+    assert first and not first & {e.id for e in user.find(marker="note-row").elements}
 
 
 async def test_the_summary_shows_the_last_wrap(user: User, ctx_with_notes):
@@ -1526,7 +1700,7 @@ async def test_an_archived_arc_says_so_and_is_reachable(user: User, repo, tmp_pa
     index listed archived arcs as labels, not links."""
     ctx = api.resolve(str(tmp_path))
     aid = api.create_arc(ctx, "Old", "", "mixed", author="ada").id
-    api.archive_arc(ctx, aid)
+    api.archive_arc(ctx, aid, author="user")
     build_page(ctx, author="ada")
     await user.open("/arcs")
     assert f"/arc?id={aid}" in _hrefs(user, "archived-arc")
@@ -1540,7 +1714,7 @@ async def test_an_arc_page_unarchives_and_describes_its_arc(user: User, repo, tm
     field with Save beside rename."""
     ctx = api.resolve(str(tmp_path))
     aid = api.create_arc(ctx, "Old", "first", "mixed", author="ada").id
-    api.archive_arc(ctx, aid)
+    api.archive_arc(ctx, aid, author="user")
     build_page(ctx, author="ada")
     await user.open(f"/arc?id={aid}")
     user.find(marker="arc-unarchive").click()
@@ -1892,6 +2066,16 @@ async def test_the_sidebar_opens_by_width_without_asking_the_browser(user: User,
     (side,) = user.find(ui.left_drawer).elements
     assert side.value is False
     assert side.props["show-if-above"] is True
+
+
+async def test_the_dimmed_page_takes_no_mouse_pan(user: User, ctx_with_notes):
+    """Below NARROW the sidebar lies over the page, and Quasar pans its
+    backdrop with the mouse in any direction: a click there that moved a few
+    px was a pan, which turns pointer events off on the body until the
+    release, so the click reached no backdrop and the sidebar stayed open."""
+    await user.open("/")
+    (side,) = user.find(ui.left_drawer).elements
+    assert side.props.get("no-swipe-backdrop") is True, side.props
 
 
 async def test_the_fonts_ship_in_the_package_and_load_from_the_gui(user: User, ctx_with_notes):
@@ -3299,7 +3483,9 @@ async def test_a_shared_stores_push_button_pulls_first(user: User, synced, tmp_p
     theirs = _publish(b, "from B")
     await user.open("/notes")
     user.find(marker="push-button").click()
-    await user.should_see("pulled 1 commit from origin/", retries=40)
+    # A pull then a push is about 3 s of git on a Windows VM: 4 s failed there
+    # in a full run (2026-11-10).
+    await user.should_see("pulled 1 commit from origin/", retries=150)
     await user.should_see("pushed 2 commits to origin", retries=40)
     assert theirs in (tmp_path / "notes.jsonl").read_text() and gitref.unpushed(tmp_path) == 0
 
@@ -3665,3 +3851,103 @@ async def test_the_map_names_the_other_sides_author(user: User, shared, tmp_path
     _both_sides_ask(shared, tmp_path)
     await user.open("/map?by=author")
     assert "sam (B)" in _map_nodes(user)
+
+
+async def test_no_undo_shows_once_a_commit_ended_the_level(user: User, repo, tmp_path, monkeypatch):
+    """The dimmed icon showed with nothing behind it: an agent wrote after the
+    person, then committed its own rows, so no level was left, and a click
+    said only "nothing to undo" (the user, 2026-11-08). It shows only while
+    another writer's write holds the level, which a click names."""
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "body": "mine"}, author="ada")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")    # an agent's write, then its commit
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "body": "theirs"}, author="claude")
+    api.commit(ctx, "c", author="claude")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    assert [r["body"] for r in store.pending_rows(tmp_path)] == ["mine"]
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    await user.should_see(marker="commit-button")
+    await user.should_not_see(marker="undo-gone")
+    await user.should_not_see(marker="undo-button")
+
+
+async def test_discard_lists_what_goes_then_throws_it_away(user: User, repo, tmp_path, monkeypatch):
+    """The user made an arc and tasks to test things, and only git could throw
+    them away (2026-11-08). Beside commit, Discard lists what it takes, and
+    its button throws exactly that away; another writer's row stays."""
+    ctx = api.resolve(str(tmp_path))
+    act = api.create_arc(ctx, "test", "d", "item", author="ada")
+    t = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "t"}, "body": "a test task",
+                      "arc_id": act.id}, author="ada")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                  "body": "theirs"}, author="claude")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    user.find(marker="discard-button").click()
+    await user.should_see(f"{t.id[-10:]} · removed · a test task")
+    await user.should_see("arc test · removed")
+    user.find(marker="discard-confirm").click()
+    await asyncio.sleep(0.2)
+    assert [r["body"] for r in store.pending_rows(tmp_path)] == ["theirs"]
+    assert [a.id for a in store.load_arcs(tmp_path)] == []
+    await user.open("/notes")
+    user.find(marker="undo-button").click()
+    await user.should_see(f"{t.id[-10:]} · comes back · a test task")
+
+
+async def test_discard_names_the_version_an_entry_goes_back_to(user: User, repo, tmp_path,
+                                                               monkeypatch):
+    """Your edit on an agent's uncommitted one goes, and the entry goes back
+    to the agent's version, not its committed one (audit, 2026-11-08)."""
+    ctx = api.resolve(str(tmp_path))
+    x = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "t"},
+                      "body": "as committed"}, author="ada")
+    api.commit(ctx, "c", everyone=True)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    api.supersede(ctx, x.id, author="claude", append_body="amended")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    api.supersede(ctx, x.id, author="ada", status="resolved")
+    build_page(ctx, author="ada")
+    await user.open("/notes")
+    user.find(marker="discard-button").click()
+    await user.should_see(f"{x.id[-10:]} · back to claude's version · as committed")
+
+
+async def test_the_demo_keeps_nothing_a_visitor_types(user: User, repo, tmp_path, monkeypatch):
+    """The composer's draft, an answer and an edit closed unsaved are kept in
+    the tab's storage, which lives 30 days: on the read-only demo one tab
+    held 2.7 million characters a script typed (audit, 2026-11-08)."""
+    from nicegui import app
+    from _cards import _emit
+    ctx = api.resolve(str(tmp_path))
+    api.add(ctx, {"kind": "question", "target": {"type": "project", "name": None},
+                  "body": "which way?", "options": ["a", "b"]}, author="claude")
+    api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                  "body": "a task"}, author="ada")
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    user.find(marker="new-note").click()
+    await asyncio.sleep(0.2)
+    user.find(marker="note-body").elements.pop().value = "a draft"
+    (d,) = [d for d in user.find(ui.dialog).elements
+            if any("sb-new-card" in c.classes for c in d.default_slot.children)]
+    d.close()
+    await asyncio.sleep(0.2)
+    (q,) = [c for c in cards(user) if any(p.get("k") == "answer" for p in c.props["card"]["main"])]
+    _emit(user, q, "typed", "an answer")
+    (t,) = [c for c in cards(user) if c.props["card"]["star"] is not None and c is not q]
+    _emit(user, t, "edit")
+    await user.should_see(marker="edit-append")
+    user.find(marker="edit-append").elements.pop().value = "an edit"
+    user.find(marker="edit-dialog").elements.pop().close()
+    await asyncio.sleep(0.2)
+    with user.client:
+        kept = {k: v for k, v in app.storage.tab.items()
+                if k in ("sb-draft", "sb-answers", "sb-edit-drafts") and v}
+    assert kept == {}

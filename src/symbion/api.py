@@ -632,8 +632,9 @@ def check_options(o) -> None:
         if len(v.strip().splitlines()) > 1:        # \n, \r, \x85, U+2028 and the rest
             raise ValueError(f"option {i} holds a line break: an answer is one line")
         if len(v.strip()) > 60:
-            raise ValueError(f"option {i} is over 60 characters: a button's label, "
-                             f"not a paragraph")
+            # The length, so a shortened retry is no guess (2026-11-08).
+            raise ValueError(f"option {i} is over 60 characters (it has {len(v.strip())}): "
+                             f"a button's label, not a paragraph")
     seen = {}
     for v in o:
         if (k := v.strip().casefold()) in seen:
@@ -1067,24 +1068,25 @@ def create_arc(ctx: Ctx, name: str, description: str, scope: str,
 # test can check (tests/test_gui_seam.py) rather than a habit reviewers must
 # remember. store.py has eleven writers; an allowlist can only be absolute if
 # every legitimate GUI write has a door here.
-def rename_arc(ctx: Ctx, arc_id: str, new_name: str) -> store.Arc:
-    return store.rename_arc(ctx.store_dir, arc_id, new_name)
+def rename_arc(ctx: Ctx, arc_id: str, new_name: str, *, author: str) -> store.Arc:
+    return store.rename_arc(ctx.store_dir, arc_id, new_name, author=author)
 
 
-def archive_arc(ctx: Ctx, arc_id: str) -> store.Arc:
-    return store.archive_arc(ctx.store_dir, arc_id)
+def archive_arc(ctx: Ctx, arc_id: str, *, author: str) -> store.Arc:
+    return store.archive_arc(ctx.store_dir, arc_id, author=author)
 
 
-def unarchive_arc(ctx: Ctx, arc_id: str) -> store.Arc:
-    return store.unarchive_arc(ctx.store_dir, arc_id)
+def unarchive_arc(ctx: Ctx, arc_id: str, *, author: str) -> store.Arc:
+    return store.unarchive_arc(ctx.store_dir, arc_id, author=author)
 
 
-def describe_arc(ctx: Ctx, arc_id: str, description: str) -> store.Arc:
-    return store.describe_arc(ctx.store_dir, arc_id, description)
+def describe_arc(ctx: Ctx, arc_id: str, description: str, *, author: str) -> store.Arc:
+    return store.describe_arc(ctx.store_dir, arc_id, description, author=author)
 
 
-def set_phases(ctx: Ctx, arc_id: str, names: list[str]) -> tuple[store.Arc, int]:
-    return store.set_phases(ctx.store_dir, arc_id, names)
+def set_phases(ctx: Ctx, arc_id: str, names: list[str], *,
+               author: str) -> tuple[store.Arc, int]:
+    return store.set_phases(ctx.store_dir, arc_id, names, author=author)
 
 
 def move_box(ctx: Ctx, entry_id: str, *, phase=None, before=None, after=None, top=False,
@@ -1164,6 +1166,14 @@ def commit(ctx: Ctx, message: str, *, author: str | None = None,
     return ok
 
 
+def discard(ctx: Ctx, *, author: str, apply: bool = True, expect=None) -> dict:
+    """Throw away what the GUI's commit would take for `author`, and the arcs
+    `author` made since the last commit (store.discard). `apply=False` says
+    what would go and writes nothing; `expect` refuses a plan that moved."""
+    return store.discard(ctx.store_dir, lambda r: r.get("author") == author, author,
+                         apply, expect)
+
+
 def push(ctx: Ctx, *, capture: bool = False,
          timeout: float | None = None) -> subprocess.CompletedProcess:
     """`git push` the store; a bare push needs an upstream, so it is set
@@ -1196,6 +1206,7 @@ class Pulled:
     upstream: str | None = None
     recovered: str | None = None                     # a killed pull's rows, put back
     old_head: str | None = None                      # HEAD before the merge, or a cut-off pull's
+    brought: list = field(default_factory=list)      # ids of the rows the merges since it added
 
     def notices(self, ctx: Ctx) -> list[str]:
         """The lines of a pull the person reads too, not only the agent, at a
@@ -1211,8 +1222,8 @@ class Pulled:
 
 def _merged_since(ctx: Ctx, p: Pulled) -> None:
     """What the merges since p.old_head brought that a pull says: a change
-    to symbion.toml, which names commands symbion runs, and a commit an
-    older symbion made (authored `git_name`)."""
+    to symbion.toml, which names commands symbion runs, a commit an older
+    symbion made (authored `git_name`), and the rows they added."""
     s, new = ctx.store_dir, f"{p.old_head}..HEAD"
     if config.CONFIG_FILE in gitref._git(s, "diff", "--no-renames", "--name-only", "-z",
                                          p.old_head, "HEAD").stdout.split("\0"):
@@ -1221,6 +1232,9 @@ def _merged_since(ctx: Ctx, p: Pulled) -> None:
         store.distrust(s, p.old_head)        # a pull a kill cut off before merge_upstream did
     p.old_client = ctx.cfg.git_name in gitref._git(
         s, "log", "--no-show-signature", "--format=%an", new).stdout.split("\n")
+    p.brought = [r["id"] for r in store.added_rows(gitref._git(
+        s, "diff", "-U0", "--no-renames", p.old_head, "HEAD", "--", store.NOTES_FILE).stdout)
+        if r.get("id")]
 
 
 def pull(ctx: Ctx, *, timeout: float = 10, until: float | None = None) -> Pulled:

@@ -455,7 +455,7 @@ def _due(n, status) -> tuple[str, str, str | None]:
     state = S.due_state(n.due) if status == "open" else None
     if state is None:
         return f"due {S.shown(n.due)}", "sb-chip", None
-    past, days = state
+    past, days, _ = state
     cls = "sb-chip-bad" if past else "sb-chip-notable" if days <= summ.DUE_DAYS else ""
     return summ.due_phrase(state), f"sb-chip {cls}".strip(), S.shown(n.due)
 
@@ -725,7 +725,7 @@ def viewer(title: str, fill, *, mono: bool = False, reveal=None, head=None,
     with ui.dialog() as dialog, \
             ui.card().classes("bg-panel sb-md-card" + (" sb-diff-card" if wide else "")) \
                 .props("autofocus tabindex=-1"):
-        with ui.row(wrap=False).classes("items-center w-full"):
+        with ui.row(wrap=False).classes("items-center w-full sb-md-head"):
             ui.label(title).classes("sb-subtitle" + (" sb-mono" if mono else ""))
             ui.space()
             if reveal:
@@ -1102,7 +1102,10 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     foot, hover, views = _card_foot(ctx, n, status, narrow, show_target, git_head, since)
     card = {"main": main, "foot": foot, "by": {"t": n.author, "h": narrow(author=n.author)},
             "age": {"t": ago(n.created_at), "tip": S.shown(n.created_at)},
-            "sid": {"t": short_id(n.id), "h": href(id=n.id), "tip": f"{n.id}\nopen this entry on its own page"},
+            # The age takes no focus: a keyboard reads its stamp in the id's tip
+            # (the GUI review, 2026-11-07), a screen reader in the age's own words.
+            "sid": {"t": short_id(n.id), "h": href(id=n.id),
+                    "tip": f"{n.id}\nwritten {S.shown(n.created_at)}\nopen this entry on its own page"},
             # On the right, after the text: on the left it pushed an open row's
             # text in past a closed row's (the user, 2026-10-01).
             "resolve": bool(resolvable), "star": has_pri if actions else None}
@@ -1145,6 +1148,9 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     def keep(text) -> None:
         # Words typed in an answer outlive the reload another card's write
         # brings (audit, 2026-10-28): kept per tab, put back once the page connects.
+        # The read-only demo keeps none: a tab's storage lives 30 days (audit, 2026-11-08).
+        if S.read_only():
+            return
         kept = app.storage.tab.setdefault(_ANSWERS, {})
         if isinstance(text, str) and text:
             kept[n.id] = text
@@ -1431,8 +1437,9 @@ def undo_dialog(ctx, author: str) -> None:
             ui.label(f"removes {short_id(i)} · {summ.clip(now[i].body or '', 80)}")
         for i in u["changed"]:
             was = S.note_from_dict(u["before"][i], kinds=ctx.kinds)
-            what = changes(now[i], was) if i in now else []
-            ui.label(f"{short_id(i)} · {', '.join(what) or 'its earlier version'} · "
+            # a row the write took away, as a discard does, comes back whole
+            what = (changes(now[i], was) or ["its earlier version"]) if i in now else ["comes back"]
+            ui.label(f"{short_id(i)} · {', '.join(what)} · "
                      f"{summ.clip(was.body or '', 80)}")
         for a in u["arcs"]:
             ui.label(f"arc {a} as it was before")
@@ -1453,6 +1460,57 @@ def undo_dialog(ctx, author: str) -> None:
         with ui.row():
             ui.button("undo", on_click=_do).props("unelevated color=primary") \
                 .mark("undo-confirm")
+            ui.button("cancel", on_click=dialog.close).props("flat")
+    dialog.open()
+
+
+def discard_dialog(ctx, author: str) -> None:
+    """Commit's other way: throw away what it would take for you, after a list
+    of what goes (api.discard). The user made an arc and tasks to test things,
+    and only git could throw them away (2026-11-08). A discard is a write, so
+    the undo arrow takes it back."""
+    if demo_says("throws away your uncommitted work"):
+        return
+    plan = api.discard(ctx, author=author, apply=False)
+    gone, back = S.entries(plan["removed"]), {r["id"] for r in plan["restored"]}
+    to = {r["id"]: r.get("author") for r in plan["returned"]}
+    kept = [*(f"{summ.clip(r.get('body') or '', 60)}: another writer's change builds on it"
+              for r in S.entries(plan["kept"])),
+            *(f"arc {i}: an entry that stays is filed in it" for i in plan["kept_arcs"]),
+            *(f"arc {i}: changed since the last commit by a writer symbion does not record"
+              for i in plan["arcs_changed"])]
+    n = len(gone) + len(plan["arcs"])
+    if not n:
+        ui.notify("nothing of yours to discard" + (f"; kept: {'; '.join(kept)}" if kept else ""),
+                  multi_line=True)
+        return
+    with ui.dialog().mark("discard-dialog") as dialog, ui.card().classes("bg-panel"):
+        ui.label("discard your uncommitted work").classes("sb-stat-label")
+        for r in gone:
+            what = ("back to its committed version" if r["id"] in back
+                    else f"back to {to[r['id']]}'s version" if r["id"] in to else "removed")
+            ui.label(f"{short_id(r['id'])} · {what} · {summ.clip(r.get('body') or '', 80)}")
+        for a in plan["arcs"]:
+            ui.label(f"arc {a.get('name') or a.get('id')} · removed")
+        for k in kept:
+            ui.label(f"kept · {k}").classes("sb-note-meta")
+
+        def _do():
+            dialog.close()
+            if demo_says("throws away your uncommitted work"):
+                return
+            try:
+                api.discard(ctx, author=author, expect=S.discard_ids(plan))
+            except S.DiscardChanged as e:
+                ui.notify(str(e), type="warning", multi_line=True)
+                return
+            say_after_reload(f"discarded {summ._count(n, 'item')}: the undo arrow brings "
+                             f"{'it' if n == 1 else 'them'} back")
+            ui.navigate.reload()
+
+        with ui.row():
+            ui.button(f"discard {n}", on_click=_do).props("unelevated color=negative") \
+                .mark("discard-confirm")
             ui.button("cancel", on_click=dialog.close).props("flat")
     dialog.open()
 
@@ -1525,7 +1583,11 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
         # Attaching an EXISTING note to an arc has no other route: seeding
         # mints new tasks, and target/provenance are the only two fields
         # supersede refuses. This is the one.
-        arc = ui.select(arc_options(ctx), value=n.arc_id or "",
+        arcs = arc_options(ctx)
+        if n.arc_id and n.arc_id not in arcs:   # archived or gone: a value no option holds raised
+            arcs[n.arc_id] = next((f"{a.name} (archived)" for a in S.load_arcs(ctx.store_dir)
+                                   if a.id == n.arc_id), n.arc_id)
+        arc = ui.select(arcs, value=n.arc_id or "",
                              label="arc").props("dense outlined") \
             .classes("w-full").mark("edit-arc")
         # The kinds the store lets this entry move to, and what the move
@@ -1594,7 +1656,7 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                 return
             forget()
             now = {k: f.value for k, f in texts.items() if f.value != opened[k]}
-            if now and not saved:
+            if now and not saved and not S.read_only():     # the demo keeps none, as above
                 d = dict(tab.get(_EDITS) or {})
                 d[n.id] = {"fields": now} | ({"base": base[0]} if "body" in now else {})
                 tab[_EDITS] = d
@@ -1667,14 +1729,17 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                 with own_write(ctx, author, [n.id]):
                     api.supersede(ctx, n.id, author=author, **text,
                                   tags=kept + [t for t in final if t not in n.tags and t not in kept],
-                                  arc_id=arc_v if arc_v != n.arc_id else tip.arc_id,
+                                  # unchanged, the tip's, unchecked: an entry in a gone arc saves
+                                  **({"arc_id": arc_v} if arc_v != n.arc_id else {}),
                                   **verdict, **closing, **dated, **on, **kinded)
             except (ValueError, catalog.CatalogError) as e:    # a closed catalog's refusal
                 ui.notify(str(e), type="negative")
                 return
             saved.append(True)
+            client = ui.context.client      # the close deletes the dialog, and this handler's slot
             dialog.close()
-            refresh()
+            with client:
+                refresh()
 
         for field in (body, more):
             field.on("keydown.meta.enter", _save)
@@ -1888,7 +1953,7 @@ def ref_key(o) -> str:
 
 def add_form(ctx, target_type, target_name, refresh, *, author: str,
              arc_id: str | None = None, another=None,
-             start_kind: str | None = None) -> SimpleNamespace:
+             start_kind: str | None = None, close=None) -> SimpleNamespace:
     """Writes go through api.add, which canonicalizes the target name, stamps
     provenance on checks, and takes author keyword-only. `arc_id` is the arc
     the form starts on. With `another`, Shift Enter adds the note and keeps
@@ -1896,8 +1961,9 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
     `refresh`. The target starts on (target_type, target_name), and the
     header changes it: the GUI put a note only on the project or on the page's
     object (the user, 2026-10-01). Not an arc: the arc select puts a note in one.
-    `start_kind` is the kind it starts as, when this store has it. It
-    returns a handle a dropped file drives (`chrome._dropped`)."""
+    `start_kind` is the kind it starts as, when this store has it. `close`
+    adds a close button. It returns a handle a dropped file drives
+    (`chrome._dropped`)."""
     kinds = ctx.kinds
     labels = list(kinds)
     with ui.row().classes("items-center gap-2 w-full"):
@@ -1906,6 +1972,9 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
         on_type, on_name = target_picker(ctx, target_type, target_name, commits=commits)
         refs = refs_field(ctx, commits=commits).classes("col").style("min-width:160px") \
             .mark("note-refs")
+        if close:                       # Esc alone stranded a visitor with no key to press (2026-11-09)
+            ui.button(icon="close", on_click=close) \
+                .props('flat dense round size=sm aria-label="close"').mark("composer-close")
         ui.space()
         ui.label("⌘/Ctrl Enter adds it" + (" · Shift Enter adds another" if another else "")
                  + " · Esc closes").classes("sb-subtitle")

@@ -12,6 +12,60 @@ import re
 import sys
 
 
+_HEREDOC = re.compile(r"<<-? *(['\"]?)(\w+)\1")
+
+
+def _scan(text, cut, outer="", q=""):
+    """(where the scan stopped, the quote state there), from state `q`. With
+    `cut`, it stops at the first `;`, `&`, `|`, `)` or newline outside quotes
+    and comments, or at `outer`, the quote around another shell's command. A
+    backslash outside single quotes escapes the next character; `>&` and `&>`
+    are redirections; a `$(` in the command holds its own `)`; a comment runs
+    to its line's end. Without `cut`, a heredoc's body is skipped: its state is
+    a newline and its delimiter."""
+    d, i = 0, 0
+    while i < len(text):
+        if q.startswith("\n"):
+            m = re.compile(r"(?m)^" + re.escape(q[1:]) + r"$").search(text, i)
+            if not m:
+                return len(text), q
+            i, q = m.end(), ""
+            continue
+        c = text[i]
+        if q == "#":
+            if c == "\n":
+                if cut:
+                    return i, q
+                q = ""
+        elif q != "'" and c == "\\":
+            i += 2
+            continue
+        elif q:
+            if c == q:
+                q = ""
+        elif cut and c == outer:
+            return i, q
+        elif not cut and text.startswith("<<", i) and (m := _HEREDOC.match(text, i)):
+            j = text.find("\n", m.end())
+            q = "\n" + m[2]
+            if j < 0:
+                return len(text), q
+            i = j + 1
+            continue
+        elif c in "'\"":
+            q = c
+        elif c == "#" and text[i - 1:i] in ("", " ", "\t", "(", "\n"):
+            q = "#"
+        elif c == "(" and text[i - 1:i] == "$":
+            d += 1
+        elif c == ")" and d:
+            d -= 1
+        elif cut and (c in ";|)\n" or c == "&" and ">" not in (text[i - 1:i], text[i + 1:i + 2])):
+            return i, q
+        i += 1
+    return i, q
+
+
 def nosymbion(cmd):
     """The command less its symbion commands and their heredoc bodies, as
     gotchas.sh cuts them: writing about a file is no use of it. A variable
@@ -19,20 +73,29 @@ def nosymbion(cmd):
     for name in re.findall(r"""(?:^|[\s;&|(])([A-Za-z_]\w*)=["']?(?:[^\s"';&|]*/)?symbion(?=[\s"';&|]|$)""",
                            cmd):
         cmd = re.sub(r"\$(?:%s|\{%s\}) " % (name, name), "symbion ", cmd)
-    out, rest = [], cmd
+    # A command runs to the end of its command, as gotchas.sh cuts it: `--body
+    # 'first; then src/x.py'` fired on src/x.py (audit, 2026-11-08). The quote
+    # state before the word, carried along so each character is read once:
+    # inside a comment the word is no command; inside a quoted string (`ssh h
+    # 'cd x; symbion …'`) it is another shell's, which that quote also ends,
+    # unless a `$(` opens it (`"$(symbion …)"`), which its `)` ends.
+    out, rest, state = [], cmd, ""
     while (m := re.search(r"symbion ", rest)):
         pre, rest = rest[:m.start()], rest[m.end() - 1:]
-        word = re.split(r'[;&|("\n]', pre)[-1].lstrip(" ")
-        if " " in word or (word and not word.endswith("/")):
+        state = _scan(pre, False, q=state)[1]
+        word = re.split(r'[;&|(\n]', pre)[-1].lstrip(" ")     # `grep "symbion x"`: no command
+        if " " in word or (word and not word.endswith("/")) or state == "#":
             out.append(pre + "symbion")
             continue
-        seg = re.split(r"[;&|\n]", rest, maxsplit=1)[0]
+        # in a heredoc's body, or opened by `$(`: a new context
+        outer = "" if state.startswith("\n") or re.search(r"\$\( *$", pre) else state
+        seg = rest[:_scan(rest, True, outer)[0]]
         rest = rest[len(seg):]
         if "<<" in seg:                             # its body runs to the delimiter's line
             d = seg.split("<<", 1)[1].lstrip("-").lstrip(" ")
             d = d[1:].split(d[0], 1)[0] if d[:1] in ("'", '"') else re.match(r"\w*", d).group()
-            i = rest.find("\n" + d)
-            rest = rest[i + 1 + len(d):] if i >= 0 else ""
+            i = rest.find("\n" + d) if d else -1     # a `<<<` has no delimiter line
+            rest = rest[i + 1 + len(d):] if i >= 0 else rest
         out.append(pre)
     return "".join(out) + rest
 
@@ -44,6 +107,24 @@ def strings(x):
     elif isinstance(x, (list, dict)):
         for v in x.values() if isinstance(x, dict) else x:
             yield from strings(v)
+
+
+def in_worktree(call, name, root):
+    """Whether the call names `name` in a linked worktree of the repo whose
+    root dir is `root`: the dir before it holds a `.git` file naming
+    `<root>/.git/worktrees/`, as gotchas.sh reads it. Tried on a line's or a
+    quote's whole tail (a path with a blank), then a word's (audit, 2026-11-08)."""
+    tail = r"(?![A-Za-z0-9._~/-])"
+    for dirs in (r"([^\n\"']*/)", r"([^\s\"']*/)"):
+        for m in re.finditer(dirs + re.escape(name) + tail, call):
+            try:
+                with open(m[1] + ".git", encoding="utf-8") as f:
+                    g = f.readline().rstrip("\n")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if g.startswith("gitdir: ") and f"/{root}/.git/worktrees/" in g:
+                return True
+    return False
 
 
 def main():
@@ -87,9 +168,10 @@ def main():
     gate = Path(mark + (".edit" if edit else ".seen"))
     seen = set(gate.read_text(encoding="utf-8").splitlines()) if gate.exists() else set()
     output = []
-    for row in listing.read_text(encoding="utf-8").splitlines():
+    # Not splitlines(): it splits at U+2028 too, which a row's text may hold.
+    for row in filter(None, listing.read_text(encoding="utf-8").split("\n")):
         ident, name, text, root = row.split("\t")[:4]    # a field added to the list is dropped here
-        if ident in seen:
+        if ident in seen or name not in call:   # the regex is quadratic on a run with no blank
             continue
         # Same root/path boundary rule as gotchas.sh: README.md must not
         # match docs/README.md or README.md.bak. Absolute paths keep the root.
@@ -98,7 +180,8 @@ def main():
             prefix += r"(?:[^\s\"']*/" + re.escape(root) + r"/)?"
         else:
             prefix += r"(?:[^\s\"']*/)?"
-        if not re.search(prefix + re.escape(name) + r"(?![A-Za-z0-9._~/-])", call):
+        if not re.search(prefix + re.escape(name) + r"(?![A-Za-z0-9._~/-])", call) \
+                and not (root and in_worktree(call, name, root)):
             continue
         output.append(json.loads('"' + text + '"'))
         seen.add(ident)

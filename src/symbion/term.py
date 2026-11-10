@@ -234,7 +234,7 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None,
     if since:
         post.append(f"  {summ._count(since, 'commit')} since", ink(META))
     if due is not None:
-        past, days = due
+        past, days, _ = due
         post.append("  " + summ.due_phrase(due), ink(ROLE[summ.due_role(past, days)]))
     if head is not None:
         post.append(f"  superseded → {head.id[-ID_TAIL:]}", FADED)
@@ -263,9 +263,10 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None,
     return line + target + post + where + after + tail, indent
 
 
-def _teaser(n, faded: bool, indent: int, width: int) -> Text | None:
+def _teaser(n, faded: bool, indent: int, width: int, grep=None) -> Text | None:
     """One line under the target: a check's result, else the body, else what
-    it checked."""
+    it checked. Under `list --grep`, when neither that line nor the one above
+    shows a match, the field that holds one, from shortly before the match."""
     if n.spec.verdict and n.result is not None:
         label, text = "result: ", n.result
     elif n.body:
@@ -273,12 +274,22 @@ def _teaser(n, faded: bool, indent: int, width: int) -> Text | None:
     elif n.checked is not None:
         label, text = "checked: ", n.checked
     else:
-        return None
+        label = text = None
     if width - indent < MIN_BODY:
         indent = 4
+    room = lambda: max(1, width - indent - len(label))
+    cut = summ.clip(text, room()) if text is not None else None
+    # ponytail: reads the head line's target, refs and tags as shown; a narrow
+    # terminal cuts them. Pass the printed head here if a hidden match there matters.
+    hit = summ.unseen(n, grep, [cut] if cut else []) if grep is not None else None
+    if hit:
+        label = "" if hit == "body" else f"{hit}: "
+        cut = summ.excerpt(summ.clipped_fields(n)[hit], room(), grep)
+    if cut is None:
+        return None
     line = Text(" " * indent)
     line.append(label, FADED if faded else META)
-    line.append(summ.clip(text, max(1, width - indent - len(label))), FADED if faded else BODY)
+    line.append(cut, FADED if faded else BODY)
     return line
 
 
@@ -314,15 +325,15 @@ def _details(n, head, state, written=None) -> list[Text]:
 
 def print_note(n, *, status, state, due, subject, head, full, gui=None, since=None,
                seams=(), links=(), written=None, successor=None, side=None, phase=None,
-               arc=None) -> None:
+               arc=None, last=None, grep=None) -> None:
     """`status` is the chain head's, `state` api.verdict_state's pair and
-    `due` store.due_state's pair for an open row, all computed by the caller
+    `due` store.due_state's triple for an open row, all computed by the caller
     the same way for the pipe line. `gui` is the URL of a serve on the row's
     store; `seams` summary.seams' for the body; `links` summary.links';
     `successor` gitref.successor's for a `rewritten` state; `side` the side
     of a row the reader's side did not raise, which the short view names
     (the full one names it with its author). `arc` is the Arc of a box, `phase`
-    its column on a phased one."""
+    its column on a phased one; `last` summary.at_seams'."""
     con = Console(highlight=False, markup=False, emoji=False, theme=MARKDOWN)
     width = None if full else con.width
     line, indent = _head(n, status=status, state=state, due=due, subject=subject,
@@ -330,14 +341,14 @@ def print_note(n, *, status, state, due, subject, head, full, gui=None, since=No
                          side=None if full else side, phase=phase, arc=arc)
     if not full:
         con.print(_fitted(line), no_wrap=True, overflow="ellipsis", crop=True)
-        teaser = _teaser(n, status == "resolved" or head is not None, indent, width)
+        teaser = _teaser(n, status == "resolved" or head is not None, indent, width, grep)
         if teaser is not None:
             con.print(_fitted(teaser), no_wrap=True, overflow="ellipsis", crop=True)
         return
     con.print(_fitted(line))
     for t in _details(n, head, state, written):
         con.print(_fitted(t))
-    for piece, seam in summ.at_seams(n.body, seams) if n.body else ():
+    for piece, seam in summ.at_seams(n.body, seams, last) if n.body else ():
         md = Markdown(piece, code_theme=_CodeTheme())
         # ponytail: sets rich's own attribute; test_a_tag_in_a_body_prints_on_a_tty
         # fails if rich renames it.

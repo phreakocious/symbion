@@ -101,6 +101,21 @@ def test_an_arc_field_one_side_changed_takes_that_side():
     assert (got["description"], got["name"], dropped) == ("mine", "theirs", [])
 
 
+def test_an_arc_both_sides_changed_keeps_the_later_writer_and_says_nothing():
+    """Each arc edit stamps its writer (`changed_by`, `changed_at`), so two
+    sides that change different fields of one arc both set them: the later
+    stamp is who changed it last, and no value of the arc's was dropped."""
+    base = [arc("a")]
+    early = dict(changed_by="ada", changed_at="2026-10-21T00:00:00+00:00")
+    late = dict(changed_by="bo", changed_at="2026-10-24T00:00:00+00:00")
+    for o, t, who in ((early, late, "bo"), (late, early, "bo")):
+        lines, dropped = merge.merge_arcs(base, [arc("a", description="mine", **o)],
+                                          [arc("a", name="theirs", **t)])
+        got = arcs_of(lines)["a"]
+        assert (got["description"], got["name"], got["changed_by"],
+                got["changed_at"], dropped) == ("mine", "theirs", who, late["changed_at"], [])
+
+
 def test_both_sides_archiving_keeps_the_earlier_archived_at():
     base = [arc("a")]
     early = arc("a", archived=True, archived_at="2026-10-21T00:00:00+00:00")
@@ -134,6 +149,36 @@ def test_an_arc_field_the_merge_does_not_know_is_compared_too():
     # A key only the other side holds comes across.
     lines, dropped = merge.merge_arcs(base, base, theirs)
     assert arcs_of(lines)["a"]["color"] == "blue" and dropped == []
+
+
+def test_a_placement_both_sides_changed_names_the_boxes_not_both_boards():
+    """A dropped placement was said as both whole boards in JSON: 60 boxes made
+    one pull line of 14,826 characters, past the session-start budget (audit,
+    2026-11-08). It names each box whose place it drops."""
+    def board(*doing):
+        return [{"id": f"box{i:02}", "phase": "doing" if i in doing else "todo"} for i in range(60)]
+    ph = ["todo", "doing"]
+    lines, dropped = merge.merge_arcs([arc("a", phases=ph, placement=board())],
+                                      [arc("a", phases=ph, placement=board(1))],
+                                      [arc("a", phases=ph, placement=board(2))])
+    assert arcs_of(lines)["a"]["placement"] == board(2)
+    assert dropped == ["arc a: kept the upstream's placement of its boxes, and dropped yours of "
+                       "1 box: box01 (doing)"]
+
+
+@pytest.mark.parametrize("puller", ["mover", "dropper"])
+def test_a_box_moved_into_a_phase_the_other_side_dropped_is_named(puller):
+    """One side drops a phase while the other moves a box into it: after the
+    pull the box read in the first phase, and no line said so (audit,
+    2026-11-08). Either side's pull says it; an arc already so says nothing."""
+    three, two = ["todo", "doing", "review"], ["todo", "doing"]
+    moved = arc("a", phases=three, placement=[{"id": "box1", "phase": "review"}])
+    ours, theirs = (moved, arc("a", phases=two))[::1 if puller == "mover" else -1]
+    lines, dropped = merge.merge_arcs([arc("a", phases=three)], [ours], [theirs])
+    assert arcs_of(lines)["a"]["phases"] == two
+    assert dropped == ["arc a: box box1 is placed in phase 'review', which one side dropped: "
+                       "it reads in 'todo'"]
+    assert merge.merge_arcs(lines, lines, lines)[1] == []
 
 
 def test_an_unreadable_arc_line_is_kept_unless_a_side_fixed_it():

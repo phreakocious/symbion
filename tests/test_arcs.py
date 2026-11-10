@@ -285,6 +285,15 @@ def test_a_stale_phase_lands_at_the_end_of_the_first_phase(tmp_path):
     assert _cols(tmp_path, act)["next"] == ["b", "a", "c"]
 
 
+def test_a_box_placed_twice_reads_its_first_placement(tmp_path):
+    """arc_board reads one {id: phase} map, not a scan per box (audit,
+    2026-11-08); the scan took the first match, and so does the map."""
+    act, ids = _board_arc(tmp_path, ["a", "b"], phases=("next", "doing"))
+    act = store._edit_arc(tmp_path, act.id, lambda a: store.replace(a, placement=(
+        {"id": ids["b"], "phase": "doing"}, {"id": ids["b"], "phase": "next"})))
+    assert _cols(tmp_path, act)["doing"] == ["b"]
+
+
 def test_a_placement_for_an_entry_off_the_arc_is_ignored(tmp_path):
     act, ids = _board_arc(tmp_path, ["a", "b"], phases=("next", "doing"))
     act = store._edit_arc(tmp_path, act.id, lambda a: store.replace(a, placement=(
@@ -505,3 +514,34 @@ def test_a_malformed_placement_reads_as_a_malformed_arc_line(tmp_path):
     store.rename_arc(tmp_path, other.id, "renamed")
     assert bad in store.arcs_path(tmp_path).read_text(encoding="utf-8")
     assert [a.id for a in store.load_arcs(tmp_path)] == [act.id, other.id]
+
+
+def test_an_arcs_last_change_is_its_newest_entry_version_or_move(repo, tmp_path, monkeypatch):
+    """Arcs sorts and labels arcs by it (2026-11-08): the latest version of any
+    entry filed in the arc, or a move on its board, else the arc's creation.
+    An entry in another arc does not count, and neither does a phase edit:
+    the arc's row is rewritten with no time."""
+    from datetime import datetime
+    from symbion import api
+    store.ensure_store(tmp_path)
+    ctx = api.resolve(str(tmp_path))
+    at = lambda hh: monkeypatch.setenv("SYMBION_NOW", f"2026-01-10T{hh}:00:00+00:00")
+    def last():
+        act = next(a for a in store.load_arcs(tmp_path) if a.id == "a")
+        stamp, by = store.arc_last_change(store.load(tmp_path), act)
+        return datetime.fromisoformat(stamp).hour, by
+    task = lambda arc, who, name: api.add(ctx, {"kind": "task", "target": {"type": "item", "name": name},
+                                          "arc_id": arc}, author=who)
+    at("01"); api.create_arc(ctx, "a", "d", "item", author="ada")
+    api.create_arc(ctx, "b", "d", "item", author="ada")
+    assert last() == (1, "ada")
+    at("02"); one, two = task("a", "bo", "x1"), task("a", "bo", "x2")
+    assert last() == (2, "bo")
+    at("03"); task("b", "cy", "x3")
+    assert last() == (2, "bo")
+    at("04"); api.supersede(ctx, one.id, author="cy", status="resolved")
+    assert last() == (4, "cy")
+    at("05"); api.set_phases(ctx, "a", ["todo", "doing"], author="user")
+    assert last() == (4, "cy")
+    at("06"); api.move_box(ctx, two.id, author="dee", phase="doing")
+    assert last() == (6, "dee")

@@ -42,7 +42,10 @@ def search_pattern(q: str):
     lookaheads to one attempt per row instead of one per character."""
     terms = [r"\s+".join(map(re.escape, (p or w).split()))
              for p, w in re.findall(r'"([^"]*)"?|([^\s"]+)', q)]
-    terms = [t for t in terms if t]
+    # One lookahead per word: 30,000 one-letter words held the event loop 5 s
+    # (audit, 2026-11-08).
+    # ponytail: words past the 32nd distinct one are not searched; a person types fewer
+    terms = list(dict.fromkeys(t for t in terms if t))[:32]
     if not terms:
         return None
     return re.compile(r"\A" + "".join(f"(?=[\\s\\S]*?{t})" for t in terms), re.I)

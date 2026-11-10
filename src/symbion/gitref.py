@@ -1212,7 +1212,15 @@ def committed(store_dir) -> str:
     if not paths:                                 # a wrap with nothing pending
         return "committed: the message alone, no entries or files"
     files = [p for p in paths if p != store.NOTES_FILE]
-    said = ([f"entries {rows}"] if rows else []) + ([f"arc changes {arcs}"] if arcs else [])
+    # `commit --all` took a lost line under a bare `committed` (2026-11-09).
+    lost = store.removed_rows(_git(store_dir, "show", "-U0", "--format=", "HEAD", "--",
+                                   store.NOTES_FILE, errors="replace", keep=False).stdout
+                              ) if store.NOTES_FILE in paths else []
+    said = ([f"entries {rows}"] if rows else []) + \
+        ([f"{len(lost)} line{'' if len(lost) == 1 else 's'} removed from {store.NOTES_FILE}: "
+          + ", ".join((r.get("id") or "?")[-10:] for r in lost[:3])
+          + (f", +{len(lost) - 3} more" if len(lost) > 3 else "")] if lost else []) + \
+        ([f"arc changes {arcs}"] if arcs else [])
     if files:
         more = f", +{len(files) - 3} more" if len(files) > 3 else ""
         said.append(f"{len(files)} file{'' if len(files) == 1 else 's'}: "

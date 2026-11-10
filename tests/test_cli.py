@@ -232,6 +232,50 @@ def test_list_grep_reads_measurements(tmp_path, capsys):
         assert [r["body"] for r in got] == ["deploy"], pattern
 
 
+def test_list_grep_prints_a_hidden_match_from_just_before_it(tmp_path, capsys):
+    """A search before a write printed entries with no sign of why each was
+    there: of the entries real patterns found, more than half matched only
+    past a clipped line, and the reader guessed, ran `show`, or took `--json`
+    through a script (2026-11-09). An entry whose match no printed line shows
+    prints the line that holds it from just before the match; any other
+    prints as it did."""
+    def add(*a):
+        assert run("add", *a, store_dir=tmp_path) == 0
+        return capsys.readouterr().out.strip()
+
+    def rows(*a):
+        """{id: the lines a piped listing prints below its first line}"""
+        assert run("list", *a, store_dir=tmp_path) == 0
+        out, cur = {}, None
+        for ln in capsys.readouterr().out.splitlines():
+            if m := re.search(r"(\d{8}-\d{6}-\d{6}-[0-9a-f]{3})$", ln):
+                cur = out.setdefault(m.group(1), [])
+            elif cur is not None and ln.startswith("    "):
+                cur.append(ln.strip())
+        return out
+    lead, pad = "The cache is cut at start. ", "filler words "
+    deep = add("note", "--target", "item:a", "--body",
+               lead + pad * 60 + "the needle sits here, far past the lead. " + "after " * 40)
+    near = add("note", "--target", "item:a", "--body", "A needle in the lead. " + pad * 60)
+    tagged = add("note", "--target", "item:a", "--tag", "needle", "--body",
+                 lead + pad * 61 + "a needle past the lead too")
+    check = add("check", "--target", "item:a", "--external", "--result", "it passed",
+                "--checked", "ran the suite " + "again " * 60 + "with the needle flag",
+                "--body", "A check of the cache.")
+    got = rows("--grep", "needle")
+    (line,) = got[deep]
+    assert line.startswith("…") and "the needle sits here" in line and lead.strip() not in line, line
+    assert len(line) <= summ.LIST_BODY_CHARS, len(line)
+    assert got[near] == [summ.clip("A needle in the lead. " + pad * 60, summ.LIST_BODY_CHARS)]
+    assert got[tagged][0].startswith(lead.strip()), "its tag on the first line shows the match"
+    checked, result, body = got[check]
+    assert checked.startswith("checked: …") and checked.endswith("with the needle flag"), checked
+    assert (result, body) == ("result: it passed", "A check of the cache."), got[check]
+    assert rows("--grep", "sits here,", "-F")[deep][0].startswith("…"), "a literal too"
+    assert rows()[deep][0].startswith(lead.strip()), "no --grep: the lead, as before"
+    assert rows("--grep", "needle", "--full")[deep][-1].startswith(lead.strip()), "--full: whole"
+
+
 def test_supersede_target_moves_one_entry(tmp_path, capsys):
     """`--target` moves one entry and keeps its id; `rename` moves every
     entry on a name. Beside `--add-tag`, it is not dropped by the tag-only
@@ -438,7 +482,8 @@ def test_add_names_the_open_heads_already_on_its_target(tmp_path, capsys):
 def test_the_open_rows_note_lists_a_target_once_a_session(tmp_path, capsys, monkeypatch):
     """On a busy file every add listed the same unrelated rows (2026-10-15).
     In an agent session a target's rows are listed
-    at its first add there, and a later add prints the count. Session start
+    at its first add there, and a later add says nothing of them: no session
+    acted on the count-only line it printed until 2026-11-09. Session start
     lists them again: a compacted session has lost them."""
     bodies = (f"b{i}" for i in range(20))
 
@@ -451,9 +496,8 @@ def test_the_open_rows_note_lists_a_target_once_a_session(tmp_path, capsys, monk
         assert "if this entry settles or revises one" in add("item:x")[1], "no session: each time"
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
     assert f"\n  {first}  b0" in add("item:x")[1]
-    err = add("item:x")[1]
-    assert "note: 4 open on item:x, listed at this session's first add there " \
-           "(context --target item:x)\n" in err and first not in err, err
+    out, err = add("item:x")
+    assert out and "open on item:x" not in err and first not in err, err
     add("item:y")
     assert "if this entry settles" in add("item:y")[1], "each target its own list"
     monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"session_id": "s1"}')))
@@ -505,8 +549,8 @@ def test_the_clip_note_comes_once_a_session_then_for_a_dated_opening(tmp_path, c
 def test_a_compaction_lets_the_once_a_session_notes_speak_again(
         tmp_path, capsys, monkeypatch, session_env):
     """A note a session hears once leaves its context at a compaction, and
-    "listed at this session's first add there" then points at text the agent
-    no longer holds (the user, 2026-10-30). Session start clears those marks
+    the agent no longer holds a target's listed entries (the user,
+    2026-10-30). Session start clears those marks
     under the session id used by either harness's CLI commands."""
     monkeypatch.setenv(session_env, "s1")
     n = iter(range(9))
@@ -519,14 +563,14 @@ def test_a_compaction_lets_the_once_a_session_notes_speak_again(
         return err("add", "task", "--target", "item:a", "--body",
                    f"Cut cache {next(n)}. " + "context " * 20)
 
-    clip, listed, short = ("first 100 chars", "if this entry settles or revises one",
-                           "listed at this session's first add there")
+    clip, listed, opening = ("first 100 chars", "if this entry settles or revises one",
+                             "open on item:a")
     alt = "read `list --open` as `list --status open`"
     long = "an entry, or an addition to one, is about 500"
     assert clip in add()
     said = add()
     assert clip not in said and listed in said, said
-    assert short in add()
+    assert opening not in add()
     assert alt in err("list", "--open") and alt not in err("list", "--open")
     assert long in err("add", "note", "--target", "item:b", "--body", "x" * 600)
     assert long not in err("add", "note", "--target", "item:b", "--body", "y" * 600), \
@@ -536,9 +580,17 @@ def test_a_compaction_lets_the_once_a_session_notes_speak_again(
     run("summary", "--hook", store_dir=tmp_path)
     capsys.readouterr()
     said = add()
-    assert clip in said and listed in said and short not in said, said
+    assert clip in said and listed in said, said
     assert alt in err("list", "--open")
     assert long in err("add", "note", "--target", "item:b", "--body", "z" * 600)
+
+
+def test_session_start_clears_every_note_a_session_hears_once():
+    """A heard-once mark left off the list session start clears stays silent
+    after a compaction, when the agent no longer holds the note."""
+    src = Path(cli.__file__).read_text(encoding="utf-8")
+    used = set(re.findall(r'(?:_first_in_session|_session_mark)\("(\w+)"', src))
+    assert used and used <= set(cli._HEARD_ONCE), used - set(cli._HEARD_ONCE)
 
 
 def test_a_write_whose_text_runs_past_500_chars_says_so(tmp_path, capsys, monkeypatch):
@@ -1635,6 +1687,32 @@ def test_list_on_a_tty_lines_up_columns_inside_the_width(repo, tmp_path, capsys,
     assert body.lstrip().startswith("fails about one run in twenty"), body
     assert len(body) - len(body.lstrip()) == head.index("item:"), (head, body)
     assert "\x1b[38;2;" in raw, "the entries carry colour"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="rich reads a piped Windows console as "
+                    "legacy, which takes no ANSI codes, so term prints no colour")
+def test_list_grep_on_a_tty_shows_a_hidden_match_under_the_target(repo, tmp_path, capsys, tty):
+    """A person's listing has one line under the target, and a match past it
+    read as a false hit there too. Under `--grep` that line is the field
+    that holds the match, from just before it, inside the width."""
+    store_dir = tmp_path / "store"
+    tty()
+    lead = "The cache is cut at start. "
+    nid = _add(store_dir, capsys, "note", "--target", "item:a", "--body",
+               lead + "filler words " * 40 + "the needle sits here. " + "after " * 30)
+    cid = _add(store_dir, capsys, "check", "--target", "item:b", "--external",
+               "--result", "it passed", "--checked", "ran " + "again " * 40 + "with the needle flag")
+
+    def under(i, *a):
+        run("list", *a, store_dir=store_dir)
+        lines = _screen(capsys.readouterr().out)
+        assert max(len(ln) for ln in lines) <= 80, lines
+        return lines[next(k for k, ln in enumerate(lines) if ln.startswith(i[-10:])) + 1].strip()
+    assert under(nid).startswith(lead.strip())
+    got = under(nid, "--grep", "needle")
+    assert got.startswith("…") and "the needle sits here" in got, got
+    assert under(cid, "--grep", "needle").startswith("checked: …"), "not the result, which has none"
+    assert under(cid, "--grep", "passed") == "result: it passed", "a match that shows: as before"
 
 
 def test_a_long_tty_row_gives_up_refs_then_tags_before_its_target(repo, tmp_path, capsys, tty):
@@ -3137,6 +3215,18 @@ def test_arc_list_aligns_the_progress_column_on_the_longest_id(tmp_path, capsys)
     assert len({ln.index(" 0/0") for ln in lines}) == 1
 
 
+def test_a_verb_no_branch_takes_is_refused_by_name(tmp_path, capsys):
+    """A parsed verb with no handler printed nothing and exited 0 (dogfood,
+    2026-11-09)."""
+    store.ensure_store(tmp_path)
+    ctx = api.resolve(str(tmp_path))
+    assert cli._dispatch(argparse.Namespace(cmd="ghost"), ctx) == 2
+    assert cli._dispatch_arc(argparse.Namespace(cmd="arc", acmd="ghost"), ctx) == 2
+    err = capsys.readouterr().err.splitlines()
+    assert err == [f"symbion {v}: no handler ran, so nothing was done; this is a bug in symbion"
+                   for v in ("ghost", "arc ghost")], err
+
+
 def test_dir_is_accepted_after_the_subcommand(tmp_store, tmp_path):
     """_extract_dir's whole reason to exist: a leading-only global --dir
     would need docs warning agents never to put it later. Every
@@ -3146,6 +3236,11 @@ def test_dir_is_accepted_after_the_subcommand(tmp_store, tmp_path):
     assert cli.main(["add", "--kind", "note", "--type", "project",
                      "--body", "b2", f"--dir={tmp_path}"]) == 0
     assert len(store.load(tmp_path)) == 2
+    # A flag's text that starts `--dir=` is the text (audit, 2026-11-08).
+    text = "--dir=~/x is not expanded by a shell"
+    assert cli.main(["add", "--kind", "note", "--type", "project",
+                     "--body", text, "--dir", str(tmp_path)]) == 0
+    assert text in {n.body for n in store.load(tmp_path)}
 
 
 def test_supersede_ref_replaces_the_inherited_refs_and_checks_the_type(tmp_path, capsys):
@@ -3738,6 +3833,14 @@ def test_replace_swaps_a_span_that_occurs_once_and_keeps_the_rest(repo, tmp_path
     store.supersede(tmp_path, _earlier(tmp_path, capsys, tid), author="x",
                     replace_body=[("then b", "then B")])
     assert store.heads(store.load(tmp_path))[0].body == "see `a.py:120`\n\nthen B, then d"
+    # The new text's cites are checked as a body's are (audit #32, 2026-11-08).
+    capsys.readouterr()
+    assert run("supersede", tid, "--replace", "then d", "then 20990101-000000-000000-abc",
+               store_dir=tmp_path) == 0
+    assert "note: no entry in this store matches 20990101-000000-000000-abc" in \
+        capsys.readouterr().err
+    assert run("supersede", tid, "--replace", "then 20990101-000000-000000-abc", "then d",
+               store_dir=tmp_path) == 0
 
 
 def test_replace_keeps_a_pre_registrations_registered_text(repo, tmp_path, capsys):
@@ -3799,6 +3902,27 @@ def test_a_pre_registrations_uncommitted_amendment_takes_a_rewrite(repo, tmp_pat
         assert store.chain_tip(store.load(tmp_path), rid).body == body
 
 
+def test_a_fresh_pre_registrations_checked_refusal_names_undo(repo, tmp_path, capsys):
+    """The add's note sent an agent to `supersede --checked`, which refused and
+    named no way back (dogfood, 2026-11-08). Uncommitted, the refusal names
+    undo, and undo works; committed, undo cannot reach it and goes unnamed."""
+    run("add", "prediction", "--target", "item:p", "--body", "x rises", store_dir=tmp_path)
+    pid = capsys.readouterr().out.strip()
+    assert run("supersede", pid, "--checked", "run x", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert (f"None of it is committed: `symbion undo {pid[-10:]}` takes back its last write "
+            f"if no other write or commit came since, then add it anew") in err, err
+    assert run("undo", pid[-10:], store_dir=tmp_path) == 0
+    capsys.readouterr()
+    run("add", "prediction", "--target", "item:q", "--body", "y rises", store_dir=tmp_path)
+    qid = capsys.readouterr().out.strip()
+    run("commit", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("supersede", qid, "--checked", "run y", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert "stays as written" in err and "symbion undo" not in err, err
+
+
 def test_an_add_with_no_body_names_undo(repo, tmp_path, capsys):
     """A stray `add bug` with no --body wrote an empty entry, and the next
     write put it out of undo's reach (dogfood, 2026-10-31). The add says so.
@@ -3806,7 +3930,8 @@ def test_an_add_with_no_body_names_undo(repo, tmp_path, capsys):
     run("add", "bug", "--target", "project", store_dir=tmp_path)
     out, err = capsys.readouterr()
     tail = out.strip()[-10:]
-    assert re.search(rf"note: no body on {tail}: `symbion --dir \S+ undo {tail}` takes", err), err
+    assert re.search(rf"note: no body on {tail}: `symbion --dir \S+ undo {tail}` takes this "
+                     rf"write back until another write or a commit", err), err
     assert run("undo", tail, store_dir=tmp_path) == 0
     run("add", "check", "--target", "project", "--checked", "ran x", "--result", "ok",
         store_dir=tmp_path)
@@ -3835,11 +3960,15 @@ def test_add_kind_choices_come_from_the_table_and_the_error_names_it(tmp_path, c
     rc = run("add", "--kind", "bug", "--type", "project", store_dir=tmp_path)
     err = capsys.readouterr().err
     assert rc == 2 and "invalid kind 'bug'" in err and "anomaly" in err and "[kinds]" in err
+    # The skill names the defaults: the store's kind with the same bits comes
+    # before the table edit (dogfood, 2026-11-09).
+    assert "'bug' is a default kind, with the bits of this store's anomaly: use that, or" in err
     # A default the table lacks names the line to paste: an older table has
     # no `prediction`.
     assert run("add", "prediction", "--target", "item:p", store_dir=tmp_path) == 2
     err = capsys.readouterr().err
     assert "add under [kinds]" in err and "prediction = { status = true, verdict = true" in err
+    assert "'prediction' is a default kind: to use it here" in err, err
 
 
 _VOCAB = '[kinds]\nanomaly = { status = true }\nnote = {}\n[catalogs]\nfile = "echo a.py"\n'
@@ -3964,7 +4093,7 @@ def test_show_is_list_id(tmp_path, capsys):
     assert capsys.readouterr().out == want
     assert run("show", "-h", store_dir=tmp_path) == 0, "was `list --id -h`: an error"
     assert capsys.readouterr().out.startswith(
-        "usage: symbion show [-h] [--json] [--all] [--full] id [id ...]")
+        "usage: symbion show [-h] [--json] [--all] [--full] [--last N] id [id ...]")
 
 
 def test_show_takes_several_ids(tmp_path, capsys):
@@ -4016,6 +4145,46 @@ def test_show_names_who_added_each_amendment_and_when(tmp_path, capsys, tty):
     assert run("show", nid, store_dir=tmp_path) == 0
     lines = [stamp.sub(", T --", ln.strip()) for ln in _screen(capsys.readouterr().out)]
     assert [ln for ln in lines if ln in want] == want, lines
+
+
+def test_show_last_keeps_the_first_text_and_the_newest_amendments(tmp_path, capsys, tty):
+    """`show` on an entry with many amendments buried its claim and its
+    latest state (dogfood, 2026-11-04). `--last N` keeps the first text and the
+    newest N amendments, and the line between them counts the rest."""
+    store.ensure_store(tmp_path)
+    run("add", "--kind", "note", "--type", "project", "--author", "claude",
+        "--body", "the claim", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    for who, text in (("ada", "first finding"), ("claude", "second finding"),
+                      ("human", "third finding")):
+        run("supersede", nid, "--append", "--body", text, "--author", who, store_dir=tmp_path)
+        nid = capsys.readouterr().out.strip()
+    stamp = re.compile(r", \d{4}-\d\d-\d\d \S+ --$")
+
+    def body(*argv):
+        assert run("show", *argv, store_dir=tmp_path) == 0
+        return [stamp.sub(", T --", ln.strip()) for ln in capsys.readouterr().out.splitlines()[2:]]
+    hid = "amendments not shown (show without --last prints all)"
+    assert body(nid, "--last", "1") == body("--last", "1", nid) == body(nid, "--last=1") == [
+        "the claim", f"-- 2 {hid}; human added below, T --", "third finding"]
+    assert body(nid, "--last", "0") == ["the claim", f"-- 3 {hid} --"]
+    assert body(nid, "--last", "3") == body(nid, "--last", "9") == body(nid)
+    tty()
+    assert run("show", nid, "--last", "1", store_dir=tmp_path) == 0
+    screen = " ".join(ln.strip() for ln in _screen(capsys.readouterr().out))
+    assert "the claim" in screen and "third finding" in screen and "second finding" not in screen
+    assert f"2 {hid}" in screen, screen
+
+
+def test_last_without_a_full_body_is_refused(tmp_path, capsys):
+    """A cut no output can show must not pass for one that ran."""
+    store.ensure_store(tmp_path)
+    run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    for argv in (["list", "--last", "1"], ["show", nid, "--json", "--last", "1"]):
+        assert run(*argv, store_dir=tmp_path) == 2, argv
+        assert "--last" in capsys.readouterr().err, argv
+    assert run("show", nid, "--last", "-1", store_dir=tmp_path) == 2
 
 
 def test_a_unique_id_tail_stands_for_the_id_on_every_verb_that_takes_one(tmp_store, tmp_path, capsys):
@@ -4573,6 +4742,25 @@ def test_a_ref_to_an_item_no_row_names_says_so(tmp_path, capsys):
     assert "names item:typo2" in err and "item:typo," not in err, err
 
 
+def test_a_big_batch_of_new_items_is_one_note_and_no_guesses(tmp_path, capsys, monkeypatch):
+    """500 new item names took 8 s of typo guesses after the write, and 500
+    note lines (audit, 2026-11-08). Past the cap: one line, and no guess."""
+    run("add", "task", "--target", "item:stored", store_dir=tmp_path)
+    called = []
+    monkeypatch.setattr(cli.catalog, "did_you_mean", lambda *a: called.append(a) or "")
+    n = cli._GUESS_CAP + 1
+    src = tmp_path.with_name(tmp_path.name + "-batch.jsonl")
+    src.write_text("".join(json.dumps({"kind": "note", "target": "project", "body": f"b{i}",
+                                       "refs": [f"item:new {i}"]}) + "\n" for i in range(n)))
+    capsys.readouterr()
+    assert run("add", "--from-json", str(src), store_dir=tmp_path) == 0
+    notes = [ln for ln in capsys.readouterr().err.splitlines() if "new item" in ln]
+    assert notes == [f"note: {n} new item names, more than {cli._GUESS_CAP}, so none was "
+                     f"checked against the stored names for a typo; these refs start new "
+                     f"items: item:new 0, item:new 1, item:new 2, +{n - 3} more"], notes
+    assert called == []
+
+
 def test_a_new_item_a_letter_off_a_stored_one_says_did_you_mean(tmp_path, capsys):
     """`add --target item:NAME` one letter off a stored item forked its thread
     at exit 0 (2026-10-13, 2026-10-15): `item` has no catalog to miss. A new
@@ -4643,10 +4831,30 @@ def test_a_verdict_row_with_no_checked_says_so(tmp_path, capsys):
         assert run("add", kind, "--target", "project", "--body", "x", store_dir=tmp_path) == 0
         err = capsys.readouterr().err
         assert f"note: no --checked on this {kind} entry" in err, err
+        # supersede refuses --checked on a pre-registration (dogfood, 2026-11-08)
+        assert ("set at its add, so `undo` this write" in err) == (kind == "prediction"), err
     for argv in (["add", "check", "--target", "project", "--checked", "pytest", "--result", "ok"],
                  ["add", "task", "--target", "project", "--body", "x"]):
         assert run(*argv, store_dir=tmp_path) == 0
         assert "no --checked" not in capsys.readouterr().err, argv
+
+
+def test_a_pre_registration_says_resolve_closes_it_whole(tmp_path, capsys):
+    """Scoring one claim of a prediction closed a second one judged days later,
+    which was then registered again (dogfood, 2026-11-04). The add says so
+    while undo still reaches it; no other kind hears it."""
+    assert run("add", "prediction", "--target", "project", "--body", "two claims",
+               store_dir=tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert "note: resolve --result closes a prediction whole" in err, err
+    # A commit ends the undo too: "while it is the store's last" led an agent
+    # to try one after a commit (dogfood, 2026-11-09).
+    assert f"undo {out.strip()[-10:]}` takes this write back until another write or a commit" \
+        in err, err
+    for kind in ("check", "task"):
+        assert run("add", kind, "--target", "project", "--body", f"one {kind}",
+                   store_dir=tmp_path) == 0
+        assert "closes a" not in capsys.readouterr().err, kind
 
 
 def test_a_parked_row_with_no_due_says_its_writer_will_not_see_it(tmp_path, capsys, monkeypatch):
@@ -5877,6 +6085,14 @@ def test_list_since_wrap_opens_at_this_sessions_start_not_a_siblings_wrap(tmp_pa
     assert run("list", "--since", "wrap", store_dir=tmp_path) == 0
     out = capsys.readouterr().out
     assert "s1 after its own wrap" in out and "after its compaction" not in out, out
+    # A wrap in a second store keeps this store's mark (audit, 2026-11-08).
+    other = tmp_path.with_name(tmp_path.name + "-other")
+    store.ensure_store(other)
+    at(9), run("commit", "--wrap", "-m", "elsewhere\n\nscratch", store_dir=other)
+    capsys.readouterr()
+    assert run("list", "--since", "wrap", store_dir=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "s1 after its own wrap" in out and "after its compaction" not in out, out
 
 
 def test_an_arc_line_symbion_cannot_read_survives_every_arc_write(tmp_path, capsys):
@@ -6452,6 +6668,42 @@ def test_commit_names_the_files_it_takes_beside_the_rows(tmp_path, capsys, monke
             in capsys.readouterr().out)
 
 
+def test_commit_names_a_committed_line_gone_from_notes_jsonl(tmp_path, capsys, monkeypatch):
+    """A line HEAD holds, gone from disk with no copy an edit kept: the dry
+    run read `nothing to commit` over ` M notes.jsonl`, a plain
+    commit left it unsaid, and `commit --all` took it under a bare
+    `committed` (2026-11-02)."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")   # every row is this session's
+    run("add", "note", "--target", "project", "--body", "kept", store_dir=tmp_path)
+    run("add", "note", "--target", "project", "--body", "lost", store_dir=tmp_path)
+    kept, lost = capsys.readouterr().out.split()
+    run("commit", store_dir=tmp_path)
+    # An edit of a committed row moves its line aside under a new id: no loss.
+    run("supersede", kept, "--body", "kept, edited", store_dir=tmp_path)
+    notes = tmp_path / "notes.jsonl"
+    notes.write_text("".join(ln + "\n" for ln in notes.read_text().splitlines() if lost not in ln))
+    capsys.readouterr()
+    assert run("commit", "--dry-run", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out == (
+        f"would commit: entries user 1\n  {kept[-10:]}  user  note  kept, edited\n"
+        "would leave, as no entry keeps a copy: 1 line removed from notes.jsonl\n"
+        f"  removed  {lost[-10:]}  user  note  lost\n")
+    assert run("commit", "--all", "--dry-run", store_dir=tmp_path) == 0
+    assert capsys.readouterr().out == (
+        "would commit: entries user 1; 1 line removed from notes.jsonl\n"
+        f"  {kept[-10:]}  user  note  kept, edited\n  removed  {lost[-10:]}  user  note  lost\n")
+    assert run("commit", store_dir=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("committed: entries user 1\n"), out
+    assert re.search(r"left uncommitted, as no entry keeps a copy: 1 line removed from "
+                     rf"notes\.jsonl: {lost[-10:]}; symbion --dir \S+ commit --all takes the "
+                     r"removal\n", out), out
+    assert run("commit", "--all", store_dir=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"committed: 1 line removed from notes.jsonl: {lost[-10:]}\n"), out
+    assert "left uncommitted" not in out, out
+
+
 def test_commit_names_arcs_jsonl_as_its_dry_run_does(tmp_path, capsys, monkeypatch):
     """The dry run listed `arcs.jsonl` and the commit left it out, so the arc
     a session created went unnamed in the line it read after (2026-10-15)."""
@@ -6659,29 +6911,57 @@ def test_every_line_that_names_other_sessions_entries_says_how_old_the_newest_is
                      capsys.readouterr().err)
 
 
-def test_a_commit_names_each_arc_change_by_its_writer(tmp_path, capsys):
+def test_a_commit_names_each_arc_change_by_its_writer(tmp_path, capsys, monkeypatch):
     """A commit took the user's arc move from the GUI under a `Rows:` trailer
     of its own rows, and named only the file (2026-11-06). An `Arcs:` trailer
-    names each change: a new arc by its author, a move by its mover, and a
-    change that records no writer (phases, rename, archive) as unknown. A
-    box a later move shifts keeps its mover, and counts once."""
+    names each change: a new arc by its author, a move by its mover, an
+    edit of the arc by its writer, and a change with no writer (a hand edit)
+    as unknown. A box a later move shifts keeps its mover, and counts once.
+    `arc phases` counted unknown until each arc edit stamped its writer
+    (dogfood, 2026-11-06). The clock ticks a microsecond a call, so every
+    write lands in one second: an edit a second-resolution stamp could not
+    tell from the committed one read as unknown."""
+    from datetime import datetime, timedelta, timezone
+    tick = iter(range(10**6))
+    monkeypatch.setattr(store, "_utcnow", lambda: datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
+                        + timedelta(microseconds=next(tick)))
     aid, (a, b) = _phased_arc(tmp_path, capsys, "one", "two")
+    run("arc", "create", "--name", "third", store_dir=tmp_path)
+    third = capsys.readouterr().out.strip()
     _commit(tmp_path, capsys)
     run("arc", "move", b, "--phase", "later", "--author", "human", store_dir=tmp_path)
     run("arc", "move", a, "--phase", "later", "--after", b, store_dir=tmp_path)
-    run("arc", "phases", aid, "next", "later", "soon", store_dir=tmp_path)
+    run("arc", "phases", aid, "next", "later", "soon", "--author", "bo", store_dir=tmp_path)
     run("arc", "create", "--name", "second", "--author", "ada", store_dir=tmp_path)
     run("add", "note", "--target", "project", "--body", "a row", store_dir=tmp_path)
+    path = tmp_path / "arcs.jsonl"
+    path.write_text("".join(ln.replace('"description": ""', '"description": "by hand"')
+                            if f'"id": "{third}"' in ln else ln
+                            for ln in path.read_text().splitlines(keepends=True)))
     capsys.readouterr()
     assert run("commit", "--dry-run", store_dir=tmp_path) == 0
-    said = "arc changes ada 1, human 1, unknown 1, user 1"
+    said = "arc changes ada 1, bo 1, human 1, unknown 1, user 1"
     assert capsys.readouterr().out.startswith(f"would commit: entries user 1; {said}; 1 file\n")
     assert run("commit", store_dir=tmp_path) == 0
     assert capsys.readouterr().out.startswith(
         f"committed: entries user 1; {said}; 1 file: arcs.jsonl\n")
     msg = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%B"],
                          capture_output=True, text=True).stdout
-    assert msg.strip() == "update entries\n\nRows: user 1\nArcs: ada 1, human 1, unknown 1, user 1"
+    assert msg.strip() == ("update entries\n\nRows: user 1\n"
+                           "Arcs: ada 1, bo 1, human 1, unknown 1, user 1")
+    for verb in (["rename", aid, "renamed"], ["describe", aid, "a board"],
+                 ["archive", aid], ["unarchive", aid]):
+        assert run("arc", *verb, "--author", "cy", store_dir=tmp_path) == 0
+        capsys.readouterr()
+        assert run("commit", "--dry-run", store_dir=tmp_path) == 0
+        assert "arc changes cy 1;" in capsys.readouterr().out, verb
+        _commit(tmp_path, capsys)
+    # The same mover moving the same box again, in the second of its last move.
+    assert run("arc", "move", b, "--phase", "soon", "--author", "human", store_dir=tmp_path) == 0
+    capsys.readouterr()
+    assert run("commit", "--dry-run", store_dir=tmp_path) == 0
+    assert "arc changes human 1;" in capsys.readouterr().out
+    _commit(tmp_path, capsys)
     run("add", "note", "--target", "project", "--body", "another row", store_dir=tmp_path)
     capsys.readouterr()
     run("commit", store_dir=tmp_path)
@@ -6724,6 +7004,35 @@ def test_a_commit_from_another_projects_tree_leaves_the_stores_files(tmp_path, c
         assert capsys.readouterr().out == "would commit: 1 file\n  tools/lint.sh\n"
     assert run("commit", store_dir=s) == 0
     assert capsys.readouterr().out.startswith("committed: 1 file: tools/lint.sh\n")
+
+
+def test_a_commit_that_leaves_the_stores_files_leaves_a_staged_one(tmp_path, capsys, monkeypatch):
+    """A change staged by hand (`git add`) went in with a commit from another
+    project's tree, whose dry run had named it as left: the commit took the
+    index as it found it (2026-11-09). The change stays on disk, unstaged. A
+    new doc the rows name goes in, staged by hand or not."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    proj, s = tmp_path / "proj", tmp_path / "proj-notes"
+    proj.mkdir()
+    _git(proj, "init", "-q", "-b", "main")
+    run("add", "note", "--target", "project", "--body", "w", store_dir=s)
+    (s / "docs").mkdir(exist_ok=True)
+    (s / "docs" / "theirs.md").write_text("v1\n")
+    run("commit", "--all", store_dir=s)
+    (s / "docs" / "theirs.md").write_text("v2\n")       # a session of proj's own, at work
+    (s / "docs" / "mine.md").write_text("detail\n")
+    _git(s, "add", "docs/theirs.md", "docs/mine.md")
+    run("add", "note", "--target", "project", "--body", "from afar", "--ref", "doc:mine.md",
+        store_dir=s)
+    capsys.readouterr()
+    assert run("commit", store_dir=s) == 0              # the cwd: another project
+    out = capsys.readouterr().out
+    assert "committed: entries user 1; 1 file: docs/mine.md\n" in out, out
+    assert "left uncommitted, as the store is another project's: 1 file: docs/theirs.md;" in out, out
+    took = subprocess.run(["git", "-C", str(s), "show", "--name-only", "--format=", "HEAD"],
+                          capture_output=True, text=True).stdout.split()
+    assert took == ["docs/mine.md", "notes.jsonl"]
+    assert (s / "docs" / "theirs.md").read_text() == "v2\n"
 
 
 def test_commit_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capsys):
@@ -6770,6 +7079,10 @@ def test_a_misspelled_toml_key_is_named_with_its_near_miss(tmp_path, capsys, mon
     (tmp_path / "symbion.toml").write_text("local_only = true\n")
     run("schema", store_dir=tmp_path)
     assert "symbion.toml sets" not in capsys.readouterr().err
+    # [uses] went in 535af8e, and a known key hid it (audit, 2026-11-08)
+    (tmp_path / "symbion.toml").write_text("[uses]\nx = 1\n")
+    run("schema", store_dir=tmp_path)
+    assert "symbion.toml sets uses, which this symbion does not read" in capsys.readouterr().err
 
 
 def test_commit_a_hook_refuses_says_so_with_the_hooks_words(tmp_path, capsys,
@@ -7803,9 +8116,56 @@ def test_add_names_a_row_resolved_at_a_commit_this_branch_lacks(repo, tmp_path, 
             assert run("add", "bug", "--target", "item:lint", "--body", body,
                        store_dir=tmp_path) == 0
             assert (f"note: {fixed} on item:lint" in capsys.readouterr().err) is says, body
+        m.setenv("CLAUDE_CODE_SESSION_ID", "s1")     # a compaction drops the note from s1's context
+        m.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(
+            b'{"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"}')))
+        run("summary", "--hook", store_dir=tmp_path)
+        capsys.readouterr()
+        assert run("add", "bug", "--target", "item:lint", "--body", "after s1's compaction",
+                   store_dir=tmp_path) == 0
+        assert f"note: {fixed} on item:lint" in capsys.readouterr().err
     git("merge", "-q", "fix")
     run("add", "bug", "--target", "item:lint", "--body", "again", store_dir=tmp_path)
     assert "this branch lacks" not in capsys.readouterr().err
+
+
+def test_the_unmerged_fix_note_judges_a_rows_newest_commit_after_a_fault(repo, tmp_path,
+                                                                          capsys):
+    """The note named a row resolved on this branch for an older ref a kept
+    prototype branch holds, once a session for good; and it named one after a
+    `decision`, which records no fault (dogfood, 2026-11-09). The newest
+    commit ref is the one `resolve --ref` appends, so a row that cites the
+    commit that broke it, on this branch, and was fixed on another still
+    gets the note."""
+    git = lambda *a: _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", *a)
+    head = lambda: subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+                                  capture_output=True).stdout.strip()
+    broke = head()
+    git("switch", "-q", "-c", "proto")
+    git("commit", "-q", "--allow-empty", "-m", "prototype, kept")
+    proto = head()
+    git("switch", "-q", "main")
+    git("commit", "-q", "--allow-empty", "-m", "done another way")
+    other_way = _add(tmp_path, capsys, "idea", "--target", "item:cards", "--ref",
+                     f"commit:{proto}", "--body", "cut a card's elements")
+    run("resolve", other_way, "--ref", "commit:HEAD", store_dir=tmp_path)
+    capsys.readouterr()
+    git("switch", "-q", "-c", "fix")
+    git("commit", "-q", "--allow-empty", "-m", "fix")
+    fix = head()
+    cites = _add(tmp_path, capsys, "bug", "--target", "item:cards", "--ref",
+                 f"commit:{broke}", "--body", "cards render twice")
+    run("resolve", cites, "--ref", "commit:HEAD", store_dir=tmp_path)
+    git("switch", "-q", "main")
+    capsys.readouterr()
+    assert run("add", "decision", "--target", "item:cards", "--body",
+               "cards stay server-built", store_dir=tmp_path) == 0
+    assert "this branch lacks" not in capsys.readouterr().err
+    assert run("add", "bug", "--target", "item:cards", "--body", "cards render twice on main",
+               store_dir=tmp_path) == 0
+    err = capsys.readouterr().err
+    assert (f"note: {cites} on item:cards was resolved at {fix[:7]}, which fix holds") in err, err
+    assert f"note: {other_way} on" not in err, err
 
 
 def test_list_due_by_takes_rows_due_through_that_day(repo, tmp_path, capsys):
@@ -7832,7 +8192,35 @@ def test_list_due_by_takes_rows_due_through_that_day(repo, tmp_path, capsys):
     assert "--due-by: 'soon' is not a date: use YYYY-MM-DD" in capsys.readouterr().err
 
 
+def test_a_due_with_an_hour_reads_in_hours_or_minutes_within_a_day(repo, tmp_path, capsys,
+                                                                     monkeypatch):
+    """A pre-registration due at 16:30Z read `due today` from midnight on,
+    and nothing said when its data would be in (2026-11-03). Within a day
+    of a due with an hour, `list` and the summary count hours, or minutes
+    under an hour, on both sides of it (the user, 2026-11-09). A date, or a
+    time a day or more away, reads in days."""
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:00:00Z")
+    want = {"soon": ("2026-01-10T15:00Z", "due in 3h"),
+            "close": ("2026-01-10T12:40Z", "due in 40m"),
+            "now": ("2026-01-10T12:00:30Z", "due in <1m"),
+            "late": ("2026-01-10T11:20Z", "overdue 40m"),
+            "later": ("2026-01-10T08:00Z", "overdue 4h"),
+            "tomorrow": ("2026-01-11T09:00Z", "due in 21h"),
+            "on the day": ("2026-01-10", "due today"),
+            "far": ("2026-01-12T12:00Z", "due in 2d")}
+    ids = {name: _add(tmp_path, capsys, "--kind", "task", "--type", "item", "--name", name,
+                      "--due", due).splitlines()[0] for name, (due, _) in want.items()}
+    assert run("list", store_dir=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert run("summary", store_dir=tmp_path) == 0
+    summary = capsys.readouterr().out
+    for name, (_, words) in want.items():
+        assert f"({words})" in next(ln for ln in out.splitlines() if ids[name] in ln), name
+        assert f"  {words} [task] item:{name} " in summary, (name, summary)
+
+
 def test_supersede_sets_and_clears_due(repo, tmp_path, capsys):
+
     tid = _add(tmp_path, capsys, "--kind", "task", "--type", "item", "--name", "t")
     assert run("supersede", tid, "--due", "2026-10-01T22:30Z", store_dir=tmp_path) == 0
     capsys.readouterr()

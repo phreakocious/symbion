@@ -100,7 +100,7 @@ TEXT goes below or above; `--replace OLD NEW` swaps one span. Tags, refs, the
 target and the due date change alike.
 `resolve <id>` closes a status entry, and its `--body` goes below. A committed
 entry is never deleted, and `list --all` shows its earlier versions. `undo <id>`
-takes back this session's last write while no commit has run since.
+takes back this session's last write until another write or a commit.
 
 `mechanics.md` (`symbion skill mechanics`) says which edits keep an earlier version and
 what each summary line and label means. Read it when symbion's output shows
@@ -163,8 +163,8 @@ under the store's `docs/`; the entry names it by its path there
 A trap, such as a test that passes alone and fails in its file's run or a step
 that must come before an edit, goes on its file tagged `gotcha`: in Claude Code,
 Codex and Pi, the first non-symbion call in each session or subagent that names
-the file prints its first 200 characters, and its first edit prints them again, so
-the trap and its fix fit in them. One trap is one entry; a how-to is a plain note.
+the file prints its first 200 characters, so the trap and its fix fit in them. One
+trap is one entry; a how-to is a plain note.
 
 A `check` reaches no open view, so a running job also needs a `task` due at
 its end, resolved with the result. A result the user reports from this tree

@@ -475,3 +475,87 @@ def test_a_phone_page_gutter_is_the_top_bars_16px():
     assert re.search(r"\.nicegui-content \{ padding: 0; \}", phone), phone[:300]
     assert re.search(r"\.sb-main \{ padding: 4px 16px 56px; \}", phone)
     assert re.search(r"\.sb-topbar \{[^}]*padding: 8px 16px", phone)
+
+
+def test_a_board_page_widens_its_column_and_the_top_bar_follows():
+    """In 920px, four board columns left a card 201px and cut its foot, and
+    five scrolled sideways beside empty page at 1920 wide (2026-11-08). A
+    board page's column takes about 300px a board column, counted from 3
+    columns up with no step missing, and the top bar reads the same width."""
+    from symbion.gui.theme import DARK_CSS
+    main = re.search(r"\.sb-main\s+\{([^}]*)\}", DARK_CSS)[1]
+    bar = re.search(r"\.sb-topbar \{([^}]*)\}", DARK_CSS)[1]
+    assert "max-width: var(--sb-main-w)" in main and "calc(var(--sb-main-w) + 32px)" in bar
+    counts = [int(n) for n in re.findall(
+        r"body:has\(\.sb-phases > \.sb-phase:nth-child\((\d+)\)\) \{ --sb-cols: \1; \}", DARK_CSS)]
+    assert counts == list(range(3, 3 + len(counts))) and len(counts) >= 4, counts
+    per, extra = map(int, re.search(r"body:has\(\.sb-phases\) \{ --sb-main-w: max\(920px, "
+                                    r"calc\(var\(--sb-cols, 2\) \* (\d+)px \+ (\d+)px\)\); \}", DARK_CSS).groups())
+    row = 4 * per + extra - 64 + 12                 # .sb-main's padding out, the row's reach in
+    assert (row - 3 * 6) / 4 - 12 >= 280            # a card in four columns: its column, less 12px
+
+
+def test_a_board_column_greens_toward_done_and_a_stalled_phase_is_grey():
+    """A column's strip greens by its place toward done, and a ramp alone
+    read a blocked column as nearly done (2026-11-08): a phase named with a
+    stall's word is grey. Every column has a place, with no step missing,
+    and done is always the full green."""
+    from symbion.gui.theme import DARK_CSS
+    lane = DARK_CSS.split(".sb-phase, .sb-phase-seg {", 1)[1].split("}", 1)[0]
+    assert "--i: 8;" in lane and "(var(--i) - 1) / (var(--sb-cols, 2) - 1)" in lane, lane
+    places = [int(n) for n in re.findall(r"\.sb-phases > \.sb-phase:nth-child\((\d+)\) \{ --i: \1; \}", DARK_CSS)]
+    assert places == list(range(1, 8)), places
+    assert re.search(r"\.sb-phase:last-child, \.sb-phase-seg\[data-phase=\"done\"\] "
+                     r"\{ --sb-step: var\(--q-good\); \}", DARK_CSS)
+    grey = re.search(r":is\(\.sb-phase, \.sb-phase-seg\):is\((.*?)\) \{\s*--sb-step: "
+                     r"color-mix\(in srgb, var\(--q-muted\)", DARK_CSS, re.S)
+    assert grey and set(re.findall(r'\[data-phase~="(\w+)" i\]', grey[1])) == {"blocked", "waiting", "stuck", "hold"}
+
+
+def test_a_board_cards_mover_keeps_its_text_and_the_id_wraps():
+    """With basis 0 the id stayed beside the mover and cut "from in review ·
+    now" to 60 of its 144px on a 288px card (2026-11-08). The mover's basis
+    is its text, so the line breaks before the id; only a card too narrow
+    for the text alone cuts it."""
+    from symbion.gui.theme import DARK_CSS
+    moved = re.search(r"\.sb-moved \{([^}]*)\}", DARK_CSS)[1]
+    assert "flex: 0 1 auto" in moved and "max-width: 100%" in moved, moved
+    assert "margin-left: auto" in re.search(r"\.sb-note-by \{([^}]*)\}", DARK_CSS)[1]
+
+
+def test_a_board_strip_is_one_hue_at_greens_chroma():
+    """Mixed in sRGB toward the border, a column strip's first steps were
+    teal-grey (hue 208, chroma 0.017, against green's 143 and 0.109), and the
+    blocked grey sat 0.058 from one in OKLab under simulated deuteranopia,
+    against 0.097 on one hue (2026-11-08). The strip mixes in OKLCH toward
+    green at the border's lightness, as the map's ramps step."""
+    from symbion.gui import theme as Th
+    lane = Th.DARK_CSS.split(".sb-phase, .sb-phase-seg {", 1)[1].split("}", 1)[0]
+    assert "color-mix(in oklch, var(--q-good)" in lane and "var(--sb-ramp-lo))" in lane, lane
+    lo = re.search(r"--sb-ramp-lo: (#[0-9a-f]{6});", Th.DARK_CSS)[1]
+    (l0, c0, h0), (_, c, h) = Th.oklch(lo), Th.oklch(Th.PALETTE.good)
+    assert abs(h0 - h) < 1 and abs(c0 - c) < 0.005, (lo, h0, c0)
+    assert abs(l0 - Th.oklch(Th.PALETTE.border)[0]) < 0.01
+
+
+def test_a_board_ramp_starts_where_a_card_shows_it_at_3_to_1():
+    """From 20%, the strip's first step read 2.41:1 on the page, under the
+    3:1 a graphic needs (WCAG 2, 1.4.11; 2026-11-08). The ramp starts at the
+    first step a card, its lightest ground, shows at 3:1, and the strip and
+    the arc's bar read that start."""
+    from symbion.gui import theme as Th
+    P, t0 = Th.PALETTE, Th.RAMP_T0
+    at = lambda t: Th._contrast(Th._toward(P.border, P.good, t / 100), P.bg_panel)
+    assert at(t0) >= 3 > at(t0 - 1), (t0, at(t0), at(t0 - 1))
+    assert f"--sb-ramp-t0: {t0}%;" in Th.DARK_CSS
+    lane = Th.DARK_CSS.split(".sb-phase, .sb-phase-seg {", 1)[1].split("}", 1)[0]
+    assert "calc(var(--sb-ramp-t0) + (100% - var(--sb-ramp-t0))" in lane, lane
+
+
+def test_an_arcs_bar_draws_only_done_at_full_height():
+    """At full height, an arc with nothing done read as a full bar, and one
+    whose boxes all sat in the last phase before done as nearly finished
+    (2026-11-08): done fills the bar, every other phase is a thin line."""
+    height = lambda sel: re.search(r"(?<![-\w])height: ([^;]+);", " ".join(_bodies(sel)))[1]
+    assert height('.sb-phase-seg[data-phase="done"]') == "100%"
+    assert 2 * int(height(".sb-phase-seg").removesuffix("px")) < int(height(".sb-phase-bar").removesuffix("px"))

@@ -305,6 +305,18 @@ def test_start_shim_treats_a_broken_symbion_as_missing_with_a_warm_cache(tmp_pat
     assert (r.returncode, r.stdout) == (0, TO_SETUP)
 
 
+def test_start_shim_takes_a_crlf_answer_from_the_cli(tmp_path):
+    """Python on Windows writes CRLF to a pipe: the path kept its CR, named no
+    dir, and a working CLI read as missing (audit, 2026-11-08)."""
+    env, skill = _env(tmp_path), _skill(tmp_path / "pkg" / "skill")
+    log = _cli(tmp_path, skill)
+    fake = tmp_path / "bin" / "symbion"
+    fake.write_text(fake.read_text().replace(f"echo '{skill}'", f"printf '%s\\r\\n' '{skill}'"))
+    r = _run(START, _project(tmp_path), env)
+    assert (r.returncode, r.stdout) == (0, "PKG-START\n")
+    assert _cache(env).read_text() == f"{skill}\n" and log.exists()
+
+
 def test_start_shim_finds_the_package_again_when_the_cache_is_stale(tmp_path):
     env, skill = _env(tmp_path), _skill(tmp_path / "pkg" / "skill")
     log = _cli(tmp_path, skill)
@@ -340,6 +352,12 @@ def _run_agy(tmp_path, env, stdin):
                           capture_output=True, env=env)
 
 
+def _agy_said(r) -> str:
+    """The one message an agy hook answer injects."""
+    (step,) = json.loads(r.stdout)["injectSteps"]
+    return step["systemMessage"]["systemMessage"]
+
+
 @AGY_PATHS
 def test_start_shim_under_agy_takes_the_project_from_its_stdin(tmp_path):
     spaced = tmp_path / "with space"
@@ -351,7 +369,7 @@ def test_start_shim_under_agy_takes_the_project_from_its_stdin(tmp_path):
         call = json.dumps({"conversationId": "c1", "workspacePaths": [str(project)]},
                           separators=seps)
         r = _run_agy(spaced, env, call)
-        assert (r.returncode, r.stdout) == (0, f"PKG-START {project}\n{call}\n"), seps
+        assert (r.returncode, _agy_said(r)) == (0, f"PKG-START {project}\n{call}"), seps
 
 
 def test_start_shim_under_agy_without_a_workspace_says_nothing(tmp_path):
@@ -372,7 +390,22 @@ def test_start_shim_names_its_host_to_the_package_hook(tmp_path):
     marked = {**env, "ANTIGRAVITY_CONVERSATION_ID": "c1"}
     assert _run(START, project, marked).stdout == "PKG-START claude\n"
     call = json.dumps({"workspacePaths": [str(project)]})
-    assert _run_agy(tmp_path, env, call).stdout == "PKG-START antigravity\n"
+    assert _agy_said(_run_agy(tmp_path, env, call)) == "PKG-START antigravity"
+
+
+@AGY_PATHS
+def test_start_shim_under_agy_puts_plain_text_in_its_json(tmp_path):
+    """agy reads only JSON: a broken symbion.toml's error is plain text, and
+    reached agy as a hook answer it could not parse (audit, 2026-11-08)."""
+    env, skill = _env(tmp_path), _skill(tmp_path / "pkg" / "skill")
+    (skill / "session_start.sh").write_text(
+        "printf 'error: could not parse \"a\\\\b\"\\tx\\r\\n\\001next %%s\\n'\n")
+    _cli(tmp_path, skill)
+    call = json.dumps({"workspacePaths": [str(_project(tmp_path))]})
+    r = _run_agy(tmp_path, env, call)
+    assert (r.returncode, _agy_said(r)) == (0, 'error: could not parse "a\\b" x\nnext %s')
+    (skill / "session_start.sh").write_text("echo '{\"injectSteps\": []}'\n")
+    assert _run_agy(tmp_path, env, call).stdout == '{"injectSteps": []}\n'
 
 
 @AGY_PATHS

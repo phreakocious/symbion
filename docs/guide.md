@@ -102,7 +102,11 @@ symbion init --agent codex --yes    # makes them
 
 `--agent hermes` sets up Hermes Agent, and `--agent both` is Codex and Claude
 Code. On Claude Code the plugin carries the skill and the hooks, so `init` (its
-default agent) makes only the store there. `--agent antigravity` makes only the
+default agent) makes only the store there. There, init names a
+`~/.claude/skills/symbion` link or a symbion hook in `~/.claude/settings.json`
+left from an install before the plugin: with both, each session gets the skill,
+the summary and each gotcha twice. It says how to remove each, and removes
+neither. `--agent antigravity` makes only the
 store too, and prints the plugin's install line until `agy` has the plugin:
 
 ```bash
@@ -112,10 +116,7 @@ agy plugin install https://github.com/phreakocious/symbion/tree/main/plugin
 agy copies the plugin into `~/.gemini/config/plugins/symbion` and finds it at its
 next start. The copy holds the stub skill, the setup and wrap skills
 (`/symbion:setup` and `/symbion:wrap`), and the session-start hook. agy has no
-gotcha hook. The hook runs in `sh`; on Windows that is untested. It names a `~/.claude/skills/symbion`
-link or a symbion hook in `~/.claude/settings.json` left from an install before
-the plugin: with both, each session gets the skill, the summary and each gotcha
-twice. It says how to remove each, and removes neither.
+gotcha hook. The hook runs in `sh`; on Windows that is untested.
 
 `--agent pi` makes only the store as well, and prints the Pi package's install
 line until Pi's `settings.json` lists it:
@@ -153,7 +154,9 @@ session's call names a file that an entry tagged `gotcha` is on, a symbion
 command aside, and again the first time it edits that file, the agent
 gets that entry's lead, its age, how many commits have changed the file since,
 and the command that retires it: a gotcha has no status, and the agent in
-the file is the one placed to judge whether it still holds. It reads a list
+the file is the one placed to judge whether it still holds. At the edit, an
+entry the agent already got in full comes back as one line of ids, with the
+`symbion show` command that prints them: the hook answers after the edit. It reads a list
 the session-start hook writes under
 `~/.cache/symbion/gotchas/`, and the package's directory from
 `~/.cache/symbion/skill_dir`, which the plugin's session-start hook writes from
@@ -180,9 +183,10 @@ edit. For `apply_patch`, it checks only file headers, including move destination
 Existing installations can add it with `symbion init --agent codex --merge-hook`,
 then review it in `/hooks`. With hooks inline in `config.toml`, init prints the
 TOML to append there instead. A `~/.agents/skills/symbion` that is not the link
-is left alone and named. On Windows the link is a directory junction when the
-account cannot make a symlink, so neither Developer Mode nor an elevated
-terminal is needed.
+is left alone and named, and init registers no hook until it is moved aside:
+each hook runs its script through that path. On Windows the link is a
+directory junction when the account cannot make a symlink, so neither
+Developer Mode nor an elevated terminal is needed.
 
 **Give Codex access to the store.** Codex's sandbox writes only inside the
 project, and the store sits beside it. Launch `codex --add-dir
@@ -365,6 +369,9 @@ their own. It names the entries it left and the newest one's age, and `commit --
 takes them too, for a session that ended without committing. From another project's
 tree, as with `--dir ../other-notes`, it takes no file but the new docs your entries
 name: the store's other changed files are its own project's work, and it names them.
+A line the last commit holds that is gone from `notes.jsonl`, with no copy an edit
+kept under a new id (a hand edit, a repair), is no session's: `commit` and its dry
+run name it, and only `commit --all` takes the removal.
 
 ## Share a store
 
@@ -498,16 +505,18 @@ to an entry stays good (`serve` prints it, and `--port` picks another). It has:
   text), and text over 2,000 characters can be saved to the store's `docs/`
   with the entry pointing at it. With an entry open, the file joins its refs,
   or its text goes in at the cursor;
-- a page per note: a rule in its body marks where each amendment joined it,
-  with who added it and when, and its earlier versions show an edit as a
-  diff; a tag index;
+- a page per note: a rule in its body marks each amendment that joined it at
+  a line break, with who added it and when, and its earlier versions show an
+  edit as a diff; a tag index;
 - an arc's page, as a checklist you tick or as a board: drag a box to another
   column or along one, or move it with its arrows. A drop on done resolves the
   box, and a drag out of done reopens it. Edit arc sets the columns;
 - commit and push buttons, shown while there is something to commit or push.
-  The commit button takes only the entries written as you, and the `docs/`
-  files they name, so an agent's pending entries stay for it to commit. In a
-  shared store both buttons pull, then push, as `commit` does at a terminal;
+  The commit button takes the entries written as you, the new `docs/` files
+  they name and every arc change, so an agent's pending entries stay for it
+  to commit. In a shared store both buttons pull, then push, as `commit`
+  does at a terminal. Discard, beside commit, throws away what the commit
+  would take for you, after a list; the undo arrow brings it back;
 - a button with a count, shown when an entry was written or edited after the
   page was drawn: by an agent, at a terminal, or in another tab. The page does
   not redraw by itself. The button lists those entries beside the page, with

@@ -113,7 +113,7 @@ where two separate adds would store both.
   its age.
 - **Due dates.** `--due 2026-10-01` (or an ISO datetime) on any status entry. An
   open entry past due or due within 7 days leads the session-start summary
-  (`overdue 2d`, `due in 3d`), and a parked one from its due date on. `list --overdue` lists those past due, `list
+  (`overdue 2d`, `due in 3d`; within a day of a datetime, `due in 3h`, `overdue 40m`), and a parked one from its due date on. `list --overdue` lists those past due, `list
   --due-by DATE` those due by then, past due included, and `supersede <id>
   --due ''` clears one.
 - **Untouched entries.** An open entry no one has edited through 5 active days,
@@ -256,7 +256,8 @@ refused, and a shared store with no `origin` says `no remote`.
   value and each line both sides rewrote by hand that it dropped, the commits
   pulled (or `up to date`), a changed `symbion.toml`, and a clone that runs an
   older symbion. At session start you see those last two lines too, not only the
-  agent. The merge driver handles `notes.jsonl` and `arcs.jsonl`. Git handles every other file, and it can fail on one:
+  agent. It then names each entry someone else wrote in what it brought; at
+  session start, only those the summary does not print. The merge driver handles `notes.jsonl` and `arcs.jsonl`. Git handles every other file, and it can fail on one:
   `symbion.toml`, or a file under `docs/` or `archive/`. Then `pull` changes
   nothing. It names the files, prints the git commands that finish the merge,
   and exits 1. A store that is not shared refuses `pull`.

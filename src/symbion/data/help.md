@@ -141,14 +141,20 @@ review. Create one on the Arcs page. Each box is an entry filed in the arc,
 of a kind that is open until resolved: a task, a bug, a question, on any
 target. Pick the arc in the new-entry form, or in an entry's edit dialog.
 The Arcs page shows each arc's progress, and an arc is done when every box
-is resolved.
+is resolved. It lists the arc changed most recently first, and each says when
+it started and when it last changed: an entry in it written, edited or
+resolved, or a box moved on its board. Point at a time to see it in full.
 
 An arc's page shows it as a **list** or a **board**, by the toggle at its
 top. The board has a column for each of the arc's **phases**, then done.
 Drag a box to another column or along one, or use its arrows. A drop on
 done resolves the box, and a drag out of done reopens it. **Edit arc** sets
 the phases, comma-separated; with none, the board has one open column and
-done.
+done. A column's top edge grows greener toward done. A phase whose name holds
+the word blocked, waiting, stuck or hold stays grey: it is out of the flow.
+The bar under an arc's name, here and on **Arcs**, is its boxes by phase in
+those colours: done first as a thick bar, then the columns from right to
+left as a thin line. Point at a part to see its phase and count.
 
 An arc's **scope** says what it is mostly about, such as `item` or `file`.
 The scope does not limit it: a file task, a project bug and an item question
@@ -196,9 +202,9 @@ not removed.
 A click on an entry's words opens it in the peek, beside the page: its
 whole text and its earlier versions. **j** and **k** move it to the next
 or the previous entry; in it, **x** resolves, **s** stars, **e** edits,
-**a** answers a question, **o** opens the entry's page, and **Esc** closes
-it. A write in the peek reloads the page, and the peek opens again on the
-entry.
+**a** answers a question, **o** opens the entry's page, and **Esc**, or a
+click on the page's background, closes it. A write in the peek reloads the
+page, and the peek opens again on the entry.
 A click with ⌘, Ctrl or Shift opens the entry's page in a new tab.
 
 **⌘K** (Ctrl K off a Mac) opens the palette: one box to go to a place, run
@@ -215,8 +221,16 @@ acts on it and resolves the question.
 
 The undo arrow appears in the top bar while the store's last write is
 yours and not yet committed. It takes that write back. There is one undo,
-for the store's last write: once someone else writes, or a commit runs, the
-arrow dims, and clicking it says which write holds the undo now.
+for the store's last write: once someone else writes, the arrow dims, and
+clicking it says which write holds the undo now. Once a commit runs, there is
+nothing left to undo, and the arrow goes.
+
+**Discard**, the sweep icon beside commit, throws away what the commit would
+take for you: your new entries go, an edit you made to a committed entry goes
+back to its committed version (or to the uncommitted version another writer
+made, when yours sat on it), and an arc you made since the last commit goes. It lists
+them first, and keeps what another writer's work builds on. A discard is a
+write, so the undo arrow brings it back.
 
 A page shows the store as it was when the page opened. When an entry is
 written or edited after that, by an agent, at a terminal or in another tab,

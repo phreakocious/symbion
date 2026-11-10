@@ -419,6 +419,7 @@ def test_every_write_requires_author_by_keyword(repo, tmp_path):
         (api.undo,            (ctx, "someid")),
         (api.move_box,        (ctx, "someid")),
         (api.reopen_and_place, (ctx, "someid")),
+        (api.discard,         (ctx,)),
     ]
     assert sorted(fn.__name__ for fn, _ in cases) == sorted(writers), \
         "cases must cover every author-required writer api.py actually has"
@@ -475,10 +476,10 @@ def test_arc_passthroughs_round_trip(repo, tmp_path):
     act = api.create_arc(ctx, "camp", "d", "project", author="ada")
     assert act.author == "ada"
 
-    api.rename_arc(ctx, act.id, "camp2")
+    api.rename_arc(ctx, act.id, "camp2", author="user")
     assert [a.name for a in store.load_arcs(tmp_path)] == ["camp2"]
 
-    api.archive_arc(ctx, act.id)
+    api.archive_arc(ctx, act.id, author="user")
     gone = store.load_arcs(tmp_path)[0]
     assert gone.archived is True and gone.archived_at.endswith("+00:00"), gone   # UTC
 
@@ -1277,7 +1278,8 @@ _Q = {"kind": "question", "target": {"type": "project", "name": None}, "body": "
 @pytest.mark.parametrize("bad, said", [
     ([], "one to three"), ("a", "one to three"), (["a", "b", "c", "d"], "at most three"),
     (["a", " "], "option 2 is empty"), (["a", 3], "option 2 is a string"),
-    (["x" * 61], "over 60 characters"), (["a\nb"], "line break"), (["a\rb"], "line break"),
+    (["x" * 61], r"over 60 characters \(it has 61\)"), (["  " + "x" * 63 + " "], r"\(it has 63\)"),
+    (["a\nb"], "line break"), (["a\rb"], "line break"),
     (["a\u2028b"], "line break"),
     (["Ship", "ship "], "options repeat"),
 ])
@@ -1316,7 +1318,7 @@ def test_supersede_judges_a_given_options_list(repo, tmp_path):
 WRITES = {"save_doc", "retag", "add", "add_many", "supersede", "seed", "create_arc",
           "rename_arc", "archive_arc", "unarchive_arc", "describe_arc", "undo", "commit",
           "push", "pull", "sync", "set_phases", "move_box", "reopen_and_place",
-          "rename_target", "retype"}
+          "rename_target", "retype", "discard"}
 
 
 def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
@@ -1357,11 +1359,11 @@ def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
         "supersede": lambda: api.supersede(ctx, t.id, author="bob", append_body="more"),
         "seed": lambda: api.seed(ctx, arc.id, "item", ["z"], author="ada"),
         "create_arc": lambda: api.create_arc(ctx, "b", "", "item", author="ada"),
-        "rename_arc": lambda: api.rename_arc(ctx, arc.id, "c"),
-        "archive_arc": lambda: api.archive_arc(ctx, arc.id),
-        "unarchive_arc": lambda: api.unarchive_arc(ctx, arc.id),
-        "describe_arc": lambda: api.describe_arc(ctx, arc.id, "e"),
-        "set_phases": lambda: api.set_phases(ctx, arc.id, ["next"]),
+        "rename_arc": lambda: api.rename_arc(ctx, arc.id, "c", author="user"),
+        "archive_arc": lambda: api.archive_arc(ctx, arc.id, author="user"),
+        "unarchive_arc": lambda: api.unarchive_arc(ctx, arc.id, author="user"),
+        "describe_arc": lambda: api.describe_arc(ctx, arc.id, "e", author="user"),
+        "set_phases": lambda: api.set_phases(ctx, arc.id, ["next"], author="user"),
         "move_box": lambda: api.move_box(ctx, t.id, top=True, author="ada"),
         "reopen_and_place": lambda: api.reopen_and_place(ctx, t.id, top=True, author="ada"),
         "undo": lambda: api.undo(ctx, None, author="ada", apply=False),
@@ -1371,6 +1373,7 @@ def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
         "sync": lambda: api.sync(ctx),
         "rename_target": lambda: api.rename_target(ctx, "item", "x", "y", author="ada"),
         "retype": lambda: api.retype(ctx, "item", "thing", author="ada"),
+        "discard": lambda: api.discard(ctx, author="ada"),
     }
     assert set(calls) == WRITES
     monkeypatch.setenv("SYMBION_READ_ONLY", "1")

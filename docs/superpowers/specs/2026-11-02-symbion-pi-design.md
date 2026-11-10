@@ -66,7 +66,9 @@ what Claude Code gets today (the user: "that would be ideal"):
   `{"hookSpecificOutput":{"hookEventName":…,"additionalContext":…}}` or nothing.
   For the tool names `Edit|Write|MultiEdit|NotebookEdit` it matches only the value
   after the first key ending in `_path"` (Claude Code's `file_path`), and those
-  names also get the re-print on a file's first edit.
+  names also get the re-print on a file's first edit. (Amended 2026-11-09: a row
+  the reader already got in full re-prints as one line of ids, since the answer
+  lands after the edit; the user's call.)
 - `symbion summary --hook` reads `session_id` from its stdin JSON (it must match
   `[A-Za-z0-9_-]{1,128}`), writes that session's gotcha list, resets its seen marks,
   and prints Claude Code's JSON: `additionalContext` for the agent and a one-line

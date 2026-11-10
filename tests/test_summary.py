@@ -830,7 +830,7 @@ def test_the_due_block_lists_past_due_and_due_soon_open_rows_once(tmp_path):
     data = summary.summary(tmp_path, cfg, _now=now)
     assert [(d["id"], d["phrase"]) for d in data["due"]] == [
         (in_arc, "overdue 2d"), (starred, "overdue 1d"),
-        (parked, "overdue today"), (soon, "due in 3d")]
+        (parked, "overdue 3h"), (soon, "due in 3d")]
     assert data["due_elided"] == 0
     listed = {p["id"] for p in data["priority"]} | {h["id"] for h in data["heads"]}
     assert not listed & {d["id"] for d in data["due"]}, "a due entry prints once"
@@ -937,11 +937,10 @@ def test_a_rewrite_drops_the_seams_whose_words_it_cut_and_an_unchanged_body_keep
     chance = _versions(("ada", "q one two"), ("sam", "q one two\n\nthe answer here"),
                        ("kim", "a fresh text with the rest new"))
     assert summary.seams(*chance) == []
-    # An append that went on with the sentence put its seam inside a word.
+    # An append that went on with the sentence has no seam to carry.
     inside = _versions(("ada", "filter as you type"), ("sam", "filter as you type, then search"),
                        ("kim", "Filter as you type, then search\n\nok"))
-    assert summary.seams(*inside) == [(18, "sam", t2, False, False),
-                                      (31, "kim", "2026-10-03T00:00:00+00:00", False, True)]
+    assert summary.seams(*inside) == [(31, "kim", "2026-10-03T00:00:00+00:00", False, True)]
     # The edit took back what the seam marked.
     taken = _versions(("ada", "one two three"), ("sam", "one two three #gui\n"),
                       ("kim", "one two three"))
@@ -950,6 +949,31 @@ def test_a_rewrite_drops_the_seams_whose_words_it_cut_and_an_unchanged_body_keep
     assert summary.seams(*after) == [(1, "kim", "2026-10-03T00:00:00+00:00", False, False)]
     # A body written into an empty row is its first text, not an amendment.
     assert summary.seams(*_versions(("ada", ""), ("sam", "b"))) == []
+
+
+def test_a_seam_falls_only_at_a_line_break():
+    """A `--replace` that extended the last sentence drew `-- added below --`
+    mid-sentence, and a `--replace` copied from `show` was then refused
+    (the user chose a seam only at a line break, 2026-11-09)."""
+    t2 = "2026-10-02T00:00:00+00:00"
+    assert summary.seams(*_versions(("ada", "the fix is done"),
+                                    ("sam", "the fix is done and green"))) == []
+    assert summary.seams(*_versions(("ada", "is done"), ("sam", "This is done"))) == []
+    # The break may sit on either side of the join, behind spaces.
+    assert summary.seams(*_versions(("ada", "one\n"), ("sam", "one\nmore"))) == \
+        [(4, "sam", t2, False, False)]
+    assert summary.seams(*_versions(("ada", "one"), ("sam", "one  \nmore"))) == \
+        [(3, "sam", t2, False, False)]
+    assert summary.seams(*_versions(("ada", "one"), ("sam", "top \none"))) == \
+        [(5, "sam", t2, True, False)]
+    # An edit that went on with the line before a seam: the seam keeps its break.
+    assert summary.seams(*_versions(
+        ("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
+        ("kim", "one two three and more\n\nfour five six"))) == [(22, "sam", t2, False, False)]
+    # An edit that joined the two paragraphs left no break to mark.
+    assert summary.seams(*_versions(
+        ("ada", "one two three"), ("sam", "one two three\n\nfour five six"),
+        ("kim", "one two three four five six"))) == []
 
 
 def test_an_edit_that_also_writes_a_paragraph_below_gets_a_seam_before_it():

@@ -1,9 +1,12 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import sysconfig
+import time
 from pathlib import Path
 
 import pytest
@@ -90,6 +93,23 @@ def test_hook_prints_the_zero_line_for_an_empty_but_existing_store(git_repo, tmp
     assert r.returncode == 0
     assert r.stderr == ""
     assert "bug 0" in _context(r.stdout)
+
+
+def test_the_plugin_shim_runs_the_real_cli_package_hook(git_repo, tmp_path):
+    """The plugin's shim against the installed CLI, not a fake. Python on
+    Windows writes `skill --path` to the pipe with CRLF. Git's sh drops the CR
+    in `$(…)`; dash, which runs this test under Git Bash, keeps it, and
+    without the shim's strip read a working CLI as missing (2026-11-10)."""
+    store_dir = tmp_path / "store"
+    store.ensure_store(store_dir)
+    shim = HOOK.parents[4] / "plugin" / "hooks" / "session_start.sh"
+    r = subprocess.run([SH, str(shim)], cwd=git_repo, input="", capture_output=True, text=True,
+                       env={**SRC_ENV, "PATH": TOOLS, "SYMBION_DIR": str(store_dir),
+                            "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")})
+    assert (r.returncode, r.stderr) == (0, "")
+    assert "bug 0" in _context(r.stdout)
+    cached = (tmp_path / "c" / "symbion" / "skill_dir").read_text(encoding="utf-8")
+    assert Path(cached.rstrip("\n")) == HOOK.parent
 
 
 def test_hook_shows_the_person_one_line_and_the_agent_the_summary(git_repo, tmp_path):
@@ -482,17 +502,60 @@ def test_a_subagent_gets_a_gotcha_the_main_agent_already_had(git_repo, tmp_path)
     assert call({"agent_id": "a9"}) == "", "a tool's argument named agent_id is not the call's"
 
 
+def _shown(*rows, sym="symbion"):
+    """gotchas.sh's line at an edit for rows the reader already got in full."""
+    tails = " ".join(r.id[-10:] for r in rows)
+    w, it = ("gotcha {} was", "it") if len(rows) == 1 else ("gotchas {} were", "them")
+    return (f"symbion: this file's {w.format(tails)} shown in full earlier in this session "
+            f"(`{sym} show {tails}` prints {it} again).")
+
+
+def test_an_edit_reprints_in_full_only_what_this_reader_never_got(git_repo, tmp_path):
+    """At a file's first edit, each row this reader got before comes back as
+    one line of ids, and a row it never got comes in full (the user, 2026-11-09).
+    The line's command reaches a named store too."""
+    s = tmp_path / "named-notes"
+    store.ensure_store(s)
+    x, y = ({"type": "file", "name": n} for n in ("src/x.py", "src/y.py"))
+    a = store.add(s, kind="note", target=x, author="ann", tags=["gotcha"], body="trap a")
+    b = store.add(s, kind="note", target=x, author="ann", tags=["gotcha"], body="trap b")
+    c = store.add(s, kind="note", target=y, refs=[x], author="ann", tags=["gotcha"], body="trap c")
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c"),
+           "SYMBION_DIR": str(s)}
+    for sid in ("s1", "s2"):
+        r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env,
+                           input=json.dumps({"session_id": sid, "hook_event_name": "SessionStart"}))
+        assert r.returncode == 0, r
+
+    def call(sid, tool, path):
+        return _touch(env, {"session_id": sid, "tool_name": tool,
+                            "tool_input": {"file_path": f"{git_repo}/{path}"}})
+    assert "trap c" in call("s1", "Read", "src/y.py")
+    first, second, third = call("s1", "Edit", "src/x.py").split("\n")
+    sym = re.search(r"`(symbion --dir \S+) show", third)[1]
+    assert "trap a" in first and "trap b" in second and third == _shown(c, sym=sym)
+    assert call("s1", "Edit", "src/x.py") == ""
+    said = call("s2", "Read", "src/x.py")
+    assert all(t in said for t in ("trap a", "trap b", "trap c")), said
+    assert call("s2", "Edit", "src/x.py") == _shown(a, b, c, sym=sym)
+    exe = shutil.which("symbion", path=SYMBION_BIN)            # Windows: symbion.exe
+    shown = subprocess.run([exe, *shlex.split(sym)[1:], "show", a.id[-10:], b.id[-10:]], cwd=git_repo,
+                           capture_output=True, text=True, env={**env, "SYMBION_DIR": ""})
+    assert "trap a" in shown.stdout and "trap b" in shown.stdout, shown
+
+
 def test_a_gotcha_fires_on_its_own_file_and_again_at_its_first_edit(git_repo, tmp_path):
     """A row on README.md fired on a Read of src/README.md and was then spent
     for the session (a clean-room review, 2026-10-13), and a Bash call that
     only named a file spent its edit-time trap the same way (dogfood,
     2026-10-14). A name matches at a path boundary, from the repo's root; an
     edit matches on the file it edits, not the text it writes, and gets the
-    trap once more."""
+    trap once more: by its id when this reader got it in full before, since
+    the answer lands after the edit (the user, 2026-11-09)."""
     s = tmp_path / "proj-notes"
     store.ensure_store(s)
-    store.add(s, kind="note", target={"type": "file", "name": "README.md"}, author="ann",
-              tags=["gotcha"], body="readme trap")
+    row = store.add(s, kind="note", target={"type": "file", "name": "README.md"}, author="ann",
+                    tags=["gotcha"], body="readme trap")
     env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
 
     def call(sid, tool, **tool_input):
@@ -509,10 +572,13 @@ def test_a_gotcha_fires_on_its_own_file_and_again_at_its_first_edit(git_repo, tm
         assert call("s1", tool, **args) == "", (tool, args)
     assert "readme trap" in call("s1", "Bash", command="wc -l README.md")
     assert call("s1", "Read", file_path=f"{git_repo}/README.md") == "", "once per session"
-    assert "readme trap" in call("s1", "Edit", file_path=f"{git_repo}/README.md",
-                                 old_string="a", new_string="b"), "again at the first edit"
+    assert call("s1", "Edit", file_path=f"{git_repo}/README.md",
+                old_string="a", new_string="b") == _shown(row), "again at the first edit, by id"
     assert call("s1", "Write", file_path=f"{git_repo}/README.md", content="b") == ""
     assert call("s1", "Read", file_path=f"{git_repo}/README.md") == ""
+    # A subagent got nothing from the main agent's read: in full.
+    assert "readme trap" in _touch(env, {"session_id": "s1", "agent_id": "a1", "tool_name": "Edit",
+                                         "tool_input": {"file_path": f"{git_repo}/README.md"}})
     assert "readme trap" in call("s2", "Bash", command="cat ./README.md")
 
 
@@ -524,8 +590,8 @@ def test_a_gotcha_fires_on_its_file_in_a_linked_worktree(git_repo, tmp_path):
     under a dir with a blank; another repo's worktree and a plain dir do not."""
     s = tmp_path / "proj-notes"
     store.ensure_store(s)
-    store.add(s, kind="note", target={"type": "file", "name": "src/serve.py"}, author="ann",
-              tags=["gotcha"], body="serve trap")
+    row = store.add(s, kind="note", target={"type": "file", "name": "src/serve.py"},
+                    author="ann", tags=["gotcha"], body="serve trap")
     env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c")}
     for sid in ("s1", "s2", "s3", "s4"):
         r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True,
@@ -545,8 +611,8 @@ def test_a_gotcha_fires_on_its_file_in_a_linked_worktree(git_repo, tmp_path):
     for d in (other, tmp_path / "plain"):
         assert call("s1", "Read", file_path=f"{d}/src/serve.py") == "", d
     assert "serve trap" in call("s1", "Read", file_path=f"{inside}/src/serve.py")
-    assert "serve trap" in call("s1", "Edit", file_path=f"{inside}/src/serve.py",
-                                old_string="a", new_string="b"), "again at the first edit"
+    assert call("s1", "Edit", file_path=f"{inside}/src/serve.py",
+                old_string="a", new_string="b") == _shown(row), "again at the first edit"
     assert "serve trap" in call("s2", "Edit", file_path=f"{spaced}/src/serve.py",
                                 old_string="a", new_string="b")
     assert "serve trap" in call("s3", "Read", file_path=f"{spaced}/src/serve.py")
@@ -733,3 +799,187 @@ def test_a_symbion_command_that_names_a_file_neither_fires_nor_spends_its_gotcha
                              "git log --grep=symbion src/serve.py",
                              "cd /work\nsrc/serve.py --help")):
         assert "serve trap" in bash(cmd, sid=f"s{i + 2}"), cmd
+
+
+# ---- one case table, both gotcha hooks ----
+CODEX_GOTCHAS = HOOK.with_name("codex_gotchas.py")
+BOTH = ["gotchas.sh", "codex"]
+
+
+def _both_hooks(tmp_path, rows):
+    """A call into gotchas.sh or the Codex hook, each against `rows` (id, name,
+    text) written as `_list_gotchas` writes the list, LF on every platform:
+    Windows text mode wrote CRLF, and the root, the last field, read as a
+    `\\r` no dir matches (2026-11-09). Each call is a fresh session: a fire
+    spends its row."""
+    d = tmp_path / "c" / "symbion" / "gotchas"
+    d.mkdir(parents=True)
+    n = iter(range(1000))
+
+    def run(hook, cmd, *, sh=SH, tool="Bash", args=None, env=()):
+        sid = f"s{next(n)}"
+        (d / sid).write_text("".join(f"{i}\t{name}\t{text}\t{''.join(root)}\n"
+                                     for i, name, text, *root in rows),
+                             encoding="utf-8", newline="\n")
+        event = {"session_id": sid, "tool_name": tool, "tool_input": args or {"command": cmd}}
+        argv = [sh, str(GOTCHAS)] if hook == "gotchas.sh" else [sys.executable, str(CODEX_GOTCHAS)]
+        env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path),
+               "XDG_CACHE_HOME": str(tmp_path / "c"), **dict(env)}
+        r = subprocess.run(argv, input=json.dumps(event), capture_output=True, text=True,
+                           encoding="utf-8", env=env)
+        assert r.returncode == 0 and r.stderr == "", r
+        return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout else ""
+    return run
+
+
+@pytest.mark.parametrize("hook", BOTH)
+@pytest.mark.parametrize("cmd, fires", [
+    ("cat src/x.py", True),
+    ("symbion add note --target file:src/x.py --body x", False),
+    ('grep -n "symbion show" src/x.py', True),
+    ('symbion add note --body x <<< "text" && cat src/x.py', True),
+    # A separator or newline inside quotes is part of the argument.
+    ("symbion add note --body 'first; the fix is in src/x.py'", False),
+    ('symbion add note --body "a | b & c; see src/x.py"', False),
+    ('symbion add note --body "line one\nline two; src/x.py"', False),
+    ('symbion add note --body "say \\"a; b\\" src/x.py"', False),
+    ("symbion add note --body 'it'\\''s; src/x.py'", False),
+    ("symbion add note --body a\\; src/x.py", False),
+    ("symbion add note --body x \\\n  --ref file:src/x.py", False),
+    ("symbion add note --body x 2>&1 --ref file:src/x.py", False),
+    ("symbion add note --body 'a; b'; cat src/x.py", True),
+    ("symbion add note --body \"a\nb\" && sed -n 1p src/x.py", True),
+    # Inside a quoted string, `symbion` is another shell's command, which the
+    # quote ends; a comment's apostrophe opens no quote. Neither may swallow
+    # the call after it.
+    ('sym=".venv/bin/symbion --dir $B" && cat src/x.py', True),
+    ("symbion list --tag x  # what's open\ncat src/x.py", True),
+    ('out="$(symbion list)"; cat src/x.py', True),
+    ("ssh h 'cd w; symbion add note --body \"a; src/x.py\"; ls'", False),
+    ('echo "n: $(symbion list --target file:src/x.py | wc -l)"', False),
+    ('echo "n: $(symbion list --grep "$p" --target file:src/x.py)"', False),
+    # A heredoc's body holds no shell quotes: its apostrophe opens none.
+    ("cat > f <<'EOF'\nthe centre's miss\nEOF\nsymbion add note --target 'item:x' --ref file:src/x.py", False),
+    # A `)` ends a command, unless a `$(` in it opened one.
+    ("wc -l $(symbion list --target file:a.py) src/x.py", True),
+    ("symbion add note --body $(cat f) --ref file:src/x.py", False),
+    # longer than the 16 KB gotchas.sh reads whole: the body still goes with its command
+    ("symbion add note --body-file - <<'EOF'\nsee src/x.py\n" + "z\n" * 10000 + "EOF", False)])
+def test_both_gotcha_hooks_read_a_call_alike(tmp_path, hook, cmd, fires):
+    """Each hook cuts symbion commands its own way, and a case one got right
+    the other could miss (audit, 2026-11-08). A quoted `symbion ` is an
+    argument, and a `<<<` has no delimiter line: the call after it counts. A
+    separator inside quotes, or escaped, is part of its argument."""
+    run = _both_hooks(tmp_path, [("id1", "src/x.py", "x trap")])
+    assert run(hook, cmd) == ("x trap" if fires else "")
+
+
+@pytest.mark.parametrize("hook", BOTH)
+def test_both_gotcha_hooks_fire_in_a_linked_worktree(tmp_path, hook):
+    """gotchas.sh fired on a file in a linked worktree named by absolute path
+    (dogfood, 2026-11-04), and the Codex hook did not (audit, 2026-11-08). The
+    worktree's `.git` file names `<root>/.git/worktrees/`; another repo's
+    worktree and a plain dir do not count."""
+    run = _both_hooks(tmp_path, [("id1", "src/x.py", "x trap", "proj")])
+    for d, repo in (("wt/feature", "proj"), ("my work/feature", "proj"), ("wt/stray", "other")):
+        (tmp_path / d).mkdir(parents=True)
+        (tmp_path / d / ".git").write_text(f"gitdir: {tmp_path}/{repo}/.git/worktrees/x\n")
+    assert run(hook, f"sed -n 1p {tmp_path}/wt/feature/src/x.py") == "x trap"
+    assert run(hook, None, tool="Edit", args={
+        "file_path": f"{tmp_path}/my work/feature/src/x.py"}) == "x trap"
+    for d in ("wt/stray", "plain"):
+        assert run(hook, f"cat {tmp_path}/{d}/src/x.py") == "", d
+
+
+@pytest.mark.parametrize("hook", BOTH)
+def test_a_gotcha_holding_a_line_separator_silences_no_hook(tmp_path, hook):
+    """The Codex hook split its list with splitlines(), which splits at U+2028
+    too: one such row silenced every gotcha, with no error (audit, 2026-11-08)."""
+    run = _both_hooks(tmp_path, [("id1", "src/a.py", "a\u2028trap"), ("id2", "src/x.py", "x trap")])
+    assert run(hook, "cat src/a.py src/x.py") == "a\u2028trap\nx trap"
+
+
+@pytest.mark.parametrize("hook", BOTH)
+def test_a_long_run_with_no_blank_stays_inside_the_hook_timeout(tmp_path, hook):
+    """The Codex hook tried a path prefix at each position of a call, for each
+    row: 300 rows on an 8 KB run of `1,2,3` took 82 s, and the timeout is 5 s
+    (audit, 2026-11-08)."""
+    run = _both_hooks(tmp_path, [(f"id{i}", f"src/m{i}.py", f"trap {i}") for i in range(300)])
+    start = time.monotonic()
+    assert run(hook, "python3 -c 'print([" + ",".join(map(str, range(2000))) + "])'") == ""
+    assert time.monotonic() - start < 5
+
+
+@pytest.mark.parametrize("tool", ["Write", "Bash", "many", "lines"])
+def test_a_large_call_stays_inside_the_hook_timeout(tmp_path, tool):
+    """In bash, which is macOS's sh, under a UTF-8 locale, each cut and match
+    over the whole call is quadratic: a 280 KB Write took 21 s (audit,
+    2026-11-08), a 280 KB Bash heredoc 78 s (2026-11-09), and the timeout is
+    5 s. An edit is read by its path alone, and a long call by its ends. Each
+    symbion command costs one awk, about 4 ms, so a call holding 60 stays well
+    inside; 8 KB of lines before one took 49 s in a cut of sh's own (2026-11-09)."""
+    run = _both_hooks(tmp_path, [("id1", "src/x.py", "x trap")])
+    body = "y = 1\n" * 40000
+    args = {"file_path": "/w/src/x.py", "content": body} if tool == "Write" else \
+        {"command": f"cat > /w/out.txt <<'EOF'\n{body}EOF\ncat src/x.py"} if tool == "Bash" else \
+        {"command": "\n".join(f'symbion add note --body "step {i}; see src/m{i}.py"'
+                               for i in range(60)) + "\ncat src/x.py"} if tool == "many" else \
+        {"command": "".join(f"line {i}: it is the centre miss\n" for i in range(250))
+                    + "symbion add note --body x\ncat src/x.py"}
+    start = time.monotonic()
+    said = run("gotchas.sh", None, sh="/bin/sh" if Path("/bin/sh").exists() else SH,
+               tool="Write" if tool == "Write" else "Bash", args=args, env={"LC_ALL": "en_US.UTF-8"})
+    assert said == "x trap" and time.monotonic() - start < 5
+
+
+@pytest.mark.parametrize("field", ["name", "body"])
+def test_a_row_with_a_number_for_a_string_costs_the_hint_not_the_summary(tmp_path, monkeypatch,
+                                                                          capsys, field):
+    """Another tool's row with a number for its target's name, or for its body,
+    raised in the gotcha list, and the session started on a traceback, not
+    its summary (audit, 2026-11-08)."""
+    import io
+    from symbion import cli
+    s = tmp_path / "s-notes"
+    store.ensure_store(s)
+    store.add(s, kind="note", target={"type": "file", "name": "src/x.py"}, author="ann",
+              tags=["gotcha"], body="a trap")
+    path = store.notes_path(s)
+    row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    row["id"] = "20260101-000000-000000-bad"
+    if field == "name":
+        row["target"]["name"] = 12345
+    else:
+        row["body"] = 5
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"session_id": "s1"}')))
+    assert cli.main(["--dir", str(s), "summary", "--hook"]) == 0
+    out = capsys.readouterr().out
+    assert "hookSpecificOutput" in out and "no gotcha hints" not in out
+    # The load refuses the bad row, so the good row's hint still reaches the list.
+    listed = (cli._session_cache() / "s1").read_text(encoding="utf-8")
+    assert "a trap" in listed and "-bad\t" not in listed
+    ((_, _, why),) = store.load_malformed(s)
+    assert why == ("a target's name must be a string, not int 12345" if field == "name"
+                   else "body must be a string, not int 5")
+
+
+def test_a_bug_in_the_gotcha_list_costs_the_hints_and_says_so(tmp_path, monkeypatch, capsys):
+    """A bare `except Exception: pass` kept the summary and hid the bug: the
+    session had no hints and no word of why (audit, 2026-11-08)."""
+    import io
+    from symbion import cli
+    s = tmp_path / "s-notes"
+    store.ensure_store(s)
+    store.add(s, kind="task", target={"type": "project", "name": None}, body="canary task")
+
+    def boom(*a):
+        raise KeyError("root")
+    monkeypatch.setattr(cli, "_list_gotchas", boom)
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"session_id": "s1"}')))
+    assert cli.main(["--dir", str(s), "summary", "--hook"]) == 0
+    text = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert "canary task" in text
+    assert text.endswith("symbion: no gotcha hints this session, from a bug in symbion: "
+                         "KeyError: 'root'")

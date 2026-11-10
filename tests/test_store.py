@@ -368,6 +368,27 @@ def test_load_reads_the_declared_table_and_files_an_undeclared_kind_as_unreadabl
     assert lineno == 2 and "'bug'" in err
 
 
+@pytest.mark.parametrize("change, why", [
+    ({"author": 7}, "author must be a string, not int 7"),
+    ({"tags": "gotcha"}, "tags must be a list, not str 'gotcha'"),
+    ({"tags": ["gotcha", 1]}, "each of tags must be a string, not int 1"),
+    ({"refs": [{"type": "file", "name": 3.5}]}, "a ref's name must be a string, not float 3.5"),
+    ({"target": {"type": None, "name": "x"}}, "a target's type must be a string, not NoneType None"),
+])
+def test_a_row_with_a_wrong_type_is_refused_at_the_load_with_its_reason(tmp_path, change, why):
+    """Another tool's row with a number for a string raised in a reader far from
+    the load, and `"gotcha"` as tags read as seven one-letter tags (audit,
+    2026-11-08). The line is skipped and named instead."""
+    good = store.add(tmp_path, kind="note", target={"type": "project", "name": None}, body="ok")
+    row = {**json.loads(store.notes_path(tmp_path).read_text().splitlines()[0]),
+           "id": "20260101-000000-000000-bad", **change}
+    with open(store.notes_path(tmp_path), "a") as f:
+        f.write(json.dumps(row) + "\n")
+    assert [n.id for n in store.load(tmp_path)] == [good.id]
+    ((lineno, _, err),) = store.load_malformed(tmp_path)
+    assert (lineno, err) == (2, why)
+
+
 def test_a_verdict_field_is_refused_on_a_kind_without_the_bit(tmp_path):
     with pytest.raises(ValueError, match="no verdict"):
         store.add(tmp_path, kind="decision", target={"type": "project", "name": None},
@@ -654,14 +675,15 @@ NOW = datetime(2026, 9, 24, 12, 0, tzinfo=timezone(timedelta(hours=9)))
 
 
 @pytest.mark.parametrize("due, want", [
-    ("2026-09-23", (True, -1)),
-    ("2026-09-24", (False, 0)),               # a date is due through the end of its day
-    ("2026-10-01", (False, 7)),
-    ("2026-09-24T11:00:00+09:00", (True, 0)),  # an instant earlier today is past
-    ("2026-09-24T13:00:00+09:00", (False, 0)),
-    ("2026-09-24T02:30:00+00:00", (True, 0)),  # 11:30 at NOW's offset
-    ("2026-09-23T23:00:00+00:00", (True, 0)),  # 08:00 at NOW's offset: today, though UTC reads the 23rd
-    ("2026-09-24T14:00:00+00:00", (False, 0)),  # 23:00 at NOW's offset: still today
+    ("2026-09-23", (True, -1, None)),
+    ("2026-09-24", (False, 0, None)),         # a date is due through the end of its day
+    ("2026-10-01", (False, 7, None)),
+    ("2026-09-24T11:00:00+09:00", (True, 0, timedelta(hours=-1))),  # earlier today is past
+    ("2026-09-24T13:00:00+09:00", (False, 0, timedelta(hours=1))),
+    ("2026-09-24T02:30:00+00:00", (True, 0, timedelta(minutes=-30))),  # 11:30 at NOW's offset
+    # 08:00 at NOW's offset: today, though UTC reads the 23rd
+    ("2026-09-23T23:00:00+00:00", (True, 0, timedelta(hours=-4))),
+    ("2026-09-24T14:00:00+00:00", (False, 0, timedelta(hours=11))),  # 23:00 at NOW's offset
 ])
 def test_due_state_is_past_due_and_calendar_days_at_now(due, want):
     assert store.due_state(due, NOW) == want
@@ -806,6 +828,8 @@ def test_time_is_utc_unless_tz_is_set(monkeypatch):
     assert store.canon_due("2026-10-01T09:00") == "2026-10-01T09:00:00+00:00"
     assert store.shown("2026-10-01T09:00:00+09:00") == "2026-10-01 00:00:00Z"
     assert store.shown("2026-10-01") == "2026-10-01"
+    # a move's stamp is to the microsecond, so commit can tell two apart; a reader needs seconds
+    assert store.shown("2026-10-01T09:00:00.619806+00:00") == "2026-10-01 09:00:00Z"
     monkeypatch.setenv("TZ", "set")
     assert store.zone() is None
     assert store.since_cutoff("2026-09-03T11:00") == datetime(2026, 9, 3, 11).astimezone()
@@ -1067,10 +1091,10 @@ def test_the_first_write_moves_the_git_dirs_sessions_and_undo_level(tmp_path, mo
     for f in state.iterdir():
         f.unlink()
     state.rmdir()                               # the store as 0.13.0 left it
-    assert store.sessions(tmp_path) == {old.id: "s1"} and store.undoable(tmp_path)
+    assert store.sessions(tmp_path) == {old.id: "s1"} and store.undo_state(tmp_path) == "mine"
     store._snapshot(tmp_path)                   # a write's first step, as _lock takes it
     assert not legacy.exists() and not legacy.with_name(store.UNDO_DIR).exists()
-    assert store.sessions(tmp_path) == {old.id: "s1"} and store.undoable(tmp_path)
+    assert store.sessions(tmp_path) == {old.id: "s1"} and store.undo_state(tmp_path) == "mine"
     assert (state / ".gitignore").read_text() == "*\n"
 
 
@@ -1435,9 +1459,20 @@ def test_a_commit_with_nothing_to_take_ends_the_undo_level(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t",
                     "commit", "-q", "-m", "by hand"], check=True)
-    assert store.undoable(tmp_path), "control: the level outlives a hand commit"
+    assert store.undo_state(tmp_path) == "mine", "control: the level outlives a hand commit"
     assert store.commit(tmp_path, "c", SimpleNamespace(git_name="t", git_email="t@t")) is False
-    assert not store.undoable(tmp_path)
+    assert store.undo_state(tmp_path) != "mine"
+
+
+def test_removed_rows_are_the_lines_no_added_line_keeps():
+    """A diff's removed line is lost unless an added line holds it but for
+    the id, as an edit keeps its old version, or the line only moved."""
+    a, b = '{"id": "1", "body": "a"}', '{"id": "2", "body": "b"}'
+    assert store.removed_rows(f"-{a}\n+{a}\n") == []                          # moved
+    assert store.removed_rows(f'-{a}\n+{{"id": "9", "body": "a"}}\n') == []   # kept
+    assert store.removed_rows(f"-{a}\n-{b}\n+{b}\n") == [{"id": "1", "body": "a"}]
+    # A rewrite in place is a new version and the loss of the committed one.
+    assert store.removed_rows(f'-{a}\n+{{"id": "1", "body": "x"}}\n') == [{"id": "1", "body": "a"}]
 
 
 def test_undo_refuses_what_it_should_not_take_back(tmp_path):
@@ -1449,6 +1484,9 @@ def test_undo_refuses_what_it_should_not_take_back(tmp_path):
     a = store.add(tmp_path, kind="note", target=project, body="a", author="ann")
     b = store.add(tmp_path, kind="note", target=project, body="b", author="bob")
     with pytest.raises(store.UndoRefused, match=f"did not touch {a.id}.*the add of {b.id} by bob"):
+        store.undo(tmp_path, a.id, lambda last, rows: True)
+    # It read as a way through: undo b, then undo a. There is one level.
+    with pytest.raises(store.UndoRefused, match=f"never one before it. Correct {a.id} with supersede"):
         store.undo(tmp_path, a.id, lambda last, rows: True)
     with pytest.raises(store.UndoRefused, match=f"not yours: it was the add of {b.id} by bob"):
         store.undo(tmp_path, b.id, lambda last, rows: False)
@@ -1473,21 +1511,21 @@ def test_an_undo_preview_changes_nothing_and_names_each_earlier_version(tmp_path
     files = lambda: [(tmp_path / f).read_text() for f in ("notes.jsonl", "arcs.jsonl")]
     x = store.add(tmp_path, kind="task", target={"type": "project", "name": None},
                   body="b", author="ann", status="open")
-    assert store.commit(tmp_path, "c", cfg) and not store.undoable(tmp_path)
+    assert store.commit(tmp_path, "c", cfg) and store.undo_state(tmp_path) != "mine"
     store.supersede(tmp_path, x.id, author="ann", status="resolved")
-    assert store.undoable(tmp_path)
+    assert store.undo_state(tmp_path) == "mine"
     was = files()
     u = store.undo(tmp_path, None, yes, apply=False)
-    assert files() == was and store.undoable(tmp_path)
+    assert files() == was and store.undo_state(tmp_path) == "mine"
     assert u["changed"] == [x.id] and u["before"][x.id]["status"] == "open"
     with pytest.raises(store.UndoRefused, match="not yours"):
         store.undo(tmp_path, None, lambda last, rows: False, apply=False)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
-    assert not store.undoable(tmp_path), "another session's write"
+    assert store.undo_state(tmp_path) != "mine", "another session's write"
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
     with open(tmp_path / "notes.jsonl", "a") as f:
         f.write("\n")
-    assert not store.undoable(tmp_path), "the files changed outside symbion"
+    assert store.undo_state(tmp_path) != "mine", "the files changed outside symbion"
 
 
 def test_a_ref_of_a_type_the_store_lacks_is_refused_on_add(tmp_store):
@@ -1610,3 +1648,19 @@ def test_a_store_commit_is_stamped_by_symbions_clock_in_utc(tmp_path, monkeypatc
     dates = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%ai%n%ci"],
                            capture_output=True, text=True, encoding="utf-8").stdout.splitlines()
     assert dates == ["2026-01-10 12:00:00 +0000"] * 2, dates
+
+
+def test_a_committed_line_that_is_not_a_row_blocks_no_commit(tmp_path):
+    """Reads pass over a line that is not a row; a commit of some rows read
+    each of HEAD's lines as one, and raised IndexError on it, so one hand
+    edit stopped every plain commit (audit, 2026-11-08)."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    project = {"type": "project", "name": None}
+    store.add(tmp_path, kind="note", target=project, body="a", author="ann")
+    with open(tmp_path / "notes.jsonl", "a", encoding="utf-8") as f:
+        f.write("not a row\n")
+    assert store.commit(tmp_path, "all of it", cfg)
+    store.add(tmp_path, kind="note", target=project, body="b", author="ann")
+    assert store.commit(tmp_path, "ann's", cfg, keep=lambda r: r.get("author") == "ann")
+    assert store.pending_rows(tmp_path) == []

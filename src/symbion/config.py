@@ -17,7 +17,7 @@ CONFIG_FILE = "symbion.toml"
 # a warning, not a refusal, so an older symbion still reads a newer toml.
 KNOWN_KEYS = ("catalogs", "command_timeout", "default_branch", "git_email", "git_name",
               "kinds", "local_only", "project_root", "provenance", "renames", "repos",
-              "resolvers", "shared", "stale_target_noun", "uses", "work_root")
+              "resolvers", "shared", "stale_target_noun", "work_root")
 # A repo's catalog under [repos] unless [catalogs] names the repo: every file
 # git lists, committed or not, less what it ignores.
 FILE_CATALOG = "git ls-files --cached --others --exclude-standard"
@@ -343,7 +343,7 @@ def load(store, project_root: Path, work_root: Path | None = None) -> Config:
     p = Path(store) / CONFIG_FILE
     d = tomllib.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
     # A wrong type crashed every command, the hook included, far from its key.
-    for k in ("provenance", "catalogs", "resolvers", "renames", "uses"):
+    for k in ("provenance", "catalogs", "resolvers", "renames"):
         if k in d and not isinstance(d[k], dict):
             raise ValueError(f"{k} in {p} is {d[k]!r}: write it as a [{k}] table"
                              + (", its command under `command =`" if k == "provenance" else ""))

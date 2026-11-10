@@ -118,7 +118,7 @@ def test_arc_and_a_colon_lists_the_arcs_active_first(repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     old, one, two = (api.create_arc(ctx, name, "", "item", author="ada").id
                      for name in ("ship zero", "ship one", "other two"))
-    api.archive_arc(ctx, old)
+    api.archive_arc(ctx, old, author="user")
 
     def ids(q):
         return [r["href"].split("id=")[1] for r in _groups(ctx, q)["go to"]["rows"]]
@@ -143,12 +143,60 @@ def test_an_ids_tail_finds_its_entry_here_to_peek_and_another_stores_to_open(rep
     _serving(far, "http://127.0.0.1:20001/")
     (row,) = _groups(ctx, here[-3:])["entries by id"]["rows"]
     assert (row["peek"], row["href"]) == (here, f"/notes?id={here}")
-    assert row["id"] == f"{here[-10:-3]}<mark>{here[-3:]}</mark>"
+    # The tail may also occur in the id's digits (414769-414): each is marked.
+    assert row["id"] == here[-10:].replace(here[-3:], f"<mark>{here[-3:]}</mark>")
     g = _groups(ctx, there[-3:])
     (row,) = g["entries by id"]["rows"]
     assert "peek" not in row
     assert (row["store"], row["href"]) == ("far", f"http://127.0.0.1:20001/notes?id={there}")
     assert "other stores" not in g, "none of them say it, under an id found in one"
+
+
+def test_another_serve_is_asked_past_any_proxy_and_its_rows_read_as_text(repo, tmp_path,
+                                                                         monkeypatch):
+    """An HTTP proxy the environment named took what the person typed, and its
+    answer reached the page as sent: a row's words as HTML, its link, and a
+    button its `click` pressed on Enter (audit, 2026-11-08). The ask goes
+    direct, and a row another serve sends is rebuilt from named fields."""
+    import http.server
+    import threading
+    seen = []
+
+    class Proxy(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.requestline)
+            body = json.dumps({"entries": 1}).encode()
+            self.send_response(200)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Proxy)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{srv.server_port}")
+    for k in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(k, raising=False)
+    try:
+        assert _REAL_ASK("http://127.0.0.1:9", "what i typed") is None   # nothing listens at 9
+    finally:
+        srv.shutdown()
+    assert seen == []
+
+    ctx = api.resolve(str(tmp_path))
+    _serving(tmp_path / "far-notes", "http://127.0.0.1:20001/")
+    sent = {"kind": 'x" onclick="y', "kind_name": "<b>note</b>", "id": "<b>1234567abc</b>",
+            "html": "<img src=x onerror=alert(1)>a &lt;word&gt;", "href": "/notes?id=abc",
+            "click": ".sb-discard", "peek": "abc", "done": "yes"}
+    monkeypatch.setattr(palette, "_ask", lambda url, q: {
+        "entries": 1, "say": "2", "by_id": [sent, {**sent, "href": "@evil.example/"}, "row"]})
+    g = _groups(ctx, "abc")
+    assert g["entries by id"]["rows"] == [{
+        "kind": "", "kind_name": "note", "html": "a &lt;word&gt;", "id": "1234567<mark>abc</mark>",
+        "done": False, "href": "http://127.0.0.1:20001/notes?id=abc", "store": "far"}]
+    assert "other stores" not in g, "a count that is no number is none"
 
 
 def test_other_running_stores_are_counted_and_link_to_their_own_search(repo, tmp_path):

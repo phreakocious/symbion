@@ -4,11 +4,14 @@ carrying CLAUDECODE=1, and showing the resolved identity is what makes a
 misattribution visible BEFORE it is permanent in an append-only file."""
 from __future__ import annotations
 
+import itertools
 import json
 import re
+import time
 from contextlib import contextmanager
 from importlib import metadata
 from pathlib import Path
+from urllib.parse import unquote
 
 from nicegui import app, run, ui
 
@@ -19,7 +22,7 @@ from . import servers
 from .filters import href
 from .notes import (FILE_MD_EXTRAS, add_form, ago, demo_says, fenced, heading, kind_class,
                     peek_entry, reading, render_note, say_after_reload, short_id, show_said,
-                    undo_dialog, viewer)
+                    undo_dialog, viewer, discard_dialog)
 from .theme import (DARK_CSS, FONTS_HTML, LOGO_SVG, NARROW, kind_css, quasar_colors,
                     root_vars_css)
 
@@ -214,8 +217,46 @@ function sbPeek(card) {
   const f = document.activeElement;
   if (f && f.closest('.sb-main .sb-note')) f.blur();
   card.scrollIntoView({block: 'nearest'});
+  sbHold();
   emitEvent('sbPeek', {id: card.dataset.id});
 }
+// The pick keeps its place in the window as the column changes width. Chrome's
+// scroll anchoring stood still while Quasar animated the page's padding for the
+// peek: the cards above re-wrapped taller, and the pick fell below the window
+// (2026-11-09). With the pick out of the window, the card at its top, under
+// the header, is held, as Chrome's own anchoring would: a close moved the
+// cards a reader had scrolled to out of the window.
+let sbColW = 0, sbHeld = null, sbHeldTop = 0;
+function sbHold() {
+  const m = document.querySelector('.sb-main');      // none on a page whose stale list picked
+  if (m) sbColWatch.observe(m);
+  sbPickAt();
+}
+function sbPickAt() {
+  const pick = document.querySelector('.sb-main .sb-picked'), b = pick && pick.getBoundingClientRect();
+  const m = document.querySelector('.sb-main')?.getBoundingClientRect();
+  sbHeld = b && b.height && b.bottom > 0 && b.top < innerHeight ? pick : null;
+  // a point under the header can fall in a gap between sections or on a heading
+  let y = (document.querySelector('.q-header')?.getBoundingClientRect().bottom || 0) + 16;
+  for (; !sbHeld && m && y < innerHeight / 2; y += 24)
+    sbHeld = document.elementFromPoint(m.left + m.width / 2, y)?.closest('.sb-main .sb-note');
+  if (sbHeld) sbHeldTop = sbHeld.getBoundingClientRect().top;
+}
+const sbColWatch = new ResizeObserver(([e]) => {
+  const c = sbHeld, w = e.target.offsetWidth;
+  if (c && c.isConnected && sbColW && w !== sbColW) {
+    scrollBy({top: c.getBoundingClientRect().top - sbHeldTop, behavior: 'instant'});
+    if (c.classList.contains('sb-picked'))      // it re-wrapped taller too
+      c.scrollIntoView({block: 'nearest', behavior: 'instant'});
+  }
+  sbColW = w;
+  sbPickAt();
+});
+// Not while the width is changing: Chrome lays out the next frame's width before
+// this event, and the pick's drifted place was taken as its own.
+addEventListener('scroll', () => {
+  if (document.querySelector('.sb-main')?.offsetWidth === sbColW) sbPickAt();
+}, {passive: true});
 function sbPeekOpen() {
   // shell sets sb-peeking from the drawer's value. Its left edge read open
   // when closed on a page that did not scroll, under scrollbar-gutter:
@@ -233,15 +274,34 @@ document.addEventListener('click', e => {
   e.preventDefault();
   sbPeek(card);
 });
+// A click on the page's background closes the peek, as Esc and its button
+// do (the user, 2026-11-08): not one on a card, a control, the peek, or a
+// dialog, menu or palette over the page, and not one that ends a selection.
+const sbPeekStays = '.sb-peek, .sb-note, a, button, input, textarea, select, label, ' +
+  '[role=button], .q-btn, .q-field, .q-dialog, .q-menu, .q-notification, .sb-palette';
+document.addEventListener('click', e => {
+  if (e.defaultPrevented || e.button !== 0 || !sbPeekOpen() || getSelection().toString()) return;
+  const t = e.target.closest ? e.target : null;
+  if (!t || !t.isConnected || t.closest(sbPeekStays)) return;
+  document.querySelector('.sb-peek-close')?.click();
+});
 // The peek in the URL as #peek=<id>: it opened and closed beside history,
 // so a phone's Back left the page under it, and a reload or a shared link
 // lost it (the GUI review, 2026-11-07). Opening pushes one entry, j and k
 // replace it, so one Back closes the peek; a close by its button goes back.
+// The entry under the peek restores no scroll as history returns to it: it
+// held the scroll from when the peek opened, so a close threw a reader who
+// had scrolled back there, and where the peek locks the body it held 0
+// (2026-11-09). It restores again from the moment history lands on it.
 function sbPeekHash(id) {
   const h = '#peek=' + encodeURIComponent(id);
   if (location.hash === h) return;
   if (history.state && history.state.sbPeek) history.replaceState({sbPeek: 1}, '', h);
-  else history.pushState({sbPeek: 1}, '', h);
+  else {
+    history.scrollRestoration = 'manual';
+    history.pushState({sbPeek: 1}, '', h);
+    history.scrollRestoration = 'auto';         // the peek's own entry: a reload restores it
+  }
 }
 function sbPeekUnhash() {
   if (!location.hash.startsWith('#peek=')) return;
@@ -256,9 +316,52 @@ function sbPeekFromHash() {
   if (card) sbPeek(card); else emitEvent('sbPeek', {id});
 }
 addEventListener('popstate', () => {
-  if (location.hash.startsWith('#peek=')) sbPeekFromHash();
-  else if (sbPeekOpen()) document.querySelector('.sb-peek-close')?.click();
+  if (location.hash.startsWith('#peek=')) return sbPeekFromHash();
+  history.scrollRestoration = 'auto';
+  if (sbPeekOpen()) document.querySelector('.sb-peek-close')?.click();
 });
+// Below PEEK_WIDE Quasar locks the body while the peek is open, and at the
+// unlock puts the scroll back only when the URL is the one it locked at. The
+// #peek= entry changed the URL, and a close by Esc left the page at its top
+// (2026-11-09). This puts it back where the lock found it. It watches from
+// before the scripts that mount the page: a page built with the peek open
+// locks before DOMContentLoaded, and takes its place from the cookie below,
+// where the lock found scrollY at 0 (2026-11-10).
+let sbKeptY = null;
+document.addEventListener('readystatechange', () => {
+  if (document.readyState !== 'interactive') return;
+  let y = null;
+  new MutationObserver(() => {
+    const b = document.body, locked = b.classList.contains('q-body--prevent-scroll');
+    if (locked && y === null) {
+      y = -parseFloat(b.style.top) || 0;
+      if (sbKeptY !== null) b.style.top = -(y = sbKeptY) + 'px';
+      sbKeptY = null;
+    } else if (!locked && y !== null) {
+      if (Math.abs(scrollY - y) > 1) scrollTo({top: y, behavior: 'instant'});
+      y = null;
+    }
+  }).observe(document.body, {attributes: true, attributeFilter: ['class']});
+});
+addEventListener('load', () => { sbKeptY = null; });     // the mount's lock has run by now
+// A page that unloads with the peek open names itself, the entry and its
+// scroll in a cookie, which a reload's request carries: `_peek_kept` builds
+// that page with the peek open. A locked body holds its scroll in its top:
+// scrollY read 0, and the reload came back at the page's top (2026-11-10).
+// Each load reads the scroll and clears the cookie.
+addEventListener('beforeunload', () => {
+  const m = sbPeekOpen() && location.hash.match(/^#peek=(.+)$/);
+  const b = document.body, y = b.classList.contains('q-body--prevent-scroll') ?
+    -parseFloat(b.style.top) || 0 : scrollY;
+  if (m) document.cookie = 'sb-peek=' + encodeURIComponent(location.pathname + location.search +
+    ' ' + decodeURIComponent(m[1]) + ' ' + Math.round(y)) + '; path=/; max-age=5; samesite=lax';
+});
+{
+  const c = document.cookie.match(/(?:^|;\\s*)sb-peek=([^;]*)/);
+  const [at, , y] = c ? decodeURIComponent(c[1]).split(' ') : [];
+  if (at === location.pathname + location.search && +y > 0) sbKeptY = +y;
+}
+document.cookie = 'sb-peek=; path=/; max-age=0; samesite=lax';
 const sbPeekKeys = {x: '.sb-resolve', s: '.sb-star', e: '.sb-edit', o: '.sb-peek-page',
                     a: '.sb-answer-field input', Escape: '.sb-peek-close'};
 document.addEventListener('keydown', e => {
@@ -629,6 +732,9 @@ def store_name(ctx) -> str:
     return root.name if root and not ctx.cfg.repos else ctx.store_dir.name
 
 
+_BUILDS = itertools.count(1)
+
+
 def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
           here: str = "", new=("project", None, None), kind: str | None = None,
           cards: bool = True, search=None, tab: str | None = None) -> None:
@@ -643,6 +749,12 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     `kind` the kind it starts as. `cards` is False on a page with no entry
     cards, and `search` maps a page that narrows itself to the URL of the
     words searched: see `_search_box`."""
+    # Chrome restores a reload's scroll by the DOM id of the element at the
+    # window's top, and NiceGUI numbers elements as the page builds them:
+    # after a write that moved a card or added a button, that id was another
+    # card's, and the page jumped to it (2026-11-09). No two builds number
+    # alike, so Chrome finds no such id and restores the offset.
+    ui.context.client.next_element_id += next(_BUILDS) * 100_000
     ui.dark_mode().enable()
     name = store_name(ctx)
     # The project, then the page: the tab strip truncates from the right, and
@@ -717,8 +829,11 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     # Not value=None: its open-state probe waits 1 s on each connect and logs a
     # traceback when the visitor has left or the tab sleeps. Quasar reads
     # show-if-above at mount and sends "open" itself when wide.
+    # No-swipe-backdrop: Quasar pans the dimmed page with the mouse in any
+    # direction, and a click there that moved a few px closed nothing.
     with ui.left_drawer(value=False, fixed=True, bordered=False) \
-            .props(f"show-if-above width=248 breakpoint={NARROW}").classes("sb-side") as drawer:
+            .props(f"show-if-above width=248 breakpoint={NARROW} no-swipe-backdrop") \
+            .classes("sb-side") as drawer:
         _sidebar(ctx, author, name, heads, here)
     with ui.header(elevated=False).classes("sb-header"):
         # Dozens of stops came before the first card on every page (the GUI
@@ -765,13 +880,22 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
                 ui.label(author).classes("sb-badge").mark("author-badge-top")
     # Beside the page from PEEK_WIDE up, over it below, where a panel beside
     # it left the cards too narrow to read.
-    with ui.right_drawer(value=False, fixed=True, bordered=False) \
-            .props(f"width={PEEK_WIDTH} breakpoint={PEEK_WIDE - 1}").classes("sb-peek") as peek:
-        show_drift = _peek_panel(ctx, author, peek, heads)
+    # No swipe: below the breakpoint Quasar's drawer pans with the mouse too,
+    # and handles a pan's last event 50 ms after the release. The release is
+    # also a click that closes the peek, and once the drawer is hidden that
+    # last event returns before it clears the pan: the backdrop then stayed
+    # over the page, clear, and nothing took a click (the user, 2026-11-09).
+    kept = _peek_kept()
+    with ui.right_drawer(value=bool(kept), fixed=True, bordered=False) \
+            .props(f"width={PEEK_WIDTH} breakpoint={PEEK_WIDE - 1} "
+                   "no-swipe-open no-swipe-close no-swipe-backdrop").classes("sb-peek") as peek:
+        show_drift = _peek_panel(ctx, author, peek, heads, kept)
     # The pick is lit while the peek is open: it stayed lit after the panel
     # was gone (the user, 2026-10-16). The card keeps `sb-picked`, j/k's
     # place; every way to close the peek sets the drawer's value.
     layout = ui.context.client.layout
+    if kept:
+        layout.classes(add="sb-peeking")
     def peeking(e) -> None:
         if e.value:
             layout.classes(add="sb-peeking")
@@ -811,27 +935,43 @@ def _drift_list(ctx, author: str, drawn: dict, arcs: bool) -> None:
                         actions=False, git_head=git_head, seen=rd)
 
 
-def _peek_panel(ctx, author: str, drawer, heads):
+PEEK_COOKIE = "sb-peek"
+
+
+def _peek_kept() -> str | None:
+    """The entry the peek showed as this page was reloaded: `_PEEK_JS` names
+    the page's URL and the entry in a cookie as a page unloads, and a link to
+    another URL carries it too. Opened once the socket connected, the peek
+    slid in over a page drawn without it, and every card wrapped a second
+    time (the user, 2026-11-09)."""
+    try:
+        request = ui.context.client.request
+    except RuntimeError:            # a client built with no request
+        return None
+    at, _, nid = unquote(request.cookies.get(PEEK_COOKIE, "")).partition(" ")
+    nid = nid.partition(" ")[0]         # the page's scroll follows, for its script
+    here = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+    return nid if nid and at == here else None
+
+
+def _peek_panel(ctx, author: str, drawer, heads, kept: str | None = None):
     """The entry `_PEEK_JS` names in an `sbPeek` event, as its own page shows
     it. A write in it reloads the page, as a card's write does, and the page
-    opens the peek on the entry again: redrawn alone, the peek left an
-    answered question on the board (the user, 2026-10-16). Returns what opens
-    it on `_drift_list` of `heads`, the entries the page drew."""
-    shown = [None]
+    comes with the peek on `kept`, that entry, again: redrawn alone, the peek
+    left an answered question on the board (the user, 2026-10-16). Returns
+    what opens it on `_drift_list` of `heads`, the entries the page drew."""
+    shown = [kept]
     key = (str(ctx.store_dir), author)
     drawn = {n.id: n for n in heads}
-
-    def wrote() -> None:
-        app.storage.tab[_PEEKED] = shown[0]
-        ui.navigate.reload()
 
     @ui.refreshable
     def body():
         if shown[0] is _DRIFT:
-            _drift_list(ctx, author, _DRAWN.get(key, drawn),
-                        key in _ARCS and _arcs_stamp(ctx.store_dir) != _ARCS[key]["stamp"])
+            seen, arcs = _page_seen(key) or (_DRAWN.get(key, drawn), _ARCS.get(key))
+            _drift_list(ctx, author, seen,
+                        arcs is not None and _arcs_stamp(ctx.store_dir) != arcs["stamp"])
         elif shown[0]:
-            peek_entry(ctx, shown[0], author, wrote)
+            peek_entry(ctx, shown[0], author, lambda: ui.navigate.reload())
 
     with ui.element("div").classes("sb-peek-inner").mark("peek"):
         with ui.row(wrap=False).classes("items-center w-full sb-peek-head"):
@@ -846,33 +986,33 @@ def _peek_panel(ctx, author: str, drawer, heads):
                 .tooltip("close (Esc)").mark("peek-close")
         body()
 
-    def show(nid) -> None:
+    def show(nid, built: bool = False) -> None:
         shown[0] = nid
         page.set_visibility(nid is not _DRIFT)
         if nid is not _DRIFT and isinstance(nid, str):
             page._props["href"] = href(id=nid)          # set, not parsed: the id is the URL's
             page.update()
             ui.run_javascript(f"sbPeekHash({json.dumps(nid)})")
-        body.refresh()
-        drawer.show()
+        if not built:
+            body.refresh()
+            drawer.show()
     ui.on("sbPeek", lambda e: show((e.args or {}).get("id")))
 
     client = ui.context.client
 
     def again() -> None:
         with client:
-            if nid := app.storage.tab.pop(_PEEKED, None):
+            if kept:
                 # its card, still on the board, keeps j/k's place
-                ui.run_javascript(f"sbCards().find(c => c.dataset.id === {json.dumps(nid)})"
-                                  "?.classList.add('sb-picked')")
-                show(nid)
+                ui.run_javascript(f"sbCards().find(c => c.dataset.id === {json.dumps(kept)})"
+                                  "?.classList.add('sb-picked'); sbHold()")
+                show(kept, built=True)      # the page came with it drawn
             else:
-                ui.run_javascript("sbPeekFromHash()")   # a reload, or a link with #peek=
+                ui.run_javascript("sbPeekFromHash()")   # a link with #peek=, or no cookie came
     client.on_connect(again)
     return lambda: show(_DRIFT)
 
 
-_PEEKED = "sb-peeked"
 _DRAFT = "sb-draft"
 _DRIFT = object()           # the peek's other content: `_drift_list`
 
@@ -901,6 +1041,10 @@ def _dropped(ctx, a: dict, made: dict, open_form) -> None:
     drop design (2026-10-15) has the table this follows."""
     if a.get("refused"):
         ui.notify(a["refused"], type="warning")
+        return
+    # Its catalog match and doc name said whether a file the repo or docs/
+    # holds exists, tracked or not (audit, 2026-11-08).
+    if demo_says("opens the dropped file in a new entry"):
         return
     name, text, cursor = a["name"], a["text"], a.get("cursor")
     md = name.lower().endswith((".md", ".markdown"))
@@ -998,7 +1142,7 @@ def _new_note_button(ctx, author: str, target_type, target_name, arc_id,
             made["form"] = add_form(ctx, target_type, target_name,
                                     lambda: ui.navigate.reload(), author=author,
                                     arc_id=arc_id, another=lambda: added.append(1),
-                                    start_kind=kind)
+                                    start_kind=kind, close=dialog.close)
             if draft := app.storage.tab.get(_DRAFT):     # in `slot`: the tab is the page's
                 made["form"].restore(draft)
 
@@ -1006,7 +1150,9 @@ def _new_note_button(ctx, author: str, target_type, target_name, arc_id,
             # A draft closed with Esc outlives the reload a card's write
             # brings (audit, 2026-10-28); open, it is the form's again.
             app.storage.tab.pop(_DRAFT, None)
-            if not e.value and made["form"].busy():
+            # The read-only demo keeps nothing a visitor types: a tab's storage
+            # lives 30 days (audit, 2026-11-08).
+            if not e.value and made["form"].busy() and not S.read_only():
                 app.storage.tab[_DRAFT] = made["form"].state()
             if added and not e.value:
                 ui.navigate.reload()
@@ -1277,22 +1423,38 @@ def _arcs_stamp(store_dir):
         return None
 
 
+def _page_seen(key):
+    """(drawn, arcs): what this page's git buttons recorded for `key`, or None.
+    Kept on the page's client: by (store, writer) alone, a second tab's draw
+    took the first's, which then lit its own writes as news (audit, 2026-11-08)."""
+    try:
+        seen = getattr(ui.context.client, "sb_seen", None)
+    except RuntimeError:                    # no page: a background task
+        return None
+    return seen[1:] if seen and seen[0] == key else None
+
+
 @contextmanager
 def own_write(ctx, author: str, ids=()):
     """Wrap the page's own write: it is no news to the page, so the stale
     button lights for others' writes only. The arcs stamp is adopted only if
     arcs.jsonl was as the page last recorded it before the write; otherwise
     an arc change the poll has not seen stays offered. The entries `ids`
-    count as drawn. ponytail: only the writer's latest page records, so a
-    second tab of the same writer lights for the first's writes; an entry in
-    `ids` another writer changed in the same instant counts as drawn."""
+    count as drawn, on this page and on the writer's latest, which the app
+    badge reads. ponytail: another tab of the same writer lights for this
+    one's writes; an entry in `ids` another writer changed in the same
+    instant counts as drawn."""
     key = (str(ctx.store_dir), author)
+    pages = [p for p in (_page_seen(key), (_DRAWN.get(key), _ARCS.get(key)))
+             if p and p[0] is not None]
     before = _arcs_stamp(ctx.store_dir)
     yield
-    if key in _ARCS and before == _ARCS[key]["stamp"]:
-        _ARCS[key]["stamp"] = _arcs_stamp(ctx.store_dir)
-    if ids and key in _DRAWN:
-        _DRAWN[key].update({n.id: n for n in S.heads(S.load(ctx.store_dir)) if n.id in ids})
+    after = _arcs_stamp(ctx.store_dir)
+    heads = {n.id: n for n in S.heads(S.load(ctx.store_dir)) if n.id in ids} if ids else {}
+    for drawn, arcs in pages:
+        if arcs is not None and before == arcs["stamp"]:
+            arcs["stamp"] = after
+        drawn.update(heads)
 
 
 def _drift(drawn: dict, now) -> tuple[int, int]:
@@ -1388,14 +1550,14 @@ def _tip_on_hover(el, text) -> None:
 
 def git_state(ctx, author: str) -> tuple:
     """(the writer's pending entries, other writers', a changed registry,
-    commits not on the remote, the undo level): what the top bar's undo,
+    commits not on the remote, whose the undo level is): what the top bar's undo,
     commit and push buttons show, and the palette's actions."""
     rows = S.pending_rows(ctx.store_dir)
     keep = S.with_bases(rows, lambda r: r.get("author") == author)
     mine = len(S.entries([r for r in rows if keep(r)]))
     return (mine, len(S.entries([r for r in rows if not keep(r)])),
             gitref.registry_modified(ctx.store_dir),
-            gitref.unpushed(ctx.store_dir), S.undoable(ctx.store_dir))
+            gitref.unpushed(ctx.store_dir), S.undo_state(ctx.store_dir))
 
 
 def _git_buttons(ctx, author: str, heads, on_stale) -> None:
@@ -1415,6 +1577,7 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
     _DRAWN[key] = drawn
     seen = {"stamp": None, "heads": heads}
     arcs = _ARCS[key] = {"stamp": _arcs_stamp(ctx.store_dir)}
+    ui.context.client.sb_seen = (key, drawn, arcs)
 
     def store_state():
         # The file is parsed again only when it changed: every page ticks.
@@ -1437,21 +1600,23 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
         if any(state[5]):
             _stale_button(*state[5], on_stale,
                           lambda: _drift_tip(drawn, seen["heads"], state[5][2]))
-        if state[4]:
+        if state[4] == "mine":
             # No label to compute: the dialog says what the undo takes back.
             ui.button(icon="undo", on_click=lambda: undo_dialog(ctx, author)) \
                 .props('flat dense round aria-label="undo your last write"') \
                 .classes("sb-undo").mark("undo-button").tooltip("undo your last write")
-        elif state[0]:
+        elif state[0] and state[4] == "other":
             # The person's write is uncommitted, but the one level is another
-            # writer's, or a commit ended it: the icon had gone, and the user
-            # looked for it (2026-10-16). A click shows undo's refusal, which
-            # names the write that holds the level.
+            # writer's: the icon had gone, and the user looked for it
+            # (2026-10-16). A click shows undo's refusal, which names the
+            # write that holds the level. With no level (a commit ended it) a
+            # click could say only "nothing to undo" (the user, 2026-11-08).
             ui.button(icon="undo", on_click=lambda: undo_dialog(ctx, author)) \
                 .props('flat dense round aria-label="why your last write cannot be undone"') \
                 .classes("sb-undo sb-undo-gone").mark("undo-gone") \
                 .tooltip("your last write can no longer be undone: click to see why")
         _commit_button(ctx, author, *state[:3])
+        _discard_button(ctx, author, *state[:3])
         _push_button(ctx, state[3])
 
     shown = [read()]
@@ -1475,13 +1640,23 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
             sent[0] = state[6]
             ui.run_javascript(f"sbBadge({state[6]})")
     if not S.read_only():           # nothing changes there: only anonymous load
-        timer = ui.timer(_GIT_EVERY, tick, immediate=False).mark("git-poll")  # the page has just read it
-
         # A hidden tab polled as often as a shown one (the GUI review,
         # 2026-11-07). It slows, never stops: the installed app's badge is set
-        # from this tick, and a hidden window is when it counts.
+        # from this tick, and a hidden window is when it counts. The timer
+        # keeps its pace: NiceGUI reads `interval` when a sleep ends, so a tab
+        # shown again waited out the hidden one's minute (audit, 2026-11-08).
+        away = [None]                       # when a hidden tab last read
+
+        async def every() -> None:
+            if away[0] is not None:
+                if time.monotonic() - away[0] < _HIDDEN_EVERY:
+                    return
+                away[0] = time.monotonic()
+            await tick()
+        ui.timer(_GIT_EVERY, every, immediate=False).mark("git-poll")  # the page has just read it
+
         async def hidden(e) -> None:
-            timer.interval = _HIDDEN_EVERY if e.args else _GIT_EVERY
+            away[0] = time.monotonic() if e.args else None
             if not e.args:
                 await tick()                # shown again: the bar is read now
         ui.on("sbHidden", hidden)
@@ -1566,6 +1741,18 @@ def _commit_button(ctx, author: str, n: int, others: int, registry: bool) -> Non
         _tip_on_hover(b, lambda: _commit_tip(ctx, author))
         ui.label("commit").classes("sb-btn-word")
         ui.label(str(n) if n else "registry")
+
+
+def _discard_button(ctx, author: str, n: int, others: int, registry: bool) -> None:
+    """Commit's other way, beside it: throw away what the commit would take
+    for you, after a dialog lists it (notes.discard_dialog). Quiet, as push
+    is: a commit is the usual end of a write."""
+    if not n and not registry:
+        return
+    ui.button(icon="delete_sweep", on_click=lambda: discard_dialog(ctx, author)) \
+        .props('flat dense round color=muted aria-label="discard your uncommitted work"') \
+        .classes("sb-discard").mark("discard-button") \
+        .tooltip("discard your uncommitted work: a list first, and undo brings it back")
 
 
 def _push_button(ctx, n: int | None) -> None:

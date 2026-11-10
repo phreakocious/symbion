@@ -4,7 +4,7 @@ A wrap is the session's last use of its context: what it knows that no entry
 holds goes into the store now. It leaves the store true and one commit whose
 message is the handoff, and writes no file. The next session's summary prints
 that message as `last wrap by …`, with its age and the repo commits since,
-above the open entries.
+below the open entries.
 
 1. **Asks.** Reread your own messages in this session. Each ask you put to
    the user ("say if…", "want me to…?", "should I…?") that no later message

@@ -78,6 +78,26 @@ async def test_ticking_a_done_row_reopens_it(user: User, seeded):
     assert store.arc_progress(store.load(ctx.store_dir), act.id)[0] == 0
 
 
+async def test_a_ticked_rows_id_tip_holds_its_age_stamp(user: User, seeded):
+    """The age takes no focus, so a keyboard reads its stamp in the id's tip
+    (the GUI review, 2026-11-07). An open box shows no age, and no stamp."""
+    ctx, act = seeded
+    item = store.arc_items(store.load(ctx.store_dir), act.id)[0]
+    api.supersede(ctx, item.id, author="ada", status="resolved")
+    heads = {n.target.name: n.id for n in store.arc_items(store.load(ctx.store_dir), act.id)}
+
+    @ui.page("/t")
+    def page():
+        checklist(ctx, act, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see(item.target.name)
+    done = _card(user, heads.pop(item.target.name)).props["card"]
+    (box,) = (_card(user, nid).props["card"] for nid in heads.values())
+    assert f"written {done['age']['tip']}\n" in done["sid"]["tip"]
+    assert box["age"] is None and "written" not in box["sid"]["tip"]
+
+
 def test_a_tick_is_authored_by_the_human_not_claude(seeded, monkeypatch):
     """The tick goes through api.supersede with the GUI author. A supersede
     inherits target and provenance but NEVER the author -- a correction is
@@ -296,7 +316,7 @@ async def test_the_phase_menu_moves_a_box_like_arc_move(user: User, repo, tmp_pa
         ctx = api.resolve(str(d))
         act = api.create_arc(ctx, "camp", "d", "item", author="ada")
         api.seed(ctx, act.id, "item", ["one", "two"], author="ada")
-        api.set_phases(ctx, act.id, ["todo", "doing"])
+        api.set_phases(ctx, act.id, ["todo", "doing"], author="user")
         out[name] = ctx, act
     ctx, act = out["gui"]
     one = next(n for n in store.arc_items(store.load(ctx.store_dir), act.id) if n.target.name == "one")
@@ -359,7 +379,7 @@ async def test_the_phases_editor_sets_phases_and_shows_a_refusal(user: User, see
 
 async def test_a_read_only_serve_offers_no_move(user: User, seeded, monkeypatch):
     ctx, act = seeded
-    api.set_phases(ctx, act.id, ["todo", "doing"])
+    api.set_phases(ctx, act.id, ["todo", "doing"], author="user")
     monkeypatch.setenv("SYMBION_READ_ONLY", "1")
 
     @ui.page("/t")
@@ -415,7 +435,7 @@ def phased(repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     act = api.create_arc(ctx, "camp", "d", "item", author="ada")
     api.seed(ctx, act.id, "item", ["one", "two", "three"], author="ada")
-    api.set_phases(ctx, act.id, ["todo", "doing"])
+    api.set_phases(ctx, act.id, ["todo", "doing"], author="user")
     ids = {n.target.name: n.id for n in store.arc_items(store.load(ctx.store_dir), act.id)}
     build_page(ctx, author="ada")
     return ctx, act, ids
@@ -485,7 +505,7 @@ async def test_board_columns_follow_arc_board(user: User, phased):
     assert _columns(user) == want == {"todo": [ids["two"]], "doing": [ids["three"]],
                                       "done": [ids["one"]]}
     await not_see(user, "checklist-phase")          # the column names it; the list keeps it
-    api.set_phases(ctx, act.id, [])
+    api.set_phases(ctx, act.id, [], author="user")
     await _board(user, act, click=False)
     assert _columns(user) == {"open": [ids["two"], ids["three"]], "done": [ids["one"]]}
     await not_see(user, "checklist-order")
@@ -534,7 +554,7 @@ async def test_a_card_shows_its_mover_and_an_unmoved_one_nothing(user: User, pha
     assert [c.props["card"]["move"] is None for c in cards(user)] == [True, False, False]
     monkeypatch.delenv("SYMBION_READ_ONLY")
     # Without phases the line has room for the mover.
-    api.set_phases(ctx, act.id, [])
+    api.set_phases(ctx, act.id, [], author="user")
     api.move_box(ctx, ids["one"], before=ids["three"], author="human")
     await _board(user, act, click=False)
     assert part(user, "board-moved", card=_card(user, ids["one"])).text == "moved · human · now"
@@ -605,7 +625,7 @@ async def test_a_move_pick_hands_focus_back_to_the_moved_card(user: User, phased
 
 async def test_a_board_card_on_an_arc_without_phases_moves_up_and_down(user: User, phased):
     ctx, act, ids = phased
-    api.set_phases(ctx, act.id, [])
+    api.set_phases(ctx, act.id, [], author="user")
     await _board(user, act)
     (board,) = user.find(marker="arc-board").elements
     assert "sb-phases" in board.classes            # the narrow card's rules reach it
@@ -668,7 +688,7 @@ async def test_a_drop_in_the_open_column_of_an_arc_without_phases_orders_it(user
                                                                            phased):
     """The column reads `open`, a name the arc does not have: the move gives no phase."""
     ctx, act, ids = phased
-    api.set_phases(ctx, act.id, [])
+    api.set_phases(ctx, act.id, [], author="user")
     await _board(user, act)
     _page(user, "sbMove", {"id": ids["three"], "phase": "open", "before": ids["one"]})
     await asyncio.sleep(0.1)
@@ -705,7 +725,7 @@ async def test_a_drop_after_the_last_shown_card_of_a_capped_column_lands_there(
     act = api.create_arc(ctx, "camp", "d", "item", author="ada")
     for name in ("n0", "n1", "n2", "n3", "x"):
         api.seed(ctx, act.id, "item", [name], author="ada")
-    api.set_phases(ctx, act.id, ["todo", "doing"])
+    api.set_phases(ctx, act.id, ["todo", "doing"], author="user")
     ids = {n.target.name: n.id for n in store.arc_items(store.load(ctx.store_dir), act.id)}
     api.move_box(ctx, ids["x"], phase="doing", author="ada")
     build_page(ctx, author="ada")
@@ -717,6 +737,12 @@ async def test_a_drop_after_the_last_shown_card_of_a_capped_column_lands_there(
     assert _columns(user)["todo"] == [ids["n0"], ids["n1"], ids["x"]]
 
 
+def _bar(bar) -> list:
+    """An arc's progress bar as [(phase, count, its place on the board)], left to right."""
+    return [(s.props["data-phase"], int(s._style["flex"].split()[0]), int(s._style["--i"]))
+            for s in bar.default_slot.children]
+
+
 async def test_a_drop_on_done_moves_the_header_count(user: User, phased):
     """The board is not redrawn after a drop, so the count and bar over it
     are updated on their own."""
@@ -725,13 +751,41 @@ async def test_a_drop_on_done_moves_the_header_count(user: User, phased):
     await _board(user, act)
     (count,) = user.find(marker="arc-count").elements
     (bar,) = user.find(marker="arc-progress").elements
-    assert (count.text, bar.value) == ("1/3", 1 / 3)
+    assert (count.text, bar.props["aria-valuenow"]) == ("1/3", 1)
     _page(user, "sbMove", {"id": ids["two"], "phase": "done", "before": None})
     await asyncio.sleep(0.1)
-    assert (count.text, bar.value) == ("2/3", 2 / 3)
+    assert (count.text, bar.props["aria-valuenow"]) == ("2/3", 2)
+    assert _bar(bar) == [("done", 2, 3), ("todo", 1, 1)]
     _page(user, "sbMove", {"id": ids["one"], "phase": "doing", "before": None})
     await asyncio.sleep(0.1)
-    assert (count.text, bar.value) == ("1/3", 1 / 3)
+    assert (count.text, bar.props["aria-valuenow"]) == ("1/3", 1)
+    assert _bar(bar) == [("done", 1, 3), ("doing", 1, 2), ("todo", 1, 1)]
+
+
+async def test_an_arcs_bar_is_its_boxes_by_phase(user: User, phased):
+    """A progress bar said only done or not (2026-11-08): it is the arc's boxes
+    by phase, done first, then the board's columns right to left, each as
+    wide as its count, its tip the phase and count, and a screen reader hears
+    the whole. The arcs page draws the same bar, with the arc's own count of
+    columns, and an arc without phases has open and done."""
+    ctx, act, ids = phased
+    api.move_box(ctx, ids["two"], author="ada", phase="doing")
+    api.supersede(ctx, ids["three"], author="ada", status="resolved")
+    plain = api.create_arc(ctx, "plain", "d", "item", author="ada")
+    api.seed(ctx, plain.id, "item", ["four", "five"], author="ada")
+    await _board(user, act)
+    (bar,) = user.find(marker="arc-progress").elements
+    assert _bar(bar) == [("done", 1, 3), ("doing", 1, 2), ("todo", 1, 1)]
+    assert [s.props["data-tip"] for s in bar.default_slot.children] == ["done 1", "doing 1", "todo 1"]
+    assert (bar.props["role"], bar.props["aria-valuemax"], bar._style["--sb-cols"]) == \
+        ("progressbar", 3, "3")
+    assert bar.props["aria-valuetext"] == "1 of 3 done; doing 1, todo 1"
+    await user.open("/arcs")
+    bars = {b.parent_slot.parent.default_slot.children[0].default_slot.children[0].text: b
+            for b in user.find(marker="arc-bar").elements}
+    assert _bar(bars["camp"]) == _bar(bar) and bars["camp"]._style["--sb-cols"] == "3"
+    assert _bar(bars["plain"]) == [("open", 2, 1)] and bars["plain"]._style["--sb-cols"] == "2"
+
 
 
 async def test_a_drop_on_done_resolves(user: User, phased):
@@ -873,7 +927,7 @@ async def test_an_open_list_row_has_a_grip_and_its_phase(user: User, phased):
     assert _grips(user) == {ids["two"]: "todo", ids["three"]: "doing"}
     assert "data-phase" not in _card(user, ids["one"]).props
     assert not any("draggable" in c.props for c in cards(user)), "the grip drags, not the row"
-    api.set_phases(ctx, act.id, [])
+    api.set_phases(ctx, act.id, [], author="user")
     await user.open(f"/arc?id={act.id}")
     assert _grips(user) == {ids["two"]: "open", ids["three"]: "open"}
     await _board(user, act)
@@ -903,7 +957,7 @@ async def test_a_list_drop_reorders_and_moves_across_phases(user: User, phased):
 
 async def test_a_list_drop_on_an_arc_without_phases_stores_a_null_phase(user: User, phased):
     ctx, act, ids = phased
-    api.set_phases(ctx, act.id, [])
+    api.set_phases(ctx, act.id, [], author="user")
     await user.open(f"/arc?id={act.id}")
     await user.should_see(marker="arc-list")
     _page(user, "sbMove", {"id": ids["three"], "phase": "open", "before": ids["one"],
@@ -928,3 +982,71 @@ async def test_a_read_only_list_has_grips_and_its_drop_writes_nothing(user: User
     assert _arc(ctx, act).placement is None
     assert _card(user, ids["one"]).id != drawn, "the row goes back"
     assert _order(user) == [ids["one"], ids["two"], ids["three"]]
+
+
+async def test_arcs_sorts_by_last_change_and_says_it(user: User, repo, tmp_path, monkeypatch):
+    """To tell a moving arc from a quiet one at a glance (2026-11-08): Arcs puts
+    the most recently changed first, and each card says its age and its last
+    change, each with its full stamp as the tip. An arc changed only by its
+    creation says so once. The arc page says the same, and a drop updates it."""
+    from symbion.gui.pages import build_page
+    store.ensure_store(tmp_path)
+    ctx = api.resolve(str(tmp_path))
+    at = lambda hh: monkeypatch.setenv("SYMBION_NOW", f"2026-01-10T{hh}:00:00+00:00")
+    at("01"); old = api.create_arc(ctx, "old", "d", "item", author="ada")
+    at("02"); api.create_arc(ctx, "new", "d", "item", author="ada")
+    at("03"); box = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "x"},
+                                  "arc_id": old.id}, author="bo")
+    at("05")
+    build_page(ctx, author="ada")
+    await user.open("/arcs")
+    cards_ = sorted(user.find(marker="arc-card").elements, key=lambda e: e.id)
+    lines = sorted(user.find(marker="arc-when").elements, key=lambda e: e.id)
+    texts = [" ".join(c.text for c in w.default_slot.children) for w in lines]
+    assert [c.default_slot.children[0].default_slot.children[0].text for c in cards_] == ["old", "new"]
+    assert texts == ["started 4h ago by ada · last change 2h ago by bo", "started 3h ago by ada"]
+    (change,) = [e for e in user.find(marker="arc-last-change").elements]
+    assert change.props["data-tip"] == store.shown("2026-01-10T03:00:00+00:00")
+    api.set_phases(ctx, old.id, ["todo", "doing"], author="user")
+    await _board(user, old)
+    at("06")
+    _page(user, "sbMove", {"id": box.id, "phase": "doing", "before": None})
+    await asyncio.sleep(0.1)
+    (head,) = user.find(marker="arc-when").elements
+    assert " ".join(c.text for c in head.default_slot.children) == \
+        "started 5h ago by ada · last change just now by ada"
+
+
+async def test_a_box_id_reaches_the_page_script_as_a_string(user: User, phased, monkeypatch):
+    """An id is taken as written, so a pushed row's could close the string
+    around it in sbFocusMove and run script in the viewer's page (audit,
+    2026-11-08). A star, a move and a tick each send it as JSON."""
+    import json
+    from nicegui import Client
+    ctx, act, ids = phased
+    evil = 'x");window.pwned=1;("'
+    p = store.notes_path(ctx.store_dir)
+    text = p.read_text(encoding="utf-8")
+    assert text.count(json.dumps(ids["one"])) == 1
+    p.write_text(text.replace(json.dumps(ids["one"]), json.dumps(evil)), encoding="utf-8")
+    sent, real = [], Client.run_javascript
+    monkeypatch.setattr(Client, "run_javascript",
+                        lambda self, code, **kw: sent.append(code) or real(self, code, **kw))
+    await _board(user, act)
+    for press in ("note-star", "board-right", "note-resolve"):
+        part(user, press, card=_card(user, evil)).click()
+        await asyncio.sleep(0.2)
+    focus = [s for s in sent if s.startswith("sbFocusMove(")]
+    assert len(focus) == 3 and all(s.startswith(f"sbFocusMove({json.dumps(evil)}") for s in focus)
+
+
+async def test_a_drop_counts_the_columns_it_redraws_again(user: User, phased):
+    """A drop redrew the cards of the two columns it touched and left their
+    counts as the page drew them: `todo` read 3 over 2 cards (audit, 2026-11-08)."""
+    ctx, act, ids = phased
+    await _board(user, act)
+    _page(user, "sbMove", {"id": ids["one"], "phase": "doing", "before": None})
+    await asyncio.sleep(0.2)
+    counts = {c.props["data-phase"]: e.text for c in user.find(marker="board-column").elements
+              for e in c.descendants() if "board-count" in e._markers}
+    assert (counts["todo"], counts["doing"]) == ("2", "1"), counts

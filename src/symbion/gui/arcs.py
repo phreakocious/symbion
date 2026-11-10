@@ -3,6 +3,7 @@ task with the flipped status; the superseding row's created_at is the
 'when', and its author is the human who ticked it."""
 from __future__ import annotations
 
+import json
 from urllib.parse import quote
 
 from nicegui import ui
@@ -101,6 +102,50 @@ def board(ctx, act, refresh, *, author: str, seen=None, limit=None) -> None:
             .classes("sb-board-aside").mark("board-parked")
 
 
+def phase_bar(bar, notes, act) -> None:
+    """Fill `bar`, an arc's progress, with its boxes by phase: done first, then
+    the board's columns right to left, each as wide as its count and in its
+    column strip's colour (theme: .sb-phase-seg). A segment's tip names its
+    phase and count; a screen reader reads the whole as one progressbar."""
+    cols = S.arc_board(notes, act)
+    done, total = len(cols[-1][1]), sum(len(rows) for _, rows in cols)
+    rest = ", ".join(f"{name or 'open'} {len(rows)}" for name, rows in cols[-2::-1] if rows)
+    bar.clear()
+    bar._style["--sb-cols"] = str(len(cols))
+    bar._props.update({"role": "progressbar", "aria-valuemin": 0, "aria-valuemax": total,
+                       "aria-valuenow": done,
+                       "aria-valuetext": f"{done} of {total} done" + (f"; {rest}" if rest else "")})
+    with bar:
+        for i, (name, rows) in reversed(list(enumerate(cols, 1))):
+            if rows:
+                seg = ui.element("div").classes("sb-phase-seg").mark("arc-bar-seg") \
+                    .style(f"flex: {len(rows)} 1 0; --i: {i}")
+                seg._props["data-phase"] = name or "open"
+                seg._props["data-tip"] = f"{name or 'open'} {len(rows)}"
+    bar.update()
+
+
+def _when(stamp: str) -> str:
+    """`ago` as words after a verb: `3h ago`, `just now`, or a date."""
+    t = ago(stamp)
+    return "just now" if t == "now" else t if len(t) == 10 and t[4] == "-" else f"{t} ago"
+
+
+def when_line(line, notes, act) -> None:
+    """Fill `line` with the arc's age and its last change, each with its full
+    stamp as the tip, so a glance at Arcs tells a moving arc from a quiet one.
+    A last change that is the arc's creation is not said twice."""
+    at, by = S.arc_last_change(notes, act)
+    line.clear()
+    with line:
+        ui.label(f"started {_when(act.created_at)} by {act.author}") \
+            ._props["data-tip"] = S.shown(act.created_at)
+        if (at, by) != (act.created_at, act.author):
+            ui.label("·").classes("sb-sep")
+            ui.label(f"last change {_when(at)}" + (f" by {by}" if by else "")) \
+                .mark("arc-last-change")._props["data-tip"] = S.shown(at)
+
+
 def redraw_box(ctx, arc_id: str, nid: str, refresh, *, author: str) -> None:
     """After a drop the browser has drawn and the store took: the cards of the
     column it left and the column it entered made again as the store now has
@@ -139,6 +184,9 @@ def redraw_box(ctx, arc_id: str, nid: str, refresh, *, author: str) -> None:
                 if fu.id in drawn:
                     _box(ctx, act, fu, None if phase == S.DONE else col, refresh,
                          author=author, mixed=mixed, placed=held.get(fu.id, {}))
+        # Its count too: it read as the page drew it (audit, 2026-11-08).
+        next(e for e in box.parent_slot.parent.descendants() if "board-count" in e._markers) \
+            .set_text(str(len(col)))
 
 
 def _moved(act, placed: dict) -> dict | None:
@@ -231,7 +279,9 @@ def _box(ctx, act, fu, col, refresh, *, author: str, mixed: bool, placed=None) -
             # the tick's row: its author ticked it, then
             "by": {"t": fu.author, "h": href(author=fu.author)} if done else None,
             "age": {"t": ago(fu.created_at), "tip": S.shown(fu.created_at)} if done else None,
-            "sid": {"t": short_id(fu.id), "h": href(id=fu.id), "tip": f"{fu.id}\nopen this entry on its own page"},
+            "sid": {"t": short_id(fu.id), "h": href(id=fu.id),     # its age's stamp, as notes.py's
+                    "tip": f"{fu.id}\n" + (f"written {S.shown(fu.created_at)}\n" if done else "")
+                    + "open this entry on its own page"},
             "resolve": "reopen" if done else "resolve", "star": "priority" in fu.tags}
     el = Card(card, []).classes(f"sb-note w-full {kind_class(fu.kind)} sb-has-actions sb-resolvable"
                                 + (" sb-starred" if "priority" in fu.tags else "")
@@ -257,7 +307,7 @@ def _box(ctx, act, fu, col, refresh, *, author: str, mixed: bool, placed=None) -
                 api.supersede(ctx, fu.id, author=author, status="open" if done else "resolved")
             refresh()
         # As a move: the redraw dropped focus at the page's top (the GUI review, 2026-11-07).
-        client.run_javascript(f'sbFocusMove("{fu.id}", ".sb-resolve")')
+        client.run_javascript(f'sbFocusMove({json.dumps(fu.id)}, ".sb-resolve")')
 
     def move(how: str, name: str) -> None:
         if demo_says("moves the box"):
@@ -277,13 +327,13 @@ def _box(ctx, act, fu, col, refresh, *, author: str, mixed: bool, placed=None) -
         # On a board, to the arrow pressed, else one still enabled: ↓ to the
         # column's foot disables it.
         if placed is None:
-            client.run_javascript(f'sbFocusMove("{fu.id}")')
+            client.run_javascript(f'sbFocusMove({json.dumps(fu.id)})')
             return
         if how == "phase":
             ph = list(act.phases or ())
             how = "right" if name in ph and ph.index(name) > ph.index(S.box_phase(act, fu)) \
                 else "left"
-        client.run_javascript(f'sbFocusMove("{fu.id}", ".sb-mv-{how}:not(.disabled)", '
+        client.run_javascript(f'sbFocusMove({json.dumps(fu.id)}, ".sb-mv-{how}:not(.disabled)", '
                               f'".sb-move .q-btn:not(.disabled)")')
 
     def on_act(e) -> None:
@@ -298,7 +348,7 @@ def _box(ctx, act, fu, col, refresh, *, author: str, mixed: bool, placed=None) -
             client = ui.context.client
             with own_write(ctx, author, [fu.id]):
                 toggle_star(ctx, fu, refresh, author=author)
-            client.run_javascript(f'sbFocusMove("{fu.id}", ".sb-star")')
+            client.run_javascript(f'sbFocusMove({json.dumps(fu.id)}, ".sb-star")')
         elif what == ["edit"]:
             edit_dialog(ctx, fu, refresh, author=author)
         elif what == ["copy"]:
@@ -343,7 +393,9 @@ def index(ctx, *, author: str) -> None:
 
         create.on_click(_create)
 
-    for a in active:
+    # the most recently changed first: moving arcs rise, quiet ones sink
+    last = {a.id: S.written_at(None, S.arc_last_change(notes, a)[0]) for a in active}
+    for a in sorted(active, key=lambda a: last[a.id], reverse=True):
         done, total = S.arc_progress(notes, a.id)
         finished = bool(total) and done == total
         with ui.element("div").classes("sb-card sb-arc sb-filterable w-full" +
@@ -354,8 +406,8 @@ def index(ctx, *, author: str) -> None:
                 ui.space()
                 ui.label(f"{done}/{total}" + (" done" if finished else "")).classes("sb-count") \
                     .mark("arc-count")
-            ui.linear_progress(value=(done / total if total else 0.0), show_value=False,
-                               color="positive" if finished else "primary").props("rounded")
+            phase_bar(ui.element("div").classes("sb-phase-bar").mark("arc-bar"), notes, a)
+            when_line(ui.row().classes("sb-arc-when sb-note-meta").mark("arc-when"), notes, a)
             if a.description:
                 ui.label(a.description).classes("sb-subtitle")
 

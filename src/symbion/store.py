@@ -96,6 +96,8 @@ class Arc:
     # One {id, phase, by?, at?} per placed box; list order is the order within a phase.
     # ponytail: a shared store merges it as one field, so the upstream's whole order wins; merge per box if two writers reorder one arc
     placement: tuple | None = None
+    changed_by: str | None = None      # the last edit's writer, for commit's `Arcs:` trailer
+    changed_at: str | None = None
     extra: dict | None = None          # a newer symbion's fields, written back as read
 
 
@@ -222,16 +224,17 @@ def newest_first(rows) -> list:
     return sorted(reversed(list(rows)), key=written_at, reverse=True)
 
 
-def due_state(due: str, now: datetime | None = None) -> tuple[bool, int] | None:
-    """(past due, calendar days from today to the due date), both at `now`'s
-    offset, the display zone's by default. A date is due through the end of
-    its day; a datetime is past due from that instant, so it can be past due
-    with 0 days left. None for a value the writer would refuse -- a
+def due_state(due: str, now: datetime | None = None) -> tuple[bool, int, timedelta | None] | None:
+    """(past due, calendar days from today to the due date, time left), at
+    `now`'s offset, the display zone's by default. A date is due through the
+    end of its day, and has no time left; a datetime is past due from that
+    instant, so it can be past due with 0 days left, and its time left is
+    then below zero. None for a value the writer would refuse -- a
     hand-edited row still loads."""
     now = now or now_shown()
     try:
         d = date.fromisoformat(due)
-        return now.date() > d, (d - now.date()).days
+        return now.date() > d, (d - now.date()).days, None
     except ValueError:
         pass
     try:
@@ -239,7 +242,7 @@ def due_state(due: str, now: datetime | None = None) -> tuple[bool, int] | None:
     except ValueError:
         return None
     dt = (dt if dt.tzinfo else dt.astimezone()).astimezone(now.tzinfo)
-    return now >= dt, (dt.date() - now.date()).days
+    return now >= dt, (dt.date() - now.date()).days, dt - now
 
 
 def is_overdue(note, now: datetime | None = None) -> bool:
@@ -372,11 +375,40 @@ def check_types(objs, target_types) -> None:
             raise ValueError(f"unknown target type: {t!r}")
 
 
+_TEXT_KEYS = ("id", "kind", "created_at", "author", "body", "status", "checked", "result",
+              "arc_id", "supersedes", "due", "target_blob", "side")
+
+
+def _check_types(d: dict) -> None:
+    """A row another tool wrote with a number for a name or a body raised in
+    a reader far from the load: the session-start gotcha list (audit,
+    2026-11-08). The load refuses it here, and `load_malformed` names its line."""
+    def refuse(where, want, v):
+        raise ValueError(f"{where} must be {want}, not {type(v).__name__} {v!r}")
+    for k in _TEXT_KEYS:
+        if (v := d.get(k)) is not None and not isinstance(v, str):
+            refuse(k, "a string", v)
+    for k in ("tags", "options", "refs"):
+        if (v := d.get(k)) is not None and not isinstance(v, (list, tuple)):
+            refuse(k, "a list", v)
+    for k in ("tags", "options"):
+        for x in d.get(k) or ():
+            if not isinstance(x, str):
+                refuse(f"each of {k}", "a string", x)
+    for where, t in (("target", d.get("target")), *(("ref", r) for r in d.get("refs") or ())):
+        if isinstance(t, dict):
+            if not isinstance(t.get("type"), str):
+                refuse(f"a {where}'s type", "a string", t.get("type"))
+            if t.get("name") is not None and not isinstance(t["name"], str):
+                refuse(f"a {where}'s name", "a string", t["name"])
+
+
 def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
     """`kinds` is the store's table (label -> Kind); None means the defaults.
     An undeclared label is refused with the declared set, and the three
     retired names get the migration hint on top."""
     kinds = K.DEFAULT_KINDS if kinds is None else kinds
+    _check_types(d)
     t = d["target"]
     target = t if isinstance(t, Target) else Target(type=t["type"], name=t.get("name"))
     if d["kind"] not in kinds:
@@ -533,12 +565,20 @@ def shown(stamp: str) -> str:
         dt = datetime.fromisoformat(stamp)
     except (TypeError, ValueError):
         return str(stamp)
-    s = (dt if dt.tzinfo else dt.astimezone()).astimezone(zone()).isoformat(sep=" ")
+    dt = (dt if dt.tzinfo else dt.astimezone()).replace(microsecond=0)
+    s = dt.astimezone(zone()).isoformat(sep=" ")
     return s.removesuffix("+00:00") + "Z" if s.endswith("+00:00") else s
 
 
 def _now_iso() -> str:
     return _utcnow().isoformat(timespec="seconds")
+
+
+def _now_fine() -> str:
+    """A stamp commit's `Arcs:` trailer reads as a change (an arc edit, a box
+    move): at seconds, a change in the second of the commit before it read
+    as none, and counted `unknown`."""
+    return _utcnow().isoformat(timespec="microseconds")
 
 
 _last_minted = None
@@ -858,16 +898,17 @@ def _undo_level(store):
     return sess, level, last
 
 
-def undoable(store) -> bool:
-    """Can this session take back the store's last write: one this session
-    made (none, for a person), the files as it left them? The GUI's undo
-    button reads it on every page and every few seconds, so it reads no
-    rows: `undo` checks the author on the click."""
+def undo_state(store) -> str | None:
+    """Whose write the one undo level holds, the files as it left them:
+    "mine", one this session made (none, for a person), which it can take
+    back; "other", another session's; None, no level (a commit, a pull or an
+    undo ended it). The GUI's undo button reads it on every page and every
+    few seconds, so it reads no rows: `undo` checks the author on the click."""
     try:
         last = _undo_level(store)[2]
     except UndoRefused:
-        return False
-    return last.get("session", "") == (session_key() or "")
+        return None
+    return "mine" if last.get("session", "") == (session_key() or "") else "other"
 
 
 def undo(store, note_id: str | None, mine, apply: bool = True) -> dict:
@@ -914,7 +955,8 @@ def undo(store, note_id: str | None, mine, apply: bool = True) -> dict:
                "before": {r["id"]: r for r in gone if r.get("id")}}
         if note_id is not None and note_id not in touched:
             raise UndoRefused(f"the last write did not touch {note_id}: undo takes back "
-                              f"only the last write, which was {undo_words(out)}")
+                              f"only the last write, which was {undo_words(out)}, and "
+                              f"never one before it. Correct {note_id} with supersede")
         if not mine(last, wrote):
             raise UndoRefused(f"the last write is not yours: it was {undo_words(out)}")
         if not apply:
@@ -1341,17 +1383,14 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                 not body.startswith(_committed_floor(store, notes, old)):
             # An uncommitted one read as editable, since all of it was added
             # since the last commit, and undo went unnamed (dogfood, 2026-10-31).
-            fresh = _never_committed(store, notes, old)
             raise ValueError(f"{old.id} is a pre-registration: its registered text and each "
                              f"committed amendment stay as written, so a body may change only "
                              f"text added since the last `symbion commit` (--append adds "
-                             f"after it)" + (f". None of it is committed: `symbion undo "
-                                             f"{old.id[-10:]}` takes back its last write if "
-                                             f"that is the store's last, then add it anew"
-                                             if fresh else ""))
+                             f"after it)" + _undo_anew(store, notes, old))
         if base.get("checked") != old.checked:
             raise ValueError(f"{old.id} is a pre-registration: --checked names its registered "
-                             f"run and stays as written; a different run is a new entry")
+                             f"run and stays as written; a different run is a new entry"
+                             + _undo_anew(store, notes, old))
     # A legacy row (a hand-written migration, or a kind whose bits changed)
     # can carry a field its kind cannot hold. The reader loads it as written;
     # the WRITER owns the invariants, so an INHERITED illegal field is dropped
@@ -1500,6 +1539,16 @@ def _never_committed(store, notes, tip: Note) -> bool:
         ids.add(n.id)
         n = by_id.get(n.supersedes)
     return not any(_line_id(raw) in ids for raw in committed)
+
+
+def _undo_anew(store, notes, old: Note) -> str:
+    """A refused edit's way back for a pre-registration none of which is
+    committed. Any later write or commit ends the undo, not only another
+    writer's (dogfood, 2026-11-09)."""
+    if not _never_committed(store, notes, old):
+        return ""
+    return (f". None of it is committed: `symbion undo {old.id[-10:]}` takes back its "
+            f"last write if no other write or commit came since, then add it anew")
 
 
 def _committed_lines(store) -> set | None:
@@ -1911,10 +1960,9 @@ def retype(store, from_type, to_type, author=None, target_types=None) -> tuple[i
         return moved, repointed
 
 
-def added_rows(diff: str) -> list[dict]:
-    """The rows a notes.jsonl diff adds, an in-place rewrite included. A
-    line that does not parse is `{}`: a hand edit must not block a commit.
-    A version an edit kept is not one: it is a removed line under a new id."""
+def _diff_rows(diff: str) -> dict[str, list[dict]]:
+    """A notes.jsonl diff's rows by side, `+` and `-`. A line that does not
+    parse is `{}`: a hand edit must not block a commit."""
     rows = {"+": [], "-": []}
     for line in jsonl_lines(diff):
         if line[:2] in ("+{", "-{"):
@@ -1923,8 +1971,25 @@ def added_rows(diff: str) -> list[dict]:
             except ValueError:
                 row = None
             rows[line[0]].append(row if isinstance(row, dict) else {})
+    return rows
+
+
+def added_rows(diff: str) -> list[dict]:
+    """The rows a notes.jsonl diff adds, an in-place rewrite included. A
+    version an edit kept is not one: it is a removed line under a new id."""
+    rows = _diff_rows(diff)
     kept = {_sans_id(r) for r in rows["-"]}
     return [r for r in rows["+"] if not r or _sans_id(r) not in kept]
+
+
+def removed_rows(diff: str) -> list[dict]:
+    """The lines a notes.jsonl diff removes that no added line keeps but for
+    its id, as an edit keeps its old version: a committed version lost, by
+    a hand edit or a repair. added_rows reads the other side only, so a dry
+    run read `nothing to commit` over one (2026-11-02)."""
+    rows = _diff_rows(diff)
+    kept = {_sans_id(r) for r in rows["+"]}
+    return [r for r in rows["-"] if not r or _sans_id(r) not in kept]
 
 
 def _sans_id(row: dict) -> str:
@@ -1961,9 +2026,10 @@ def arcs_by_writer(store, staged: bool = False) -> str:
     """`ada 1, unknown 1`: the commit's `Arcs:` trailer, each change to
     arcs.jsonl since HEAD by its writer, in the index (`staged`, what a
     commit took) or the work tree (what it would take). A new arc counts for
-    its author and a moved box for its mover (`by`); any other change
-    records no writer and counts as `unknown`. A commit took the user's GUI
-    move under a message that named only its rows (2026-11-06)."""
+    its author, a moved box for its mover (`by`), and any other edit for its
+    writer (`changed_by`); a change no stamp names, such as a hand edit,
+    counts as `unknown`. A commit took the user's GUI move under a message
+    that named only its rows (2026-11-06)."""
     def arcs(text):
         out = {}
         for ln in jsonl_lines(text):
@@ -1995,24 +2061,36 @@ def arcs_by_writer(store, staged: bool = False) -> str:
                  if p.get("by") and (p.get("id"), p["by"], p.get("at")) not in seen]
         by.update(moves)
         if rest(a) != rest(w) or (not moves and placed(a) != placed(w)):
-            by["unknown"] += 1
+            stamped = a.get("changed_at") not in (None, w.get("changed_at"))
+            by[(a.get("changed_by") if stamped else None) or "unknown"] += 1
     return ", ".join(f"{a} {n}" for a, n in sorted(by.items()) if n)
 
 
 def pending_rows(store) -> list[dict]:
     """What `commit` would take from notes.jsonl: the rows added or
-    rewritten since HEAD, or every row before the first commit. Plumbing:
-    a porcelain `git diff` rewrites the index under index.lock when a file's
-    stat data is stale, and a `symbion commit`'s `git add` beside it refused
-    while the GUI polled this (2026-10-16)."""
+    rewritten since HEAD, or every row before the first commit."""
+    return added_rows(_notes_diff(store))
+
+
+def lost_rows(store) -> list[dict]:
+    """HEAD's lines gone from notes.jsonl that no pending row keeps
+    (removed_rows): only `commit --all` takes their removal."""
+    return removed_rows(_notes_diff(store))
+
+
+def _notes_diff(store) -> str:
+    """notes.jsonl's diff from HEAD, or every line added before the first
+    commit. Plumbing: a porcelain `git diff` rewrites the index under
+    index.lock when a file's stat data is stale, and a `symbion commit`'s
+    `git add` beside it refused while the GUI polled this (2026-10-16)."""
     git = ["git", "-C", str(store)]
     if subprocess.run([*git, "rev-parse", "-q", "--verify", "HEAD"],
                       capture_output=True).returncode:
         f = Path(store) / NOTES_FILE
         text = f.read_text(encoding="utf-8") if f.exists() else ""
-        return added_rows("".join(f"+{ln}\n" for ln in jsonl_lines(text)))
-    return added_rows(subprocess.run([*git, "diff-index", "-p", "-U0", "HEAD", "--", NOTES_FILE],
-                                     capture_output=True, text=True, encoding="utf-8").stdout)
+        return "".join(f"+{ln}\n" for ln in jsonl_lines(text))
+    return subprocess.run([*git, "diff-index", "-p", "-U0", "HEAD", "--", NOTES_FILE],
+                          capture_output=True, text=True, encoding="utf-8").stdout
 
 
 def commit(store, message: str, cfg, keep=None, files: bool = False,
@@ -2044,6 +2122,18 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
         if r.returncode == 0 and keep is not None and files:
             r = subprocess.run([*git, "add", "-A", "--", ".", f":(exclude){NOTES_FILE}"],
                                capture_output=True, text=True, encoding="utf-8")
+        if r.returncode == 0 and keep is not None and not files:
+            # A change someone staged by hand is a file this commit leaves: with
+            # the index as found it went in, after the dry run had named it as
+            # left (2026-11-09). An unmerged path stays, and git refuses it.
+            # ponytail: the change stays on disk, unstaged; a version staged
+            # and then edited again is no longer in the index.
+            r = subprocess.run([*git, "diff", "--cached", "--name-only", "-z", "--no-renames",
+                                "--diff-filter=u"], capture_output=True, text=True, encoding="utf-8")
+            others = [p for p in r.stdout.split("\0") if p and p not in (NOTES_FILE, ARCS_FILE)]
+            if r.returncode == 0 and others:
+                r = subprocess.run([*git, "--literal-pathspecs", "reset", "-q", "--", *others],
+                                   capture_output=True, text=True, encoding="utf-8")
         if r.returncode == 0 and paths:
             # Only a doc no commit has taken: an edit to a tracked one is its
             # writer's, and an ignored one makes `git add` refuse. Literal:
@@ -2113,6 +2203,127 @@ def with_bases(rows, keep):
     return lambda r: r.get("id") in take
 
 
+class DiscardChanged(ValueError):
+    pass
+
+
+def discard_ids(plan: dict) -> frozenset:
+    """What `expect` holds: the rows and arcs a discard plan takes away, and
+    each version it gives an id back, whole, with that id. A write that changed
+    which version takes the id back went through (audit, 2026-11-08)."""
+    return frozenset({r.get("id") for r in plan["removed"]} | {a.get("id") for a in plan["arcs"]}
+                     | {json.dumps(r, sort_keys=True) for r in plan["returned"]})
+
+
+def discard(store, mine, author: str, apply: bool = True, expect=None) -> dict:
+    """Throw away what a commit taking `mine` would take, and the arcs
+    `author` made since the last commit: the user's way to drop a test arc
+    and its tasks without git (2026-11-08). A new row goes; a committed line
+    an edit moved aside under a new id comes back as committed, and so does
+    another writer's pending version under the entry's id. A row of
+    `mine` that another writer's pending revision builds on stays, so does
+    an arc a row that stays is filed in, and so does any other change to a
+    committed arc, which records no writer. One write, so `undo` takes it
+    back; `apply=False` writes nothing. With `expect`, the ids a dry run
+    named (discard_ids), it refuses when the store changed since: the GUI's
+    dialog lists one plan, and its button must not throw away another.
+
+    Returns {"removed": rows dropped, "restored": committed rows put back,
+    "returned": another writer's pending versions a dropped edit sat on,
+    each under the entry's id it takes back, "arcs": arcs removed, "kept":
+    rows of `mine` kept, "kept_arcs": ids of `author`'s new arcs kept,
+    "arcs_changed": ids of committed arcs with changes since HEAD}, rows and
+    arcs as dicts."""
+    # ponytail: a committed row that cites a discarded one is left citing an
+    # unknown id; refuse, or name it, if that is ever seen.
+    require_store(store)
+    with _lock(store, undoable=apply):
+        def committed(name):
+            r = subprocess.run(["git", "-C", str(store), "show", f"HEAD:{name}"],
+                               capture_output=True, text=True, encoding="utf-8")
+            return [ln for ln in jsonl_lines(r.stdout) if ln] if r.returncode == 0 else []
+
+        def loads(ln):
+            with suppress(ValueError):
+                if isinstance(d := json.loads(ln), dict):
+                    return d
+            return {}
+        pending = pending_rows(store)
+        own, theirs = with_bases(pending, mine), with_bases(pending, lambda r: not mine(r))
+        drop = {r["id"] for r in pending if own(r) and not theirs(r)}
+        # Your edit on another writer's pending version hands that version the
+        # entry's id back, as one on a committed line puts the line back: it
+        # stayed under its kept id, a second head (audit, 2026-11-08).
+        later = {r["supersedes"]: r["id"] for r in pending
+                 if r.get("id") in drop and r.get("supersedes")}
+        back = {}
+        for b in {r.get("id") for r in pending} - drop - {None}:
+            i = b
+            while i in later:
+                i = later[i]
+            if i != b:
+                back[b] = i
+        path = notes_path(store)
+        raws = jsonl_lines(path.read_text(encoding="utf-8")) if path.exists() else []
+        head = committed(NOTES_FILE)
+        held = set(head)        # a list test per line was quadratic (audit, 2026-11-08)
+        put_back = {_sans_id(loads(h)): h for h in head
+                    if _line_id(h) in drop and _line_id(h) not in back.values()}
+        out = {"removed": [], "restored": [], "returned": [], "arcs": [], "kept": [],
+               "kept_arcs": [], "arcs_changed": []}
+        lines = []
+        for raw in raws:
+            row = loads(raw) if raw else {}
+            if row.get("id") in drop:
+                out["removed"].append(row)
+            elif row.get("id") in back:
+                lines.append(_dumps({**row, "id": back[row["id"]]}))
+                out["returned"].append({**row, "id": back[row["id"]]})
+            elif raw and raw not in held and (h := put_back.pop(_sans_id(row), None)):
+                lines.append(h)
+                out["restored"].append(loads(h))
+            else:
+                lines.append(raw)
+        out["kept"] = [r for r in pending if own(r) and theirs(r) and r["id"] not in back]
+        def arcs_of(r):
+            """Each arc a row is filed in, targets or refs: a row left naming a
+            removed arc is one `add` refuses to write (audit, 2026-11-08)."""
+            objs = [r.get("target"), *(r.get("refs") or ())]
+            return {r.get("arc_id"), *(o.get("name") for o in objs
+                                       if isinstance(o, dict) and o.get("type") == "arc")}
+        filed = set().union(*(arcs_of(loads(ln)) for ln in lines if ln))
+        was = {loads(ln).get("id"): ln for ln in committed(ARCS_FILE)}
+        apath = arcs_path(store)
+        araws = jsonl_lines(_read_utf8(apath)) if apath.exists() else []
+        gone = set()
+        for raw in filter(None, araws):
+            a = loads(raw)
+            if a.get("id") in was:
+                if raw != was[a["id"]]:
+                    out["arcs_changed"].append(a["id"])
+            elif a.get("author") == author:
+                if a.get("id") in filed:
+                    out["kept_arcs"].append(a["id"])
+                else:
+                    out["arcs"].append(a)
+                    gone.add(a.get("id"))
+        if expect is not None and discard_ids(out) != expect:
+            raise DiscardChanged("the store changed since the list was drawn, so nothing was "
+                                 "discarded: open Discard again to see what it takes now")
+        if apply:
+            if lines != raws:
+                _replace_atomically(path, "\n".join(lines) + "\n" if lines else "")
+            if gone:
+                left = [r for r in araws if r and loads(r).get("id") not in gone]
+                _replace_atomically(apath, "".join(r + "\n" for r in left))
+            known = sessions(store)
+            for b, i in back.items():           # the id goes back to the version's session
+                _append_line_unlocked(_state_dir(store, make=True) / SESSIONS_FILE,
+                                      f"{i}\t{known.get(b, '')}")
+            _forget_committed(store)
+        return out
+
+
 def _stage_kept(store: Path, keep) -> subprocess.CompletedProcess:
     """Stage HEAD's rows plus the pending rows `keep` takes, in file order,
     and arcs.jsonl. A kept revision brings its pending base: a commit must
@@ -2135,7 +2346,8 @@ def _stage_kept(store: Path, keep) -> subprocess.CompletedProcess:
     pending = [(ln, (added_rows(f"+{ln}") or [{}])[0]) for ln in disk if ln not in seen]
     # A version an edit kept is HEAD's line under a new id: it goes where
     # that line was, with the edit, and is never taken on its own.
-    olds = {_sans_id(r): r.get("id") for r in (added_rows(f"+{ln}")[0] for ln in old) if r}
+    olds = {_sans_id(r): r.get("id") for r in ((added_rows(f"+{ln}") or [{}])[0] for ln in old)
+            if r}
     moved = {olds[_sans_id(r)]: ln for ln, r in pending if r and _sans_id(r) in olds}
     kept_ids = {_line_id(ln) for ln in moved.values()}
     taken = with_bases([r for _, r in pending], lambda r: keep(r) and r.get("id") not in kept_ids)
@@ -2483,6 +2695,7 @@ def arc_from_dict(d: dict, legal_scopes=None) -> Arc:
         side=d.get("side"),
         phases=tuple(d["phases"]) if d.get("phases") is not None else None,
         placement=tuple(d["placement"]) if d.get("placement") is not None else None,
+        changed_by=d.get("changed_by"), changed_at=d.get("changed_at"),
         extra={k: v for k, v in d.items() if k not in _ARC_KEYS} or None,
     )
 
@@ -2496,6 +2709,8 @@ def arc_to_dict(act: Arc) -> dict:
         **({"side": act.side} if act.side is not None else {}),
         **({"phases": list(act.phases)} if act.phases is not None else {}),
         **({"placement": list(act.placement)} if act.placement is not None else {}),
+        **({"changed_by": act.changed_by, "changed_at": act.changed_at}
+           if act.changed_by is not None else {}),
         **(act.extra or {}),
     }
 
@@ -2560,9 +2775,11 @@ def create_arc(store, name, description, target_scope, author="unknown",
     return act
 
 
-def _edit_arc(store, id, change) -> Arc:
-    """Arc `id` as `change(arc)` returns it, written under the lock; KeyError
-    if there is none. The id stays, so its rows' arc_id still resolve."""
+def _edit_arc(store, id, change, author="unknown") -> Arc:
+    """Arc `id` as `change(arc)` returns it, written under the lock and
+    stamped with its writer; KeyError if there is none. The id stays, so its
+    rows' arc_id still resolve. Unstamped, every edit but a move counted
+    `unknown` in commit's `Arcs:` trailer (dogfood, 2026-11-06)."""
     require_store(store)
     with _lock(store):
         acts = load_arcs(store)
@@ -2571,29 +2788,35 @@ def _edit_arc(store, id, change) -> Arc:
             raise KeyError(id)
         new = change(old)
         if new != old:
+            new = _stamped(new, author)
             _write_arcs_unlocked(store, [new if a.id == id else a for a in acts])
     return new
 
 
-def rename_arc(store, id, new_name) -> Arc:
-    return _edit_arc(store, id, lambda a: replace(a, name=new_name))
+def _stamped(act: Arc, author) -> Arc:
+    """`act` with its writer."""
+    return replace(act, changed_by=author, changed_at=_now_fine())
 
 
-def archive_arc(store, id, _clock=None) -> Arc:
+def rename_arc(store, id, new_name, author="unknown") -> Arc:
+    return _edit_arc(store, id, lambda a: replace(a, name=new_name), author)
+
+
+def archive_arc(store, id, _clock=None, author="unknown") -> Arc:
     """An arc archived already is returned as it is: archiving it again
     moved `archived_at`, the date it left the summary."""
     clock = _clock or _utcnow
     return _edit_arc(store, id, lambda a: a if a.archived else replace(
-        a, archived=True, archived_at=clock().isoformat(timespec="seconds")))
+        a, archived=True, archived_at=clock().isoformat(timespec="seconds")), author)
 
 
-def unarchive_arc(store, id) -> Arc:
+def unarchive_arc(store, id, author="unknown") -> Arc:
     """Back on the summary: `undo` takes an archive back only before a commit."""
-    return _edit_arc(store, id, lambda a: replace(a, archived=False, archived_at=None))
+    return _edit_arc(store, id, lambda a: replace(a, archived=False, archived_at=None), author)
 
 
-def describe_arc(store, id, description) -> Arc:
-    return _edit_arc(store, id, lambda a: replace(a, description=description))
+def describe_arc(store, id, description, author="unknown") -> Arc:
+    return _edit_arc(store, id, lambda a: replace(a, description=description), author)
 
 
 # ---- arc membership, progress, seeding ----
@@ -2625,19 +2848,34 @@ def arc_progress(notes, arc_id):
     return done, len(items)
 
 
+def arc_last_change(notes, act: Arc) -> tuple[str, str]:
+    """(stamp, author) of the arc's newest change: the latest version of any
+    entry filed in it, or a move on its board, else its creation. A rename or a
+    phase edit does not count: until 2026-11-09 the arc's own line held no time."""
+    marks = [(n.created_at, n.author) for n in heads(notes) if n.arc_id == act.id]
+    marks += [(p["at"], p.get("by") or "") for p in act.placement or () if p.get("at")]
+    return max([(act.created_at, act.author), *marks], key=lambda m: written_at(None, m[0]))
+
+
 DONE = "done"  # the board's last column; reserved as a phase name
 
 
-def box_phase(act: Arc, note) -> str | None:
+def box_phase(act: Arc, note, placed=None) -> str | None:
     """The board column a box sits in: DONE once resolved; None for an open box
     on an arc without phases; else its placed phase, where a null phase, a
-    phase no longer in `act.phases` or no placement reads as the first."""
+    phase no longer in `act.phases` or no placement reads as the first.
+    `placed`, from `_placed(act)`, spares a board one scan per box."""
     if note.status == "resolved":
         return DONE
     if not act.phases:
         return None
-    phase = next((p.get("phase") for p in act.placement or () if p["id"] == note.id), None)
+    phase = (_placed(act) if placed is None else placed).get(note.id)
     return phase if phase in act.phases else act.phases[0]
+
+
+def _placed(act: Arc) -> dict:
+    """{box id: its placed phase}; an id placed twice keeps its first."""
+    return {p["id"]: p.get("phase") for p in reversed(act.placement or ())}
 
 
 def arc_board(notes, act: Arc) -> list[tuple[str | None, list]]:
@@ -2649,8 +2887,9 @@ def arc_board(notes, act: Arc) -> list[tuple[str | None, list]]:
     names = list(act.phases or (None,))
     cols: dict = {n: [] for n in names}
     done = []
+    placed = _placed(act)       # a scan per box was boxes x placements (audit, 2026-11-08)
     for b in boxes:
-        ph = box_phase(act, b)
+        ph = box_phase(act, b, placed)
         (done if ph == DONE else cols[ph]).append(b)
     rank = {p["id"]: i for i, p in enumerate(act.placement or ())
             if p.get("phase") is None or p["phase"] in (act.phases or ())}
@@ -2713,7 +2952,7 @@ def _place(act: Arc, notes, entry, phase, before, after, top, author, now) -> Ar
     return replace(act, placement=tuple(rest + ahead + [mine] + behind))
 
 
-def set_phases(store, arc_id: str, names: list[str]) -> tuple[Arc, int]:
+def set_phases(store, arc_id: str, names: list[str], author="unknown") -> tuple[Arc, int]:
     """The arc with its phases `names` (none clears them), and how many resolved
     boxes' placements that dropped. Refused: a bad name, or dropping a phase an
     open box is placed in."""
@@ -2762,6 +3001,7 @@ def set_phases(store, arc_id: str, names: list[str]) -> tuple[Arc, int]:
             dropped = len(placed) - len(keep)
             new = replace(act, phases=tuple(names), placement=keep or None)
         if new != act:
+            new = _stamped(new, author)
             _write_arcs_unlocked(store, [new if a.id == arc_id else a for a in acts])
     return new, dropped
 
@@ -2777,7 +3017,7 @@ def move_box(store, entry_id: str, *, phase: str | None = None, before: str | No
         if entry.status == "resolved":
             raise ValueError(f"{entry_id} is resolved, so it sits in {DONE}: "
                              f"`supersede {entry_id} --status open` reopens it")
-        new = _place(act, notes, entry, phase, before, after, top, author, _now_iso())
+        new = _place(act, notes, entry, phase, before, after, top, author, _now_fine())
         _write_arcs_unlocked(store, [new if a.id == act.id else a for a in acts])
     return new
 
@@ -2794,7 +3034,7 @@ def reopen_and_place(store, entry_id: str, *, phase: str | None = None,
         entry, act = _box_of(acts, notes, entry_id)
         if entry.status != "resolved":
             raise ValueError(f"{entry_id} is open already: `arc move {entry_id}` places it")
-        new = _place(act, notes, entry, phase, before, after, top, author, _now_iso())
+        new = _place(act, notes, entry, phase, before, after, top, author, _now_fine())
         note = _supersede_unlocked(store, notes, entry_id, author=author, side=side,
                                    status="open")
         _write_arcs_unlocked(store, [new if a.id == act.id else a for a in acts])

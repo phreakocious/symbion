@@ -7,7 +7,7 @@ import shlex
 from bisect import bisect_right
 from collections import Counter
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from itertools import pairwise, zip_longest
 from pathlib import Path
@@ -120,6 +120,39 @@ def when_added(stamp: str) -> str:
     return "just now" if a == "now" else f"{a} ago"
 
 
+def excerpt(s, n: int, grep) -> str:
+    """`clip(s, n)` from shortly before `grep`'s first match in `s`, behind an
+    ellipsis that says text was cut before it."""
+    m = grep.search(s)
+    at = max(m.start() - n // 4, 0) if m else 0
+    start = max(s.rfind(" ", 0, at), s.rfind("\n", 0, at)) + 1
+    return "…" + clip(s[start:], n - 1) if start else clip(s, n)
+
+
+def clipped_fields(n) -> dict:
+    """The fields a listing clips, in the order it prints them, each as the
+    text it clips."""
+    return {k: v for k, v in (
+        ("checked", n.checked), ("result", n.result),
+        ("measured", measured(n.measurements) if n.measurements else None),
+        ("options", options_line(n.options) if n.options else None), ("body", n.body)) if v}
+
+
+def unseen(n, grep, shown) -> str | None:
+    """Under `list --grep`, the first clipped field of `n` that holds a match
+    when nothing the listing prints shows one: not the first line's target,
+    refs or tags, and none of `shown`, the clipped texts below it. The
+    listing prints that field as an `excerpt`. A listing that cannot show why
+    an entry matched reads as a false hit, and of the entries real patterns
+    found, more than half matched only past a clip (2026-11-09). None when a
+    match shows, or lies across two fields."""
+    head = [n.target.name or "", *(f"{r.type}:{r.name or ''}" for r in n.refs),
+            *(f"#{t}" for t in n.tags)]
+    if any(grep.search(t) for t in (*head, *shown)):
+        return None
+    return next((k for k, v in clipped_fields(n).items() if grep.search(v)), None)
+
+
 def measured(m: dict) -> str:
     """A row's measurements on one line, by name (store.note_from_dict)."""
     return ", ".join(f"{k}={v}" for k, v in m.items())
@@ -139,11 +172,16 @@ def age_phrase(stamp: str) -> str:
 
 
 def due_phrase(state) -> str:
-    """`store.due_state`'s pair as words. Past due with 0 days left is a
-    datetime that passed earlier today."""
-    past, days = state
+    """`store.due_state`'s triple as words. Within a day of a due with an
+    hour, the hours, or minutes under an hour, either side of it: one due at
+    16:30Z read `due today` from midnight (the user, 2026-11-09)."""
+    past, days, left = state
+    if left is not None and abs(left) < timedelta(days=1):
+        m = int(abs(left).total_seconds() // 60)
+        span = f"{m // 60}h" if m >= 60 else f"{m}m" if m else "<1m"
+        return f"overdue {span}" if past else f"due in {span}"
     if past:
-        return f"overdue {-days}d" if days < 0 else "overdue today"
+        return f"overdue {-days}d"
     return "due today" if days == 0 else f"due in {days}d"
 
 
@@ -659,8 +697,8 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
         "heads": [digest(n, HEAD_CHARS) for n in shown],
         "heads_elided": len(heads) - len(shown),
         "due": [{**digest(n, BODY_CHARS), "due": n.due,
-                 "past": past, "days": days, "phrase": due_phrase((past, days))}
-                for n, (past, days) in due[:d_cap]],
+                 "past": st[0], "days": st[1], "phrase": due_phrase(st)}
+                for n, st in due[:d_cap]],
         "due_elided": max(0, len(due) - d_cap),
         "untouched": [{**digest(n, HEAD_CHARS), "active_days": active_days(n)}
                       for n in untouched[:u_cap]],
@@ -803,7 +841,10 @@ def seams(by_id, n) -> list[tuple[int, str, str, bool, bool]]:
     (the user, 2026-10-08). One link can add both above and below: a
     prepend, then an append that rewrote the uncommitted row in place. A
     link that edited the old body reads through _edit_seams. An in-place
-    edit of an uncommitted row leaves no link, so no seam."""
+    edit of an uncommitted row leaves no link, so no seam. A seam falls only
+    at a line break: a `--replace` that went on with the last sentence drew
+    one mid-sentence, and a `--replace` copied from `show` was then refused
+    (the user, 2026-11-09)."""
     out = []
     for old, new in pairwise(reversed(list(_chain(by_id, n)))):
         if not old.body or new.body == old.body:
@@ -814,10 +855,18 @@ def seams(by_id, n) -> list[tuple[int, str, str, bool, bool]]:
             continue
         end = i + len(old.body)
         # A side that added only whitespace has no seam: there is no text to mark.
-        out = ([(i, new.author, new.created_at, True, False)] if new.body[:i].strip() else []) \
+        out = ([(i, new.author, new.created_at, True, False)]
+               if new.body[:i].strip() and _at_break(new.body, i) else []) \
             + [(at + i, *s) for at, *s in out] \
-            + ([(end, new.author, new.created_at, False, False)] if new.body[end:].strip() else [])
+            + ([(end, new.author, new.created_at, False, False)]
+               if new.body[end:].strip() and _at_break(new.body, end) else [])
     return out
+
+
+def _at_break(text: str, at: int) -> bool:
+    """Does `at` sit in whitespace that holds a line break?"""
+    head, tail = text[:at], text[at:]
+    return "\n" in head[len(head.rstrip()):] + tail[:len(tail) - len(tail.lstrip())]
 
 
 _WORD = re.compile(r"\S+")
@@ -840,13 +889,11 @@ def _edit_seams(old: str, new: str, out, author: str, created_at: str):
     moved = {}                                  # offset -> seam; a later one wins
     for at, *s in out:
         k = sum(w.end() <= at for w in ow)      # the first old word that ends below the seam
-        if k < len(ow) and ow[k].start() < at:  # inside it: an append went on with the sentence
-            if k in copy:
-                moved[nw[copy[k]].start() + at - ow[k].start()] = s
-        elif k - 1 in copy:
-            moved[nw[copy[k - 1]].end()] = s
-        elif copy.get(k):
-            moved[nw[copy[k] - 1].end()] = s
+        near = ([nw[copy[k - 1]].end()] if k - 1 in copy else []) \
+            + ([nw[copy[k] - 1].end()] if copy.get(k) else [])
+        to = next((p for p in near if _at_break(new, p)), None)
+        if to is not None:
+            moved[to] = s
     # ponytail: no seam for a paragraph written above the first kept run (only
     # a hand-written --body makes one); mirror the tail's check if one turns up.
     if blocks:
@@ -861,11 +908,12 @@ def _edit_seams(old: str, new: str, out, author: str, created_at: str):
             if (new[a:at] if s[3] else new[at:b]).strip()]
 
 
-def at_seams(body: str, seams) -> list[tuple[str, str | None]]:
+def at_seams(body: str, seams, last=None) -> list[tuple[str, str | None]]:
     """`body` cut at each of seams()'s offsets: `(piece, line)` pairs, the
     line naming who added the text below it (above it, for a prepend) and
     when; the last piece's is None. A cut's blank lines go: the line
-    stands between the pieces instead."""
+    stands between the pieces instead. `last` keeps the first piece and the
+    newest `last` amendments, and the line after the first counts the rest."""
     out, start = [], 0
     for at, who, when, above, edited in seams:
         out.append((body[start:at],
@@ -873,7 +921,13 @@ def at_seams(body: str, seams) -> list[tuple[str, str | None]]:
                     f"{'the above' if above else 'below'}, {S.shown(when)} --"))
         start = at
     out.append((body[start:], None))
-    return [(p.strip("\n"), line) for p, line in out] if seams else out
+    out = [(p.strip("\n"), line) for p, line in out] if seams else out
+    # ponytail: pieces in body order, so a prepend counts as the newest; only
+    # a pre-registration's body is sure to grow below alone.
+    if last is not None and (cut := len(out) - 1 - last) > 0:
+        hid = f"-- {_count(cut, 'amendment')} not shown (show without --last prints all)"
+        out = [(out[0][0], hid + (f"; {out[cut][1][3:]}" if last else " --")), *out[cut + 1:]]
+    return out
 
 
 # A cite: a whole id, the 10-character tail SKILL.md says to cite, or the

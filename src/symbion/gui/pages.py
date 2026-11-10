@@ -910,9 +910,13 @@ def build_page(ctx, *, author: str) -> None:
             header = {}                             # body's count and bar, which a drop updates
 
             def _progress() -> None:
-                done, total = S.arc_progress(reading(ctx).loaded, id)
+                loaded = reading(ctx).loaded
+                done, total = S.arc_progress(loaded, id)
                 header["count"].set_text(f"{done}/{total}")
-                header["bar"].set_value(done / total if total else 0.0)
+                a = next((x for x in S.load_arcs(ctx.store_dir) if x.id == id), None)
+                if a is not None:
+                    arcs.phase_bar(header["bar"], loaded, a)
+                    arcs.when_line(header["when"], loaded, a)
 
             def _view(board: bool) -> None:
                 with slot:                          # the tab is the page's (chrome's _DRAFT)
@@ -963,9 +967,10 @@ def build_page(ctx, *, author: str) -> None:
                                       color="primary" if on else None) \
                                 .props(f"unelevated dense no-caps aria-pressed={str(on).lower()}") \
                                 .mark(f"arc-view-{word}")
-                header["bar"] = ui.linear_progress(value=(done / total if total else 0.0),
-                                                   show_value=False).props("rounded") \
-                    .mark("arc-progress")
+                header["bar"] = ui.element("div").classes("sb-phase-bar").mark("arc-progress")
+                arcs.phase_bar(header["bar"], rd.loaded, a)
+                header["when"] = ui.row().classes("sb-arc-when sb-note-meta").mark("arc-when")
+                arcs.when_line(header["when"], rd.loaded, a)
 
                 # Shown by Edit arc, and always for an archived arc: Unarchive is in it.
                 with ui.row().classes("items-center gap-2 w-full sb-card").mark("arc-form") as form:
@@ -976,7 +981,7 @@ def build_page(ctx, *, author: str) -> None:
                             return
                         if (rename.value or "").strip():
                             with refusal_shown():
-                                api.rename_arc(ctx, id, rename.value)
+                                api.rename_arc(ctx, id, rename.value, author=author)
                                 ui.navigate.reload()        # the name is in the top bar
 
                     ui.button("Save", on_click=_rename).props("flat dense").mark("arc-rename")
@@ -989,7 +994,7 @@ def build_page(ctx, *, author: str) -> None:
                             return
                         with refusal_shown():
                             with own_write(ctx, author):
-                                api.describe_arc(ctx, id, desc.value or "")
+                                api.describe_arc(ctx, id, desc.value or "", author=author)
                             body.refresh()
 
                     ui.button("Save", on_click=_describe).props("flat dense").mark("arc-describe")
@@ -999,7 +1004,7 @@ def build_page(ctx, *, author: str) -> None:
                         if demo_says("archives the arc"):
                             return
                         with refusal_shown():
-                            api.archive_arc(ctx, id)
+                            api.archive_arc(ctx, id, author=author)
                             ui.navigate.to("/arcs")
 
                     def _unarchive():
@@ -1007,7 +1012,7 @@ def build_page(ctx, *, author: str) -> None:
                             return
                         with refusal_shown():
                             with own_write(ctx, author):
-                                api.unarchive_arc(ctx, id)
+                                api.unarchive_arc(ctx, id, author=author)
                             view["edit"] = True         # the form stays under the hand
                             body.refresh()
 
@@ -1054,7 +1059,7 @@ def build_page(ctx, *, author: str) -> None:
                                 names = [x.strip() for x in (ph.value or "").split(",")] \
                                     if (ph.value or "").strip() else []
                                 with own_write(ctx, author):
-                                    api.set_phases(ctx, id, names)
+                                    api.set_phases(ctx, id, names, author=author)
                                 body.refresh()
 
                         ui.button("Save", on_click=_phases).props("flat dense") \

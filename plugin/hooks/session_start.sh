@@ -34,6 +34,10 @@ d=
 if command -v symbion >/dev/null 2>&1; then
   d=$(symbion skill --path 2>/dev/null) || d=
 fi
+# Python on Windows writes CRLF to a pipe. Git's sh drops the CR in `$(…)`, and
+# dash keeps it: the path then named no dir, and a working CLI read as missing
+# (audit 2026-11-08; dash measured 2026-11-10).
+d=${d%"$(printf '\r')"}
 if [ -f "$d/session_start.sh" ]; then
   cached=
   { read -r cached < "$cache"; } 2>/dev/null
@@ -41,7 +45,15 @@ if [ -f "$d/session_start.sh" ]; then
   [ "$cached" = "$d" ] \
     || { mkdir -p "${cache%/*}" && printf '%s\n' "$d" > "$cache.$$" && mv -f "$cache.$$" "$cache"; }
   if [ "$1" = antigravity ]; then
-    printf '%s\n' "$agy" | sh "$d/session_start.sh"
+    out=$(printf '%s\n' "$agy" | sh "$d/session_start.sh")
+    # agy reads only JSON. An error (a broken symbion.toml, a traceback) is
+    # plain text, so it goes into agy's JSON as one string (audit, 2026-11-08).
+    case "$out" in
+      ''|'{'*) [ -z "$out" ] || printf '%s\n' "$out" ;;
+      *) out=$(printf '%s\n' "$out" | LC_ALL=C tr '\t' ' ' | LC_ALL=C tr -d '\000-\010\013-\037' \
+           | LC_ALL=C sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s%s", (NR > 1 ? "\\n" : ""), $0}')
+         printf '{"injectSteps":[{"systemMessage":{"systemMessage":"%s"}}]}\n' "$out" ;;
+    esac
     exit 0
   fi
   exec sh "$d/session_start.sh"

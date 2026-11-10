@@ -64,7 +64,30 @@ def test_codex_preserves_existing_config_and_foreign_skill(tmp_path, monkeypatch
     assert settings.read_text() == contents
     assert (link / "SKILL.md").read_text() == "mine"
     out = capsys.readouterr().out
-    assert "left alone" in out and "run /hooks to review it" in out
+    assert "left alone" in out and "note: no hook registered: each runs its script through" in out
+
+
+@pytest.mark.parametrize("how", ["dangling", "foreign"])
+def test_codex_registers_no_hook_through_a_link_that_is_not_symbions(tmp_path, capsys, how):
+    """Each hook runs its script through the skill link. A reinstall left it
+    pointing nowhere, and --merge-hook merged both hooks; with someone's own
+    directory there, init said "left alone" and wrote them anyway. Each then
+    failed at every session start (audit, 2026-11-08)."""
+    link = Path.home() / ".agents/skills/symbion"
+    link.parent.mkdir(parents=True)
+    if how == "dangling":
+        link.symlink_to(tmp_path / "gone", target_is_directory=True)
+        args = ["--merge-hook"]
+    else:
+        link.mkdir()
+        args = ["--yes"]
+    rc = cli.main(["--dir", str(tmp_path / "notes"), "init", "--agent", "codex", *args])
+    said = capsys.readouterr()
+    assert not (Path.home() / ".codex/hooks.json").exists()
+    if how == "dangling":
+        assert rc != 0 and f"through {link}, which points nowhere" in said.err, said
+    else:
+        assert rc == 0 and "note: no hook registered" in said.out, said
 
 
 def test_the_installed_codex_hook_reads_its_session_cwd_as_codex(tmp_path, monkeypatch):

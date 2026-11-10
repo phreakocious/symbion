@@ -175,6 +175,24 @@ option B).
   the column names where the box is, so the line reads `from next · 2h` (`moved ·
   2h` for a reorder), the whole move in its tip; without phases, `moved · claude ·
   2h`.)*
+  *(2026-11-08: where that line cannot hold the mover's whole text and the id, the id
+  wraps to a line of its own, at the right. Kept beside it, the id cut `from in review
+  · now` to 60 of its 144px on a 288px card.)*
+  *(2026-11-08, the user, relaying a user's request to break the columns up: a column
+  is a lane, a faint panel whose top strip greens by its place toward done. Hues by
+  place were rejected, since every free hue is a kind's mark or a status colour, and
+  red for blocked would need a colour stored per phase. A ramp alone read a blocked
+  column as nearly done, so a phase named with the word blocked, waiting, stuck or
+  hold is grey. The name decides, not a mark on the arc: a miss costs a strip's
+  colour, and a mark would cost a stored field. The board page also widens to give
+  each column about 300px where the window has room.)*
+  *(2026-11-08, later, the user: an arc's progress bar, on its page and on Arcs, is
+  its boxes by phase in the strips' colours, done first, then the columns right to
+  left, each part's tip its phase and count. Done fills the bar's height and the rest
+  are a thin line: at full height, an arc with nothing done read as a full bar, and
+  one whose boxes sat in the last phase as nearly finished. The ramp mixes in OKLCH at green's hue
+  and chroma, as the map's do, and starts where a card shows it at 3:1: from 20% in
+  sRGB, its first step was teal-grey, and 2.41:1 on the page.)*
 - **No drag required.** Every move has a path without a drag: the phase chip opens a
   menu of the phases, plus up and down. Keyboard, screen reader and phone users move
   boxes that way; HTML5 drag and drop is unreliable on iPhone Safari.

@@ -125,7 +125,8 @@ name with a `/` in it, such as `/etc/nginx.conf`. A name that is no path, such
 as a service or a host, never fires one, as a target or as a ref. Put a trap on
 the file where it bites; a trap with no such file is a note that `context
 --target` finds. A symbion command never fires a gotcha, or spends one: writing
-about an object is no use of it.
+about an object is no use of it. Behind an assignment (`X=1 symbion …`) it reads
+as another command, and fires.
 
 A piped catalog must fail when its producer fails, or a failed producer reads
 as an empty catalog, and with a resolver every name mints as new. dash refuses

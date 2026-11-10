@@ -32,7 +32,7 @@ GUI_DIR = Path(__file__).resolve().parent.parent / "src" / "symbion" / "gui"
 ALLOWED_STORE_READS = {
     "load", "load_malformed", "load_arcs", "heads", "heads_for", "chain_tip", "chain_tips",
     "query",
-    "tag_counts", "arc_items", "arc_progress", "arc_board", "box_phase", "DONE", "read_status", "due_state", "since_cutoff",
+    "tag_counts", "arc_items", "arc_progress", "arc_board", "arc_last_change", "box_phase", "DONE", "read_status", "due_state", "since_cutoff",
     "exists", "newest_first", "written_at", "shown", "appended", "stamp_sha", "unholdable",
     "notes_path", "arcs_path", "id_tail", "pending_rows", "with_bases", "entries", "Note", "Arc",
     "Target",
@@ -41,7 +41,8 @@ ALLOWED_STORE_READS = {
     "UndoRefused", "undo_words",                 # api.undo's refusal, and its words
     "RefsDropped",                               # api.supersede's refusal under keep_refs
     "Twin",                                      # api.add's refusal of an uncommitted twin
-    "undoable", "note_from_dict",                # the undo button's read, and its dialog's rows
+    "undo_state", "note_from_dict",              # the undo button's read, and its dialog's rows
+    "discard_ids", "DiscardChanged",             # the discard dialog's plan, and its refusal
     "now_shown",                                 # the clock, which SYMBION_NOW can stop
     "zone",                                      # the zone `shown` prints in: the map's weeks
     "read_only", "ReadOnly",                     # serve --read-only, and its refusal
@@ -127,7 +128,8 @@ CLI_STORE_CALLS = ALLOWED_STORE_READS | {
     "stored_names",                                       # read: list --name's stored form
     "jsonl_lines",                                        # a text helper
     "_replace_atomically",                                # a file helper: --merge-hook's settings
-    "pending_rows", "rows_by_author", "arcs_by_writer",   # reads: what commit would take
+    "pending_rows", "rows_by_author", "arcs_by_writer",   # reads: what commit would take,
+    "lost_rows",                                          # and a removal only --all takes
     "NOTES_FILE", "ARCS_FILE",
     "session_key", "sessions",                            # reads: the env's agent session,
                                                           # and the rows each session wrote

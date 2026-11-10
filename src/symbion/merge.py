@@ -137,16 +137,45 @@ def _merge_arc(base: dict, ours: dict, theirs: dict, dropped: list) -> dict:
             v = o
         elif o == b:
             v = t
+        elif k in ("changed_by", "changed_at"):
+            # who edited it last, a stamp no side's value depends on: the later one, unsaid
+            v = o if str(ours.get("changed_at")) > str(theirs.get("changed_at")) else t
         elif k == "archived_at" and ours.get("archived") is True and theirs.get("archived") is True:
             # ponytail: stamps compare as text, which holds while all are UTC
             v = min((x for x in (o, t) if isinstance(x, str)), default=t)
         else:
             v = t
-            dropped.append(f"arc {ours['id']}: kept the upstream's {k} {_show(t)}, "
+            dropped.append(_placement_dropped(ours["id"], b, o, t) if k == "placement" else
+                           f"arc {ours['id']}: kept the upstream's {k} {_show(t)}, "
                            f"dropped yours, {_show(o)}")
         if v is not _MISSING:
             merged[k] = v
+    # One side dropped a phase while the other moved a box into it: the box
+    # read in the first phase, unsaid (audit, 2026-11-08). A placement already
+    # so on this side is not news.
+    phases, had = merged.get("phases"), ours.get("phases") or ()
+    for x in merged.get("placement") or () if isinstance(phases, list) and phases else ():
+        if isinstance(x, dict) and x.get("phase") is not None and x["phase"] not in phases \
+                and (x not in (ours.get("placement") or ()) or x["phase"] in had):
+            dropped.append(f"arc {ours['id']}: box {x.get('id')} is placed in phase "
+                           f"{x['phase']!r}, which one side dropped: it reads in {phases[0]!r}")
     return merged
+
+
+def _placement_dropped(arc_id, base, o, t) -> str:
+    """The boxes this side placed that the upstream's placement drops, by id:
+    both whole boards as JSON made one pull line of 14,826 characters (audit,
+    2026-11-08)."""
+    def by_id(v):
+        return {b.get("id"): b for b in v if isinstance(b, dict)} if isinstance(v, list) else {}
+    kept, was = by_id(t), by_id(base)
+    lost = [b for b in by_id(o).values() if b not in (kept.get(b.get("id")), was.get(b.get("id")))]
+    if not lost:
+        return f"arc {arc_id}: kept the upstream's order of its boxes, and dropped yours"
+    named = ", ".join(f"{b.get('id')} ({b.get('phase') or 'no phase'})" for b in lost[:5])
+    return (f"arc {arc_id}: kept the upstream's placement of its boxes, and dropped yours of "
+            f"{len(lost)} box{'es' if len(lost) != 1 else ''}: {named}"
+            + (f", +{len(lost) - 5} more" if len(lost) > 5 else ""))
 
 
 def merge_arcs(base: list[str], ours: list[str], theirs: list[str]) -> tuple[list[str], list[str]]:
