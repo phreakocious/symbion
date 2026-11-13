@@ -964,11 +964,17 @@ def _shim_args(base, which, pv, data, stdin, stub_sleep, cache=True):
     base = Path(base)
     base.mkdir(parents=True, exist_ok=True)
     root = base / f"root-{pv}"
-    shutil.copytree(PLUGIN / "hooks", root / "hooks", dirs_exist_ok=True)
+    shutil.copytree(PLUGIN / "hooks", root / "hooks", dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("upgrade.sh"))
     (root / ".claude-plugin").mkdir(exist_ok=True)
     (root / ".claude-plugin" / "plugin.json").write_text(f'{{"name": "symbion", "version": "{pv}"}}\n')
-    (root / "hooks" / "upgrade.sh").write_text(
-        f'sleep {stub_sleep}\necho "$1" >> \'{base / "stub.runs"}\'\n')
+    # A worker from an earlier shim can still be reading the stub, so a second setup
+    # leaves it alone: the real upgrade.sh copied over it ran the real worker, which
+    # closed the version, and the stub never ran (a CI run, 2026-11-13).
+    stub = root / "hooks" / "upgrade.sh"
+    text = f'sleep {stub_sleep}\necho "$1" >> \'{base / "stub.runs"}\'\n'
+    if not stub.exists() or stub.read_text() != text:
+        stub.write_text(text)
     for n in ("mkdir", "find", "git"):
         _fake(base, n, f'for _p in /bin /usr/bin; do [ -x "$_p/{n}" ] && exec "$_p/{n}" "$@"; done')
     env = {**_env(base), "CLAUDE_PLUGIN_ROOT": str(root)}
@@ -1057,6 +1063,17 @@ def test_check_launches_one_worker_per_version(tmp_path):
         assert _shim(tmp_path, "gotchas", pv="0.16.0", data=data).stderr == ""
     _wait_for(lambda: _stub_runs(tmp_path) == ["0.16.0"])
     assert (data / "upgrade/hold-0.16.0").is_dir()
+
+
+def test_a_second_shim_setup_writes_nothing_over_the_stub(tmp_path):
+    stub = tmp_path / "root-0.16.0" / "hooks" / "upgrade.sh"
+    _shim_args(tmp_path, "gotchas", "0.16.0", None, "", 0)
+    stub.chmod(0o444)        # a write over it fails, except as root
+    try:
+        _shim_args(tmp_path, "gotchas", "0.16.0", None, "", 0)
+    finally:
+        stub.chmod(0o644)
+    assert stub.read_text().startswith("sleep 0\n")
 
 
 def test_two_starts_at_once_launch_one_worker(tmp_path):              # RF 4
