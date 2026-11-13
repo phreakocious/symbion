@@ -59,10 +59,13 @@ symbion_json_text() {
 # done. WHEN is start (a session start) or tool (a tool call). Inert outside Claude
 # Code: agy, Pi and a hand run set neither env var. With its marker present this
 # runs builtins only, as gotchas.sh calls it on every tool call. On the fresh
-# path mkdir of hold-PV is the lock: of two hooks racing, one wins. A hold older
-# than an hour is mostly a failed or waiting attempt's throttle, which upgrade.sh
-# keeps on purpose; only a session start retries it, so tool calls never do. A
-# worker still hung past an hour gets a second beside it: uv and pip time out.
+# path the shell's exclusive create of the file hold-PV (set -C) is the lock: of
+# two hooks racing, one wins. mkdir was none where it is uutils' before 0.11
+# (Ubuntu 26.04's): both of two racing creates exited 0 (a CI run, 2026-11-13).
+# A hold older than an hour is mostly a failed or waiting attempt's throttle,
+# which upgrade.sh keeps on purpose; only a session start retries it, so tool
+# calls never do. A worker still hung past an hour gets a second beside it: uv
+# and pip time out.
 # Needs `here`, the hooks dir. Never reads stdin: gotchas.sh hands it on.
 symbion_upgrade_check() {
   [ -n "$CLAUDE_PLUGIN_DATA" ] && [ -n "$CLAUDE_PLUGIN_ROOT" ] || return 0
@@ -72,14 +75,14 @@ symbion_upgrade_check() {
   [ -e "$_up/ok-$pv" ] && return 0
   if [ -e "$_up/hold-$pv" ]; then
     [ "$1" = start ] || return 0
-    # shortcut: two session starts in the gap between this age test and the rmdir,
-    # over a hold past an hour, launch two workers (B's rmdir removes the fresh hold
+    # shortcut: two session starts in the gap between this age test and the rm,
+    # over a hold past an hour, launch two workers (B's rm removes the fresh hold
     # A just made); uv locks its tool dir, pipx does not. Upgrade: make the claim
     # atomic by moving a pre-built hold into place.
     [ -n "$(find "$_up/hold-$pv" -prune -mmin +60 2>/dev/null)" ] || return 0
-    rmdir "$_up/hold-$pv" 2>/dev/null || return 0
+    rm -f "$_up/hold-$pv" 2>/dev/null || return 0
   fi
-  mkdir -p "$_up" 2>/dev/null && mkdir "$_up/hold-$pv" 2>/dev/null || return 0
+  mkdir -p "$_up" 2>/dev/null && (set -C; : > "$_up/hold-$pv") 2>/dev/null || return 0
   # All three streams go to /dev/null first, by exec, so the host never waits on the
   # hook's pipes: on a background compound OpenBSD's sh kept a copy of each pipe it
   # redirected, and the hook waited out the worker (an OpenBSD run, 2026-11-13).

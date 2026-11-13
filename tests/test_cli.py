@@ -7246,8 +7246,8 @@ def test_a_commit_names_each_arc_change_by_its_writer(tmp_path, capsys, monkeypa
 def test_a_commit_from_another_projects_tree_leaves_the_stores_files(tmp_path, capsys, monkeypatch):
     """A dogfood row's commit, run with --dir from another project, took two
     files a session of the store's own had changed, and its push shipped
-    them (2026-10-31). From outside the store's project it takes its rows and
-    the new docs they name, and names each file it left."""
+    them (2026-10-31). From outside the store's project it takes its rows, arcs.jsonl
+    and the new docs they name, and names each file it left."""
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
     proj, s = tmp_path / "proj", tmp_path / "proj-notes"
     proj.mkdir()
@@ -7574,6 +7574,23 @@ def test_supersede_takes_external_only_where_the_row_already_has_it(repo, tmp_pa
     rows = {n.id: n for n in store.load(tmp_path)}
     assert (rows[ext].result, rows[ext].provenance["external"]) == ("ok, re-read", True)
     assert rows[sha].result == "ok" and len(rows) == 3, "ext's two versions and sha"
+
+
+def test_supersede_external_result_on_a_pre_registration_names_resolve(repo, tmp_path, capsys):
+    """`supersede --status resolved --result R --external` on an open
+    prediction was told to `add --external`, which splits the prediction from
+    its result (2026-11-13). The refusal names the resolve that works."""
+    pid = _add(tmp_path, capsys, "prediction", "--target", "item:p", "--checked", "a host's log",
+               "--body", "x rises")
+    for flags in (["--status", "resolved", "--result", "rose"], ["--result", "rose"]):
+        assert run("supersede", pid, "--external", *flags, store_dir=tmp_path) == 1
+        err = capsys.readouterr().err
+        assert f"`symbion resolve {pid[-10:]} --result TEXT --external`" in err, err
+        assert "add --external" not in err
+    assert run("supersede", pid, "--external", "--append", "--body", "more",
+               store_dir=tmp_path) == 1
+    assert "add --external" in capsys.readouterr().err, "no result: a new reading is an add"
+    assert run("resolve", pid, "--result", "rose", "--external", store_dir=tmp_path) == 0
 
 
 def test_from_json_takes_external(tmp_path, capsys, monkeypatch):

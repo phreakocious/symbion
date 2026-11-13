@@ -140,6 +140,11 @@ in any project: the install is the user's, not the project's. The upgrade:
    `mkdir`. A session start retries a hold over an hour old, and that retry is a
    known race: two session starts within milliseconds, over a hold past an hour,
    can launch two workers. It is recorded as a `shortcut:` in `upgrade_lib.sh`.
+
+   *Changed 2026-11-13:* `hold-<pv>` is a file made by the shell's exclusive create,
+   `(set -C; : > FILE)`. Where `mkdir` is uutils' before 0.11 (Ubuntu 26.04 ships
+   0.10), both of two racing creates of one directory exit 0, so `mkdir` was no lock
+   there.
 2. Stops if an attempt for this version ran less than an hour ago (my call), so a
    failure or a wait does not retry on every tool call.
 3. Finds how symbion was installed: `uv tool`, `pipx`, editable, other, or none.

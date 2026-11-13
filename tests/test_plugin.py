@@ -687,7 +687,8 @@ def _cli_v(tmp_path, version, loc, crlf=False, warn=False):
 
 def _work(tmp_path, cli, pv, tool=None, uname=None, crlf=False, warn=False) -> Path:
     up = tmp_path / "data" / "upgrade"
-    (up / f"hold-{pv}").mkdir(parents=True, exist_ok=True)
+    up.mkdir(parents=True, exist_ok=True)
+    (up / f"hold-{pv}").write_text("")
     if cli:
         _cli_v(tmp_path, cli[0], cli[1], crlf, warn)
     if tool:    # ok moves the fake CLI to the plugin's version, noop changes nothing, fail is a
@@ -854,7 +855,7 @@ def test_worker_compares_numbers_not_text(tmp_path):
 
 def test_worker_waits_for_pypi(tmp_path):
     up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path, "uv")), pv="0.16.0", tool="noop")
-    assert not (up / "ok-0.16.0").exists() and (up / "hold-0.16.0").is_dir()
+    assert not (up / "ok-0.16.0").exists() and (up / "hold-0.16.0").is_file()
     assert not (up / "result").exists() and _log(up)[-1]["outcome"] == "wait"
 
 
@@ -907,7 +908,7 @@ def test_worker_reports_a_cli_with_no_version_after_the_upgrade_once(tmp_path):
     assert "`uv tool upgrade symbion` failed (log: " in _result(up)
     (up / "result").unlink()                                   # delivered
     _work(tmp_path, cli=cli, pv="0.16.0", tool="break")
-    assert not (up / "result").exists() and not (up / "ok-0.16.0").exists() and (up / "hold-0.16.0").is_dir()
+    assert not (up / "result").exists() and not (up / "ok-0.16.0").exists() and (up / "hold-0.16.0").is_file()
     rows = _log(up)
     assert [(r["outcome"], r["exit"]) for r in rows] == [("failed", 0), ("failed", 0)]
     assert rows[0]["output"].endswith("symbion -V gave no version after the upgrade")
@@ -920,7 +921,7 @@ def test_worker_reports_a_failure_once_per_version(tmp_path):
     assert f"(log: {tmp_path / 'data'}/upgrade/log.jsonl)." in _result(up)    # the worker joins with `/`
     (up / "result").unlink()                                   # delivered
     _work(tmp_path, cli=cli, pv="0.16.0", tool="fail")
-    assert not (up / "result").exists() and (up / "hold-0.16.0").is_dir()
+    assert not (up / "result").exists() and (up / "hold-0.16.0").is_file()
     assert [r["outcome"] for r in _log(up)] == ["failed", "failed"]
     assert "error: no network" in _log(up)[0]["output"]
 
@@ -952,7 +953,7 @@ def _data(base, ok=(), hold=None, hold_age_min=0, result=None) -> Path:
     for v in [ok] if isinstance(ok, str) else ok:
         (up / f"ok-{v}").write_text("")
     if hold:
-        (up / f"hold-{hold}").mkdir(exist_ok=True)
+        (up / f"hold-{hold}").write_text("")
         t = time.time() - hold_age_min * 60
         os.utime(up / f"hold-{hold}", (t, t))
     if result:
@@ -976,7 +977,10 @@ def _shim_args(base, which, pv, data, stdin, stub_sleep, cache=True):
     if not stub.exists() or stub.read_text() != text:
         stub.write_text(text)
     for n in ("mkdir", "find", "git"):
-        _fake(base, n, f'for _p in /bin /usr/bin; do [ -x "$_p/{n}" ] && exec "$_p/{n}" "$@"; done')
+        # mkdir without -p acts as uutils' before 0.11 (Ubuntu 26.04's) does in a race: it waits, then
+        # exits 0 though another create made the dir meanwhile (a CI run, 2026-11-13)
+        pre = 'case $1 in -p) ;; *) sleep 0.5; set -- -p "$@" ;; esac\n' if n == "mkdir" else ""
+        _fake(base, n, pre + f'for _p in /bin /usr/bin; do [ -x "$_p/{n}" ] && exec "$_p/{n}" "$@"; done')
     env = {**_env(base), "CLAUDE_PLUGIN_ROOT": str(root)}
     if data is not None:
         env["CLAUDE_PLUGIN_DATA"] = str(data)
@@ -1062,7 +1066,7 @@ def test_check_launches_one_worker_per_version(tmp_path):
     for _ in range(3):
         assert _shim(tmp_path, "gotchas", pv="0.16.0", data=data).stderr == ""
     _wait_for(lambda: _stub_runs(tmp_path) == ["0.16.0"])
-    assert (data / "upgrade/hold-0.16.0").is_dir()
+    assert (data / "upgrade/hold-0.16.0").is_file()
 
 
 def test_a_second_shim_setup_writes_nothing_over_the_stub(tmp_path):
@@ -1130,7 +1134,7 @@ def test_a_session_start_keeps_a_hold_under_an_hour_old(tmp_path):
     hold = data / "upgrade/hold-0.16.0"
     mtime = hold.stat().st_mtime
     assert _shim(tmp_path, "start", pv="0.16.0", data=data).stderr == ""
-    # find is the age test; a retry would rmdir the hold and mkdir a new one
+    # find is the age test; a retry would rm the hold and make a new one
     assert len(_calls(tmp_path, "find")) == 1 and hold.stat().st_mtime == mtime
     assert _stub_runs(tmp_path) == []
 

@@ -2255,7 +2255,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     cm.add_argument("--all", dest="everyone", action="store_true",
                     help="take every pending entry and file: by default a commit takes the entries "
                          "this agent session wrote, or with no session, your author's, and from "
-                         "another project's tree no file but the new docs they name")
+                         "another project's tree no file but arcs.jsonl and the new docs they name")
     sub.add_parser("push", help="git push the store to its remote; commit first")
     sub.add_parser("pull", help="fetch a shared store's origin and merge it; pending entries "
                                 "stay pending, each its session's")
@@ -4178,9 +4178,15 @@ def _dispatch(args, ctx) -> int:
 
     if args.cmd == "supersede":
         if args.external and tip is not None and not (tip.provenance or {}).get("external"):
+            # An add would split a pre-registration from its result (2026-11-13).
+            if tip.spec.status and tip.spec.verdict and store.read_status(tip) == "open" \
+                    and (args.status == "resolved" or args.result is not None):
+                hint = (f"`symbion resolve {tip.id[-10:]} --result TEXT --external` judges "
+                        f"this open pre-registration on a reading outside this repo")
+            else:
+                hint = "a reading outside this repo is a new entry: add --external"
             print(f"supersede: --external: {tip.id} is stamped with a commit, and a "
-                  f"supersede keeps the stamp; a reading outside this repo is a new entry: "
-                  f"add --external", file=sys.stderr)
+                  f"supersede keeps the stamp; {hint}", file=sys.stderr)
             return 1
         fields = _body_fields(args)
         measures = _measures_from_flags(args.measures)

@@ -291,7 +291,7 @@ see at session start: one line, and in a [shared store](#share-a-store) above it
 the pull's lines that say `symbion.toml` changed, with the command that shows
 the change, or that a clone runs an older symbion, and, until you run
 `symbion trust`, the line that says writes wait on it. The not-on-PATH line and the `error:` lines
-print as plain text, and the PowerShell hook prints all of it that way.
+print as plain text, from either hook.
 
 | output | meaning |
 |---|---|

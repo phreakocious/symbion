@@ -1,5 +1,5 @@
 name: symbion
-version: "0.16.0"
+version: "0.16.1"
 description: "symbion for Hermes Agent: the project's open entries at a session's start, and a file's gotchas the first time the agent touches it. It runs the installed symbion CLI."
 author: phreakocious
 requires_hermes: ">=0.23.1"

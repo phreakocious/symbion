@@ -1,7 +1,8 @@
 # The detached upgrade worker: `sh upgrade.sh PV`, launched by a shim with a full
-# path, stdout and stderr on /dev/null, and hold-PV already made (mkdir is the
-# lock). It decides from `symbion -V` alone, closes PV with ok-PV, and always
-# exits 0: a hook never fails a session. POSIX sh. State is $CLAUDE_PLUGIN_DATA/upgrade/.
+# path, stdout and stderr on /dev/null, and hold-PV already made (its exclusive
+# create is the lock). It decides from `symbion -V` alone, closes PV with ok-PV,
+# and always exits 0: a hook never fails a session. POSIX sh. State is
+# $CLAUDE_PLUGIN_DATA/upgrade/.
 exec >/dev/null 2>&1
 # The shims' cut (session_start.sh says why), though the lib launches this with a `/`.
 here=.
@@ -48,7 +49,7 @@ symbion_result() {
 symbion_close() {
   symbion_log "$1"
   : > "$_up/ok-$pv"
-  rmdir "$_up/hold-$pv"
+  rm -f "$_up/hold-$pv"
 }
 
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)

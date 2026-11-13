@@ -123,8 +123,8 @@ model you hand work to, writes under its own name (`--author sonnet-review`).
 
 A write is pending until `symbion commit`, and on this disk only until
 `symbion push`. `commit` takes the entries this session wrote, under any author,
-and the store's changed files (from another project's tree, only new docs they
-name); `--all` takes every entry and file, `--dry-run` lists what it would take. Each write and each commit says what is
+and the store's changed files (from another project's tree, only `arcs.jsonl` and
+the new docs they name); `--all` takes every entry and file, `--dry-run` lists what it would take. Each write and each commit says what is
 still pending or unpushed.
 
 ## Reading

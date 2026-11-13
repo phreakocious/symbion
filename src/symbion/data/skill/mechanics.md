@@ -245,8 +245,9 @@ store, or a tail two entries share, names no entry.
 `symbion commit` takes the entries this agent session wrote, under any author
 (with no session, your author's), and every changed file in the store. From
 another project's tree (`--dir` from outside the store's project) it takes no
-file but the new docs those entries name, and names each file it left. An edit
-of another session's uncommitted entry brings that entry into your commit: a
+file but `arcs.jsonl` and the new docs those entries name, and names each file
+it left. An edit of another session's uncommitted entry brings that entry into
+your commit: a
 commit never holds an edit without the version it edits. Its
 commit message ends with a `Rows: claude 3` trailer naming them by author. When
 arcs.jsonl changed, an `Arcs: ada 1, unknown 1` trailer follows: a new arc
