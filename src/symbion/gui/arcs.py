@@ -64,6 +64,15 @@ def checklist(ctx, act, refresh, *, author: str, seen=None, limit=None) -> int:
     return len(items[limit:]) if limit is not None else 0
 
 
+def scope_chip(act) -> None:
+    """The arc's scope, which `arc seed` sweeps, named as one; none for
+    `mixed`, the default, which says nothing. A bare `mixed` read as the
+    arc's target (a browser agent's review, 2026-11-11)."""
+    if act.target_scope != "mixed":
+        ui.label(f"scope: {act.target_scope}").classes("sb-chip").mark("arc-scope") \
+            ._props["data-tip"] = "what this arc's entries are about; `arc seed` adds a box per name"
+
+
 def board(ctx, act, refresh, *, author: str, seen=None, limit=None) -> None:
     """The arc's columns side by side, in board order (store.arc_board): each
     phase, or `open` on an arc without phases, then done. Each box is the
@@ -402,7 +411,7 @@ def index(ctx, *, author: str) -> None:
                                        (" sb-done" if finished else "")).mark("arc-card"):
             with ui.row().classes("items-baseline gap-2 w-full"):
                 ui.link(a.name, f"/arc?id={quote(a.id)}").classes("sb-arc-name")
-                ui.label(a.target_scope).classes("sb-chip sb-target")
+                scope_chip(a)
                 ui.space()
                 ui.label(f"{done}/{total}" + (" done" if finished else "")).classes("sb-count") \
                     .mark("arc-count")

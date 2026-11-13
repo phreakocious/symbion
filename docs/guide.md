@@ -17,7 +17,8 @@ From the project, in Claude Code:
 
 The first line adds the repo as a marketplace (Claude Code asks `y` to add it,
 then a scope) and installs the plugin, live in the same session. The plugin holds
-a setup command, a stub skill and two small hooks. The stub runs `symbion skill`,
+setup and wrap commands, a stub skill and two small hooks, which also bring the
+matching CLI after a plugin update (see Upgrading). The stub runs `symbion skill`,
 and the hooks run the installed package's own `session_start.sh` and
 `gotchas.sh`, so the skill and the hooks always match the CLI.
 
@@ -88,6 +89,19 @@ TAB completes verbs, flags and the store's values: kinds, target types, the
 ids and tags. zsh and fish describe each value. A `--dir` on the line picks
 the store.
 
+## Upgrading
+
+In Claude Code, turn on auto-update for the symbion marketplace (`/plugin`,
+Marketplaces, symbion, Enable auto-update), or update the plugin in `/plugin`.
+Then run `/reload-plugins` or start a new session. The package follows: the
+first tool call or session start after an update runs `uv tool upgrade symbion`
+or `pipx upgrade symbion`, whichever installed it, and restarts any `symbion
+serve`; on Windows the agent's line says to restart it by hand. An editable
+install, or one not made by uv or pipx, is left alone, with a note to the agent.
+
+Everywhere else, run `uv tool upgrade symbion` or `pipx upgrade symbion`, then
+`symbion serve --restart`.
+
 ## Adopt in a fresh repo
 
 From the repo's root:
@@ -114,7 +128,9 @@ agy plugin install https://github.com/phreakocious/symbion/tree/main/plugin
 ```
 
 agy copies the plugin into `~/.gemini/config/plugins/symbion` and finds it at its
-next start. The copy holds the stub skill, the setup and wrap skills
+next start. An upgrade of symbion leaves that copy as it was: `init --agent
+antigravity` names a copy whose version is not symbion's, and the command that
+updates it. The copy holds the stub skill, the setup and wrap skills
 (`/symbion:setup` and `/symbion:wrap`), and the session-start hook. agy has no
 gotcha hook. The hook runs in `sh`; on Windows that is untested.
 
@@ -210,12 +226,30 @@ startup, so switch to auto in the session.
 
 For Hermes Agent, `init --agent hermes` links `$HERMES_HOME/skills/symbion`
 (default `~/.hermes/skills/symbion`), where Hermes finds it with no change to
-its config, and registers no hook: no Hermes hook puts text in front of the
-model once, at session start. A named profile has its own `HERMES_HOME`: run
-`init --agent hermes` again with it set. An install before this one linked
-`~/.agents/skills` and listed it under `skills.external_dirs`; that still
-works beside the new link. The summary comes from a line in the project's
-`AGENTS.md` (step 3).
+its config. A named profile has its own `HERMES_HOME`: run `init --agent
+hermes` again with it set. An install before this one linked `~/.agents/skills`
+and listed it under `skills.external_dirs`; that still works beside the new
+link. init also prints the plugin's install line until
+`$HERMES_HOME/plugins/symbion` holds it:
+
+```bash
+hermes plugins install phreakocious/symbion#plugin --enable
+```
+
+The plugin needs Hermes 0.23.1 or later. Hermes clones the repo's `plugin/` directory and loads `plugin/__init__.py`
+from it. The plugin runs the same two hooks: the summary on a session's first
+turn, after a resume and after a compaction that rewrites the history, and the
+gotcha line on the results of `terminal`, `read_file`, `write_file` and
+`patch`. A `delegate_task` subagent gets the gotchas but no summary, and its
+writes count as its parent session's. The plugin offers its setup and wrap
+skills as `/symbion:setup` and `/symbion:wrap`, and the installed CLI's skill as
+`symbion:symbion`. Its hooks run in Hermes's gateway, so `symbion` must be on the
+gateway's PATH, not only your shell's: Hermes's terminal reads a login shell's PATH,
+and the gateway keeps the one it started with. When the gateway finds no `symbion`,
+the session-start line names its PATH. From a shell where `symbion -V` works, run
+`hermes gateway install --force` for a gateway service, else `hermes gateway stop`:
+the next chat starts it again with that shell's PATH. On Windows it is untested. Without the
+plugin, a line in the project's `AGENTS.md` asks for the summary (step 3).
 Hermes's default local terminal writes to the store beside the project with
 no further setup.
 
@@ -248,8 +282,8 @@ printf '{"workspacePaths":["%s"]}' "$PWD" | ANTIGRAVITY_CONVERSATION_ID=by-hand 
 It prints `{"injectSteps": [{"systemMessage": {"systemMessage": …}}]}`, and the
 text in the table below is that inner `systemMessage`, which the model reads.
 
-Hermes Agent has no hook to run: start a session after step 3, and its first
-command should be `symbion summary`.
+Hermes Agent's plugin runs this same hook. Without the plugin, start a session
+after step 3: its first command should be `symbion summary`.
 
 `session_start.sh` prints one JSON line: the text in the table below is its
 `additionalContext`, what the agent reads, and its `systemMessage` is what you
@@ -266,19 +300,20 @@ print as plain text, and the PowerShell hook prints all of it that way.
 | either, then `  N entries not yet in the store's git (symbion commit)` | working; `/symbion:wrap` at session end commits them |
 | either, then `… (symbion commit --all once their session has ended, the newest written 2h ago)` | the entries are another session's, and `symbion commit` takes only yours: `--all` takes them once that session has ended. The age is the only clue to whether it has: an idle session that is still open writes nothing either |
 | `symbion: cannot read store at … because 'symbion' is not on PATH` | see [Install](#install) |
-| `symbion: this project has a symbion store, but the symbion CLI is not installed or does not run: run /symbion:setup.` | the plugin's hook, with no `symbion` that runs: `/symbion:setup` installs it. In Antigravity the line ends `see Install at https://github.com/phreakocious/symbion` |
+| `symbion: this project has a symbion store, but the symbion CLI is not installed or does not run: run /symbion:setup.` | the plugin's hook, with no `symbion` that runs: `/symbion:setup` installs it. In Antigravity the line ends `see Install at https://github.com/phreakocious/symbion`, and in Pi `run /symbion-setup.` In Hermes Agent with no `symbion` on the gateway's PATH, it names that PATH and the `hermes gateway` command that restarts the gateway with yours |
 | `symbion: no store at …; run \`symbion init\`` | no store yet, or `.symbion`/`SYMBION_DIR` names a missing path |
 | `error: …/.symbion is a link to …` or `error: cannot read …/.symbion` | `.symbion` is there but is not a file symbion can read; the message gives the fix |
-| nothing | no store, no `.symbion` and no `SYMBION_DIR`, or the plugin is not installed (Claude Code, Antigravity), or the hook is not registered or not trusted (Codex) |
+| nothing | no store, no `.symbion` and no `SYMBION_DIR`, or the plugin is not installed (Claude Code, Antigravity, Hermes Agent), or the hook is not registered or not trusted (Codex) |
 
 **3. Tell the agent.** One line in `CLAUDE.md` (Claude Code) or `AGENTS.md`
-(Codex, Antigravity, Hermes Agent):
+(Codex, Antigravity), and for Hermes Agent in the first of `.hermes.md`,
+`AGENTS.override.md`, `AGENTS.md` and `CLAUDE.md` it finds, else a new `AGENTS.md`:
 
 ```
 - We use symbion for durable notes and tickets.
 ```
 
-Hermes Agent runs no hook, so it needs a second line. Hermes reads only the
+Without its plugin, Hermes Agent runs no hook and needs a second line. Hermes reads only the
 first of `.hermes.md`, `AGENTS.override.md`, `AGENTS.md` and `CLAUDE.md` it
 finds in the project, so put the line in that file:
 
@@ -341,7 +376,7 @@ symbion arc move <id> --phase doing           # --top, --before ID or --after ID
 never blocks an entry; `symbion summary` shows the uncommitted count until a
 commit. The wrap (`wrap.md` in the skill) files an open `question` for each ask
 the user left unanswered, writes entries for what the session learned, changed
-and finished, then commits the store with the day as its
+and finished, then commits the store with the next session's handoff as its
 message:
 
 ```bash
@@ -363,8 +398,8 @@ With nothing to commit, `commit` exits 1, as git does, so a script's `symbion co
 then, so a session that changed only the repo still leaves its handoff. The first `commit` also takes the files
 `init` wrote (`.gitignore`, `README.md`, `symbion.toml`): `init` commits nothing.
 
-`commit` takes your entries: in a Claude Code or Codex session, the ones that session
-wrote; at a plain terminal, your author's. Two sessions on one store each commit
+`commit` takes your entries: in an agent session (Claude Code, Codex, Antigravity, Pi, Hermes Agent),
+the ones that session wrote; at a plain terminal, your author's. Two sessions on one store each commit
 their own. It names the entries it left and the newest one's age, and `commit --all`
 takes them too, for a session that ended without committing. From another project's
 tree, as with `--dir ../other-notes`, it takes no file but the new docs your entries
@@ -476,8 +511,9 @@ to an entry stays good (`serve` prints it, and `--port` picks another). It has:
   pull requests;
 - the commits behind a card's `N commits since` or `behind N`, and what they
   changed, a click away;
-- a Docs page: every markdown file an entry is on or points at, the
-  project's and the store's `docs/`, the most named first, each with its
+- a Docs page: every file in the store's `docs/` an entry is on, of any
+  type, and every markdown file of the project's an entry is on or points
+  at, the most named first, each with its
   entries, the open ones among them, and a button that opens it;
 - a Map page: the store's entries as a treemap, grouped on up to three axes
   (target, tag, kind, status, author, arc, week written). A tile's area is its
@@ -564,8 +600,8 @@ The first such link asks, once, whether the app may open `web+symbion` links.
 An app installed before symbion registered the scheme learns it when Chrome
 next updates the app: close its windows and open it again.
 
-`?` lists the keys. It writes as **you**: `SYMBION_AUTHOR`, else git
-`user.name`, shown at the foot of the sidebar, or in the top bar on a window
+`?` lists the keys. It writes as **you**: `SYMBION_AUTHOR`, else the store's
+git `user.name`, shown at the foot of the sidebar, or in the top bar on a window
 too narrow for one. `--author NAME` overrides.
 
 It listens on 127.0.0.1, for this machine only, and answers only at `localhost`
@@ -595,3 +631,5 @@ every one in place: in its own terminal, on its own port, and its open tabs
 reload. It prints the version each now runs, or in a checkout the commit, and
 ends with a count (`restarted 3 of 3 serves`). `--stop` stops them all.
 Neither works on Windows: there, Ctrl-C each one and start it again.
+`symbion serve --list`, from anywhere and on Windows too, prints each running
+serve's store, URL, pid, and the commit or version it runs.

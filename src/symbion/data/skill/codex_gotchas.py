@@ -109,16 +109,41 @@ def strings(x):
             yield from strings(v)
 
 
+def _before(call, name):
+    """The text before each place the call holds `name` with no path char
+    after it. A pattern with a dir before the name tried every start of a
+    run with no blank: 16 KB took 2.4 s, and the timeout is 5 s (audit,
+    2026-11-12)."""
+    for m in re.finditer("(?=" + re.escape(name) + r"(?![A-Za-z0-9._~/-]))", call):
+        yield call[:m.start()]
+
+
+def named(call, name, root):
+    """Whether the call names `name` as gotchas.sh does: at a word's start,
+    after `./` or a char no path holds, or after a dir ending in `/<root>/`
+    (with no root, any dir). README.md must not match docs/README.md or
+    README.md.bak. Absolute paths keep the root."""
+    for before in _before(call, name):
+        word = re.split(r"[\s\"']", before)[-1]
+        bare = word[:-2] if word.endswith("./") else word
+        if not re.fullmatch(r"[A-Za-z0-9._~/@+-]", bare[-1:]) or \
+                word.endswith(f"/{root}/" if root else "/"):
+            return True
+    return False
+
+
 def in_worktree(call, name, root):
     """Whether the call names `name` in a linked worktree of the repo whose
     root dir is `root`: the dir before it holds a `.git` file naming
     `<root>/.git/worktrees/`, as gotchas.sh reads it. Tried on a line's or a
     quote's whole tail (a path with a blank), then a word's (audit, 2026-11-08)."""
-    tail = r"(?![A-Za-z0-9._~/-])"
-    for dirs in (r"([^\n\"']*/)", r"([^\s\"']*/)"):
-        for m in re.finditer(dirs + re.escape(name) + tail, call):
+    for before in _before(call, name):
+        line = re.split(r"[\n\"']", before)[-1]
+        for d in (line, re.split(r"[\s\"']", line)[-1]):
+            if not d.endswith("/"):
+                continue
             try:
-                with open(m[1] + ".git", encoding="utf-8") as f:
+                with open(d + ".git", encoding="utf-8") as f:
                     g = f.readline().rstrip("\n")
             except (OSError, UnicodeDecodeError):
                 continue
@@ -171,17 +196,9 @@ def main():
     # Not splitlines(): it splits at U+2028 too, which a row's text may hold.
     for row in filter(None, listing.read_text(encoding="utf-8").split("\n")):
         ident, name, text, root = row.split("\t")[:4]    # a field added to the list is dropped here
-        if ident in seen or name not in call:   # the regex is quadratic on a run with no blank
+        if ident in seen or name not in call:
             continue
-        # Same root/path boundary rule as gotchas.sh: README.md must not
-        # match docs/README.md or README.md.bak. Absolute paths keep the root.
-        prefix = r"(?<![A-Za-z0-9._~/@+\-])(?:\./)?"
-        if root:
-            prefix += r"(?:[^\s\"']*/" + re.escape(root) + r"/)?"
-        else:
-            prefix += r"(?:[^\s\"']*/)?"
-        if not re.search(prefix + re.escape(name) + r"(?![A-Za-z0-9._~/-])", call) \
-                and not (root and in_worktree(call, name, root)):
+        if not named(call, name, root) and not (root and in_worktree(call, name, root)):
             continue
         output.append(json.loads('"' + text + '"'))
         seen.add(ident)
@@ -189,6 +206,10 @@ def main():
             with Path(mark + suffix).open("a", encoding="utf-8") as stream:
                 stream.write(ident + "\n")
     if output:
+        # The words every row shares, written beside the list: once, before the first row.
+        head = Path(str(listing) + ".head")
+        if head.is_file():
+            output.insert(0, json.loads('"' + head.read_text(encoding="utf-8") + '"'))
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                                 "additionalContext": "\n".join(output)}}))
 

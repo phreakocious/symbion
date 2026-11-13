@@ -1096,6 +1096,22 @@ def test_a_copy_that_is_not_whole_is_named_and_nothing_is_put_back(sides, capsys
     assert _state(b) == was and aside.is_dir()
 
 
+def test_pull_names_what_a_cut_off_pull_brought(sides, capsys):
+    """A pull a kill cut off after its merge leaves nothing to merge: the
+    next `pull` said only that it was up to date, and the answer the merge
+    brought waited for a session start (audit, 2026-11-12)."""
+    a, b = sides
+    q = publish(a, "Deploy on Friday or Monday?")
+    assert sym(b, "pull") == 0
+    assert sym(b, "resolve", q, "--body", "Monday.") == 0
+    assert sym(b, "commit", "--all") == 0
+    _killed_pull(a, "reapply")
+    capsys.readouterr()
+    assert sym(a, "pull") == 0
+    out = capsys.readouterr().out
+    assert "in what the pull brought:" in out and "Monday." in out, out
+
+
 def hook(clone, capsys) -> tuple[str, str]:
     """`summary --hook` in a clone: the text the agent reads, and the person's line."""
     capsys.readouterr()
@@ -1721,6 +1737,37 @@ def test_the_other_sides_agent_does_not_move_the_news_cutoff(sides, capsys, monk
     add(a, "a's second")
     err = capsys.readouterr().err
     assert "from the user" in err and "b's agent" not in err, err
+
+
+@pytest.mark.parametrize("b_name", ["B", "A"])
+def test_an_answer_another_process_pulled_is_news_to_the_asker(sides, capsys, monkeypatch,
+                                                                b_name):
+    """A commit keeps its session's mark on the question for a week. The
+    other clone's answer kept the question's id, and a pull by another
+    process (a terminal, the GUI's sync) left the mark on the answer: it read
+    as the asker's own, and no write named it (audit, 2026-11-12). The mark
+    follows the asker's version. Two clones of one person share a side."""
+    a, b = sides
+    git(b, "config", "user.name", b_name)
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:00:00+00:00")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "asker")
+    rid = add(a, "Friday or Monday?")
+    assert sym(a, "commit") == 0
+    assert store.sessions(a, committed=True) == {rid: "asker"}
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    assert sym(b, "pull") == 0
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:05:00+00:00")
+    assert sym(b, "resolve", rid, "--body", "Monday.", "--author", "human") == 0
+    assert sym(b, "commit", "--all") == 0
+    assert sym(a, "pull") == 0
+    marks = store.sessions(a, committed=True)
+    assert rid not in marks and list(marks.values()) == ["asker"], marks
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "asker")
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T12:10:00+00:00")
+    capsys.readouterr()
+    add(a, "unrelated")
+    err = capsys.readouterr().err
+    assert "written by someone else" in err and "Monday." in err, err
 
 
 @pytest.fixture

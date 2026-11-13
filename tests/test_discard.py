@@ -141,3 +141,21 @@ def test_discard_gives_another_writers_version_the_entry_id_back(repo, tmp_path,
     assert [r["id"] for r in done["returned"]] == [x.id]
     assert (done["restored"], done["kept"]) == ([], [])
     assert store.sessions(tmp_path).get(x.id) == "s1"
+
+
+def test_discard_gives_a_committed_rows_session_mark_back(repo, tmp_path, monkeypatch):
+    """A session writes an entry in the user's words and commits it; the
+    user edits it, then discards the edit. The committed line comes back
+    under the entry's id, and with it the mark that it is the session's, so
+    its next write does not name the entry as someone else's."""
+    store.ensure_store(tmp_path)
+    ctx = api.resolve(str(tmp_path))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    x = _note(ctx, "in the user's words", "ada")
+    api.commit(ctx, "c")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    api.supersede(ctx, x.id, author="ada", append_body="the user's edit")
+    assert x.id not in store.sessions(tmp_path, committed=True)
+    api.discard(ctx, author="ada")
+    assert store.sessions(tmp_path, committed=True).get(x.id) == "s1"
+    assert x.id not in store.sessions(tmp_path)

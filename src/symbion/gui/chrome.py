@@ -795,9 +795,18 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     # it sets every border a light brown !important, and only the lock check takes
     # it off, once Dark Reader's background answers. A slow answer showed every
     # card in a bright full border (Dark Reader 4.9.133, 2026-10-01). The
-    # script takes it off first.
+    # script takes it off first. A theme begun before this meta was parsed
+    # leaves the meta to remove it, but a copy of an @import still loading
+    # lands after: Quasar's rules out of their layer, its `body.body--dark`
+    # painted the ground in Dark Reader's shade of Quasar's own grey until a
+    # reload (4.9.135, 2026-11-10). So the script also turns off each style
+    # Dark Reader adds later. Off, not removed: a removed copy came back
+    # every 2 s, all 1150 rules.
     ui.add_head_html('<meta name="darkreader-lock"><script>'
-                     'document.querySelectorAll(".darkreader--fallback").forEach(e => e.remove())'
+                     'document.querySelectorAll(".darkreader--fallback").forEach(e => e.remove());'
+                     'new MutationObserver(ms => ms.forEach(m => m.addedNodes.forEach(n =>'
+                     ' n.matches?.("style.darkreader") && (n.media = "not all"))))'
+                     '.observe(document.documentElement, {childList: true, subtree: true})'
                      '</script>')
     ui.add_head_html(f"<style>{DARK_CSS}{kind_css(ctx.kinds)}</style>")
     ui.add_head_html(_KEYS_JS)
@@ -889,7 +898,7 @@ def shell(ctx, author: str, crumbs, *, q: str = "", keep: dict | None = None,
     with ui.right_drawer(value=bool(kept), fixed=True, bordered=False) \
             .props(f"width={PEEK_WIDTH} breakpoint={PEEK_WIDE - 1} "
                    "no-swipe-open no-swipe-close no-swipe-backdrop").classes("sb-peek") as peek:
-        show_drift = _peek_panel(ctx, author, peek, heads, kept)
+        show_drift = _peek_panel(ctx, author, peek, kept)
     # The pick is lit while the peek is open: it stayed lit after the panel
     # was gone (the user, 2026-10-16). The card keeps `sb-picked`, j/k's
     # place; every way to close the peek sets the drawer's value.
@@ -954,22 +963,21 @@ def _peek_kept() -> str | None:
     return nid if nid and at == here else None
 
 
-def _peek_panel(ctx, author: str, drawer, heads, kept: str | None = None):
+def _peek_panel(ctx, author: str, drawer, kept: str | None = None):
     """The entry `_PEEK_JS` names in an `sbPeek` event, as its own page shows
     it. A write in it reloads the page, as a card's write does, and the page
     comes with the peek on `kept`, that entry, again: redrawn alone, the peek
     left an answered question on the board (the user, 2026-10-16). Returns
-    what opens it on `_drift_list` of `heads`, the entries the page drew."""
+    what opens it on `_drift_list` of the entries the page drew, as the
+    page's git buttons, made first, recorded them."""
     shown = [kept]
     key = (str(ctx.store_dir), author)
-    drawn = {n.id: n for n in heads}
 
     @ui.refreshable
     def body():
         if shown[0] is _DRIFT:
-            seen, arcs = _page_seen(key) or (_DRAWN.get(key, drawn), _ARCS.get(key))
-            _drift_list(ctx, author, seen,
-                        arcs is not None and _arcs_stamp(ctx.store_dir) != arcs["stamp"])
+            seen, arcs, _ = _page_seen(key)
+            _drift_list(ctx, author, seen, _arcs_stamp(ctx.store_dir) != arcs["stamp"])
         elif shown[0]:
             peek_entry(ctx, shown[0], author, lambda: ui.navigate.reload())
 
@@ -999,14 +1007,18 @@ def _peek_panel(ctx, author: str, drawer, heads, kept: str | None = None):
     ui.on("sbPeek", lambda e: show((e.args or {}).get("id")))
 
     client = ui.context.client
+    # The first connect only: a reconnect runs `again` too, and the hash is
+    # current by then. Kept, it pointed the peek back at `kept` (audit, 2026-11-12).
+    first = [kept] if kept else []
 
     def again() -> None:
         with client:
-            if kept:
+            if first:
+                nid = first.pop()
                 # its card, still on the board, keeps j/k's place
-                ui.run_javascript(f"sbCards().find(c => c.dataset.id === {json.dumps(kept)})"
+                ui.run_javascript(f"sbCards().find(c => c.dataset.id === {json.dumps(nid)})"
                                   "?.classList.add('sb-picked'); sbHold()")
-                show(kept, built=True)      # the page came with it drawn
+                show(nid, built=True)       # the page came with it drawn
             else:
                 ui.run_javascript("sbPeekFromHash()")   # a link with #peek=, or no cookie came
     client.on_connect(again)
@@ -1364,10 +1376,15 @@ def _search_box(q: str, keep: dict, *, cards: bool = True, to=None) -> None:
     itself by them, as the map does: there typing filters nothing."""
     narrows = to is not None
     to = to or (lambda text: href(**{**keep, "q": text}))
-    box = ui.input(placeholder="Search · Enter narrows the page" if narrows
-                   else "Filter · Enter searches all", value=q) \
-        .props('dense outlined clearable aria-label="search"').classes("sb-search") \
-        .mark("search")
+    long, short = (("Search · Enter narrows the page", "Search") if narrows
+                   else ("Filter · Enter searches all", "Filter or search"))
+    # From 601 to NARROW px the box gets what the bar leaves, 129px at 640, and
+    # the long text read "Filter · Enter searchi" (the user's pick, 2026-11-12).
+    # shortcut: read at each render, so a resize across NARROW keeps the old text
+    # until the next page; a matchMedia listener if that matters.
+    box = ui.input(placeholder=long, value=q) \
+        .props(f'''dense outlined clearable aria-label="search" :placeholder="matchMedia('(min-width: 601px) and (max-width: {NARROW}px)').matches ? '{short}' : '{long}'"''') \
+        .classes("sb-search").mark("search")
     with box.add_slot("prepend"):
         ui.icon("search", size="xs")
     with box.add_slot("append"):
@@ -1411,8 +1428,6 @@ _HIDDEN_EVERY = 60
 # drew. The app badge counts what others wrote since. ponytail: one serve's
 # memory; after a restart it counts from the next page drawn.
 _DRAWN: dict = {}
-# The same key -> {"stamp": arcs.jsonl's (mtime_ns, size) as the page drew it}.
-_ARCS: dict = {}
 
 
 def _arcs_stamp(store_dir):
@@ -1424,7 +1439,7 @@ def _arcs_stamp(store_dir):
 
 
 def _page_seen(key):
-    """(drawn, arcs): what this page's git buttons recorded for `key`, or None.
+    """(drawn, arcs, writes): what this page's git buttons recorded for `key`, or None.
     Kept on the page's client: by (store, writer) alone, a second tab's draw
     took the first's, which then lit its own writes as news (audit, 2026-11-08)."""
     try:
@@ -1440,21 +1455,28 @@ def own_write(ctx, author: str, ids=()):
     button lights for others' writes only. The arcs stamp is adopted only if
     arcs.jsonl was as the page last recorded it before the write; otherwise
     an arc change the poll has not seen stays offered. The entries `ids`
-    count as drawn, on this page and on the writer's latest, which the app
-    badge reads. ponytail: another tab of the same writer lights for this
-    one's writes; an entry in `ids` another writer changed in the same
-    instant counts as drawn."""
-    key = (str(ctx.store_dir), author)
-    pages = [p for p in (_page_seen(key), (_DRAWN.get(key), _ARCS.get(key)))
-             if p and p[0] is not None]
+    count as drawn on this page alone: another tab of the writer's drew them
+    before the write, and lights for it. Counted on the writer's latest page
+    too, the newer tab kept its old card and lit nothing (audit, 2026-11-12);
+    the app badge counts other writers' heads, so it never needed them.
+    ponytail: an entry in `ids` another writer changed in the same instant
+    counts as drawn. A tick reads in a thread while the write runs on the
+    loop: one that read between the write and this mark lit the page's own
+    write for that tick (2026-11-12), so the write is counted, and a tick
+    that read across it drops what it read."""
+    page = _page_seen((str(ctx.store_dir), author))
     before = _arcs_stamp(ctx.store_dir)
-    yield
-    after = _arcs_stamp(ctx.store_dir)
-    heads = {n.id: n for n in S.heads(S.load(ctx.store_dir)) if n.id in ids} if ids else {}
-    for drawn, arcs in pages:
-        if arcs is not None and before == arcs["stamp"]:
-            arcs["stamp"] = after
-        drawn.update(heads)
+    try:
+        yield
+    finally:
+        if page is not None:
+            page[2][0] += 1
+    if page is None:
+        return
+    drawn, arcs, _ = page
+    if before == arcs["stamp"]:
+        arcs["stamp"] = _arcs_stamp(ctx.store_dir)
+    drawn.update({n.id: n for n in S.heads(S.load(ctx.store_dir)) if n.id in ids} if ids else {})
 
 
 def _drift(drawn: dict, now) -> tuple[int, int]:
@@ -1576,8 +1598,9 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
     key = (str(ctx.store_dir), author)
     _DRAWN[key] = drawn
     seen = {"stamp": None, "heads": heads}
-    arcs = _ARCS[key] = {"stamp": _arcs_stamp(ctx.store_dir)}
-    ui.context.client.sb_seen = (key, drawn, arcs)
+    arcs = {"stamp": _arcs_stamp(ctx.store_dir)}
+    writes = [0]                              # the page's own writes, counted by own_write
+    ui.context.client.sb_seen = (key, drawn, arcs, writes)
 
     def store_state():
         # The file is parsed again only when it changed: every page ticks.
@@ -1627,8 +1650,11 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
     sent = [None]                             # the first tick sends the badge
 
     async def tick():
+        began = writes[0]
         state = await run.io_bound(read)      # git, off the event loop
         if state is None:                     # the app is stopping
+            return
+        if writes[0] != began:                # the page's own write ran during the read
             return
         if state[:6] != shown[0][:6]:
             buttons.refresh(state)

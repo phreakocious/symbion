@@ -122,35 +122,43 @@ def when_added(stamp: str) -> str:
 
 def excerpt(s, n: int, grep) -> str:
     """`clip(s, n)` from shortly before `grep`'s first match in `s`, behind an
-    ellipsis that says text was cut before it."""
+    ellipsis that says text was cut before it. The cut is at a word's start,
+    or inside a word longer than the lead: from the word's start, a long path
+    filled the clip before the match (audit, 2026-11-12)."""
     m = grep.search(s)
     at = max(m.start() - n // 4, 0) if m else 0
     start = max(s.rfind(" ", 0, at), s.rfind("\n", 0, at)) + 1
+    if at - start > n // 4:
+        start = at
     return "…" + clip(s[start:], n - 1) if start else clip(s, n)
 
 
-def clipped_fields(n) -> dict:
+def clipped_fields(n, by_id) -> dict:
     """The fields a listing clips, in the order it prints them, each as the
-    text it clips."""
+    text it clips. `by_id` is picked's. A picked question's options follow its
+    pick, and print only when they hold a match: an unpicked option's had no
+    line (audit, 2026-11-12)."""
+    pick = picked(n, by_id)
     return {k: v for k, v in (
         ("checked", n.checked), ("result", n.result),
         ("measured", measured(n.measurements) if n.measurements else None),
-        ("options", options_line(n.options) if n.options else None), ("body", n.body)) if v}
+        ("answered", pick), ("options", options_line(n.options) if n.options else None),
+        ("body", n.body)) if v}
 
 
-def unseen(n, grep, shown) -> str | None:
+def unseen(n, grep, shown, by_id) -> str | None:
     """Under `list --grep`, the first clipped field of `n` that holds a match
     when nothing the listing prints shows one: not the first line's target,
     refs or tags, and none of `shown`, the clipped texts below it. The
     listing prints that field as an `excerpt`. A listing that cannot show why
     an entry matched reads as a false hit, and of the entries real patterns
     found, more than half matched only past a clip (2026-11-09). None when a
-    match shows, or lies across two fields."""
+    match shows, or lies across two fields. `by_id` is picked's."""
     head = [n.target.name or "", *(f"{r.type}:{r.name or ''}" for r in n.refs),
             *(f"#{t}" for t in n.tags)]
     if any(grep.search(t) for t in (*head, *shown)):
         return None
-    return next((k for k, v in clipped_fields(n).items() if grep.search(v)), None)
+    return next((k for k, v in clipped_fields(n, by_id).items() if grep.search(v)), None)
 
 
 def measured(m: dict) -> str:
@@ -162,6 +170,24 @@ def options_line(o) -> str:
     """A question's answers on one line, the default first. ` | `, not a
     comma: an answer is a phrase, and phrases hold commas."""
     return " | ".join(o)
+
+
+def picked(n, by_id) -> str | None:
+    """The option a question's body gives on a line of its own, below its
+    first line: an answer button writes the option's words alone. None when
+    no option, or more than one, has such a line; no answered question had
+    two (2026-11-11). Only a line added since the first version counts, each
+    as often as it was added: a default the question stated on a line of its
+    own read as its answer (audit, 2026-11-12). None with no chain, `by_id`."""
+    if by_id is None:
+        return None
+
+    def key(s):
+        return s.strip().rstrip(".").casefold()
+    asked = Counter(key(line) for line in (_root(by_id, n).body or "").splitlines())
+    lines = Counter(key(line) for line in (n.body or "").splitlines()[1:]) - asked
+    found = [o for o in n.options or () if key(o) in lines]
+    return found[0] if len(found) == 1 else None
 
 
 def age_phrase(stamp: str) -> str:
@@ -352,8 +378,8 @@ def starred(notes):
 # The empty state is the onboarding surface:
 # it prints while the store holds zero rows and never again, so it is bounded
 # by store state, not by a session the tool does not keep.
-FIRST_CONTACT = ('no entries yet: symbion add task --target project --body "..."  '
-                 '(before a write, an agent loads the symbion skill)')
+FIRST_VERB = 'no entries yet: symbion add task --target project --body "..."'
+FIRST_CONTACT = f"{FIRST_VERB}  (before a write, an agent loads the symbion skill)"
 
 
 def empty_summary() -> dict:
@@ -1244,8 +1270,10 @@ def render_summary(d: dict, paint=plain, person: bool = False) -> str:
             f"{_count(n, 'open entry')} untouched for {UNTOUCHED_DAYS} or more active days "
             f"(days anyone wrote an entry here)"
             f"{f', the oldest {shown} below' if 0 < shown < n else ''}" + ("" if person else
-            f": after the user's "
-            f"first request, check {'it' if one else 'each'} against the repo and the store, "
+            # Not at the first request: a plan tacked onto an answer about something else went
+            # unread, and in a loop plans piled up unanswered (dogfood, 2026-11-04 to 11-12).
+            f": once the user's "
+            f"first task is done, or at the wrap, check {'it' if one else 'each'} against the repo and the store, "
             f"then suggest a plan: resolve, citing what settled it; a question, for what only "
             f"the user can decide{park}; a date to come back to it, `symbion supersede ID "
             f"--due DATE`; or the work, if it still stands"), "warn"))
@@ -1315,8 +1343,10 @@ def render_summary(d: dict, paint=plain, person: bool = False) -> str:
         out.append(f"  symbion serve: {d['gui']}" + ("" if person else
                    f"; when you point the user at an entry, link it: {d['gui']}/notes?id=<id>"))
     if d.get("store") and d.get("rows") == 0:
-        out.append("  " + FIRST_CONTACT)
-    elif d.get("skill"):
+        # The line below says where the skill is; an empty store needs it most
+        # (an agy session saw only the parenthesis, 2026-11-11).
+        out.append("  " + (FIRST_VERB if d.get("skill") else FIRST_CONTACT))
+    if d.get("skill"):
         # After bootstrap agents learned symbion from --help and guesses, not
         # from the skill: later sessions neither loaded it nor ran `schema`
         # (2026-09-24).

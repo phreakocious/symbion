@@ -126,8 +126,8 @@ the summary below reads the local store`).
     an entry with a due date, a pre-registration, a starred entry, one waiting
     on you, an arc's box, and one an open question cites, until the question
     closes.
-    The line names the ways out, and asks for a plan after the user's first
-    request.
+    The line names the ways out, and asks for a check of each and a plan once
+    the user's first task is done, or at the wrap.
 11. What is not yet in the store's git, any unreadable line, and the command
     that fixes each.
 12. `last wrap by <author>, <age>, N commits since: <first line>`, and the
@@ -200,12 +200,15 @@ previous commit, whichever came later.
 
 `add` also prints a `note:` line on stderr for the open entries already on its
 target, an id in the body that matches no entry, a catalog name stored as
-typed, a verdict entry with no `--checked` or stamped on a dirty tree, and a
+typed, a verdict entry with no `--checked` or stamped on a dirty tree (a
+pre-registration's add refuses the first and skips the second), and a
 parked entry of yours with no `--due`. In an agent session, it lists a
 target's open entries at your first add there and not again until the next
 session start. `add`, `resolve` and `supersede` say when
 the text they write runs past 500 characters: in an agent session, once until
-the next session start. A pre-registration's body does not count. Each write
+the next session start. A pre-registration's body does not count. A
+pre-registration's add says that `resolve --result` closes it whole: in an agent
+session, also once until the next session start. Each write
 ends with the count of entries not yet committed; an arc write with none
 pending says `arcs.jsonl not committed`. Where some are another session's, it
 says how old the newest of those is: an old one suggests that session has ended.

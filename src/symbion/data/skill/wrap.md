@@ -9,10 +9,12 @@ below the open entries.
 1. **Asks.** Reread your own messages in this session. Each ask you put to
    the user ("say if…", "want me to…?", "should I…?") that no later message
    of theirs answered is an open `question`: the ask in plain words, and when
-   its answers fit in three, `--option` for each, the default first. An ask held only in chat, a note, a
-   resolved entry or the handoff is not an open `question`. Where
-   `symbion schema` lists no `question` kind, the handoff's paragraph names
-   each such ask instead, with what the work does until an answer.
+   its answers fit in three, `--option` for each, the default first. An offer
+   to keep the store (file a task, set a due date, tag an entry) is no ask:
+   do it or drop it. An ask held only in chat, a note, a resolved entry or the
+   handoff is not an open `question`. Where `symbion schema` lists no
+   `question` kind, the handoff's paragraph names each such ask instead, with
+   what the work does until an answer.
 
 2. **Entries.** What the session learned, decided, found broken or started,
    and no entry holds yet, goes on the object it concerns, after a

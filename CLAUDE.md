@@ -38,7 +38,9 @@ an item, an arc or the project, kept in a sibling git repo of JSONL.
   `.claude-plugin/marketplace.json` makes the repo its marketplace. `package.json`
   makes the repo a Pi package whose one extension, `plugin/pi/symbion.ts`, runs the
   same hooks and sends the setup and wrap skills as `/symbion-setup` and
-  `/symbion-wrap`.
+  `/symbion-wrap`. `plugin/plugin.yaml` and `plugin/__init__.py` make `plugin/`
+  Hermes Agent's plugin too, which runs the same hooks and offers the setup and wrap
+  skills as `/symbion:setup` and `/symbion:wrap`.
 - `README.md`: what symbion does and how to install it. `docs/guide.md`: install
   in full and adopting symbion in a project. `docs/reference.md`: how it behaves, and
   development.

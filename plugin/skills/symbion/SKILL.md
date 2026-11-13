@@ -4,3 +4,5 @@ description: "Use when the project has a symbion store (the session-start summar
 ---
 
 !`symbion skill 2>&1 || echo "symbion skill failed, as above. /symbion:setup installs or upgrades the symbion CLI."`
+
+If no skill text appears above, read `SKILL.md` in the directory that `symbion skill --path` prints.

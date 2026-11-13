@@ -426,6 +426,10 @@ body:has(.sb-phases) { --sb-main-w: max(920px, calc(var(--sb-cols, 2) * 306px + 
             padding: 6px; border-radius: 12px; position: relative;
             background: color-mix(in srgb, var(--q-panel) 65%, var(--q-dark-page));
             box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--q-border) 60%, transparent); }
+/* an empty column keeps its least width: at 640 a finished arc's `open 0` took
+   half the board and pressed its done cards into a column 180px wide (a browser
+   agent's review, 2026-11-11) */
+.sb-phase:not(:has(.sb-note)) { flex-grow: 0; }
 /* a column's strip and its segment in the arc's bar (.sb-phase-bar) take one colour */
 .sb-phase, .sb-phase-seg { --i: 8;
             --sb-step: color-mix(in oklch, var(--q-good) calc(var(--sb-ramp-t0) + (100% - var(--sb-ramp-t0))
@@ -644,6 +648,8 @@ a.sb-tag:hover { color: var(--q-primary); }
                 text-wrap: pretty; }
 /* a path or a URL with no space in it breaks rather than widening the page */
 .sb-note-text, .sb-verdict, .sb-note .nicegui-markdown { overflow-wrap: anywhere; }
+/* an id breaks at its hyphen, in a clip or a body's link */
+.sb-nobr, .nicegui-markdown a[href^="/notes?id="] { white-space: nowrap; }
 .sb-note-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px;
                 font-size: 12px; }
 /* who, when and which row: one group at the right that wraps as a unit;

@@ -1,4 +1,4 @@
-# symbion for Claude Code, Antigravity and Pi
+# symbion for Claude Code, Antigravity, Pi and Hermes Agent
 
 A notebook and ticket registry for one project, shared by you and your coding
 agent. Each new session starts with the open bugs, tasks and questions, and a
@@ -34,6 +34,22 @@ pi install git:github.com/phreakocious/symbion
 
 There its extension, `plugin/pi/symbion.ts`, runs these hooks, adds the skill
 (/skill:symbion) and carries /symbion-setup and /symbion-wrap.
+
+In Hermes Agent, this directory is the plugin:
+
+```
+hermes plugins install phreakocious/symbion#plugin --enable
+/symbion:setup
+```
+
+There `__init__.py` runs these hooks in Hermes's gateway, and registers the
+setup and wrap skills (/symbion:setup, /symbion:wrap) and the installed CLI's
+skill (symbion:symbion). The hooks find `symbion` on the gateway's PATH.
+
+Under Claude Code, the plugin upgrades the installed symbion itself, once per
+plugin version; its state and `log.jsonl` are in
+`${CLAUDE_PLUGIN_DATA}/upgrade/`, and a failed attempt retries at a session
+start after an hour.
 
 The plugin carries no copy of the skill: its stub and hooks run the installed
 CLI's own, so the two always match. More: https://github.com/phreakocious/symbion

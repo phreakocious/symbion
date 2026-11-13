@@ -1018,20 +1018,68 @@ def test_a_batch_in_a_session_asks_git_for_the_sessions_file_once(tmp_path, monk
     assert len(asked) <= 1 and set(store.sessions(tmp_path)) == {n.id for n in rows}
 
 
-def test_a_commit_forgets_the_sessions_of_the_rows_it_took(tmp_path, monkeypatch):
-    """The record of which session wrote a row matters only while the row is
-    pending, so a commit keeps the entries of the rows it left and no more."""
+@pytest.mark.parametrize("now", ["", "2026-01-10T12:00:00+00:00"])
+def test_a_commit_marks_the_sessions_of_the_rows_it_took_for_a_week(tmp_path, monkeypatch, now):
+    """`commit` takes a session's rows by the record of the pending ones. A
+    row it took keeps its session, marked, for the news of a write: a row a
+    session wrote in the user's words is its own past another's commit. A
+    week on, the mark goes. The week is the one clock's: under a stopped
+    clock far from today, the wall clock's dropped each mark at once."""
     from types import SimpleNamespace
+    monkeypatch.setenv("SYMBION_NOW", now)
     cfg = SimpleNamespace(git_name="t", git_email="t@t")
     project = {"type": "project", "name": None}
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
     a = store.add(tmp_path, kind="note", target=project, body="a", author="claude")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
     b = store.add(tmp_path, kind="note", target=project, body="b", author="claude")
+    old = "20200101-000000-000000-abc"
+    store._append_line_unlocked(store._state_dir(tmp_path) / store.SESSIONS_FILE, f"{old}\ts2\tc")
     assert set(store.sessions(tmp_path)) == {a.id, b.id}
     assert store.commit(tmp_path, "c", cfg, keep=store.own_rows(tmp_path, "claude"))
     assert store.sessions(tmp_path) == {a.id: "s1"}
+    assert store.sessions(tmp_path, committed=True) == {a.id: "s1", b.id: "s2"}
     assert [r["id"] for r in store.pending_rows(tmp_path)] == [a.id]
+
+
+def test_a_pull_moves_a_committed_mark_past_a_line_it_cannot_read(tmp_path):
+    """The other clone's edit of a committed row: the mark goes to the id its
+    version now has. A malformed line in the merge raised there, after the
+    merge, and again at each pull that put the cut-off one back."""
+    store.ensure_store(tmp_path)
+    mine = {"id": "20260110-120000-000000-aaa", "body": "Friday or Monday?"}
+    theirs = {"id": mine["id"], "body": "Monday.", "supersedes": "20260110-120500-000000-bbb"}
+    store._append_line_unlocked(store._state_dir(tmp_path, make=True) / store.SESSIONS_FILE,
+                                f"{mine['id']}\tasker\tc")
+    old = {store.NOTES_FILE: [json.dumps(mine)], store.ARCS_FILE: []}
+    texts = {store.NOTES_FILE: "\n".join([json.dumps({**mine, "id": theirs["supersedes"]}),
+                                          "{not json", json.dumps(theirs)]) + "\n"}
+    store._keep_sessions(tmp_path, old, old, [], texts)
+    assert store.sessions(tmp_path, committed=True) == {theirs["supersedes"]: "asker"}
+
+
+def test_an_edit_of_a_committed_row_moves_its_session_mark(tmp_path, monkeypatch):
+    """The user's edit of a row a session wrote and committed is someone
+    else's version: the mark leaves the head for the version it kept, as for
+    a pending row, and `commit` still takes neither by it."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(git_name="t", git_email="t@t")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    a = store.add(tmp_path, kind="question", target={"type": "project", "name": None},
+                  body="a", author="human")
+    assert store.commit(tmp_path, "c", cfg, keep=store.own_rows(tmp_path, "claude"))
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    new = store.supersede(tmp_path, a.id, body="a, answered", author="human")
+    kept = new.supersedes
+    assert kept and kept != a.id
+    assert store.sessions(tmp_path, committed=True) == {kept: "s1"}
+    assert store.sessions(tmp_path) == {}
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")       # a commit that leaves it
+    b = store.add(tmp_path, kind="note", target={"type": "project", "name": None},
+                  body="b", author="claude")
+    assert store.commit(tmp_path, "c2", cfg, keep=store.own_rows(tmp_path, "claude"))
+    assert store.sessions(tmp_path, committed=True) == {kept: "s1", b.id: "s2"}
+    assert store.sessions(tmp_path) == {}, "s1's commit would take the kept version alone"
 
 
 @pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),

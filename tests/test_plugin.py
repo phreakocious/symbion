@@ -1,9 +1,12 @@
 """The Claude Code plugin (spec 2026-10-30): a thin plugin whose stub skill and
 shims reach the installed package, so the skill always matches its CLI."""
+import contextlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import time
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -162,6 +165,19 @@ def test_plugin_version_matches_the_package():
         manifest = json.loads((PLUGIN / agent / "plugin.json").read_text())
         assert manifest["name"] == "symbion", agent
         assert manifest["version"] == re.sub(r"\.dev\d+$", "", version), agent
+    # Hermes's manifest is YAML, which the standard library cannot read.
+    hermes = (PLUGIN / "plugin.yaml").read_text(encoding="utf-8")
+    assert re.search(r"^name: symbion$", hermes, re.M)
+    assert re.search(r'^version: "(.+)"$', hermes, re.M)[1] == re.sub(r"\.dev\d+$", "", version)
+
+
+def test_the_plugin_readme_covers_each_host_and_scopes_the_upgrade():
+    """Hermes's catalog clones plugin/ alone, README included, and bans
+    self-updating code: the upgrade is Claude Code's, and says so."""
+    text = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    assert "Hermes Agent" in text.splitlines()[0]
+    assert "hermes plugins install phreakocious/symbion#plugin --enable" in text
+    assert "Under Claude Code, the plugin upgrades the installed symbion itself" in text
 
 
 def test_marketplace_lists_the_plugin_dir():
@@ -250,8 +266,15 @@ def _run(script, project, env, stdin=""):
                           capture_output=True, env={**env, "CLAUDE_PROJECT_DIR": str(project)})
 
 
-def test_start_shim_is_silent_where_nothing_adopted_symbion(tmp_path):
-    r = _run(START, _project(tmp_path), _env(tmp_path))
+@pytest.mark.parametrize("pointer", [None, "\n", " \r\n\t\n"])
+def test_start_shim_is_silent_where_nothing_adopted_symbion(tmp_path, pointer):
+    """A blank `.symbion` falls through, as the package's hook reads it: the
+    shim's nonempty test sent such a project to setup at each session start
+    (audit, 2026-11-12)."""
+    p = _project(tmp_path)
+    if pointer is not None:
+        (p / ".symbion").write_bytes(pointer.encode())
+    r = _run(START, p, _env(tmp_path))
     assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
 
 
@@ -263,7 +286,11 @@ def test_start_shim_sends_an_adopted_project_to_setup(tmp_path):
     pointer = _project(tmp_path / "b")
     (pointer / ".symbion").write_text("../elsewhere-notes\n")
     named = _project(tmp_path / "c")
-    for project, extra in ((sibling, {}), (pointer, {}), (named, {"SYMBION_DIR": "/nowhere"})):
+    projects = [(sibling, {}), (pointer, {}), (named, {"SYMBION_DIR": "/nowhere"})]
+    with contextlib.suppress(OSError):                  # Windows may refuse a link
+        (_project(tmp_path / "d") / ".symbion").symlink_to(tmp_path / "nowhere")
+        projects.append((tmp_path / "d" / "p", {}))     # summary names the broken link
+    for project, extra in projects:
         r = _run(START, project, {**env, **extra})
         assert (r.returncode, r.stdout) == (0, TO_SETUP), project
 
@@ -426,29 +453,54 @@ TO_PI_SETUP = ("symbion: this project has a symbion store, but the symbion CLI i
                "installed or does not run: run /symbion-setup.\n")
 
 
-def _run_pi(project, env, stdin=""):
-    """As Pi's extension runs the hook: in the project, named in SYMBION_PROJECT_DIR."""
-    return subprocess.run(["sh", str(START), "pi"], cwd=project, input=stdin, text=True,
+def _run_host(host, project, env, stdin=""):
+    """As Pi's extension and Hermes's plugin run the hook: in the project, named
+    in SYMBION_PROJECT_DIR."""
+    return subprocess.run(["sh", str(START), host], cwd=project, input=stdin, text=True,
                           capture_output=True, env={**env, "SYMBION_PROJECT_DIR": str(project)})
 
 
-def test_start_shim_under_pi_names_its_host_to_the_package_hook(tmp_path):
+@pytest.mark.parametrize("host", ["pi", "hermes"])
+def test_start_shim_under_pi_or_hermes_names_its_host_to_the_package_hook(tmp_path, host):
     env, skill = _env(tmp_path), _skill(tmp_path / "pkg" / "skill")
     (skill / "session_start.sh").write_text('echo "PKG-START $SYMBION_HOST"\ncat\n')
     _cli(tmp_path, skill)
-    r = _run_pi(_project(tmp_path), env, '{"session_id": "p1"}\n')
-    assert (r.returncode, r.stdout) == (0, 'PKG-START pi\n{"session_id": "p1"}\n')
+    r = _run_host(host, _project(tmp_path), env, '{"session_id": "p1"}\n')
+    assert (r.returncode, r.stdout) == (0, f'PKG-START {host}\n{{"session_id": "p1"}}\n')
 
 
-def test_start_shim_under_pi_sends_an_adopted_project_to_symbion_setup(tmp_path):
-    """Pi's command is /symbion-setup: its prompt names take no namespace."""
+@pytest.mark.parametrize("host, line", [("pi", TO_PI_SETUP), ("hermes", TO_SETUP)])
+def test_start_shim_under_pi_or_hermes_sends_an_adopted_project_to_setup(tmp_path, host, line):
+    """Pi's command is /symbion-setup: its prompt names take no namespace.
+    Hermes offers the plugin's setup skill as /symbion:setup, as Claude Code does."""
     env = _env(tmp_path)
     _cli(tmp_path, None, broken=True)
     project = _project(tmp_path / "a")
     (tmp_path / "a" / "p-notes").mkdir()
     (tmp_path / "a" / "p-notes" / "notes.jsonl").write_text("")
-    assert _run_pi(project, env).stdout == TO_PI_SETUP
-    assert _run_pi(_project(tmp_path / "b"), env).stdout == ""
+    assert _run_host(host, project, env).stdout == line
+    assert _run_host(host, _project(tmp_path / "b"), env).stdout == ""
+
+
+def test_start_shim_under_hermes_names_the_gateways_path_when_no_symbion_is_on_it(tmp_path):
+    """Hermes runs the hooks in its gateway, on the PATH it started with, and its
+    terminal on a login shell's: the hook said "not installed" while the
+    terminal's `symbion -V` answered (2026-11-13), so setup would find the CLI and
+    fix nothing. A CLI on PATH that fails keeps the
+    setup line (the test above), and so does Pi."""
+    env = _env(tmp_path)
+    env["PATH"] += ":/a\\b"
+    project = _project(tmp_path / "a")
+    (tmp_path / "a" / "p-notes").mkdir()
+    (tmp_path / "a" / "p-notes" / "notes.jsonl").write_text("")
+    said = _run_host("hermes", project, env).stdout
+    assert said.startswith("symbion: this project has a symbion store, but the Hermes gateway, ")
+    if os.name != "nt":   # Git's sh prints PATH in its own form, `\` turned to `/`
+        assert f"finds no symbion on its PATH ({env['PATH']})." in said
+    assert "`hermes gateway install --force`" in said and "`hermes gateway stop`" in said
+    assert said.endswith("Otherwise run /symbion:setup.\n")
+    assert _run_host("pi", project, env).stdout == TO_PI_SETUP
+    assert _run_host("hermes", _project(tmp_path / "b"), env).stdout == ""
 
 
 def test_shims_quote_paths_with_spaces(tmp_path):
@@ -521,6 +573,11 @@ def test_setup_command_carries_the_specs_strings():
         assert s in install, s
     # init's re-check runs alone: the plugin review's minors (the user, 2026-10-30).
     assert "in a call of its own, run `symbion init` again" in install
+    # "each path and what is written there" left out the install command and where it
+    # put the CLI (stranger runs, 2026-11-04); an append to a file with no final
+    # newline joined its last line (2026-11-06).
+    assert "the exact install command and where it puts the CLI" in install
+    assert "after a newline if the file lacks a final one" in install
     # agy never reads CLAUDE.md, and its model skipped a parenthetical naming its
     # file; a new AGENTS.md would hide CLAUDE.md from Pi (live run, 2026-11-03).
     store = next(s for s in steps if s.startswith("4. "))
@@ -539,14 +596,21 @@ def test_setup_command_carries_the_specs_strings():
     assert "`symbion -V` without `BypassSandbox`" in install
     # With no bypass after the rules, the sandbox refused to list the repo's parent and
     # zsh read the sibling-store sweep as `no matches found` (agy run, 2026-11-03).
-    assert "`BypassSandbox` only for what `adoption.md` reads outside the repo" in install
+    # Default mode ran every call outside the workspace with no refusal (agy run,
+    # 2026-11-11), so the bypass is for auto mode alone.
+    assert ("in auto mode, take `BypassSandbox` only for what `adoption.md` reads "
+            "outside the repo") in install
     adoption = (SKILL_DIR / "adoption.md").read_text(encoding="utf-8")
     for s in ("Antigravity's auto mode", "`no matches found`", "in agy, with `BypassSandbox`"):
         assert s in adoption, s
     # agy's read_file refused serve's log in /tmp even with the rules.
     assert "head -1" in next(s for s in steps if "symbion serve" in s and s[0] == "8")
-    # 1 KB more for each host's file and init flag (the user, 2026-11-03).
-    assert len(text.encode()) < 5120, "it loads into context on every /symbion:setup"
+    # 1 KB more for each host's file and init flag (the user, 2026-11-03); Hermes
+    # is the second such host (2026-11-11).
+    assert len(text.encode()) < 6144, "it loads into context on every /symbion:setup"
+    four = next(s for s in steps if s[0] == "4")
+    assert "Under Hermes, every `symbion init` takes `--agent hermes`" in four
+    assert "Hermes reads the first of `.hermes.md`, `AGENTS.override.md`, `AGENTS.md` and `CLAUDE.md`" in four
     assert "in full" in next(s for s in steps if "Run `symbion skill adoption`" in s), "a dialog alone hid the table"
     assert "--no-browser" in next(s for s in steps if "symbion serve" in s and s[0] == "8")
 
@@ -561,3 +625,642 @@ def test_wrap_command_sends_the_agent_to_the_package_wrap():
     assert "run `symbion skill wrap` and follow it" in text
     assert "`symbion:symbion`" in text and (SKILL_DIR / "wrap.md").is_file()
     assert not re.findall(r"!`([^`]*)`", text)
+
+
+LIB = PLUGIN / "hooks" / "upgrade_lib.sh"
+
+
+def _pv(tmp_path, text):
+    root = tmp_path / "root"
+    (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(text)
+    r = subprocess.run(["sh", "-c", '. "$1"; symbion_plugin_version; printf %s "$pv"', "sh", str(LIB)],
+                       env={"PATH": "/usr/bin:/bin", "CLAUDE_PLUGIN_ROOT": str(root)},
+                       capture_output=True, text=True, timeout=30)
+    return r.stdout
+
+
+def test_lib_reads_the_plugin_version(tmp_path):
+    assert _pv(tmp_path, '{\n  "name": "symbion",\n  "version": "0.16.0",\n') == "0.16.0"
+    # a formatter may squeeze plugin.json onto one line
+    assert _pv(tmp_path, '{"name":"symbion","version":"0.16.0","x":1}') == "0.16.0"
+    assert _pv(tmp_path, '{"name": "symbion"}') == ""
+    assert _pv(tmp_path, '{"version": "0.16.0; rm -rf ~"}') == ""
+
+
+# The upgrade worker runs synchronously here, as the shims launch it detached. The
+# fakes answer from tmp_path/bin; each logs its argv as a JSON list to NAME.calls.
+
+# A venv's lib dir as a real one names it: Lib on Windows, where the worker cuts at \Lib\.
+_LIB = "Lib" if os.name == "nt" else "lib"
+
+
+def _venv(tmp_path, marker) -> Path:
+    lib = [_LIB] if os.name == "nt" else [_LIB, "python3.12"]
+    pkg = tmp_path.joinpath("venv", *lib, "site-packages", "symbion")
+    pkg.mkdir(parents=True, exist_ok=True)
+    if marker:
+        (tmp_path / "venv" / {"uv": "uv-receipt.toml", "pipx": "pipx_metadata.json"}[marker]).write_text("")
+    return pkg
+
+
+def _fake(tmp_path, name, body):
+    b = tmp_path / "bin"
+    b.mkdir(exist_ok=True)
+    calls = tmp_path / f"{name}.calls"
+    # the argv as a JSON list: the test's arguments hold no quote, and _calls escapes a
+    # Windows path's backslashes
+    (b / name).write_text('#!/bin/sh\n_j=\nfor _a in "$@"; do _j="$_j${_j:+, }\\"$_a\\""; done\n'
+                          f'echo "[$_j]" >> \'{calls}\'\n{body}\n')
+    (b / name).chmod(0o755)
+
+
+def _cli_v(tmp_path, version, loc, crlf=False, warn=False):
+    (tmp_path / "cli_version").write_text(version)
+    eol = "\\r\\n" if crlf else "\\n"
+    # loc is an argument, not part of the format: there `\v` of a Windows `\venv` is an escape.
+    _fake(tmp_path, "symbion",
+          ('echo "UserWarning: a warning on stderr" >&2\n' if warn else "") +
+          f'[ "$1" = "-V" ] && {{ printf "symbion %s from %s{eol}" "$(cat \'{tmp_path / "cli_version"}\')" \'{loc}\'; exit 0; }}\n'
+          '[ "$1" = serve ] && exit 0\nexit 1')
+
+
+def _work(tmp_path, cli, pv, tool=None, uname=None, crlf=False, warn=False) -> Path:
+    up = tmp_path / "data" / "upgrade"
+    (up / f"hold-{pv}").mkdir(parents=True, exist_ok=True)
+    if cli:
+        _cli_v(tmp_path, cli[0], cli[1], crlf, warn)
+    if tool:    # ok moves the fake CLI to the plugin's version, noop changes nothing, fail is a
+        # network error, partial moves it and then fails (uv on Windows when a serve holds
+        # the command's file), break leaves a CLI whose -V gives nothing
+        act = {"ok": f"printf %s {pv} > '{tmp_path / 'cli_version'}'", "noop": "exit 0",
+               "fail": "echo 'error: no network'; exit 1",
+               "partial": f"printf %s {pv} > '{tmp_path / 'cli_version'}'; echo 'error: Failed to install entrypoint'; exit 1",
+               "break": f"printf '#!/bin/sh\\nexit 1\\n' > '{tmp_path / 'bin' / 'symbion'}'"}[tool]
+        for t in ("uv", "pipx"):
+            _fake(tmp_path, t, act)
+    if uname:
+        _fake(tmp_path, "uname", f'[ "$1" = -s ] && echo {uname}')
+    env = {**_env(tmp_path), "CLAUDE_PLUGIN_DATA": str(tmp_path / "data")}
+    r = subprocess.run(["sh", str(PLUGIN / "hooks" / "upgrade.sh"), pv], env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
+    return up
+
+
+def _calls(tmp_path, name) -> list[list[str]]:
+    f = tmp_path / f"{name}.calls"
+    return [json.loads(x.replace("\\", "\\\\")) for x in f.read_text().splitlines()] if f.exists() else []
+
+
+def _log(up) -> list[dict]:
+    return [json.loads(x) for x in (up / "log.jsonl").read_text().splitlines()]
+
+
+def _result(up) -> str:
+    """The agent's line, unescaped: the worker JSON-escapes it, so a Windows path's `\\` is doubled."""
+    return json.loads('"' + (up / "result").read_text().rstrip("\n") + '"')
+
+
+def test_worker_without_symbion_closes_the_version_quietly(tmp_path):
+    up = _work(tmp_path, cli=None, pv="0.16.0")
+    assert (up / "ok-0.16.0").exists() and not (up / "hold-0.16.0").exists()
+    assert not (up / "result").exists() and _log(up)[-1]["outcome"] == "none"
+
+
+@pytest.mark.parametrize("cv", ["0.16.0", "0.16.0.dev3", "0.16.1", "0.16.0rc1", "0.16.0+local"])
+def test_worker_leaves_a_current_cli_alone(tmp_path, cv):
+    up = _work(tmp_path, cli=(cv, _venv(tmp_path, "uv")), pv="0.16.0")
+    assert (up / "ok-0.16.0").exists() and not (up / "result").exists()
+    assert _calls(tmp_path, "uv") == []
+
+
+@pytest.mark.parametrize("waiting, stays", [
+    ("symbion: the symbion plugin needs symbion 0.16.0 or later, and `uv tool upgrade symbion` "
+     "failed (log: x). Tell the user, who can run it by hand.", False),
+    ("symbion: the symbion plugin needs symbion 0.17.0 or later, and this one is 0.15.2", True),
+    ("symbion: upgraded from 0.15.2 to 0.16.0 to match the symbion plugin. Tell the user.", True)])
+def test_worker_takes_back_a_need_a_current_cli_meets(tmp_path, waiting, stays):
+    """A failed upgrade's line waited, the user upgraded by hand, and a later
+    run found the CLI current and still sent the line (audit, 2026-11-12). A
+    need it does not meet, and news of an upgrade, still go to the agent."""
+    up = tmp_path / "data" / "upgrade"
+    up.mkdir(parents=True)
+    (up / "result").write_text(waiting + "\n", newline="\n")
+    up = _work(tmp_path, cli=("0.16.0", _venv(tmp_path, "uv")), pv="0.16.0")
+    assert (up / "result").exists() == stays and _log(up)[-1]["outcome"] == "current"
+
+
+def test_worker_never_touches_an_editable_install(tmp_path):
+    up = _work(tmp_path, cli=("0.15.2", tmp_path / "src/symbion"), pv="0.16.0")
+    assert "an install the plugin does not upgrade (editable at " in _result(up)
+    assert _result(up).endswith(f"(editable at {tmp_path / 'src/symbion'}). Pull its checkout and run "
+                                "`pip install -e .` there again to upgrade it. Tell the user.")
+    assert (up / "ok-0.16.0").exists() and _calls(tmp_path, "uv") == _calls(tmp_path, "pipx") == []
+
+
+def test_worker_names_an_install_it_does_not_know(tmp_path):
+    up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path, None)), pv="0.16.0")
+    assert "(not from uv tool or pipx at " in _result(up)
+    assert _result(up).endswith("). Upgrade it with the tool that installed it. Tell the user.")
+
+
+def test_worker_tolerates_a_crlf_answer(tmp_path):
+    loc = tmp_path / "src/symbion"
+    up = _work(tmp_path, cli=("0.15.2", loc), crlf=True, pv="0.16.0")
+    assert f"(editable at {loc})." in _result(up)
+    assert _log(up)[-1]["kind"] == "editable" and _log(up)[-1]["outcome"] == "notice"
+    up = _work(tmp_path, cli=("0.16.0", _venv(tmp_path, "uv")), crlf=True, pv="0.16.0")
+    assert _log(up)[-1]["outcome"] == "current"
+
+
+def test_worker_logs_each_attempt_in_full(tmp_path):
+    up = _work(tmp_path, cli=("0.15.2", tmp_path / "src/symbion"), pv="0.16.0")
+    (row,) = _log(up)
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", row["time"])
+    # when the worker began, beside when it wrote the row: same format, so text order is time order
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", row["started"]) and row["started"] <= row["time"]
+    assert {k: row[k] for k in ("plugin", "before", "kind", "outcome")} == \
+        {"plugin": "0.16.0", "before": "0.15.2", "kind": "editable", "outcome": "notice"}
+
+
+def test_worker_compares_versions_as_numbers(tmp_path):
+    up = _work(tmp_path, cli=("0.9.9", tmp_path / "src/symbion"), pv="0.16.0")
+    assert _log(up)[-1]["outcome"] == "notice"
+    up = _work(tmp_path / "b", cli=("0.100.0", tmp_path / "src/symbion"), pv="0.16.0")
+    assert _log(up)[-1]["outcome"] == "current"
+
+
+@pytest.mark.parametrize("kind,cmd", [("uv", ["tool", "upgrade", "symbion"]), ("pipx", ["upgrade", "symbion"])])
+def test_worker_upgrades_with_the_tool_that_made_the_install(tmp_path, kind, cmd):
+    up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path, kind)), pv="0.16.0", tool="ok")
+    assert _calls(tmp_path, kind) == [cmd]
+    # "the symbion CLI": "upgraded from A to B" alone read as the store's upgrade
+    assert _result(up).startswith("symbion: the symbion CLI was upgraded from 0.15.2 to 0.16.0 "
+                                  "to match the symbion plugin.")
+    # a later session's skill came from the new CLI: no claim that it is the old one's
+    assert "If the symbion skill was loaded before this line" in _result(up)
+    assert (up / "ok-0.16.0").exists() and not (up / "hold-0.16.0").exists()
+    assert (["serve", "--restart"] in _calls(tmp_path, "symbion")) is (os.name != "nt")   # Windows: by hand
+
+
+def test_worker_cuts_the_venv_at_its_last_lib(tmp_path):
+    # the venv sits under another /lib/: a cut at the first one finds no marker
+    up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path / _LIB / "x", "uv")), pv="0.16.0", tool="ok")
+    assert _calls(tmp_path, "uv") == [["tool", "upgrade", "symbion"]] and _log(up)[0]["kind"] == "uv"
+
+
+def test_worker_cuts_only_the_git_suffix_from_the_path(tmp_path):
+    # a uv venv under "J (Work)": a cut at the first " (" reads it as editable
+    up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path / "J (Work)", "uv")), pv="0.16.0", tool="ok")
+    assert _log(up)[0]["kind"] == "uv"
+    loc = tmp_path / "J (Work)" / "src" / "symbion"
+    up = _work(tmp_path / "b", cli=("0.15.2", f"{loc} (git 1a2b3c4)"), pv="0.16.0")
+    assert f"(editable at {loc})." in _result(up)
+
+
+def _kind(loc, cwd) -> str:
+    r"""upgrade.sh's symbion_install_kind alone: sourcing the file would run the worker. The
+    function goes in a file and LOC in the environment: on Windows the command line
+    turns each `\\` into `\`, and a `sh -c` of the function read `\\Lib\\` as `\Lib\`,
+    which matched nothing."""
+    fn = re.search(r"^symbion_install_kind\(\) \{\n.*?^\}\n", (PLUGIN / "hooks" / "upgrade.sh").read_text(),
+                   re.M | re.S).group(0)
+    (cwd / "kind.sh").write_text(fn + 'symbion_install_kind "$LOC"\n', newline="\n")
+    return subprocess.run(["sh", "kind.sh"], cwd=cwd, env={**os.environ, "LOC": loc},
+                          capture_output=True, text=True, timeout=30).stdout.strip()
+
+
+def test_install_kind_reads_a_windows_pipx_venv_with_a_space(tmp_path):
+    loc = r"C:\Users\a b\pipx\venvs\symbion\Lib\site-packages\symbion"
+    if os.name == "nt":     # no `\` in a name: the same shape, a real path under tmp_path
+        venv = tmp_path / "a b" / "pipx" / "venvs" / "symbion"
+        loc = str(venv / "Lib" / "site-packages" / "symbion")
+    else:                   # `\` is no separator: the venv is one name, relative to the cwd
+        venv = tmp_path / loc.rpartition("\\Lib\\")[0]
+    venv.mkdir(parents=True)
+    (venv / "pipx_metadata.json").write_text("")
+    assert _kind(loc, tmp_path) == "pipx"
+
+
+def test_install_kind_reads_debians_dist_packages_as_other(tmp_path):
+    assert _kind("/usr/lib/python3/dist-packages/symbion", tmp_path) == "other"
+
+
+def test_worker_compares_numbers_not_text(tmp_path):
+    _work(tmp_path, cli=("0.9.0", _venv(tmp_path, "pipx")), pv="0.16.0", tool="noop")
+    assert _calls(tmp_path, "pipx") == [["upgrade", "symbion"]]    # 0.9.0 < 0.16.0
+
+
+def test_worker_waits_for_pypi(tmp_path):
+    up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path, "uv")), pv="0.16.0", tool="noop")
+    assert not (up / "ok-0.16.0").exists() and (up / "hold-0.16.0").is_dir()
+    assert not (up / "result").exists() and _log(up)[-1]["outcome"] == "wait"
+
+
+def test_worker_tells_a_wait_past_a_day_once(tmp_path):
+    """pipx upgrade drops an install's index args, and uv tool upgrade keeps a
+    pin: either waits forever, so a wait a day old is told, once a version."""
+    cli = ("0.15.2", _venv(tmp_path, "pipx"))
+    up = _work(tmp_path, cli=cli, pv="0.16.0", tool="noop")
+    assert (up / "wait-0.16.0").exists() and not (up / "result").exists()
+    _work(tmp_path, cli=cli, pv="0.16.0", tool="noop")        # an hour on: still quiet
+    assert not (up / "result").exists()
+    day = time.time() - 25 * 3600
+    os.utime(up / "wait-0.16.0", (day, day))
+    _work(tmp_path, cli=cli, pv="0.16.0", tool="noop")
+    assert _result(up).startswith("symbion: the symbion plugin needs symbion 0.16.0 or later, "
+                                  "and a day of `pipx upgrade symbion` has left it at 0.15.2 (log: ")
+    assert _log(up)[-1]["outcome"] == "wait" and not (up / "ok-0.16.0").exists()
+    (up / "result").unlink()                                   # delivered
+    _work(tmp_path, cli=cli, pv="0.16.0", tool="noop")
+    assert not (up / "result").exists()
+    # the user upgrades by hand: the next run finds the CLI current and takes a waiting line back
+    (up / "result").write_text("symbion: the symbion plugin needs symbion 0.16.0 or later, and a day\n")
+    _work(tmp_path, cli=("0.16.0", cli[1]), pv="0.16.0")
+    assert not (up / "result").exists() and (up / "ok-0.16.0").exists()
+
+
+@pytest.mark.parametrize("shell", ["sh", "dash", "ksh", "bash"])
+def test_every_hook_parses_in_each_shell(shell):
+    """OpenBSD's sh is ksh, Debian's is dash: a hook one cannot parse dies
+    silently there, and a parse error in upgrade.sh passed every macOS test
+    until an OpenBSD run (2026-11-11). macOS has /bin/ksh."""
+    exe = shutil.which(shell)
+    if exe is None:
+        pytest.skip(f"no {shell} on PATH")
+    for f in sorted((PLUGIN / "hooks").glob("*.sh")):
+        r = subprocess.run([exe, "-n", str(f)], capture_output=True, text=True, timeout=30)
+        assert (f.name, r.returncode, r.stderr) == (f.name, 0, "")
+
+
+def test_worker_reads_the_version_past_a_warning_on_stderr(tmp_path):
+    # PYTHONWARNINGS can put a line on stderr ahead of each -V answer
+    up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path, "uv")), pv="0.16.0", tool="ok", warn=True)
+    row = _log(up)[0]
+    assert (row["before"], row["after"], row["outcome"]) == ("0.15.2", "0.16.0", "upgraded")
+
+
+def test_worker_reports_a_cli_with_no_version_after_the_upgrade_once(tmp_path):
+    cli = ("0.15.2", _venv(tmp_path, "uv"))
+    up = _work(tmp_path, cli=cli, pv="0.16.0", tool="break")
+    assert "`uv tool upgrade symbion` failed (log: " in _result(up)
+    (up / "result").unlink()                                   # delivered
+    _work(tmp_path, cli=cli, pv="0.16.0", tool="break")
+    assert not (up / "result").exists() and not (up / "ok-0.16.0").exists() and (up / "hold-0.16.0").is_dir()
+    rows = _log(up)
+    assert [(r["outcome"], r["exit"]) for r in rows] == [("failed", 0), ("failed", 0)]
+    assert rows[0]["output"].endswith("symbion -V gave no version after the upgrade")
+
+
+def test_worker_reports_a_failure_once_per_version(tmp_path):
+    cli = ("0.15.2", _venv(tmp_path, "uv"))
+    up = _work(tmp_path, cli=cli, pv="0.16.0", tool="fail")
+    assert "`uv tool upgrade symbion` failed (log: " in _result(up)
+    assert f"(log: {tmp_path / 'data'}/upgrade/log.jsonl)." in _result(up)    # the worker joins with `/`
+    (up / "result").unlink()                                   # delivered
+    _work(tmp_path, cli=cli, pv="0.16.0", tool="fail")
+    assert not (up / "result").exists() and (up / "hold-0.16.0").is_dir()
+    assert [r["outcome"] for r in _log(up)] == ["failed", "failed"]
+    assert "error: no network" in _log(up)[0]["output"]
+
+
+def test_worker_logs_the_version_a_failed_command_left(tmp_path):
+    """uv on Windows replaced the package, then failed to copy the command a running serve
+    held: the row read the version from before the command (live run, 2026-11-12)."""
+    up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path, "uv")), pv="0.16.0", tool="partial", uname="MINGW64_NT-10.0")
+    row = _log(up)[-1]
+    assert (row["outcome"], row["exit"], row["before"], row["after"]) == ("failed", 1, "0.15.2", "0.16.0")
+    assert _result(up).endswith("A running `symbion serve` can hold symbion's files: stop it first.")
+
+
+def test_worker_on_windows_leaves_serve_to_the_user(tmp_path):
+    up = _work(tmp_path, cli=("0.15.2", _venv(tmp_path, "pipx")), pv="0.16.0", tool="ok", uname="MINGW64_NT-10.0")
+    assert ["serve", "--restart"] not in _calls(tmp_path, "symbion")
+    assert _result(up).endswith("Restart any running `symbion serve` by hand: Ctrl-C it and start it again.")
+    up = _work(tmp_path / "b", cli=("0.15.2", _venv(tmp_path / "b", "pipx")), pv="0.16.0", tool="fail", uname="MSYS_NT")
+    assert _result(up).endswith("A running `symbion serve` can hold symbion's files: stop it first.")
+
+
+# The shims launch the worker. A copy of plugin/hooks sits in base/root-PV with its
+# upgrade.sh swapped for a stub; fake mkdir, find and git log what the shim runs.
+
+def _data(base, ok=(), hold=None, hold_age_min=0, result=None) -> Path:
+    d = Path(base) / "data"
+    up = d / "upgrade"
+    up.mkdir(parents=True, exist_ok=True)
+    for v in [ok] if isinstance(ok, str) else ok:
+        (up / f"ok-{v}").write_text("")
+    if hold:
+        (up / f"hold-{hold}").mkdir(exist_ok=True)
+        t = time.time() - hold_age_min * 60
+        os.utime(up / f"hold-{hold}", (t, t))
+    if result:
+        (up / "result").write_text(result + "\n", newline="\n")
+    return d
+
+
+def _shim_args(base, which, pv, data, stdin, stub_sleep, cache=True):
+    base = Path(base)
+    base.mkdir(parents=True, exist_ok=True)
+    root = base / f"root-{pv}"
+    shutil.copytree(PLUGIN / "hooks", root / "hooks", dirs_exist_ok=True)
+    (root / ".claude-plugin").mkdir(exist_ok=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(f'{{"name": "symbion", "version": "{pv}"}}\n')
+    (root / "hooks" / "upgrade.sh").write_text(
+        f'sleep {stub_sleep}\necho "$1" >> \'{base / "stub.runs"}\'\n')
+    for n in ("mkdir", "find", "git"):
+        _fake(base, n, f'for _p in /bin /usr/bin; do [ -x "$_p/{n}" ] && exec "$_p/{n}" "$@"; done')
+    env = {**_env(base), "CLAUDE_PLUGIN_ROOT": str(root)}
+    if data is not None:
+        env["CLAUDE_PLUGIN_DATA"] = str(data)
+    skill = base / "pkg" / "skill"
+    if not skill.exists():
+        _skill(skill)
+    if cache:
+        _cache(env).parent.mkdir(parents=True, exist_ok=True)
+        _cache(env).write_text(f"{skill}\n", newline="\n")
+    project = base / "p"
+    if not project.exists():
+        _project(base)
+    env["CLAUDE_PROJECT_DIR"] = str(project)
+    return ["sh", str(root / "hooks" / {"start": "session_start.sh", "gotchas": "gotchas.sh"}[which])], project, env, stdin
+
+
+def _shim(base, which, pv="0.16.0", data=None, project=None, stdin="{}\n", stub_sleep=0, cache=True):
+    cmd, proj, env, stdin = _shim_args(base, which, pv, data, stdin, stub_sleep, cache)
+    if project:
+        env["CLAUDE_PROJECT_DIR"] = str(project)
+    return subprocess.run(cmd, cwd=project or proj, input=stdin, text=True, capture_output=True, env=env, timeout=30)
+
+
+def _shims_async(base, which, n, pv="0.16.0", data=None):
+    """N shims started from one setup: a second _shim_args rewrites the hooks and the
+    fakes while the first shim reads them, and it sourced an empty upgrade_lib.sh."""
+    cmd, proj, env, stdin = _shim_args(base, which, pv, data, "{}\n", 0)
+    procs = [subprocess.Popen(cmd, cwd=proj, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, env=env) for _ in range(n)]
+    for p in procs:
+        # A start shim reads no stdin and may be gone before the write: communicate()
+        # ignores the broken pipe for that, and so does this (an OpenBSD run, 2026-11-13).
+        with contextlib.suppress(BrokenPipeError):
+            p.stdin.write(stdin)
+        with contextlib.suppress(BrokenPipeError):
+            p.stdin.close()
+        # communicate() flushes stdin first: on Python 3.12 a closed one raised
+        # ValueError (an Ubuntu run, 2026-11-13); 3.14 skips it.
+        p.stdin = None
+    return procs
+
+
+def _stub_runs(base) -> list[str]:
+    f = Path(base) / "stub.runs"
+    return f.read_text().splitlines() if f.exists() else []
+
+
+def _wait_for(pred, timeout=10):
+    # Returns when pred holds; the bound only fails a slow run: 3 s timed out once
+    # in a 3.12 run of this file that took twice its usual time (2026-11-13).
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if pred():
+            return
+        time.sleep(0.05)
+    pytest.fail("timed out")
+
+
+def test_check_does_nothing_without_the_plugin_env(tmp_path):        # agy, Pi
+    r = _shim(tmp_path, "gotchas", data=None, stdin="{}\n")
+    assert _calls(tmp_path, "mkdir") == [] and r.stdout == "{}\nPKG-GOTCHAS\n"
+
+
+def test_check_with_its_marker_runs_builtins_only(tmp_path):
+    data = _data(tmp_path, ok="0.16.0")
+    _shim(tmp_path, "gotchas", pv="0.16.0", data=data)
+    assert _calls(tmp_path, "mkdir") == _calls(tmp_path, "find") == _calls(tmp_path, "git") == []
+
+
+def test_check_with_its_marker_runs_with_an_empty_path(tmp_path):
+    data = _data(tmp_path, ok="0.16.0")
+    cmd, proj, env, _ = _shim_args(tmp_path, "gotchas", "0.16.0", data, "", 0)
+    _cache(env).unlink()
+    sh = shutil.which("sh") or pytest.skip("no sh on PATH")
+    r = subprocess.run([sh, cmd[1]], cwd=proj, input="", text=True, capture_output=True,
+                       env={**env, "PATH": ""}, timeout=30)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
+    assert not list((data / "upgrade").glob("hold-*"))
+
+
+def test_check_launches_one_worker_per_version(tmp_path):
+    data = _data(tmp_path)
+    for _ in range(3):
+        assert _shim(tmp_path, "gotchas", pv="0.16.0", data=data).stderr == ""
+    _wait_for(lambda: _stub_runs(tmp_path) == ["0.16.0"])
+    assert (data / "upgrade/hold-0.16.0").is_dir()
+
+
+def test_two_starts_at_once_launch_one_worker(tmp_path):              # RF 4
+    data = _data(tmp_path)
+    procs = _shims_async(tmp_path, "start", 2, pv="0.16.0", data=data)
+    assert [p.communicate()[1] for p in procs] == ["", ""]
+    _wait_for(lambda: len(_stub_runs(tmp_path)) >= 1)
+    time.sleep(0.5)
+    assert _stub_runs(tmp_path) == ["0.16.0"]
+
+
+def test_launch_returns_before_the_worker_ends(tmp_path):
+    t = time.monotonic()
+    _shim(tmp_path, "gotchas", pv="0.16.0", data=_data(tmp_path), stub_sleep=3)
+    assert time.monotonic() - t < 1.5 and _stub_runs(tmp_path) == []
+    _wait_for(lambda: _stub_runs(tmp_path) == ["0.16.0"], timeout=6)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="no process groups; the Windows VM run covers it")
+def test_worker_outlives_a_kill_of_the_hooks_process_group(tmp_path):
+    """At a hook's timeout Claude Code kills its whole process group, and a worker in
+    that group died mid-upgrade (live run, 2026-11-12). It runs in a session of its own."""
+    if not (shutil.which("setsid") or shutil.which("perl")):
+        pytest.skip("neither setsid nor perl: the worker stays in the hook's group")
+    data = _data(tmp_path)
+    cmd, proj, env, stdin = _shim_args(tmp_path, "start", "0.16.0", data, "{}\n", 2)
+    started = tmp_path / "stub.started"
+    root = Path(cmd[1]).parents[1]
+    (root / "hooks" / "upgrade.sh").write_text(
+        f": > '{started}'\nsleep 2\necho \"$1\" >> '{tmp_path / 'stub.runs'}'\n")
+    p = subprocess.Popen(cmd, cwd=proj, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
+    p.stdin.write(stdin)
+    p.stdin.close()
+    _wait_for(started.exists)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(p.pid, 9)
+    p.wait(timeout=10)
+    _wait_for(lambda: _stub_runs(tmp_path) == ["0.16.0"], timeout=6)
+
+
+def test_only_a_session_start_retries_a_stale_hold(tmp_path):
+    data = _data(tmp_path, hold="0.16.0", hold_age_min=61)
+    hold = data / "upgrade/hold-0.16.0"
+    mtime = hold.stat().st_mtime
+    assert _shim(tmp_path, "gotchas", pv="0.16.0", data=data).stderr == ""
+    assert _calls(tmp_path, "find") == [] and hold.stat().st_mtime == mtime
+    assert _shim(tmp_path, "start", pv="0.16.0", data=data).stderr == ""
+    _wait_for(lambda: _stub_runs(tmp_path) == ["0.16.0"])
+
+
+def test_a_session_start_keeps_a_hold_under_an_hour_old(tmp_path):
+    data = _data(tmp_path, hold="0.16.0", hold_age_min=59)
+    hold = data / "upgrade/hold-0.16.0"
+    mtime = hold.stat().st_mtime
+    assert _shim(tmp_path, "start", pv="0.16.0", data=data).stderr == ""
+    # find is the age test; a retry would rmdir the hold and mkdir a new one
+    assert len(_calls(tmp_path, "find")) == 1 and hold.stat().st_mtime == mtime
+    assert _stub_runs(tmp_path) == []
+
+
+def test_two_plugin_versions_share_one_data_dir(tmp_path):
+    data = _data(tmp_path, ok=["0.16.0", "0.17.0"])
+    for pv in ("0.16.0", "0.17.0", "0.16.0"):
+        _shim(tmp_path, "gotchas", pv=pv, data=data)
+    assert _calls(tmp_path, "mkdir") == []
+
+
+def test_upgrade_check_takes_paths_with_spaces(tmp_path):             # RF 1
+    d = tmp_path / "a b"
+    _shim(d, "gotchas", pv="0.16.0", data=_data(d))
+    _wait_for(lambda: _stub_runs(d) == ["0.16.0"])
+
+
+# The gotcha shim hands the worker's result to the agent, once.
+
+def _adopted_project(base) -> Path:
+    p = _project(Path(base))
+    (Path(base) / "p-notes").mkdir()
+    (Path(base) / "p-notes" / "notes.jsonl").write_text("")
+    return p
+
+
+def _deliver(base, stdin, result) -> str:
+    data = _data(base, ok="0.16.0", result=result)
+    return _shim(base, "gotchas", pv="0.16.0", data=data, project=_adopted_project(base),
+                 stdin=stdin, cache=False).stdout
+
+
+def _deliver_with_package(base, pkg_text, result) -> str:
+    skill = Path(base) / "pkg" / "skill"
+    _skill(skill)
+    (skill / "gotchas.sh").write_text(
+        "cat >/dev/null\nprintf '%s\\n' "
+        f"'{{\"hookSpecificOutput\":{{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"{pkg_text}\"}}}}'\n")
+    data = _data(base, ok="0.16.0", result=result)
+    return _shim(base, "gotchas", pv="0.16.0", data=data, project=_adopted_project(base),
+                 stdin='{"tool_input":{}}').stdout
+
+
+def test_result_reaches_the_agent_once(tmp_path):
+    data = _data(tmp_path, ok="0.16.0", result="symbion: upgraded from 0.15.2 to 0.16.0")
+    p = _adopted_project(tmp_path)
+    first = _shim(tmp_path, "gotchas", pv="0.16.0", data=data, project=p, stdin='{"tool_input":{}}', cache=False)
+    assert json.loads(first.stdout)["hookSpecificOutput"] == {
+        "hookEventName": "PostToolUse", "additionalContext": "symbion: upgraded from 0.15.2 to 0.16.0"}
+    assert (first.returncode, first.stderr) == (0, "")
+    assert _shim(tmp_path, "gotchas", pv="0.16.0", data=data, project=p, stdin='{"tool_input":{}}',
+                 cache=False).stdout == ""
+    assert not list((data / "upgrade").glob("result*"))
+
+
+def test_result_waits_for_a_project_that_adopted_symbion(tmp_path):
+    data = _data(tmp_path, ok="0.16.0", result="symbion: upgraded to 0.16.0, distinctive")
+    r = _shim(tmp_path, "gotchas", pv="0.16.0", data=data, project=_project(tmp_path), stdin="{}", cache=False)
+    assert "distinctive" not in r.stdout and (data / "upgrade/result").exists()
+
+
+def test_result_joins_the_package_gotcha(tmp_path):
+    # both texts hold \" \\ and \n escapes, already JSON-escaped as the worker writes them
+    out = _deliver_with_package(tmp_path, pkg_text=r'trap \"q\" a\\b\nline', result=r'up \"x\" c\\d\ne')
+    assert json.loads(out)["hookSpecificOutput"]["additionalContext"] == 'up "x" c\\d\ne\ntrap "q" a\\b\nline'
+    assert not list((tmp_path / "data/upgrade").glob("result*"))
+
+
+def test_result_names_the_failure_event(tmp_path):
+    out = _deliver(tmp_path, stdin='{"hook_event_name":"PostToolUseFailure","tool_input":{}}', result="x")
+    assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUseFailure"
+    assert not list((tmp_path / "data/upgrade").glob("result*"))
+
+
+def test_result_stays_when_the_package_prints_something_else(tmp_path):
+    data = _data(tmp_path, ok="0.16.0", result="symbion: upgraded")
+    r = _shim(tmp_path, "gotchas", pv="0.16.0", data=data, project=_adopted_project(tmp_path), stdin="{}")
+    assert r.stdout == "{}\nPKG-GOTCHAS\n" and (data / "upgrade/result").read_text() == "symbion: upgraded\n"
+
+
+def test_unadopted_project_still_gets_the_package_line_unchanged(tmp_path):
+    skill = tmp_path / "pkg" / "skill"
+    _skill(skill)
+    line = '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"trap"}}'
+    (skill / "gotchas.sh").write_text(f"cat >/dev/null\necho '{line}'\n")
+    data = _data(tmp_path, ok="0.16.0", result="symbion: upgraded")
+    r = _shim(tmp_path, "gotchas", pv="0.16.0", data=data, project=_project(tmp_path), stdin="{}")
+    assert (r.stdout, r.stderr) == (line + "\n", "") and (data / "upgrade/result").exists()
+
+
+def test_a_waiting_result_asks_git_nothing_at_a_projects_root(tmp_path):
+    """While a result waits, each tool call in a project that never adopted
+    symbion ran git twice to find its main worktree, about 70 ms a call until
+    one lands in an adopted project (audit, 2026-11-12). A `.git` dir at the
+    project's root makes it its own main worktree."""
+    data = _data(tmp_path, ok="0.16.0", result="symbion: upgraded")
+    cmd, proj, env, _ = _shim_args(tmp_path, "gotchas", "0.16.0", data, "{}", 0, cache=False)
+    (tmp_path / "git.calls").unlink(missing_ok=True)
+    r = subprocess.run(cmd, cwd=proj, input="{}", text=True, capture_output=True, env=env, timeout=30)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
+    assert (data / "upgrade/result").exists() and not (tmp_path / "git.calls").exists()
+
+
+def test_a_subagent_leaves_the_result_for_the_main_agent(tmp_path):
+    data = _data(tmp_path, ok="0.16.0", result="symbion: upgraded, distinctive")
+    p = _adopted_project(tmp_path)
+    sub = _shim(tmp_path, "gotchas", pv="0.16.0", data=data, project=p, cache=False,
+                stdin='{"agent_id":"a1","tool_input":{}}')
+    assert sub.stdout == "" and (data / "upgrade/result").exists()
+    main = _shim(tmp_path, "gotchas", pv="0.16.0", data=data, project=p, cache=False, stdin='{"tool_input":{}}')
+    assert "distinctive" in json.loads(main.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert not list((data / "upgrade").glob("result*"))
+
+
+def test_delivery_writes_nothing_to_stderr_with_an_empty_path(tmp_path):
+    data = _data(tmp_path, ok="0.16.0", result="symbion: upgraded")
+    cmd, proj, env, _ = _shim_args(tmp_path, "gotchas", "0.16.0", data, "", 0, cache=False)
+    (tmp_path / "p-notes").mkdir()
+    (tmp_path / "p-notes/notes.jsonl").write_text("")
+    sh = shutil.which("sh") or pytest.skip("no sh on PATH")
+    r = subprocess.run([sh, cmd[1]], cwd=proj, input="{}", text=True, capture_output=True,
+                       env={**env, "PATH": ""}, timeout=30)
+    assert r.returncode == 0 and r.stderr == ""
+
+
+def _backslash_hook(tmp_path, name) -> tuple[list[str], Path | None]:
+    """argv and cwd that run hooks/NAME through a $0 with `\\` and no `/`, as Pi on
+    Windows does (Node's path.join). Elsewhere `\\` is no separator, so a file named
+    `hooks\\NAME` beside a copy of hooks/ gives the shell that same $0."""
+    if os.name == "nt":
+        return ["sh", str(PLUGIN / "hooks" / name)], None
+    w = tmp_path / "w"
+    shutil.copytree(PLUGIN / "hooks", w / "hooks", dirs_exist_ok=True)
+    shutil.copy(PLUGIN / "hooks" / name, w / f"hooks\\{name}")
+    return ["sh", f"hooks\\{name}"], w
+
+
+def test_hooks_find_their_library_through_a_backslash_path(tmp_path):
+    env = {**_env(tmp_path), "CLAUDE_PROJECT_DIR": str(_adopted_project(tmp_path))}   # no symbion
+    cmd, cwd = _backslash_hook(tmp_path, "session_start.sh")
+    r = subprocess.run(cmd, cwd=cwd, input="", text=True, capture_output=True, env=env, timeout=30)
+    assert (r.stdout, r.stderr) == (TO_SETUP, "")
+    data = _data(tmp_path, result="symbion: upgraded, distinctive")
+    env = {**env, "CLAUDE_PLUGIN_DATA": str(data), "CLAUDE_PLUGIN_ROOT": str(tmp_path / "no-root")}
+    cmd, cwd = _backslash_hook(tmp_path, "gotchas.sh")
+    r = subprocess.run(cmd, cwd=cwd, input='{"tool_input":{}}', text=True, capture_output=True, env=env, timeout=30)
+    assert "distinctive" in r.stdout and r.stderr == ""
+    cmd, cwd = _backslash_hook(tmp_path, "upgrade.sh")
+    subprocess.run([*cmd, "0.16.0"], cwd=cwd, text=True, capture_output=True, env=env, timeout=30)
+    assert _log(data / "upgrade")[-1]["outcome"] == "none"

@@ -18,9 +18,9 @@
   <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Codex-full-a6e3a1?labelColor=313244" alt="Codex: full"></a>
   <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Pi-full-a6e3a1?labelColor=313244" alt="Pi: full"></a>
   <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Antigravity-no%20gotcha%20hook-f9e2af?labelColor=313244" alt="Antigravity: no gotcha hook"></a>
-  <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Hermes%20Agent-no%20hooks-cdd6f4?labelColor=313244" alt="Hermes Agent: no hooks"></a>
+  <a href="https://github.com/phreakocious/symbion#codex-antigravity-pi-hermes-agent-or-the-cli-alone"><img src="https://img.shields.io/badge/Hermes%20Agent-full-a6e3a1?labelColor=313244" alt="Hermes Agent: full"></a>
   <br>
-  <sub><b>full</b>: the open entries at session start, and a file's gotchas the first time the agent touches that file. Hermes Agent gets the open entries from one line in AGENTS.md. The CLI works without any of them.</sub>
+  <sub><b>full</b>: the open entries at session start, and a file's gotchas the first time the agent touches that file. The CLI works without any of them.</sub>
 </p>
 
 <p align="center">
@@ -51,7 +51,7 @@
 - **Entries attach to things.** An entry sits on a commit, a file, a named item
   or the whole project, so `symbion context --target file:src/x.py` finds
   every entry on that file.
-- **A trap shows up when it matters.** In Claude Code, Codex and Pi, an entry
+- **A trap shows up when it matters.** In Claude Code, Codex, Pi and Hermes Agent, an entry
   tagged `gotcha` on a file reaches the agent the first time it reads or edits
   that file, with its age and how many commits have changed the file since.
 - **Checklists across a codebase.** An arc is a named line of work with one
@@ -101,13 +101,10 @@
 > codex --add-dir "../$(basename "$PWD")-notes"
 > ```
 >
-> **Hermes Agent**, from your project's root, then the two lines the
-> [guide](https://github.com/phreakocious/symbion/blob/main/docs/guide.md#adopt-in-a-fresh-repo)
-> gives for `AGENTS.md`:
+> **Hermes Agent**, then `/symbion:setup` in a new `hermes` session:
 >
 > ```bash
-> pipx install 'symbion[gui]'
-> symbion init --agent hermes --yes
+> hermes plugins install phreakocious/symbion#plugin --enable
 > ```
 >
 > **The CLI alone**: `pipx install 'symbion[gui]'`, then `symbion init --yes` in
@@ -120,6 +117,19 @@ install and again before it brings anything in. Then it starts the web page on
 your project's notebook and gives you its address. The plugin carries no copy
 of the skill: its hooks and skill run the installed CLI's own, so the two
 always match.
+
+## Upgrading
+
+In Claude Code, turn on auto-update for the symbion marketplace (`/plugin`,
+Marketplaces, symbion, Enable auto-update), or update the plugin in `/plugin`.
+Then run `/reload-plugins` or start a new session. The package follows: the
+first tool call or session start after an update runs `uv tool upgrade symbion`
+or `pipx upgrade symbion`, whichever installed it, and restarts any `symbion
+serve`; on Windows the agent's line says to restart it by hand. An editable
+install, or one not made by uv or pipx, is left alone, with a note to the agent.
+
+Everywhere else, run `uv tool upgrade symbion` or `pipx upgrade symbion`, then
+`symbion serve --restart`.
 
 ## How it compares
 
@@ -171,8 +181,19 @@ Then add one line to `AGENTS.md`, and start a session:
 - We use symbion for durable notes and tickets.
 ```
 
-`--agent hermes` sets up Hermes Agent, which takes a line more: see the
-[guide](https://github.com/phreakocious/symbion/blob/main/docs/guide.md#adopt-in-a-fresh-repo).
+For Hermes Agent 0.23.1 or later, install the plugin, then run `/symbion:setup` in a new
+`hermes` session: as in Claude Code, it installs the CLI, makes the store and
+brings in the project's open threads.
+
+```bash
+hermes plugins install phreakocious/symbion#plugin --enable
+```
+
+The plugin gives Hermes the summary at session start, after a resume and after
+a compaction, the gotcha hook and `/symbion:wrap`. With the CLI already
+installed, `symbion init --agent hermes --yes` makes the store and links the
+skill. The hooks run in Hermes's gateway, so `symbion` must be on the gateway's
+PATH.
 
 For Antigravity, install the CLI as above, then the plugin, and start a new
 `agy` session after the same `AGENTS.md` line:

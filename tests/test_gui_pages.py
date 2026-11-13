@@ -380,18 +380,73 @@ async def test_the_pages_move_keeps_an_agents_unseen_move_offered(user: User, ct
     await _until(lambda: _stale(user) == [["arcs changed"]])
 
 
-async def test_the_older_of_two_tabs_does_not_light_for_its_own_drop(
-        user: User, create_user, ctx_with_notes, monkeypatch):
+@pytest.mark.parametrize("write", ["drop", "star"])
+async def test_a_write_in_the_older_of_two_tabs_lights_the_newer_only(
+        user: User, create_user, ctx_with_notes, monkeypatch, write):
     """Each page's draw replaced the writer's one record, so a drop on the older
     tab updated the newer tab's, and the older tab lit its own write as news
-    (audit, 2026-11-08). Each page keeps its own record."""
+    (audit, 2026-11-08). Each page keeps its own record. The write still
+    counted as drawn on the writer's latest page, the newer tab, which kept
+    the old card and offered no reload (audit, 2026-11-12)."""
+    from _cards import _emit
     act, ids = await _arc_board(user, ctx_with_notes, monkeypatch)
     tab = create_user()
-    await tab.open("/notes")                        # a second tab, drawn later
+    await tab.open(f"/notes?arc={act.id}")          # a second tab, drawn later
     await asyncio.sleep(0.2)
-    _drop(user, id=ids["one"], phase="doing", before=None)
-    await asyncio.sleep(0.4)
-    assert _stale(user) == []
+    if write == "drop":
+        _drop(user, id=ids["one"], phase="doing", before=None)
+    else:
+        _emit(user, next(c for c in cards(user) if c.props["data-id"] == ids["one"]), "star")
+    await _until(lambda: _stale(tab) != [])
+    await _until(lambda: _stale(user) == [])
+
+
+async def test_a_tick_that_reads_between_the_pages_write_and_its_mark_lights_nothing(
+        user: User, ctx_with_notes, monkeypatch):
+    """A tick reads the store in a thread while the page's own write runs on
+    the loop: a read that landed after the write and before own_write's mark
+    lit the writer's tab for one tick, flaking the test above (2026-11-12).
+    Forced here: the tick's read waits for the write, and the mark for the read."""
+    import threading
+    from contextlib import contextmanager
+
+    from _cards import _emit
+    from symbion.gui import arcs, chrome
+    act, ids = await _arc_board(user, ctx_with_notes, monkeypatch)
+    armed, waiting, wrote, read = (threading.Event() for _ in range(4))
+    real_state, real_drift, real_own = chrome.git_state, chrome._drift, arcs.own_write
+    lit = []
+
+    def git_state(*a):
+        if armed.is_set() and not wrote.is_set():
+            waiting.set()
+            wrote.wait(5)
+        return real_state(*a)
+
+    def drift(*a):
+        out = real_drift(*a)
+        if wrote.is_set():
+            read.set()
+        return out
+
+    @contextmanager
+    def own_write(*a, **k):
+        with real_own(*a, **k):
+            yield
+            wrote.set()                             # on disk, not yet marked
+            assert read.wait(5), "no tick read between the write and the mark"
+    monkeypatch.setattr(chrome, "git_state", git_state)
+    monkeypatch.setattr(chrome, "_drift", drift)
+    monkeypatch.setattr(arcs, "own_write", own_write)
+    monkeypatch.setattr(chrome, "_stale_button", lambda *a: lit.append(a[:3]))
+    armed.set()
+    await _until(waiting.is_set)                    # a tick's read waits on the write
+    _emit(user, next(c for c in cards(user) if c.props["data-id"] == ids["one"]), "star")
+    await _until(read.is_set)
+    await asyncio.sleep(0.3)                        # that tick, and a few after it
+    (one,) = [n for n in store.heads(store.load(ctx_with_notes.store_dir)) if n.id == ids["one"]]
+    assert "priority" in one.tags, "the star was written"
+    assert lit == [], lit
 
 
 async def test_resolving_a_pre_registration_in_the_dialog_lights_nothing(
@@ -405,7 +460,7 @@ async def test_resolving_a_pre_registration_in_the_dialog_lights_nothing(
         '[kinds]\nprediction = { status = true, verdict = true }\n')
     ctx = api.resolve(str(tmp_path))
     act = api.create_arc(ctx, "camp", "d", "item", author="ada")
-    p = api.add(ctx, {"kind": "prediction", "target": {"type": "item", "name": "sweep"},
+    p = api.add(ctx, {"kind": "prediction", "checked": "pytest", "target": {"type": "item", "name": "sweep"},
                       "arc_id": act.id}, author="ada")
     build_page(ctx, author="ada")
     await user.open(f"/arc?id={act.id}")
@@ -660,7 +715,7 @@ async def test_earlier_versions_show_their_target(user: User, ctx_with_notes):
     """A rename is a new version whose only change is the target, and the
     earlier versions were drawn without one: the change was invisible."""
     ctx = ctx_with_notes
-    nid = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "old-name"}},
+    nid = api.add(ctx, {"body": "stub", "kind": "task", "target": {"type": "item", "name": "old-name"}},
                   author="ada").id
     api.commit(ctx, "c", everyone=True)
     api.rename_target(ctx, "item", "old-name", "new-name", author="ada")
@@ -825,7 +880,7 @@ async def test_object_view_surfaces_notes_that_REF_the_target(user: User, repo, 
 
     await user.open("/object?type=item&name=widget")
     await user.should_see("points at widget")
-    assert [e.text for e in parts(user, "note-target")] == ["item: other"]
+    assert [e.text for e in parts(user, "note-target")] == ["item:other"]   # the CLI's, as a ref's
 
 
 async def test_object_view_handles_a_name_with_a_slash(user: User, repo, tmp_path):
@@ -1076,11 +1131,12 @@ async def test_an_answer_sent_is_not_typed_again_at_its_next_turn(user: User, ct
 async def test_a_question_not_waiting_on_the_person_lists_its_options(user: User,
                                                                       ctx_with_notes):
     """Where no buttons draw (the person's own question, one they answered),
-    the options show as a meta row, as measurements do: the answer below
-    reads against its alternatives, and the card shows what `show` prints."""
+    the options show as a meta row, as measurements do, and the card shows
+    what `show` prints. Once a line below the question is one option's words,
+    the row names that pick: a clipped card hid it (the user, 2026-11-11)."""
     _q(ctx_with_notes, "Mine?", author="ada", options=["keep", "drop"])
     answered = _q(ctx_with_notes, "Theirs?", options=["yes", "no"])
-    api.supersede(ctx_with_notes, answered, author="ada", append_body="no")
+    api.supersede(ctx_with_notes, answered, author="ada", append_body="No.")
     await user.open("/notes")
     await user.should_see("Mine?")
     await not_see(user, "answer-row")
@@ -1088,7 +1144,7 @@ async def test_a_question_not_waiting_on_the_person_lists_its_options(user: User
     # One label with the CLI's separator: three phrases parted by gaps alone
     # read as one run of words in a browser shot (2026-10-17).
     assert len(rows) == 2
-    assert sorted(r.text for r in rows) == ["options: keep | drop", "options: yes | no"]
+    assert sorted(r.text for r in rows) == ["answered: no", "options: keep | drop"]
 
 
 async def test_only_a_question_someone_else_wrote_last_takes_answers(user: User,
@@ -1379,6 +1435,47 @@ async def test_a_reload_with_the_peek_open_builds_the_page_with_it_drawn(user: U
         in_peek = user.find(marker="note-row").elements
     # ids rise as the page builds: the peek's card came before the page's
     assert min(user.find(marker="note-row").elements, key=lambda e: e.id) in in_peek
+
+
+async def _reconnect(client) -> None:
+    """What NiceGUI's handshake does on a socket reconnect inside serve's
+    `reconnect_timeout`: every connect handler runs again."""
+    for handler in client.connect_handlers:
+        client.safe_invoke(handler)
+    await asyncio.sleep(0.2)
+
+
+async def test_a_reconnect_leaves_a_kept_peek_where_the_person_moved_it(
+        user: User, ctx_with_notes, monkeypatch):
+    """NiceGUI runs each connect handler on every handshake, a reconnect too,
+    and the kept peek's handler named the entry the page was reloaded on
+    again: the peek's link and the URL named it while the peek drew another,
+    and a closed peek's #peek= came back (audit, 2026-11-12)."""
+    from nicegui.outbox import Outbox
+    from symbion.gui import chrome
+    sent, emit = [], Outbox._emit
+
+    async def record(self, message):
+        if message[1] == "run_javascript" and "sbPeek" in message[2]["code"]:
+            sent.append(message[2]["code"])
+        await emit(self, message)
+
+    monkeypatch.setattr(Outbox, "_emit", record)
+    heads = store.heads(store.load(ctx_with_notes.store_dir))
+    bug, other = (next(n.id for n in heads if n.kind == k) for k in ("bug", "note"))
+    user.http_client.cookies.set(chrome.PEEK_COOKIE, quote(f"/notes {bug}", safe=""))
+    await user.open("/notes")
+    (page,) = user.find(marker="peek-page").elements
+    await _until(lambda: page.props.get("href") == f"/notes?id={bug}")
+    _peek(user, other)
+    await _until(lambda: page.props.get("href") == f"/notes?id={other}")
+    await _reconnect(user.client)
+    assert page.props.get("href") == f"/notes?id={other}"
+    user.find(marker="peek-close").click()
+    await _until(lambda: "sbPeekUnhash()" in sent)
+    del sent[:]
+    await _reconnect(user.client)
+    assert not any("sbPeekHash" in code for code in sent), sent
 
 
 async def test_a_write_in_the_peek_reloads_the_page_and_peeks_again(user: User, ctx_with_notes,
@@ -1709,6 +1806,21 @@ async def test_an_archived_arc_says_so_and_is_reachable(user: User, repo, tmp_pa
     await user.should_not_see(marker="arc-archive")
 
 
+async def test_an_arc_names_its_scope_unless_it_is_mixed(user: User, repo, tmp_path):
+    """A bare `mixed` read as the arc's target, and said nothing: the default
+    has no chip, and any other scope says it is one (2026-11-11)."""
+    ctx = api.resolve(str(tmp_path))
+    mixed = api.create_arc(ctx, "Any", "", "mixed", author="ada").id
+    items = api.create_arc(ctx, "Items", "", "item", author="ada").id
+    build_page(ctx, author="ada")
+    await user.open("/arcs")
+    assert [e.text for e in user.find(marker="arc-scope").elements] == ["scope: item"]
+    await user.open(f"/arc?id={items}")
+    await user.should_see("scope: item")
+    await user.open(f"/arc?id={mixed}")
+    await user.should_not_see(marker="arc-scope")
+
+
 async def test_an_arc_page_unarchives_and_describes_its_arc(user: User, repo, tmp_path):
     """The user, 2026-10-30: Unarchive where Archive sits, and a description
     field with Save beside rename."""
@@ -1949,6 +2061,22 @@ async def test_targets_draws_a_page_of_cards_and_names_the_rest(user: User, repo
     await user.should_not_see(marker="show-all")
 
 
+async def test_a_commit_page_counts_a_files_entries_with_their_noun(user: User, repo, tmp_path):
+    """A file with open entries read "2 · 1 open", without the noun every
+    other row has (a browser agent's review, 2026-11-11). As the Docs page."""
+    (repo / "a.py").write_text("x\n")
+    sha = _commit_all(repo, "one file")
+    (tmp_path / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n')
+    ctx = api.resolve(str(tmp_path))
+    for kind in ("task", "note"):
+        api.add(ctx, {"kind": kind, "target": {"type": "file", "name": "a.py"}, "body": kind},
+                author="ada")
+    build_page(ctx, author="ada")
+    await user.open(f"/object?type=commit&name={sha}")
+    (n,) = user.find(marker="commit-file-entries").elements
+    assert " ".join(c.text for c in n.default_slot.children) == "2 entries · 1 open"
+
+
 async def test_an_objects_page_draws_a_page_of_entries_and_files_and_names_the_rest(
         user: User, repo, tmp_path, monkeypatch):
     """/object drew every entry, and a commit's page every file: 2,000 cards
@@ -2117,11 +2245,12 @@ async def test_the_top_bar_ends_in_the_pages_title(user: User, ctx_with_notes):
     assert [c.text for c in home.default_slot.children if isinstance(c, ui.label)] == ["Summary"]
 
 
-async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_path,
+async def test_docs_lists_the_docs_entries_are_on(user: User, repo, tmp_path,
                                                          monkeypatch):
     """The user, 2026-10-16: "add Docs below Arcs in the sidebar and show all
     the documents we know about". Every markdown file an entry is on or
-    cites: the repo's, then the store's docs/, the most named first, each with
+    cites, and a store doc of any kind (2026-11-11): the repo's, then the
+    store's docs/, the most named first, each with
     its entries and the open ones among them, and a read button where the
     viewer can show it; then those no entry names, but for an ignored one
     (the user, 2026-10-27). Past BOARD_ROWS, a link shows them all."""
@@ -2134,10 +2263,12 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
     (tmp_path / "docs").mkdir(exist_ok=True)
     (tmp_path / "docs" / "plan.md").write_text("# plan\n")
     (tmp_path / "docs" / "loose.md").write_text("# loose\n")
+    (tmp_path / "docs" / "run.py").write_text("print(1)\n")      # a doc, not markdown
     for kind, typ, name, refs in (("task", "item", "README.md", []),
                                   ("note", "item", "x", [("item", "README.md")]),
                                   ("task", "item", "gone.md", []),
                                   ("note", "doc", "plan.md", []),
+                                  ("note", "doc", "run.py", []),
                                   ("task", "item", "x.py", [])):
         api.add(ctx, {"kind": kind, "target": {"type": typ, "name": name}, "body": "about it",
                       "refs": [{"type": t, "name": n} for t, n in refs]}, author="ada")
@@ -2145,8 +2276,8 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
     await user.open("/")
     await user.should_see(marker="place-docs")
     await user.open("/docs")
-    await user.should_see("3 markdown files that entries name, the most named first; "
-                          "then 2 that none do")
+    await user.should_see("4 docs with entries on them, the most first; "
+                          "then 2 markdown files with none")
     got = {}
     for board in ("docs-repo", "docs-store"):
         with user.scope(marker=board):
@@ -2157,11 +2288,12 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
             # an ellipsis cuts a long name at 375 px: each name is its tip there
             assert all(a.props["data-tip-cut"] == a.text for a in links)
             got[board + " read"] = len(user.find(marker="file-open").elements)
-    assert got == {"docs-repo": [("item: README.md", "2 · 1 open"), ("item: gone.md", "1 · 1 open"),
-                                 ("sub/Guide.MD", "0 entries")],
+    assert got == {"docs-repo": [("item: README.md", "2 entries · 1 open"),
+                                 ("item: gone.md", "1 entry · 1 open"), ("sub/Guide.MD", "0 entries")],
                    "docs-repo read": 2,
-                   "docs-store": [("plan.md", "1 entry"), ("loose.md", "0 entries")],
-                   "docs-store read": 2}
+                   "docs-store": [("plan.md", "1 entry"), ("run.py", "1 entry"),
+                                  ("loose.md", "0 entries")],
+                   "docs-store read": 3}
     # Each icon is named for the file it reads: all were "read" (the GUI review, 2026-11-07).
     names = sorted(b.props.get("aria-label", "") for b in user.find(marker="file-open").elements)
     assert names and all(n.startswith("read ") and n != "read " for n in names), names
@@ -2174,12 +2306,12 @@ async def test_docs_lists_the_markdown_files_entries_name(user: User, repo, tmp_
     past = lambda: sum("sb-past" in e.classes for e in user.find(marker="doc-row").elements)  # noqa: E731
     await user.open("/docs")
     with user.scope(marker="docs-store"):
-        assert (len(user.find(marker="doc-link").elements), past()) == (4, 2)
+        assert (len(user.find(marker="doc-link").elements), past()) == (5, 3)
         (more,) = user.find(marker="docs-more").elements
-        assert (more.text, more.props["href"]) == ("+2 more", "/docs?all=1")
+        assert (more.text, more.props["href"]) == ("+3 more", "/docs?all=1")
     await user.open("/docs?all=1")
     with user.scope(marker="docs-store"):
-        assert (len(user.find(marker="doc-link").elements), past()) == (4, 0)
+        assert (len(user.find(marker="doc-link").elements), past()) == (5, 0)
         await user.should_not_see(marker="docs-more")
 
 
@@ -2400,7 +2532,8 @@ async def test_the_sidebar_lists_the_kinds_with_no_status_under_records(
 
 def test_the_viewer_reads_only_text_it_knows_inside_the_checkout(repo, tmp_path):
     """A target name is typed text: the viewer must not read through it. It
-    shows markdown, and a file pygments names a language for."""
+    shows markdown, a file pygments names a language for, and as plain text a
+    name mimetypes calls neither binary nor packed (`.env`, `LICENSE`, a log)."""
     from symbion.gui.notes import view_path
     ctx = api.resolve(str(tmp_path))
     (repo / "docs").mkdir()
@@ -2408,10 +2541,13 @@ def test_the_viewer_reads_only_text_it_knows_inside_the_checkout(repo, tmp_path)
     (repo / "x.py").write_text("x = 1")
     (repo / "Makefile").write_text("all:")
     (repo / "logo.png").write_bytes(b"\x89PNG")
+    (repo / "notes.txt.gz").write_bytes(b"\x1f\x8b")
     (tmp_path / "out.md").write_text("outside")
-    for name in ("docs/a.md", "x.py", "Makefile"):
+    for name in (".env", "LICENSE", ".gitignore", "run.log"):
+        (repo / name).write_text("A=1")
+    for name in ("docs/a.md", "x.py", "Makefile", ".env", "LICENSE", ".gitignore", "run.log"):
         assert view_path(ctx, name) == ((repo / name).resolve(), None), name
-    for name in ("../out.md", str(tmp_path / "out.md"), "logo.png",
+    for name in ("../out.md", str(tmp_path / "out.md"), "logo.png", "notes.txt.gz",
                  "gone.md", "docs", None):
         assert view_path(ctx, name) is None, name
 
@@ -2437,6 +2573,19 @@ def test_the_viewer_refuses_symlinks_outside_the_checkout(repo, tmp_path, symlin
     (tmp_path / "out.md").write_text("outside")
     symlink(repo / "link.md", tmp_path / "out.md")
     assert view_path(ctx, "link.md") is None
+
+
+async def test_a_file_page_reads_a_file_pygments_cannot_name(user: User, repo, tmp_path):
+    """The user, 2026-11-11: the `.env` page drew show in Finder and open in
+    VS Code, and no way to read it there. It reads as plain text."""
+    (repo / ".env").write_text("TOKEN=abc\n")
+    ctx = api.resolve(str(tmp_path))
+    build_page(ctx, author="ada")
+    await user.open("/object?type=file&name=.env")
+    user.find(marker="file-open").click()
+    await user.should_see(marker="file-view", retries=40)
+    (view,) = user.find(marker="file-view").elements
+    assert "TOKEN=abc" in view.content
 
 
 async def test_a_markdown_target_opens_in_a_dialog(user: User, repo, tmp_path):
@@ -3080,7 +3229,7 @@ async def test_targets_page_boards_each_target_open_work_first(user: User, repo,
     add("bug", "widget", "open body")
     add("task", "other", "ref body", refs=[{"type": "item", "name": "widget"},
                                             {"type": "item", "name": "elsewhere"}])
-    sha = api.add(ctx, {"kind": "note", "target": {"type": "commit", "name": "HEAD"}},
+    sha = api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "commit", "name": "HEAD"}},
                   author="ada").target.name
     add("note", "quiet", "quiet body")     # newest, yet after the open ones
     build_page(ctx, author="ada")

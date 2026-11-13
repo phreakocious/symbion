@@ -12,6 +12,7 @@ import hashlib
 import html
 import itertools
 import logging
+import mimetypes
 import os
 import re
 import subprocess
@@ -468,12 +469,10 @@ def snippet(body: str, words, n: int = summ.BODY_CHARS) -> str:
     low = [w.lower() for w in words]
     if not low or any(w in head.lower() for w in low):
         return head
-    text = summ.flatten(body)
-    at = min((i for i in (text.lower().find(w) for w in low) if i >= 0), default=-1)
-    if at < 0:                       # the hit is in the target, a ref or the verdict
+    rx = re.compile("|".join(map(re.escape, low)), re.I)
+    if not rx.search(body):          # the hit is in the target, a ref or the verdict
         return head
-    start = text.rfind(" ", 0, max(at - n // 4, 0)) + 1
-    return "…" + summ.clip(text[start:], n)
+    return summ.excerpt(summ.flatten(body), n, rx)
 
 
 def marked(text: str, words) -> str:
@@ -484,6 +483,21 @@ def marked(text: str, words) -> str:
                                    sorted(set(words), key=len, reverse=True)) + ")", re.I)
     return "".join(f"<mark>{html.escape(p)}</mark>" if i % 2 else html.escape(p)
                    for i, p in enumerate(rx.split(text)))
+
+
+_TICKS = re.compile(r"(`[^`\n]+`)")
+
+
+def preview(text: str, words) -> str:
+    """A clipped body as `marked` HTML, with each `code` span as code and
+    each id on one line: it broke at its hyphen, and the full body showed
+    the code its clip printed with backticks (a browser agent's review,
+    2026-11-11). A span the clip cut keeps its backtick."""
+    def ids(p):
+        return "".join(f'<span class="sb-nobr">{marked(q, words)}</span>' if i % 2
+                       else marked(q, words) for i, q in enumerate(summ._CITE.split(p)))
+    return "".join(f"<code>{ids(p[1:-1])}</code>" if i % 2 else ids(p)
+                   for i, p in enumerate(_TICKS.split(text)))
 
 
 def heading(level: int, text: str = "") -> TextElement:
@@ -538,8 +552,8 @@ def _lexer(filename: str):
 
 
 def view_path(ctx, name, ttype=None):
-    """Where the viewer reads `name`, when it shows its kind (markdown, or a
-    file pygments names a language for): (the checkout's file, None), or
+    """Where the viewer reads `name`, when it shows its kind (`_viewable`):
+    (the checkout's file, None), or
     (None, branch) for a file only the default branch holds; else None. A
     ref to a .tf file on main had no button while another branch was checked
     out (the user, 2026-10-15). A target name is typed text, so the file
@@ -572,7 +586,14 @@ def fenced(text: str, filename: str) -> str:
 
 
 def _viewable(filename: str) -> bool:
-    return filename.lower().endswith(".md") or _lexer(filename) is not None
+    """Markdown, a file pygments names a language for, or else plain text
+    unless mimetypes calls the name binary or packed: `.env` and `LICENSE`
+    had controls that open them elsewhere and no read (the user, 2026-11-11).
+    A name nothing knows reads as text, and the click refuses a binary one."""
+    if filename.lower().endswith(".md") or _lexer(filename) is not None:
+        return True
+    kind, packed = mimetypes.guess_type(filename)
+    return packed is None and (kind is None or kind.startswith("text/"))
 
 
 # ponytail: the whole file in one dialog; page it if a large one is slow.
@@ -1096,9 +1117,11 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
             for i, o in enumerate(n.options or ())]})
     elif n.options:
         # One line, the CLI's: three phrases parted by gaps alone read as one run
-        # of words in a browser shot (2026-10-17).
+        # of words in a browser shot (2026-10-17). The pick, once there is one:
+        # on a clipped card the answer below was out of sight (the user, 2026-11-11).
+        pick = summ.picked(n, seen.by_id if seen else None)
         main.append({"k": "options", "m": "options",
-                     "t": f"options: {summ.options_line(n.options)}"})
+                     "t": f"answered: {pick}" if pick else f"options: {summ.options_line(n.options)}"})
     foot, hover, views = _card_foot(ctx, n, status, narrow, show_target, git_head, since)
     card = {"main": main, "foot": foot, "by": {"t": n.author, "h": narrow(author=n.author)},
             "age": {"t": ago(n.created_at), "tip": S.shown(n.created_at)},
@@ -1264,8 +1287,8 @@ def _card_main(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
         if text != summ.flatten(n.body):
             part["h"] = href(id=n.id)
             part["m"].append("note-full")
+        part["html"] = preview(text, hit)
         if hit:
-            part["html"] = marked(text, hit)
             part["m"].append("note-snippet")
         main.append(part)
     elif diff_to and edited(n.body, diff_to.body):
@@ -1329,8 +1352,12 @@ def _card_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None):
         t = n.target
         chip = {"pair": True}
         if not bare(n):             # else the headline says it
-            chip |= {"t": "project", "h": href(id=n.id)} if t.type == "project" or not t.name \
-                else {"t": f"{t.type}: {t.name}", "h": target_href(t.type, t.name)}
+            # A project has no object page: its chip filters by it, as a kind's
+            # does. It linked to the entry itself, which the id already does.
+            # The label is the CLI's, as a ref chip's (both, 2026-11-11).
+            chip |= {"t": "project", "h": narrow(type="project")} \
+                if t.type == "project" or not t.name \
+                else {"t": summ.ref_label(t), "h": target_href(t.type, t.name)}
             chip |= {"c": "sb-chip sb-target", "m": "note-target"}
         foot.append(pair(chip, t.name, t.type))
     if since:
@@ -1732,6 +1759,10 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                                   # unchanged, the tip's, unchecked: an entry in a gone arc saves
                                   **({"arc_id": arc_v} if arc_v != n.arc_id else {}),
                                   **verdict, **closing, **dated, **on, **kinded)
+            except S.NoBody:
+                ui.notify("this edit leaves the entry with no text: write some, or cancel",
+                          type="warning")
+                return
             except (ValueError, catalog.CatalogError) as e:    # a closed catalog's refusal
                 ui.notify(str(e), type="negative")
                 return
@@ -2032,9 +2063,6 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
             named, cleaned = api.harvest_kind(body.value or "", kinds)
             kind.value = named or kind.value
             harvested, cleaned = api.harvest_hashtags(cleaned)
-            if not cleaned and not kinds[kind.value].verdict:   # `!task` alone says nothing
-                ui.notify("empty entry", type="warning")
-                return
             target = picked_target(on_type, on_name)
             if target is None:
                 return
@@ -2053,6 +2081,9 @@ def add_form(ctx, target_type, target_name, refresh, *, author: str,
                 return
             try:
                 added = api.add(ctx, row, author=author)
+            except S.NoBody:                                # `!task` alone says nothing
+                ui.notify("empty entry", type="warning")
+                return
             except (ValueError, catalog.CatalogError) as e:  # ambiguous, closed, bad ref type
                 ui.notify(str(e), type="negative")
                 return

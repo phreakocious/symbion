@@ -177,7 +177,7 @@ async def test_ticking_a_prediction_opens_the_dialog_and_saving_a_result_resolve
     (tmp_path / "symbion.toml").write_text(PREREG)
     ctx = api.resolve(str(tmp_path))
     act = api.create_arc(ctx, "camp", "d", "item", author="ada")
-    p = api.add(ctx, {"kind": "prediction", "target": {"type": "item", "name": "sweep"},
+    p = api.add(ctx, {"kind": "prediction", "checked": "pytest", "target": {"type": "item", "name": "sweep"},
                       "arc_id": act.id}, author="ada")
 
     @ui.page("/t")
@@ -213,7 +213,7 @@ async def test_seed_all_is_a_sweep_that_never_runs_the_resolver(user: User, repo
     s = reading_store(tmp_path, counter=True)
     ctx = api.resolve(str(s))
     for f in ("40.40", "44.00"):
-        api.add(ctx, {"kind": "note", "target": {"type": "reading", "name": f}}, author="ada")
+        api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "reading", "name": f}}, author="ada")
     act = api.create_arc(ctx, "camp", "d", "reading", author="ada")
     before = calls(s)
     build_page(ctx, author="ada")
@@ -808,7 +808,7 @@ async def test_a_verdict_box_dropped_on_done_opens_the_dialog(user: User, repo, 
     (tmp_path / "symbion.toml").write_text(PREREG)
     ctx = api.resolve(str(tmp_path))
     act = api.create_arc(ctx, "camp", "d", "item", author="ada")
-    p = api.add(ctx, {"kind": "prediction", "target": {"type": "item", "name": "sweep"},
+    p = api.add(ctx, {"kind": "prediction", "checked": "pytest", "target": {"type": "item", "name": "sweep"},
                       "arc_id": act.id}, author="ada")
     build_page(ctx, author="ada")
     await _board(user, act)

@@ -146,14 +146,15 @@ def resolve(dir_value=None, follow_owner=True) -> Ctx:
 
 
 # ---- author resolution ----
-def _git_user_name() -> str:
+def _git_user_name(cwd=None) -> str:
     """Isolated so both author rules (and their tests) can vary the identity
-    without spawning git."""
+    without spawning git. `cwd` is the repo whose config answers."""
     # Keep this `subprocess.run` reached through the module: tests/test_cli.py
     # patches `cli.subprocess.run`, which is the same module object
     # only while this file says `import subprocess`. A `from subprocess import
     # run` edit here silently unhooks that patch point.
-    r = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True, encoding="utf-8")
+    r = subprocess.run(["git", "config", "user.name"], cwd=cwd, capture_output=True, text=True,
+                       encoding="utf-8")
     return r.stdout.strip()
 
 
@@ -187,18 +188,22 @@ def shell_author() -> str:
     return _git_user_name() or "user"
 
 
-def gui_author() -> str:
-    """The GUI rule: SYMBION_AUTHOR > git user.name > "user", the agent
+def gui_author(store_dir=None) -> str:
+    """The GUI rule: SYMBION_AUTHOR > the store's git user.name > "user", the agent
     markers (CLAUDECODE, CODEX_THREAD_ID, HERMES_AGENT,
     ANTIGRAVITY_CONVERSATION_ID, AI_AGENT) deliberately NOT consulted.
 
     The explorer is the human's interface, so the identity is a property of
     the surface, not of the environment. `symbion serve` is launched from the
     agent's shell and inherits CLAUDECODE=1; without this, every human click
-    is stored as author="claude" in an append-only file."""
+    is stored as author="claude" in an append-only file. The store's config,
+    not the project's: a project that commits as its agent by design set its
+    user.name to the agent's, and the person's answers in the GUI took it
+    (dogfood, 2026-11-10). The store's is the clone's identity, a shared
+    store's side."""
     if os.environ.get("SYMBION_AUTHOR"):
         return os.environ["SYMBION_AUTHOR"]
-    return _git_user_name() or "user"
+    return _git_user_name(store_dir) or "user"
 
 
 # ---- name canonicalization at the I/O boundary ----
@@ -236,10 +241,15 @@ _ROW_ID = re.compile(r"(?:…|\.\.\.)?(?:\d{8}-)?(?:\d{6}-)?\d{6}-[0-9a-f]{3}")
 def kind_as_type(typ, kinds, what: str) -> str:
     """The tail of a refusal for a kind typed as a ref or target type:
     `--ref check:<id>` meant a row (reported 2026-09-30). Rows join
-    through the object they share, and an id in the body is the pointer."""
-    if typ not in kinds:
+    through the object they share, and an id in the body is the pointer. A
+    bare id, `--ref 123456-abc`, meant the same (2026-11-03, 11-07)."""
+    if typ in kinds:
+        said = f"{typ!r} is a kind"
+    elif _ROW_ID.fullmatch(typ):
+        said = f"{typ!r} is an entry's id"
+    else:
         return ""
-    return (f"; {typ!r} is a kind: a {what} names an object, never an entry. Give this "
+    return (f"; {said}: a {what} names an object, never an entry. Give this "
             f"entry that entry's target, and cite its id in the body")
 
 
@@ -277,9 +287,13 @@ def check_refs(target_types, refs, kinds=()) -> list[dict]:
         if not isinstance(r, dict) or not isinstance(r.get("type"), str):
             raise ValueError(f"each ref is {{type, name}} or TYPE:NAME, not {r!r}")
         if r["type"] not in target_types:
+            # `--ref tools/x.py`: the whole path read as a type (2026-11-11).
+            path = r.get("name") is None and "file" in target_types \
+                and any(c in r["type"] for c in "/.")
             raise ValueError(f"unknown ref type {r['type']!r} (choose from "
                              f"{', '.join(sorted(target_types))})"
-                             + kind_as_type(r["type"], kinds, "ref"))
+                             + kind_as_type(r["type"], kinds, "ref")
+                             + (f"; a path takes its type: --ref file:{r['type']}" if path else ""))
         check_name(r["type"], r.get("name"))
         out.append({"type": r["type"], "name": catalog.nfc(r.get("name"))})
     return out
@@ -685,6 +699,19 @@ def fields_from_row(ctx: Ctx, row: dict, author: str) -> dict:
         check_measurements(row["measurements"])
     options = _stripped_options(row["options"]) if row.get("options") is not None else None
     check_arc_targets(ctx, [t, *refs])
+    # A note about a bodiless add went where `2>/dev/null` sent it (dogfood,
+    # 2026-11-10): it is refused.
+    if store.says_nothing(row):
+        raise store.NoBody("no body: give --body TEXT or --body-file PATH; only a run's record "
+                       "(--checked, --result, --measure) or an arc's box (--arc-id) may "
+                       "go without one")
+    # Only the add sets a pre-registration's --checked (supersede refuses it),
+    # and a note after the write reached an `add && commit` too late (dogfood,
+    # 2026-11-11): it is refused.
+    if spec.status and spec.verdict and not (row.get("checked") or "").strip():
+        raise ValueError(f"kind {row['kind']!r} needs --checked: it is a pre-registration, "
+                         f"so --checked names the run that will judge it, and only its add "
+                         f"can set it")
     later = bool(ctx.cfg.repos) and spec.verdict and not external
     return dict(
         kind=row["kind"],
@@ -956,8 +983,8 @@ def kind_losses(n: store.Note, kind: str, spec) -> list[str]:
 
 
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
-              add_refs=None, prepend_body: str | None = None, add_measurements=None,
-              keep_refs: bool = False, external: bool = False, replace_body=None,
+              add_refs=None, rm_refs=None, prepend_body: str | None = None,
+              add_measurements=None, external: bool = False, replace_body=None,
               **fields) -> store.Note:
     """Target, provenance and target_blob are INHERITED from the superseded row
     and never re-resolved (a tag added later is no re-reading of the file), so
@@ -987,8 +1014,7 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
     second landing as a stamped correction to an already-resolved row -- the
     same race shape as `retag`, and equally no data loss.
 
-    `keep_refs` refuses `refs` that drop one the entry holds
-    (store.RefsDropped): the CLI's `--ref`, read as adding one."""
+    `refs` replaces the entry's refs; `add_refs` and `rm_refs` edit them."""
     for key in ("provenance", "target_blob"):
         if key in fields:
             raise ValueError(
@@ -1000,6 +1026,8 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
         fields["refs"] = check_refs(ctx.input_types, fields["refs"], ctx.kinds)
     if add_refs:
         add_refs = check_refs(ctx.input_types, add_refs, ctx.kinds)
+    if rm_refs:
+        rm_refs = check_refs(ctx.input_types, rm_refs, ctx.kinds)
     check_arc_targets(ctx, [*([fields["target"]] if "target" in fields else ()),
                             *(fields.get("refs") or ()), *(add_refs or ())])
     check_arc(ctx, fields.get("arc_id"))
@@ -1027,10 +1055,10 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
                                                   f["target"]["name"])
         return f
     return store.supersede(ctx.store_dir, note_id, author=author, append_body=append_body,
-                           add_refs=add_refs, prepend_body=prepend_body,
+                           add_refs=add_refs, rm_refs=rm_refs, prepend_body=prepend_body,
                            replace_body=replace_body,
                            add_measurements=add_measurements, canonicalize=canonicalize,
-                           target_types=ctx.target_types, keep_refs=keep_refs, **fields)
+                           target_types=ctx.target_types, **fields)
 
 
 def seed(ctx: Ctx, arc_id: str, target_type: str, names=None, *, author: str,

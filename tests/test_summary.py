@@ -743,9 +743,16 @@ def test_summary_on_an_empty_store_names_the_first_verb(tmp_path):
     assert text.splitlines()[-1] == "  " + summary.FIRST_CONTACT
     assert "symbion add task --target project" in summary.FIRST_CONTACT \
         and "loads the symbion skill" in summary.FIRST_CONTACT
+    # Where an agent's skill is known, the empty store names it too: the
+    # parenthesis alone never said where (an agy session, 2026-11-11).
+    d = summary.summary(tmp_path, cfg) | {"skill": "~/x/SKILL.md"}
+    assert summary.render_summary(d).splitlines()[-2:] == [
+        "  " + summary.FIRST_VERB,
+        "  before a write: load the symbion skill (~/x/SKILL.md); "
+        "`symbion schema` lists this store's kinds"]
     store.add(tmp_path, kind="task", target={"type": "project", "name": None}, body="x")
-    assert "no notes yet" not in summary.render_summary(summary.summary(tmp_path, cfg))
-    assert "no notes yet" not in summary.render_summary(summary.empty_summary())
+    assert summary.FIRST_VERB not in summary.render_summary(summary.summary(tmp_path, cfg))
+    assert summary.FIRST_VERB not in summary.render_summary(summary.empty_summary())
 
 
 def test_a_starred_row_is_not_listed_again_in_the_heads(tmp_path):
@@ -1200,7 +1207,7 @@ def test_untouched_names_the_oldest_by_active_days_up_to_its_cap(tmp_path):
     assert len(summary.summary(tmp_path, cfg, full=True)["untouched"]) == len(ids)
     text = summary.render_summary(data)
     assert f"{len(ids)} open entries untouched for 5 or more active days (days anyone wrote an " \
-           f"entry here), the oldest {summary.UNTOUCHED_CAP} below: after" in text, \
+           f"entry here), the oldest {summary.UNTOUCHED_CAP} below: once" in text, \
         "`check each` is the rows printed, not the count"
 
 
@@ -1209,8 +1216,8 @@ def test_untouched_renders_its_ways_out_with_the_stores_parked_kind(tmp_path):
     t = _untouched_store(tmp_path, summary.UNTOUCHED_DAYS)
     text = summary.render_summary(summary.summary(tmp_path, cfg))
     assert "1 open entry untouched for 5 or more active days (days anyone wrote an entry " \
-           "here): after the user's first request, check it against the repo and the store, " \
-           "then suggest a plan" in text, text
+           "here): once the user's first task is done, or at the wrap, check it against the repo " \
+           "and the store, then suggest a plan" in text, text
     assert "symbion supersede ID --kind idea --due DATE" in text
     # still valid but waiting on something: a resolved "keep these" left them
     # untouched, and the summary asked again each session (2026-10-26)
@@ -1334,3 +1341,28 @@ def test_summary_arc_line_without_phases_is_unchanged(tmp_path):
     _phased(tmp_path, [None, None])               # all in the first phase: no counts either
     d = summary.summary(tmp_path, cfg)
     assert next(r for r in d["arcs"] if r["name"] == "board")["phases"] == []
+
+
+def test_picked_is_the_one_option_on_a_line_of_its_own_below_the_question():
+    from types import SimpleNamespace as Q
+    opts = ["Leave it", "Move it"]
+
+    def pick(body, options=opts, asked="Which?"):
+        """`body` as the head of a question first written as `asked`."""
+        first = Q(id="a", supersedes=None, body=asked, options=options)
+        head = Q(id="b", supersedes="a", body=body, options=options)
+        return summary.picked(head, {"a": first, "b": head})
+    assert pick("Which?\n\n-- below --\nmove it.") == "Move it"
+    assert pick("Leave it\nor not?", asked="Leave it") is None    # the question's own first line
+    assert pick("Which?\nLeave it\nMove it") is None              # two: no pick
+    assert pick("Which?\nMove it to the hub") is None
+    assert pick("Which?\nMove it", options=None) is None
+    # A default the question stated on a line of its own read as its answer
+    # (audit, 2026-11-12); an answer that repeats it is one
+    asked = "Ship 0.16 today, or hold for the docs?\n\nMy default, if no answer by Friday:\nhold"
+    assert pick(asked, ["ship", "hold"], asked) is None
+    assert pick(asked + "\n\nhold.", ["ship", "hold"], asked) == "hold"
+    assert pick(asked + "\n\nship", ["ship", "hold"], asked) == "ship"   # not two
+    first = Q(id="a", supersedes=None, body=asked, options=["ship", "hold"])
+    assert summary.picked(first, {"a": first}) is None
+    assert summary.picked(Q(id="b", supersedes="a", body="Which?\nMove it", options=opts), None) is None

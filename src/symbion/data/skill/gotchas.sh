@@ -204,8 +204,10 @@ names() {
     # No root (a list from before roots, or a repo not on this machine): any
     # dir, as before.
     case "$pre" in */"$3"/) return 0 ;; */) [ -z "$3" ] && return 0 ;; *) continue ;; esac
-    # The dir: a JSON string's whole tail (a path with a blank), else a word's.
-    for p in "${pre##*\"}" "${pre##*[!A-Za-z0-9._~/@+:-]}"; do
+    # The dir: a JSON string's, a single quote's or a line's whole tail (a path
+    # with a blank), else a word's. The Codex hook read all four, this two
+    # (audit, 2026-11-12).
+    for p in "${pre##*\"}" "${pre##*\'}" "${pre##*\\n}" "${pre##*[!A-Za-z0-9._~/@+:-]}"; do
       [ -f "${p}.git" ] || continue
       g=; { IFS= read -r g < "${p}.git"; } 2>/dev/null
       case "$g" in "gitdir: "*/"$3/.git/worktrees/"*) return 0 ;; esac
@@ -221,6 +223,10 @@ seen=$(cat "$gate" 2>/dev/null)
 # nothing (the user's call, 2026-11-09).
 shown=
 [ "$gate" = "$mark.seen" ] || shown=$(cat "$mark.seen" 2>/dev/null)
+# The words every row shares, said once before the call's first row; and from
+# it, `symbion` or `symbion --dir D` for the ids line below.
+hdr=$(cat "$list.head" 2>/dev/null)
+sym=${hdr%' supersede '*}; sym=${sym##*\`}; sym=${sym:-symbion}
 out= tails= n=0
 while IFS="$tab" read -r id name text root; do
   names "$call" "$name" "$root" || continue
@@ -229,11 +235,10 @@ while IFS="$tab" read -r id name text root; do
   [ "$gate" = "$mark.seen" ] || printf '%s\n' "$id" >> "$gate"
   case "$nl$shown$nl" in
     *"$nl$id$nl"*)
-      tails="$tails ${id#"${id%??????????}"}" n=$((n + 1))
-      # `symbion`, or `symbion --dir D`, from the row's own retire hint.
-      sym=${text%' supersede '*}; sym=${sym##*\`} ;;
+      tails="$tails ${id#"${id%??????????}"}" n=$((n + 1)) ;;
     *)
       printf '%s\n' "$id" >> "$mark.seen"
+      [ -n "$out" ] || out=$hdr
       out="$out${out:+\\n}$text" ;;
   esac
 done < "$list"

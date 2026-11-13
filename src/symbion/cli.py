@@ -28,7 +28,7 @@ import time
 import tomllib
 from collections import Counter
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import api, catalog, config, gitref, kinds as K, merge, store
@@ -65,6 +65,8 @@ _AGY_PLUGIN = Path(".gemini/config/plugins/symbion")   # under $HOME, where agy 
 _AGY_SKILL = _AGY_PLUGIN / "skills/symbion/SKILL.md"
 # On Pi the repo is the package: it carries the skill and the hooks (spec 2026-11-02).
 PI_PACKAGE_INSTALL = "pi install git:github.com/phreakocious/symbion"
+# On Hermes the plugin dir carries the hooks; Hermes clones it (spec 2026-11-11).
+HERMES_PLUGIN_INSTALL = "hermes plugins install phreakocious/symbion#plugin --enable"
 # Codex runs a hook in the session's cwd (its hooks docs, 2026-10-02). The
 # project is named so a CLAUDE_PROJECT_DIR inherited from a Claude Code parent
 # cannot pick another one, and the author so `summary` knows its reader:
@@ -202,11 +204,20 @@ def _claude_plugin_notes(merge: bool) -> bool:
     """On Claude Code the plugin carries the skill and the hooks (spec
     2026-10-30), so init wires nothing there. An install from before the plugin
     keeps working beside it, doubled: each old piece is named with how to
-    remove it, and none is removed, since settings.json is the user's. Nothing
-    here is a change init makes, so it returns False."""
+    remove it, and none is removed, since settings.json is the user's. With the
+    plugin enabled, the note on auto-update for the symbion marketplace says that
+    auto-update brings plugin updates and the plugin's hooks bring the matching
+    symbion with each (spec 2026-11-11). Nothing here is a change init makes, so
+    it returns False."""
     if not _claude_plugin_enabled():
         print(f"note: on Claude Code the symbion plugin carries the skill and the hooks: "
               f"{PLUGIN_INSTALL}, then /symbion:setup")
+    else:
+        # ponytail: init cannot read whether auto-update is on, so every run says it;
+        # read Claude Code's state if one is found.
+        print("note: turn on auto-update for the symbion marketplace, so plugin updates arrive "
+              "on their own and each brings the matching symbion: /plugin, Marketplaces, symbion, "
+              "Enable auto-update")
     if merge:
         print("note: --merge-hook merges nothing for Claude Code, whose hooks come with the "
               "plugin")
@@ -232,6 +243,12 @@ def _claude_plugin_notes(merge: bool) -> bool:
     return False
 
 
+def _hermes_plugin_installed() -> bool:
+    """Whether the profile's plugins/ holds symbion's plugin. Whether it is
+    enabled lives in config.yaml, which the standard library cannot read."""
+    return (_hermes_home() / "plugins/symbion/plugin.yaml").exists()
+
+
 def _pi_package_installed() -> bool:
     """Whether Pi's settings list a package whose source names symbion: the
     git source, or a local path to a checkout while one is developed. Pi
@@ -247,6 +264,37 @@ def _pi_package_installed() -> bool:
         except (OSError, ValueError, KeyError, TypeError):
             pass
     return False
+
+
+def _agy_plugin_stale(copy: Path, here: Path = Path(__file__).parent) -> str | None:
+    """A note when agy's plugin at `copy` is not this symbion's, else None.
+    agy installs a copy, which no upgrade of symbion touches. A checkout's
+    version spans many commits, so there each file git tracks in plugin/ is
+    compared as the work tree has it; an install compares versions."""
+    repo = here.parents[1]
+    tracked = [n for n in gitref._git(repo, "ls-files", "-z", "--", "plugin").stdout.split("\0")
+               if n and (repo / n).is_file()]
+    if tracked:
+        def same(n):
+            theirs = copy / n.removeprefix("plugin/")
+            return theirs.is_file() and theirs.read_bytes() == (repo / n).read_bytes()
+        differ = [n.removeprefix("plugin/") for n in tracked if not same(n)]
+        if not differ:
+            return None
+        return (f"the Antigravity plugin at {copy} differs from {repo / 'plugin'} in "
+                f"{', '.join(differ)}: run `agy plugin install {shlex.quote(str(repo / 'plugin'))}`")
+    try:
+        theirs = json.loads((copy / ".antigravity-plugin" / "plugin.json")
+                            .read_text(encoding="utf-8"))["version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        theirs = "unversioned"
+    mine = metadata.version("symbion")
+    # The release alone: a dev build of 0.15.2 ships with the 0.15.2 plugin.
+    old, new = (tuple(int(p) for p in re.findall(r"\d+", str(v))[:3]) for v in (theirs, mine))
+    if old == new:
+        return None
+    fix = f"run `{AGY_PLUGIN_INSTALL}`" if old < new else "upgrade symbion"
+    return f"the Antigravity plugin at {copy} is {theirs}, and symbion is {mine}: {fix}"
 
 
 def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = False,
@@ -265,9 +313,12 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
     if agent == "antigravity":
         # A copy without the native manifest came from Claude Code's, whose
         # hook agy cannot parse (agy 1.4.12, 2026-10-30).
-        if not (Path.home() / _AGY_PLUGIN / ".antigravity-plugin" / "plugin.json").exists():
+        copy = Path.home() / _AGY_PLUGIN
+        if not (copy / ".antigravity-plugin" / "plugin.json").exists():
             print(f"note: on Antigravity the symbion plugin carries the skill and the hook: "
                   f"{AGY_PLUGIN_INSTALL}")
+        elif (stale := _agy_plugin_stale(copy)) and missing is not None:
+            missing.append(stale)
         if merge:
             print("note: --merge-hook merges nothing for Antigravity, whose hook comes with "
                   "the plugin")
@@ -316,17 +367,19 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
                 _winapi.CreateJunction(str(target), str(link))
         changed |= _act(write, "relink" if dangling else "link", f"{link} -> {target}")
     if agent == "hermes":
-        # Hermes has no hook whose output reaches the model as a summary: its
-        # on_session_start return is ignored, and pre_llm_call fires every turn
-        # and wants JSON (hermes-agent docs, 2026-10-06). init cannot see the
-        # AGENTS.md line was added, so it names it every run.
+        # The plugin's hooks bring the summary and the gotchas; Hermes installs
+        # it, since a link here would make a catalog install refuse. Without it,
+        # the AGENTS.md line asks for the summary. init cannot see that line was
+        # added, so it names it every run.
         print(f"note: this is the skill of the Hermes profile at {_hermes_home()}; for "
               f"another profile, run init again with its HERMES_HOME")
-        print("note: Hermes runs no symbion hook; for the session-start summary, add this "
-              "line to the project's AGENTS.md:\n- At the start of a session, run "
-              "`symbion summary` unless a hook already printed it.")
+        if not _hermes_plugin_installed():
+            print(f"note: on Hermes the symbion plugin carries the hooks: {HERMES_PLUGIN_INSTALL}")
+            print("note: without the plugin, for the session-start summary, add this line to "
+                  "the project's AGENTS.md:\n- At the start of a session, run "
+                  "`symbion summary` unless a hook already printed it.")
         if merge:
-            print("note: --merge-hook merges nothing for Hermes, which runs no symbion hook")
+            print("note: --merge-hook merges nothing for Hermes, whose hooks come with the plugin")
         return changed
     if foreign:
         # Each hook runs its script through the link: registered beside
@@ -352,7 +405,8 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
                   + json.dumps(_codex_gotcha_entry(link)["hooks"][0]["command"])
                   + "\ntimeout = 5")
             if missing is not None:
-                missing.append(("PreToolUse", f"add the printed TOML to {inline}"))
+                missing.append("the symbion PreToolUse hook is not registered: add the "
+                               f"printed TOML to {inline}")
         print(f"note: {trust}")
         return changed
     # Codex delivers context before the call, and its gotcha handler
@@ -414,7 +468,7 @@ def _link_user_skill(write: bool = True, agent: str = "claude", merge: bool = Fa
             print(f"{settings} does not register the symbion {event} hook. To register it, "
                   f"run `{cmd}`, or {add}")
             if missing is not None:
-                missing.append((event, cmd))
+                missing.append(f"the symbion {event} hook is not registered: run `{cmd}`")
             if not advised:
                 print(f"An agent whose edit of that file was denied does not run --merge-hook "
                       f"itself, which would go around the denial: it asks the person to run "
@@ -590,8 +644,8 @@ def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
     if not write and (changed or not missing):
         print(f"{rest} written: re-run with --yes to make these changes" if changed
               else f"{rest} to change")
-    for event, cmd in missing:
-        print(f"the symbion {event} hook is not registered: run `{cmd}`")
+    for line in missing:
+        print(line)
     return 0 if write else int(bool(changed or missing))
 
 
@@ -861,32 +915,36 @@ def _list_gotchas(ctx, sid: str, deadline: float) -> None:
              replace(n, id=f"{n.id}\t{t.name}", target=t, target_blob=None)
              for n in rows for t in _hook_targets(n, paths)}
     since = gitref.commits_since(ctx.cfg, list(asked.values()), timeout=left) if left > 0 else {}
+    # The words every row of a burst shared, said once a call: a full line was
+    # 2/3 wrapper, repeated in each of a big file's ten or more rows (2026-11-12).
+    sym = " ".join(filter(None, ["symbion", _named_store(ctx)]))
+    head = (f"symbion gotchas on what this call names (id, target, age, commits to the file "
+            f"since; `{sym} show ID` prints one whole, `{sym} supersede ID --add-tag retired` "
+            f"retires one that no longer holds):")
     for n in rows:
         tail = n.id[-10:]
-        sym = " ".join(filter(None, ["symbion", _named_store(ctx)]))
         at = n.first_written or n.created_at
         # The line is cached for the session: `6m ago` still read so 45 minutes on.
-        written = f"written {store.shown(at) if summ.age_days(at) == 0 else summ.when_added(at)}"
+        age = store.shown(at) if summ.age_days(at) == 0 else summ.when_added(at)
         if _other_side(by_id, n, side):
-            written += f" by {summ._root(by_id, n).author}"
+            age += f" by {summ._root(by_id, n).author}"
         body = summ.clip(n.body or "", summ.GOTCHA_CHARS)
-        more = f"`{sym} show {tail}` prints all of it; " if _gotcha_len(n) > summ.GOTCHA_CHARS \
-            else ""
         for t in _hook_targets(n, paths):
             # A call that named a ref read "is on <target>" alone, as if misfiled (2026-10-30).
-            ref = "" if t == n.target else f" and refers to {t.type}:{t.name}"
-            age = written
+            ref = "" if t == n.target else f", refers to {t.type}:{t.name}"
+            churn = ""
             if moved := since.get(asked[n.id, t].id):
-                age += (f"; {'the file' if t == n.target else t.name} has changed in "
-                        f"{summ._count(moved, 'commit')} since")
-            text = (f"symbion entry {tail}, tagged gotcha, is on {n.target.type}"
-                    f"{':' + n.target.name if n.target.name else ''}{ref} ({age}): {body} "
-                    f"({more}if it no longer holds: `{sym} supersede {tail} --add-tag retired`)")
+                churn = (f", {summ._count(moved, 'commit')}"
+                         f"{'' if t == n.target else ' to ' + t.name.rsplit('/', 1)[-1]} since")
+            text = (f"- {tail} on {n.target.type}{':' + n.target.name if n.target.name else ''}"
+                    f"{ref} ({age}{churn}): {body}")
             # The root's dir name: gotchas.sh matches `<root>/<name>`, so a
             # row on README.md does not fire on src/README.md.
             root = ctx.cfg.for_type(t.type).work_root
             leaf = Path(root).name if root and not re.search(_UNSAFE, Path(root).name) else ""
             lines.append(f"{n.id}\t{t.name}\t{json.dumps(text, ensure_ascii=False)[1:-1]}\t{leaf}\n")
+    # Beside the list, not a field of it: the Codex hook keeps four fields.
+    store._replace_atomically(d / f"{sid}.head", json.dumps(head, ensure_ascii=False)[1:-1])
     store._replace_atomically(d / sid, "".join(lines))
 
 
@@ -1008,6 +1066,19 @@ def _gui(store_dir):
     return r and r["url"]
 
 
+def _serve_list() -> int:
+    """`serve --list`: agents typed it to find a store's URL, and only
+    `--restart` printed the serves, by restarting them (2026-11-08)."""
+    from .gui import servers
+    rs = servers.live()
+    if not rs:
+        print("no symbion serve is running")
+    for r in rs:
+        print(f"{r['store']}: {r['url']} (pid {r['pid']}"
+              + (f", at {r['build']}" if r.get("build") else "") + ")")
+    return 0
+
+
 def _serve_all(*, restart: bool) -> int:
     """`serve --restart` and `serve --stop`: one line per serve, exit 1 if
     any did not."""
@@ -1056,7 +1127,7 @@ def _phase_of(arcs, n) -> str | None:
 def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
                 since=None, added=None, seams=(), links=(), written=None,
                 successor=None, side=None, phase=None, arc=None, last=None,
-                grep=None) -> None:
+                grep=None, by_id=None) -> None:
     """`state` is api.verdict_state's pair for a verdict row, computed by the
     caller (batched per-listing where it needs a subject lookup); `subject`
     is the commit's subject line for a commit-target note, degrading to the
@@ -1075,7 +1146,7 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
     column on a phased arc; `arc` is its Arc, for the person's line. `last` is
     summary.at_seams'. `grep` is `list --grep`'s pattern: a clipped row whose
     match no printed line shows prints the field that holds it as
-    summary.excerpt's."""
+    summary.excerpt's. `by_id` is the store's rows by id, for summary.picked."""
     # A superseded row's own status is history: printed first, `[open]`
     # read as live beside a resolved head (2026-09-28). The head's decides.
     status = store.read_status(head if head is not None else n)
@@ -1090,7 +1161,7 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
         term.print_note(n, status=status, state=state, due=due, subject=subject,
                         head=head, full=full, gui=gui, since=since, seams=seams,
                         links=links, written=written, successor=successor, side=side,
-                        phase=phase, arc=arc, last=last, grep=grep)
+                        phase=phase, arc=arc, last=last, grep=grep, by_id=by_id)
         return
     tgt = n.target.name or ""          # `project:`, the form --target takes
     if n.target.type == "commit" and subject:
@@ -1132,8 +1203,10 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
               + (f"; earlier version saved as {n.supersedes}" if n.supersedes else ""))
     chars = summ.LIST_BODY_CHARS
     tail = [a["added"] for a in summ.added_lines(added)] if added and not full else []
+    fields = summ.clipped_fields(n, by_id)
     hit = None if full or grep is None else summ.unseen(
-        n, grep, [summ.clip(v, chars) for v in summ.clipped_fields(n).values()] + tail)
+        n, grep, [summ.clip(v, chars) for k, v in fields.items()
+                  if k != "options" or "answered" not in fields] + tail, by_id)
 
     def text(field, v):
         if full:
@@ -1153,7 +1226,13 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
     if n.measurements:
         print(f"    measured: {text('measured', summ.measured(n.measurements))}")
     if n.options:
-        print(f"    options: {text('options', summ.options_line(n.options))}")
+        # The pick, as the GUI's card names it: `list` clips the body, which holds
+        # the answer (the user, 2026-11-11).
+        pick = summ.picked(n, by_id)
+        if pick:
+            print(f"    answered: {text('answered', pick)}")
+        if not pick or hit == "options":
+            print(f"    options: {text('options', summ.options_line(n.options))}")
     if n.body and full:
         # A body is markdown by contract: printed as written here, so an
         # agent reads exactly what was stored, and symbion.term renders it.
@@ -1767,14 +1846,44 @@ def _catalog_choice(legal, what, store_dir, kinds=(), as_kind=None):
     return typed
 
 
-def _target_choice(legal, store_dir, kinds=()):
+def _flag_in(argv, flag) -> str | None:
+    """`flag`'s value in `argv`, typed `--flag V` or `--flag=V`, else None."""
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(flag + "="):
+            return a[len(flag) + 1:]
+    return None
+
+
+def _on_disk(name: str) -> bool:
+    """`name` is a file from the cwd or from this checkout's root, where
+    `file:` reads a bare name."""
+    try:
+        return Path(name).is_file() or (config.work_root() / name).is_file()
+    except (OSError, ValueError, subprocess.CalledProcessError):     # no repo, no git
+        return False
+
+
+def _target_choice(legal, store_dir, kinds=(), parser=None):
     """TYPE:NAME with TYPE checked: an unknown type can hold no notes, so a
     typo would otherwise read as a target with none. A target typed without
-    its TYPE (`--target "login page"`) is shown the form."""
+    its TYPE (`--target "login page"`) is shown the form: item's, or file's
+    for a file on disk, or after `--type T` T's. `src/x.py` was shown
+    `--target item:src/x.py`, with `--type file` and without (dogfood,
+    2026-11-11). `parser`, a verb that takes --type too, offers that pair."""
     check = _catalog_choice(legal, "type", store_dir)
 
     def parse(v):
         t, colon, _ = v.partition(":")
+        typed = _flag_in(getattr(parser, "_argv", []), "--type")
+        if not colon and t not in legal and typed not in legal and "file" in legal \
+                and _on_disk(v):
+            typed = "file"
+        if not colon and t not in legal and typed in legal:
+            raise argparse.ArgumentTypeError(
+                f"needs TYPE:NAME: --target {shlex.quote(typed + ':' + v)}"
+                + (f", or --type {typed} --name {shlex.quote(v)}" if parser else ""))
         if not colon and t not in legal:
             kind = f"; {v!r} is a kind: `add {v} --target TYPE:NAME`" if v in kinds else ""
             raise argparse.ArgumentTypeError(
@@ -1844,6 +1953,15 @@ def _kind_choice(kinds, store_dir):
     return _choice(kinds, "kind", where, store_dir)
 
 
+def _kinds_choice(kinds, store_dir):
+    """`list --kind task,bug`: agents typed a comma list (2026-11-07 to
+    11-10), refused as one kind's name. Each name is checked."""
+    one = _kind_choice(kinds, store_dir)
+    parse = lambda v: ",".join(one(k) for k in v.split(","))     # noqa: E731
+    parse.choices = one.choices
+    return parse
+
+
 _EPILOG = """\
 read:
   symbion summary                    what is open in this project
@@ -1877,9 +1995,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     init_says = ("create this project's store with a starter symbion.toml, and link the "
                  "selected agent's skill and session-start hook outside it: "
                  "~/.agents/skills and $CODEX_HOME (default ~/.codex) for "
-                 "Codex, $HERMES_HOME/skills (default ~/.hermes/skills) and no hook for "
-                 "Hermes. On Claude Code and on Antigravity the symbion plugin carries both, "
-                 "and on Pi the symbion package does, "
+                 "Codex, $HERMES_HOME/skills (default ~/.hermes/skills) for Hermes, "
+                 "whose hooks come with the symbion plugin. On Claude Code and on "
+                 "Antigravity the symbion plugin carries both, and on Pi the symbion "
+                 "package does, "
                  "so init links and registers nothing there, and on Claude Code names any "
                  "it finds from before. Existing "
                  "settings are preserved; a missing hook entry is printed for you to add, "
@@ -1908,7 +2027,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     a.add_argument("--kind", default=None, type=_kind_choice(kinds, store_dir),
                    help="one of: " + ", ".join(kinds) + "; required unless --from-json")
     a.add_argument("--target", default=None, metavar="TYPE:NAME",
-                   type=_target_choice(input_types, store_dir, kinds),
+                   type=_target_choice(input_types, store_dir, kinds, a),
                    help="the same as --type TYPE --name NAME; `project` needs no name")
     a.add_argument("--type", dest="type", default=None, metavar="TYPE",
                    type=_catalog_choice(input_types, "type", store_dir, kinds,
@@ -1968,10 +2087,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="one of: " + ", ".join(sorted(input_types)))
     li.add_argument("--name", default=None, help="target name, with --type")
     li.add_argument("--target", default=None, metavar="TYPE:NAME",
-                    type=_target_choice(input_types, store_dir),
+                    type=_target_choice(input_types, store_dir, parser=li),
                     help="the same as --type TYPE --name NAME")
-    li.add_argument("--kind", default=None, type=_kind_choice(kinds, store_dir),
-                    help="only entries of this kind")
+    li.add_argument("--kind", default=None, type=_kinds_choice(kinds, store_dir),
+                    help="only entries of this kind, or of any in a comma list (task,bug)")
     # `--open`, the guess agents made most (2026-09-21..29), is _LIST_ALTS'
     li.add_argument("--status", default=None, choices=sorted(store.STATUSES),
                     help="only open, or only resolved, entries of a status kind")
@@ -2024,9 +2143,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     # Parsed only for -h: main() rewrites `show ID` to `list --id ID` first.
     # Listed so -h and the invalid-choice error name the verb, and with its
     # arguments so `show -h` documents them instead of erroring as `list --id -h`.
+    # No prefixes: the rewrite reads whole flags, and `--js` reached no handler.
     sh = sub.add_parser("show", help="entries by id; `show ID... [--json] [--all]` runs `list --id ID...`",
                         description="entries by id: `list --id ID...`; a superseded id shows "
-                                    "its chain's head, and --all that version")
+                                    "its chain's head, and --all that version", allow_abbrev=False)
     sh.add_argument("id", nargs="+")
     sh.add_argument("--json", action="store_true")
     sh.add_argument("--all", action="store_true", help="a superseded id's own version")
@@ -2108,12 +2228,12 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="add a tag to the inherited set (repeatable)")
     sp.add_argument("--rm-tag", dest="rm_tags", action="append", default=[], metavar="TAG",
                     help="remove a tag from the inherited set (repeatable)")
-    sp.add_argument("--ref", dest="refs", action="append", default=None, metavar="TYPE:NAME",
-                    help="replace the inherited refs (repeatable), refused if that drops "
-                         "one unless '' comes first (`--ref '' --ref X`); '' alone clears "
-                         "them; omit to inherit")
-    sp.add_argument("--add-ref", dest="add_refs", action="append", default=[],
-                    metavar="TYPE:NAME", help="add a ref to the inherited set (repeatable)")
+    sp.add_argument("--ref", "--add-ref", dest="refs", action="append", default=None,
+                    metavar="TYPE:NAME",
+                    help="add a ref to the inherited set (repeatable), as add's --ref does; "
+                         "'' first replaces them (`--ref '' --ref X`), and '' alone clears them")
+    sp.add_argument("--rm-ref", dest="rm_refs", action="append", default=[],
+                    metavar="TYPE:NAME", help="remove a ref from the inherited set (repeatable)")
     sp.add_argument("--target", default=None, metavar="TYPE:NAME",
                     help="move this entry to another object (`rename` moves every entry "
                          "on a name); omit to inherit")
@@ -2180,7 +2300,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                          "each writes as --author")
     sv.add_argument("--author", default=None,
                     help="identity stamped on GUI writes (default: $SYMBION_AUTHOR, "
-                         "else git user.name; never an agent's name)")
+                         "else the store's git user.name; never an agent's name)")
     sv.add_argument("--no-browser", action="store_true", help="open no browser tab")
     sv.add_argument("--read-only", action="store_true",
                     help="a public demo: every control answers with a notice, and nothing "
@@ -2194,6 +2314,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     every.add_argument("--stop", action="store_true",
                        help="stop every serve you run on this machine, as Ctrl-C does; "
                             "then exit. Needs no store")
+    every.add_argument("--list", action="store_true",
+                       help="print every serve you run on this machine: its store, URL, pid "
+                            "and the commit it runs; then exit. Needs no store")
 
     sub.add_parser("tags", help="list tag vocabulary with counts (catches near-synonyms)")
 
@@ -2591,6 +2714,42 @@ def _name_unknown_ids(store_dir, texts, where="the body") -> None:
               file=sys.stderr)
 
 
+# A clock time, HH:MMZ or HH:MxZ, with a date before or after it or none; not
+# the MM:SS of an HH:MM:SSZ.
+_CLOCK = re.compile(r"(?:(\d{4})-)?(?:(\d\d)-(\d\d)[ T])?~?(?<![:\d])([01]?\d|2[0-3]):([0-5])([\dx])Z\b"
+                    r"(?: (\d\d)-(\d\d)\b)?")
+
+
+def _name_future_times(texts, stamp) -> None:
+    """A time typed as now that the clock has not reached: hourly loops typed
+    the time from memory, minutes ahead of the write ('~04:15Z' at
+    04:09Z), even after reading `date -u`, and a pre-registration's text cannot
+    be fixed after (dogfood, 2026-11-10). A planned time runs ahead too, mostly
+    by more, and under 2 minutes is rounding. So only 2 to 15 minutes ahead,
+    and a note, never a refusal: a stamp that is not ISO reads as the oldest
+    time, which no token is ahead of."""
+    now = store.written_at(None, stamp).astimezone(timezone.utc)
+    ahead = []
+    for text in texts:
+        for m in _CLOCK.finditer(text or ""):
+            y, mo, d, hh, m1, m2, mo2, d2 = m.groups()
+            mo, d = (mo, d) if mo else (mo2, d2)
+            try:
+                day = now.date().replace(year=int(y or now.year), month=int(mo), day=int(d)) \
+                    if mo else now.date()
+            except ValueError:
+                continue
+            t = datetime(day.year, day.month, day.day, int(hh), int(m1) * 10 + (0 if m2 == "x" else int(m2)),
+                         tzinfo=timezone.utc)
+            if 2 <= (t - now).total_seconds() / 60 < 16:
+                ahead.append(m.group(0).strip())
+    if ahead:
+        toks = list(dict.fromkeys(ahead))
+        print(f"note: {', '.join(toks)} {'is' if len(toks) == 1 else 'are'} later than this write's "
+              f"clock, {now:%H:%M}Z: a time meant as now is wrong (`date -u`); a planned one is fine",
+              file=sys.stderr)
+
+
 _GUESS_CAP = 20
 
 
@@ -2665,45 +2824,28 @@ def _name_near_tags(store_dir, written) -> None:
 
 
 def _name_unchecked(written) -> None:
-    """A verdict row with no `--checked` still reads `current`, `behind N`,
-    `external` or `pending`, as if a run backed it: a quarter of the verdict
-    heads in two adopter stores had neither field (2026-09-26). Say so at
-    write; the stamp still dates the commit, so it is a note, not a refusal."""
+    """A verdict row with no `--checked` still reads `current`, `behind N` or
+    `external`, as if a run backed it: a quarter of the verdict heads in two
+    adopter stores had neither field (2026-09-26). Say so at write; the stamp
+    still dates the commit, so it is a note, not a refusal. A pre-registration
+    without one is refused (`api.fields_from_row`)."""
     miss = [n for n in written if n.spec.verdict and not n.checked]
     if not miss:
         return
     what = (f"this {miss[0].kind} entry" if len(miss) == 1 else
             f"{len(miss)} entries ({', '.join(sorted({n.kind for n in miss}))})")
-    # supersede refuses --checked on a pre-registration, which this note sent
-    # an agent to try (dogfood, 2026-11-08)
-    fixed = ("; a pre-registration's is set at its add, so `undo` this write and add it "
-             "again" if any(n.spec.status for n in miss) else "")
     print(f"note: no --checked on {what}: it has a state but names no run; --checked "
-          f"names what ran, or on a prediction, what will run{fixed}", file=sys.stderr)
-
-
-def _name_bodiless(ctx, written) -> None:
-    """A stray `add` with no --body wrote an empty bug, and the next write put
-    it out of `undo`'s reach (dogfood, 2026-10-31). A run's record or an arc's
-    box may have no body; any other bodiless entry is named while undo still
-    reaches it."""
-    miss = [n.id for n in written if not (n.body or "").strip()
-            and not (n.result or n.checked or n.measurements or n.arc_id)]
-    if not miss:
-        return
-    me = " ".join(filter(None, ["symbion", _named_store(ctx)]))
-    ids = " ".join(i[-10:] for i in miss)
-    print(f"note: no body on {ids}: `{me} undo {miss[-1][-10:]}` takes this write back "
-          f"until another write or a commit, or `supersede ID --body TEXT` gives one",
-          file=sys.stderr)
+          f"names what ran", file=sys.stderr)
 
 
 def _name_whole_resolve(ctx, written) -> None:
     """`resolve --result` closes a pre-registration whole: scoring one claim
     closed a second one judged days later, which was then registered again
-    (dogfood, 2026-11-04). Said while undo still reaches the write."""
+    (dogfood, 2026-11-04). Said while undo still reaches the write. Once per
+    agent context, as the long-text note: a loop heard it at each of its
+    predictions and acted on none (2026-11-10)."""
     pre = [n for n in written if n.spec.status and n.spec.verdict]
-    if not pre:
+    if not pre or not _first_in_session("note", "whole resolve"):
         return
     me = " ".join(filter(None, ["symbion", _named_store(ctx)]))
     print(f"note: resolve --result closes a {pre[-1].kind} whole: two claims judged at "
@@ -2711,12 +2853,16 @@ def _name_whole_resolve(ctx, written) -> None:
           f"write back until another write or a commit", file=sys.stderr)
 
 
-def _name_dirty(written) -> None:
+def _name_dirty(ctx, written) -> None:
     """A verdict row stamped on a dirty tree reads `unverifiable (dirty
     tree)` for good, even once the tree is committed, and the write said
     nothing (2026-10-14). Name the paths while the run can still be redone:
-    an untracked scratch file counts too."""
-    miss = [n for n in written if (n.provenance or {}).get("dirty")]
+    an untracked scratch file counts too. An open pre-registration reads
+    `pending`, and its resolve is stamped anew, so its add says nothing.
+    `undo` works only until another write or a store commit, and the note
+    sent readers to it after one (2026-11-12): it names that bound."""
+    miss = [n for n in written if (n.provenance or {}).get("dirty")
+            and not (n.spec.status and n.spec.verdict and store.read_status(n) == "open")]
     if not miss:
         return
     prov = miss[0].provenance
@@ -2728,10 +2874,12 @@ def _name_dirty(written) -> None:
     has = (f"{summ._count(count, 'uncommitted path')} "
            f"({', '.join(paths[:3])}{', …' if count > 3 else ''})"
            if count else "uncommitted changes")    # a [provenance] command may name none
+    me = " ".join(filter(None, ["symbion", _named_store(ctx)]))
     print(f"note: {tree} has {has}, so {what} "
-          f"`unverifiable (dirty tree)` for good. To stamp a commit: commit, re-run, "
-          f"then `undo` and write again. A run outside the repo takes --external",
-          file=sys.stderr)
+          f"`unverifiable (dirty tree)` for good. To stamp a commit: `{me} undo "
+          f"{miss[-1].id[-10:]}` takes this write back until another write or a store "
+          f"commit; then commit, re-run and write again. Once undo refuses, a clean re-run "
+          f"is a new entry. A run outside the repo takes --external", file=sys.stderr)
 
 
 def _name_undated(written) -> None:
@@ -2761,9 +2909,9 @@ def _name_past_due(written) -> None:
                   f"window is still open", file=sys.stderr)
 
 def _name_dropped(old, note, *, refs: bool, tags: bool) -> None:
-    """`supersede --ref` and `--tag` replace, while `resolve --ref` and every
-    `--add-*` add: a session that meant to add a fixing commit dropped the
-    row's only ref, and nothing said so (2026-10-01). Name what a replace
+    """`supersede --ref ''` and `--tag` replace, while every other `--ref`
+    and `--add-*` add: a session that meant to add a fixing commit dropped
+    the row's only ref, and nothing said so (2026-10-01). Name what a replace
     dropped, measured against the row the write built on, read before it."""
     if old is None:
         return
@@ -3083,10 +3231,12 @@ def _say_pulled(ctx, p, quiet=False, cap=None, news=True) -> int:
         return 1
     if p.merged:
         print(f"pulled {summ._count(p.merged, 'commit')} from {p.upstream}")
-        if news and (found := _pulled_news(ctx, p)):
-            _print_news(*found, file=sys.stdout)
     elif not quiet:
         print(f"up to date with {p.upstream or 'origin'}")
+    # Past the merge too: a cut-off pull's merge brought rows, and the pull that
+    # put it back merged nothing (audit, 2026-11-12).
+    if news and (found := _pulled_news(ctx, p)):
+        _print_news(*found, file=sys.stdout)
     return 0
 
 
@@ -3284,7 +3434,7 @@ def _say_news(ctx, wrote) -> None:
 
 
 def _news(ctx, wrote, commit: bool = False):
-    """(header, rows, by_id, reader, since) for `_say_news`, or None. With
+    """(header, rows, by_id, reader, the listing of the rest) for `_say_news`, or None. With
     `commit`, for `symbion commit`: the floor is the later of this session's
     start summary and its previous commit here, with none outside a session.
     A write's note printed once, and an agent piped it through `tail -1`: the
@@ -3300,12 +3450,13 @@ def _news(ctx, wrote, commit: bool = False):
     at = min((pos[i] for i in wrote if i in pos), default=len(loaded))
     key = lambda n: (store.written_at(n), pos[n.id])     # noqa: E731
     # A version this session wrote is not news, under any author: a capture
-    # in the user's words came back as someone else's (2026-10-14).
-    # ponytail: pending rows only, as the sessions file keeps them; one
-    # written before a commit, and after the writer's last own write, reads as
-    # news once. A session key on each row would close it.
+    # in the user's words came back as someone else's (2026-10-14), and again
+    # after another process committed it (2026-11-11).
+    # ponytail: a commit keeps a row's session for a week; a session that
+    # outlives it reads its own row in the user's words as news once.
     sk = store.session_key()
-    ours = {i for i, k in store.sessions(ctx.store_dir).items() if k == sk} if sk else set()
+    ours = ({i for i, k in store.sessions(ctx.store_dir, committed=True).items() if k == sk}
+            if sk else set())
     read = _session_read(ctx)          # -1: a row in that second may postdate it
     if commit:
         committed = _session_read(ctx, "commit")
@@ -3327,7 +3478,8 @@ def _news(ctx, wrote, commit: bool = False):
         h for h in store.heads(loaded) if h.id not in wrote and summ.on_side(by_id, h, side)
         and any(summ.wrote_it(reader, v.author) and v.id not in ours and key(v) > since
                 and pos[v.id] < at for v in summ._chain(by_id, h)))
-    return (f"note: written by someone else {header}:", news, by_id, reader, since) if news else None
+    return (f"note: written by someone else {header}:", news, by_id, reader,
+            _list_since(ctx, since[0])) if news else None
 
 
 def _pulled_news(ctx, p):
@@ -3346,11 +3498,19 @@ def _pulled_news(ctx, p):
         and any(v.id in brought and summ.wrote_it(reader, v.author) for v in summ._chain(by_id, h)))
     since = min((store.written_at(by_id[i]) for i in brought if i in by_id), default=None)
     return ("note: written by someone else, in what the pull brought:", news, by_id, reader,
-            (since, -1)) if news else None
+            _list_since(ctx, since)) if news else None
 
 
-def _print_news(header, news, by_id, reader, since, file) -> None:
-    """What `_news` found, each row as the summary prints it."""
+def _list_since(ctx, since) -> str:
+    """The listing of the news past `_NEWS_CAP`, for this store: a bare
+    `symbion list` under `--dir` lists the default store (audit, 2026-11-12)."""
+    return " ".join(filter(None, ["symbion", _named_store(ctx), "list", "--since",
+                                  since.isoformat(timespec="seconds")]))
+
+
+def _print_news(header, news, by_id, reader, more, file) -> None:
+    """What `_news` found, each row as the summary prints it. `more` lists
+    the rest past `_NEWS_CAP`."""
     print(header, file=file)
     for h in news[:_NEWS_CAP]:
         r = summ.row_digest(by_id, h, summ.HEAD_CHARS, reader)
@@ -3360,8 +3520,7 @@ def _print_news(header, news, by_id, reader, since, file) -> None:
         print("  " + summ._labelled(summ.plain, r, first=closer and f"closed by {closer}"),
               file=file)
     if len(news) > _NEWS_CAP:
-        print(f"  +{len(news) - _NEWS_CAP} more: symbion list --since "
-              f"{since[0].isoformat(timespec='seconds')}", file=file)
+        print(f"  +{len(news) - _NEWS_CAP} more: {more}", file=file)
 
 
 _NEWS_CAP = 5
@@ -3542,6 +3701,8 @@ def _dispatch(args, ctx) -> int:
         return 0
     if args.cmd == "serve" and (args.restart or args.stop):
         return _serve_all(restart=args.restart)
+    if args.cmd == "serve" and args.list:
+        return _serve_list()
     if args.cmd == "skill":                      # the plugin loads it before a store exists
         return _skill_file(args.name) if args.name else _skill(ctx, args.path, args.unreadable)
 
@@ -3654,14 +3815,15 @@ def _dispatch(args, ctx) -> int:
             print(note.id)
             args.wrote.add(note.id)
         _name_unknown_ids(store_dir, [n.body for n in written])
+        for n in written:
+            _name_future_times([n.body, n.checked, n.result], n.created_at)
         _name_open_neighbours(store_dir, written)
         _name_unmerged_fixes(ctx.cfg, store_dir, written)
         _name_near_tags(store_dir, written)
         _name_new_items(store_dir, written)
         _name_unchecked(written)
         _name_whole_resolve(ctx, written)
-        _name_dirty(written)
-        _name_bodiless(ctx, written)
+        _name_dirty(ctx, written)
         _name_undated(written)
         _name_past_due(written)
         _name_archived_arcs(store_dir, written)
@@ -3767,7 +3929,7 @@ def _dispatch(args, ctx) -> int:
                       "instead (2h, 2026-10-16)", file=sys.stderr)
                 return 2
         filt = dict(target_type=ttype, target_name=name,
-                    kind=args.kind, tag=args.tag, arc_id=args.arc_id, author=args.author,
+                    kind=tuple(args.kind.split(",")) if args.kind else None, tag=args.tag, arc_id=args.arc_id, author=args.author,
                     grep=grep, overdue=args.overdue or None,
                     since=args.since[1] if args.since else None,
                     due_by=args.due_by[1] if args.due_by else None)
@@ -3950,7 +4112,7 @@ def _dispatch(args, ctx) -> int:
                         if state and state[0] == "rewritten" else None)
                 _print_note(n, state=state, subject=subject, successor=succ,
                             full=args.full or bool(args.note_id), head=heads_of.get(n.id),
-                            gui=gui, since=since[n.id],
+                            gui=gui, since=since[n.id], by_id=by_id,
                             added=None if bare or n.id in heads_of
                             else summ.added(by_id, n, reader, summ.LIST_BODY_CHARS),
                             seams=summ.seams(by_id, n) if args.full or args.note_id else (),
@@ -4004,11 +4166,12 @@ def _dispatch(args, ctx) -> int:
         args.wrote.add(note.id)
         _say_dropped(tip, note)
         _name_unknown_ids(store_dir, [args.body])
+        _name_future_times([args.body, args.result], note.created_at)
         _name_near_tags(store_dir, [note])
         _name_new_items(store_dir, [note], tip.refs if tip else ())
         if tip is not None and tip.spec.status and tip.spec.verdict \
                 and store.read_status(tip) == "open":
-            _name_dirty([note])                   # a pre-registration's resolve is stamped anew
+            _name_dirty(ctx, [note])                 # a pre-registration's resolve is stamped anew
         if args.body:
             _name_long_text([(note.id, len(args.body.strip()))])
         return 0
@@ -4046,7 +4209,7 @@ def _dispatch(args, ctx) -> int:
             return 1
         if args.tags is not None:                      # --tag: replace
             fields["tags"] = args.tags
-        elif (args.add_tags or args.rm_tags) and args.refs is None and not args.add_refs \
+        elif (args.add_tags or args.rm_tags) and args.refs is None and not args.rm_refs \
                 and args.body is None and not args.replace \
                 and args.status is None and args.kind is None \
                 and args.arc_id is None and args.checked is None and args.target is None \
@@ -4071,13 +4234,20 @@ def _dispatch(args, ctx) -> int:
             # and the store.supersede below raises it for "no note found".
             base = set(tip.tags) if tip else set()
             fields["tags"] = sorted((base | set(args.add_tags)) - set(args.rm_tags))
-        if args.refs is not None:                      # --ref: replace, like --tag
-            try:
-                fields["refs"] = api.check_refs(          # `--ref ''` alone: none
-                    ctx.input_types, _refs_from_flags([r for r in args.refs if r]), ctx.kinds)
-            except ValueError as e:
-                print(f"supersede: {e}", file=sys.stderr)
-                return 1
+        # --ref adds, as add's does: read as replacing, it dropped refs,
+        # and refused for that, it was the refusal agents hit most
+        # (2026-11-09). A '' among them says a replace is meant.
+        replace_refs = args.refs is not None and "" in args.refs
+        try:
+            new_refs = api.check_refs(ctx.input_types,
+                                      _refs_from_flags([r for r in args.refs or () if r]),
+                                      ctx.kinds)
+            api.check_refs(ctx.input_types, _refs_from_flags(args.rm_refs), ctx.kinds)
+        except ValueError as e:
+            print(f"supersede: {e}", file=sys.stderr)
+            return 1
+        if replace_refs:                               # `--ref ''` alone: none
+            fields["refs"] = new_refs
         # Read before the write, as tip was: the head keeps the id.
         replacing = args.body is not None and not (args.append or args.prepend)
         by_id = {n.id: n for n in store.load(store_dir)} if replacing and tip else None
@@ -4087,31 +4257,24 @@ def _dispatch(args, ctx) -> int:
             # refs under the lock. check_refs above is for the error message only;
             # the raw query must reach the lock, or a name that became
             # ambiguous since would resolve by exact match.
-            # --ref read as adding one dropped the rest, more than once
-            # by 2026-10-15; a leading '' says the replace is meant.
             note = api.supersede(ctx, args.id, author=_resolved_author(args),
-                                 add_refs=_refs_from_flags(args.add_refs),
-                                 add_measurements=measures,
-                                 keep_refs=args.refs is not None and "" not in args.refs,
-                                 **fields)
+                                 add_refs=[] if replace_refs else _refs_from_flags(args.refs or ()),
+                                 rm_refs=_refs_from_flags(args.rm_refs),
+                                 add_measurements=measures, **fields)
         except KeyError:
             _no_note(args.id, store_dir)
-            return 1
-        except store.RefsDropped as e:
-            print(f"supersede: --ref replaces the refs, and would drop "
-                  f"{', '.join(summ.ref_label(r) for r in e.dropped)}; nothing was written. "
-                  f"--add-ref adds one and keeps the rest; to replace them, lead with "
-                  f"--ref ''", file=sys.stderr)
             return 1
         print(note.id)
         args.wrote.add(note.id)
         if args.arc_id:
             _name_archived_arcs(store_dir, [note])
         _name_unknown_ids(store_dir, [args.body, *(now for _, now in args.replace or ())])
+        _name_future_times([args.body, args.checked, args.result,
+                            *(now for _, now in args.replace or ())], note.created_at)
         _name_near_tags(store_dir, [note])
         _name_new_items(store_dir, [note], tip.refs if tip else ())
         _say_dropped(tip, note)
-        _name_dropped(tip, note, refs=args.refs is not None, tags=args.tags is not None)
+        _name_dropped(tip, note, refs=replace_refs, tags=args.tags is not None)
         if by_id is not None:
             _say_body_dropped(store_dir, by_id, tip, note)
         # --append keeps the lead it adds after, so the note asked about text
@@ -4319,7 +4482,7 @@ def _dispatch(args, ctx) -> int:
             print("serve needs the gui extra: pip install 'symbion[gui]'",
                   file=sys.stderr)
             return 1
-        return gui_serve.main(ctx, author=args.author or api.gui_author(),
+        return gui_serve.main(ctx, author=args.author or api.gui_author(ctx.store_dir),
                               port=args.port, show=not args.no_browser,
                               reload=args.reload, argv=args.argv,
                               host=args.host, allow=args.allow, read_only=args.read_only)
@@ -4364,9 +4527,10 @@ def _dispatch(args, ctx) -> int:
             # 2026-10-13).
             data["skill"] = "skill_view symbion"
         if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") and (Path.home() / _AGY_SKILL).exists():
-            # agy lists each skill by the path of its copy and reads it from
-            # there (an agy session's report, 2026-10-30).
-            data["skill"] = f"~/{_AGY_SKILL.as_posix()}"
+            # The plugin's copy is the `!` stub, which agy reads unrun, and its
+            # run_command cuts `symbion skill` past ~10 KB; read_file takes the
+            # package's own whole, as on Pi (an agy session, 2026-11-11).
+            data["skill"] = (_skill_dir() / "SKILL.md").as_posix()
         if (os.environ.get("SYMBION_HOST") or api.shell_author()) == "pi":
             # Pi's model loads a skill by reading the SKILL.md its skills list
             # names: a link above, else the package's own, which the extension's
@@ -4455,7 +4619,7 @@ def _dispatch(args, ctx) -> int:
                 row = by_id.get(d["id"])
                 box = store.note_from_dict(d, kinds=ctx.kinds)
                 _print_note(box, gui=gui, phase=_phase_of(arcs, box), arc=arcs.get(box.arc_id),
-                            since=d["commits_since"],
+                            since=d["commits_since"], by_id=by_id,
                             state=(d["state"], d["distance"]) if "state" in d else None,
                             written=summ.written(by_id, row) if row else None,
                             side=_other_side(by_id, row, side) if row else None)
@@ -4919,10 +5083,10 @@ def _main(argv) -> int:
         # `init` installs into the cwd's project, so it never follows a
         # named store to the project that owns it. `completion` runs from a
         # shell's rc file, wherever the shell starts, and reads no store: the
-        # cwd stands in as one, as for `-h` below. So does `serve --restart`
-        # and `--stop`, which act on every store's serve.
+        # cwd stands in as one, as for `-h` below. So does `serve --restart`,
+        # `--stop` and `--list`, which act on every store's serve.
         storeless = (rest[:1] == ["completion"]
-                     or rest[:1] == ["serve"] and bool({"--restart", "--stop"} & set(rest)))
+                     or rest[:1] == ["serve"] and bool({"--restart", "--stop", "--list"} & set(rest)))
         if storeless:
             dir_value = os.getcwd()
         no_store = unreadable = None

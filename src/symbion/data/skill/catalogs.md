@@ -15,6 +15,13 @@ file stay readable by its old name. A line may add a tab and a description:
 only the GUI's pickers show it, and everything else reads the part before the
 tab.
 
+Every store has a built-in `doc` type, its files under the store's `docs/`
+(`symbion schema` prints its command). A `doc:` name is a path from `docs/`:
+`doc:audit.md` is `docs/audit.md`, and a leading `docs/` is dropped. A
+`[catalogs] doc` entry replaces the built-in, and runs at the store's root.
+The GUI still opens a `doc:` name as a file under `docs/`: a name your catalog
+lists from elsewhere in the store gets no viewer.
+
 ## Repos: one store over several repos
 
 Repos that change together share one store:

@@ -212,8 +212,10 @@ def test_reload_serves_a_page_from_the_console_script(tmp_path):
     assert '<meta name="darkreader-lock">' in page, page[:2000]
     # A screen reader read the page in a guessed language (the GUI review, 2026-11-07).
     assert '<html lang="en-US">' in page, page[:200]
-    # ...and takes off the fallback style Dark Reader adds before it reads the lock
+    # ...and takes off the fallback style Dark Reader adds before it reads the
+    # lock, and turns off each style it adds after
     assert 'querySelectorAll(".darkreader--fallback").forEach(e => e.remove())' in page, page[:2000]
+    assert 'n.matches?.("style.darkreader") && (n.media = "not all")' in page, page[:2000]
 
 
 @pytest.mark.parametrize("stop", [CTRL_C, STOP], ids=["ctrl-c", "term"])
@@ -413,6 +415,11 @@ def test_a_serve_writes_in_no_agent_session(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", "a1")
     monkeypatch.setenv("AI_AGENT", "pi")
     monkeypatch.setenv("PI_SESSION_ID", "p1")
+    # Hermes's terminal sets HERMES_AGENT, and the plugin SYMBION_HERMES_SESSION: setup
+    # starts a serve from there (the 0.16.0 docs review, 2026-11-13).
+    monkeypatch.setenv("HERMES_AGENT", "true")
+    monkeypatch.setenv("SYMBION_HERMES_SESSION", "h1")
+    monkeypatch.setenv("HERMES_SESSION_ID", "h2")
     store.ensure_store(tmp_path / "s")
     serve.main(api.resolve(str(tmp_path / "s")), author="t", port=1111, show=False)
     assert store.session_key() is None

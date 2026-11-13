@@ -46,7 +46,8 @@ def _isolated_home(tmp_path_factory, monkeypatch):
     # The agent running pytest must not be the author a test reads.
     for k in ("SYMBION_AUTHOR", "CLAUDECODE", "CODEX_THREAD_ID", "HERMES_AGENT",
               "CLAUDE_CODE_SESSION_ID", "ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_AGENT",
-              "SYMBION_HOST", "AI_AGENT", "PI_SESSION_ID"):
+              "SYMBION_HOST", "AI_AGENT", "PI_SESSION_ID", "HERMES_SESSION_ID",
+              "SYMBION_HERMES_SESSION"):
         monkeypatch.delenv(k, raising=False)
 
 

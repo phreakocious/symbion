@@ -1,4 +1,5 @@
-"""`init --agent hermes`: the skill link and no hook, in a temporary HOME."""
+"""`init --agent hermes`: the skill link, and the plugin named until it is
+installed, in a temporary HOME. The plugin itself is in test_hermes_plugin.py."""
 from pathlib import Path
 
 import pytest
@@ -26,16 +27,39 @@ def test_install_links_the_skill_into_hermes_home_and_writes_no_config(tmp_path,
     out = capsys.readouterr().out
     assert (home / ".hermes/skills/symbion").resolve() == SKILL
     assert "external_dirs" not in out, out
-    # The AGENTS.md line on a line of its own, so it copies whole.
-    assert "\n- At the start of a session, run `symbion summary` unless a hook already " \
-           "printed it.\n" in out, out
+    assert PLUGIN_NOTE in out and AGENTS_LINE in out, out
     assert [p.name for p in (home / ".hermes").iterdir()] == ["skills"], "no config written"
     for path in (".agents", ".codex", ".claude"):
         assert not (home / path).exists(), path
     assert cli.main([*args, "--yes"]) == 0
     out = capsys.readouterr().out
     # A re-run still names the AGENTS.md line: init cannot see it was added.
-    assert "linked" not in out and "symbion summary" in out, out
+    assert "linked" not in out and AGENTS_LINE in out, out
+
+
+# The AGENTS.md line on a line of its own, so it copies whole.
+AGENTS_LINE = ("\n- At the start of a session, run `symbion summary` unless a hook already "
+               "printed it.\n")
+PLUGIN_NOTE = f"note: on Hermes the symbion plugin carries the hooks: {cli.HERMES_PLUGIN_INSTALL}\n"
+
+
+def test_init_names_the_hermes_plugin_until_it_is_installed(tmp_path, capsys):
+    """The plugin brings the summary and the gotchas; the AGENTS.md line is
+    the fallback without it. Hermes installs the plugin itself: a link init
+    made in plugins/ would make a catalog install refuse."""
+    args = ["--dir", str(tmp_path / "notes"), "init", "--agent", "hermes", "--yes"]
+    assert cli.HERMES_PLUGIN_INSTALL == "hermes plugins install phreakocious/symbion#plugin --enable"
+    manifest = Path.home() / ".hermes/plugins/symbion/plugin.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("name: symbion\n")
+    assert cli.main(args) == 0
+    out = capsys.readouterr().out
+    assert PLUGIN_NOTE not in out and AGENTS_LINE not in out, out
+    assert (Path.home() / ".hermes/skills/symbion").resolve() == SKILL
+    assert [p.name for p in manifest.parent.iterdir()] == ["plugin.yaml"]
+    assert cli.main([*args, "--merge-hook"]) == 0
+    assert "note: --merge-hook merges nothing for Hermes, whose hooks come with the plugin\n" \
+        in capsys.readouterr().out
 
 
 def test_the_link_follows_hermes_home(tmp_path, monkeypatch, capsys):

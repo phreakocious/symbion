@@ -145,6 +145,9 @@ command = 'bash "$HOME/.agents/skills/symbion/session_start.sh"'
     out = capsys.readouterr().out
     assert f"kept hook in {settings}" in out
     assert "[[hooks.PreToolUse]]" in out
+    # a sentence in backticks read as a command to run (audit, 2026-11-12)
+    assert f"the symbion PreToolUse hook is not registered: add the printed TOML to {settings}" \
+        in out and "run `add" not in out, out
 
 
 def test_codex_gotchas_before_read_and_patch(tmp_path, monkeypatch):

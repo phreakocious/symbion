@@ -254,7 +254,7 @@ def _write(sym, ws, how, name, at):
                    "--body", "x", at=at)
     if how == "json":
         p = ws / "entries.jsonl"
-        p.write_text(json.dumps({"kind": "note", "target": f"file:{name}"}) + "\n")
+        p.write_text(json.dumps({"kind": "note", "target": f"file:{name}", "body": "x"}) + "\n")
         return sym("add", "--from-json", str(p), at=at)
     nid = sym("add", "note", "--target", "item:y", "--body", "y", at=at)[1].strip()
     flag = "--add-ref" if how == "add-ref" else "--ref"
@@ -341,7 +341,7 @@ def test_from_outside_every_repo_only_a_path_or_one_holder_answers(ws, sym):
 def test_one_batch_lands_file_rows_in_each_repo_that_holds_them(ws, sym):
     """Each row of one batch lands in its own repo, and the pending names stay per repo."""
     p = ws / "entries.jsonl"
-    p.write_text("".join(json.dumps({"kind": "note", "target": f"file:{n}"}) + "\n"
+    p.write_text("".join(json.dumps({"body": "stub", "kind": "note", "target": f"file:{n}"}) + "\n"
                          for n in ("site.yml", "outputs.tf", "vpc/main.tf")))
     rc, out, err = sym("add", "--from-json", str(p))
     assert rc == 0, err
@@ -769,7 +769,7 @@ def test_a_checks_stamp_follows_the_repo_its_target_resolves_to_in_a_batch(ws, s
     the batch's other names: row 2's `file:new.tf` is app's new file from
     row 1, so its check stamps app, not the repo the cwd stands in."""
     p = ws / "entries.jsonl"
-    p.write_text(json.dumps({"kind": "note", "target": "file:../../../tf-app/new.tf"}) + "\n"
+    p.write_text(json.dumps({"body": "stub", "kind": "note", "target": "file:../../../tf-app/new.tf"}) + "\n"
                  + json.dumps({"kind": "check", "target": "file:new.tf", "checked": "c",
                                "result": "r"}) + "\n")
     rc, out, err = sym("add", "--from-json", str(p), at=X)

@@ -240,7 +240,7 @@ def _commit_card(ctx, sha: str, loaded, every: bool = False) -> None:
                     ui.html(diffview.counts(added, deleted), sanitize=False)
                     with ui.element("span").classes("sb-docs-n").mark("commit-file-entries"):
                         if rows:
-                            ui.label(f"{len(rows)} ·" if n_open else summ._count(len(rows), "entry"))
+                            ui.label(summ._count(len(rows), "entry") + (" ·" if n_open else ""))
                         if n_open:
                             ui.label(f"{n_open} open").classes("text-notable")
                     view_button(ctx, path, ttype=ftype) or ui.element("span")
@@ -269,14 +269,14 @@ def _docs_board(ctx, title: str, docs, on, mark: str, all: str, aside: str = "")
                 past = not all and i >= BOARD_ROWS
                 with ui.element("div").classes("sb-docs-row sb-filterable" +
                                                (" sb-past" if past else "")).mark("doc-row"):
-                    ui.icon("article")
+                    ui.icon("description")      # as a commit's files: `article` is the read button's
                     shown = name if typ in ("file", "doc") else f"{typ}: {name}"
                     # the whole name, as a tip, where an ellipsis cuts it (the
                     # design critique, 2026-11-07: long names were cut at 375 px)
                     ui.link(shown, target_href(typ, name)).classes("sb-docs-name") \
                         .mark("doc-link")._props["data-tip-cut"] = shown
                     with ui.element("span").classes("sb-docs-n").mark("doc-count"):
-                        ui.label(f"{len(rows)} ·" if n_open else summ._count(len(rows), "entry"))
+                        ui.label(summ._count(len(rows), "entry") + (" ·" if n_open else ""))
                         if n_open:
                             ui.label(f"{n_open} open").classes("text-notable")
                     view_button(ctx, name, ttype=typ) or ui.element("span")
@@ -704,10 +704,13 @@ def build_page(ctx, *, author: str) -> None:
     def docs_page(all: str = ""):
         """The user, 2026-10-16: "add Docs below Arcs in the sidebar and show
         all the documents we know about". Every markdown file a row is on or
-        cites, the repo's, then the store's docs/, the most named first."""
+        cites, and every store doc of any kind, the repo's, then the store's
+        docs/, the most named first."""
         shell(ctx, author, [("Docs", None)], here="/docs", cards=False)
+        # A store doc of any kind an entry is on, a script or a record too: it
+        # had no page (a browser agent's review, 2026-11-11). The repo's: markdown.
         on = {t: rows for t, rows in _naming(S.heads(S.load(ctx.store_dir))).items()
-              if t[1] and t[1].lower().endswith(".md")}
+              if t[1] and (t[0] == "doc" or t[1].lower().endswith(".md"))}
         named = len(on)
         # Then those no entry names (the user, 2026-10-27: "README.md in
         # particular"). An item named as a path opens the same file.
@@ -723,9 +726,11 @@ def build_page(ctx, *, author: str) -> None:
         except ValueError:           # Windows: no relative path to another drive
             where = str(docs)
         with ui.column().classes("sb-main gap-5"):
-            ui.label(f"{summ._count(named, 'markdown file')} that entries name, the most "
-                     "named first" + (f"; then {len(on) - named} that none do"
-                                      if len(on) > named else "")).classes("sb-subtitle")
+            # "on", as an entry is on its target and refs: "name" read as a
+            # mention in a body, which counts for nothing here (2026-11-11)
+            ui.label(f"{summ._count(named, 'doc')} with entries on them, the most first"
+                     + (f"; then {summ._count(len(on) - named, 'markdown file')} with none"
+                        if len(on) > named else "")).classes("sb-subtitle")
             _docs_board(ctx, "in the repo", [t for t in on if t[0] != "doc"], on, "docs-repo", all)
             _docs_board(ctx, "in the store", [t for t in on if t[0] == "doc"], on, "docs-store",
                         all, aside=f"· {where}")
@@ -946,7 +951,7 @@ def build_page(ctx, *, author: str) -> None:
                 rd = reading(ctx)
                 done, total = S.arc_progress(rd.loaded, id)
                 with ui.row().classes("items-baseline gap-3 w-full"):
-                    ui.label(a.target_scope).classes("sb-chip sb-target")
+                    arcs.scope_chip(a)
                     header["count"] = ui.label(f"{done}/{total}").classes("sb-count") \
                         .mark("arc-count")
                     ui.space()

@@ -39,7 +39,7 @@ def test_author_rules_differ_on_claudecode(monkeypatch):
     stamp every human button click as claude, permanently, append-only."""
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.delenv("SYMBION_AUTHOR", raising=False)
-    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+    monkeypatch.setattr(api, "_git_user_name", lambda cwd=None: "ada")
 
     assert api.author_default() == "claude"
     assert api.gui_author() == "ada"
@@ -50,7 +50,7 @@ def test_a_codex_shell_writes_as_codex_and_its_gui_as_the_person(monkeypatch):
     2026-10-02). A Codex launched from a Claude Code session carries both."""
     monkeypatch.setenv("CODEX_THREAD_ID", "thread-1")
     monkeypatch.setenv("CLAUDECODE", "1")
-    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+    monkeypatch.setattr(api, "_git_user_name", lambda cwd=None: "ada")
 
     assert api.author_default() == "codex"
     assert api.gui_author() == "ada"
@@ -63,7 +63,7 @@ def test_a_hermes_shell_writes_as_hermes_and_its_gui_as_the_person(monkeypatch):
     from a Claude Code session carries CLAUDECODE too."""
     monkeypatch.setenv("HERMES_AGENT", "true")
     monkeypatch.setenv("CLAUDECODE", "1")
-    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+    monkeypatch.setattr(api, "_git_user_name", lambda cwd=None: "ada")
 
     assert api.author_default() == "hermes"
     assert api.gui_author() == "ada"
@@ -77,7 +77,7 @@ def test_an_agy_shell_writes_as_antigravity_and_its_gui_as_the_person(monkeypatc
     monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", "c1")
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
-    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+    monkeypatch.setattr(api, "_git_user_name", lambda cwd=None: "ada")
 
     assert api.author_default() == "antigravity"
     assert api.gui_author() == "ada"
@@ -94,7 +94,7 @@ def test_a_pi_shell_writes_as_pi_and_its_gui_as_the_person(monkeypatch):
     monkeypatch.setenv("PI_SESSION_ID", "p1")
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
-    monkeypatch.setattr(api, "_git_user_name", lambda: "ada")
+    monkeypatch.setattr(api, "_git_user_name", lambda cwd=None: "ada")
 
     assert api.author_default() == "pi"
     assert api.gui_author() == "ada"
@@ -105,6 +105,25 @@ def test_a_pi_shell_writes_as_pi_and_its_gui_as_the_person(monkeypatch):
     assert store.session_key() == "s1"
 
 
+def test_a_hermes_shell_keys_its_session_by_hermes_and_the_plugins_root(monkeypatch):
+    """Hermes gives each terminal command HERMES_SESSION_ID, a delegate_task
+    child its own. The plugin gives each one SYMBION_HERMES_SESSION, the root
+    session's id, so a child's writes count as its parent's, as a Claude Code
+    subagent's do (spec 2026-11-11)."""
+    monkeypatch.setenv("HERMES_AGENT", "true")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")      # a Hermes started from Claude Code
+    monkeypatch.setenv("HERMES_SESSION_ID", "h-child")
+    assert store.session_key() == "h-child"
+    monkeypatch.setenv("SYMBION_HERMES_SESSION", "h-root")
+    assert store.session_key() == "h-root"
+    for v in ("SYMBION_HERMES_SESSION", "HERMES_SESSION_ID"):
+        monkeypatch.delenv(v)
+    assert store.session_key() is None                      # never Claude's id under Hermes
+    monkeypatch.delenv("HERMES_AGENT")
+    monkeypatch.setenv("SYMBION_HERMES_SESSION", "h-root")
+    assert store.session_key() == "s1"                      # the variable counts only under Hermes
+
+
 def test_symbion_author_wins_for_both(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("SYMBION_AUTHOR", "sam")
@@ -112,9 +131,21 @@ def test_symbion_author_wins_for_both(monkeypatch):
     assert api.gui_author() == "sam"
 
 
+def test_gui_author_reads_the_stores_git_name_not_the_projects(tmp_path, monkeypatch):
+    """A project that commits as its agent by design sets its own user.name to
+    the agent's, and the person's answers in the GUI took it (dogfood,
+    2026-11-10). The store's config names the person."""
+    monkeypatch.delenv("SYMBION_AUTHOR", raising=False)
+    for d, name in (("proj", "Agent"), ("proj-notes", "Person")):
+        subprocess.run(["git", "init", "-q", str(tmp_path / d)], check=True)
+        subprocess.run(["git", "-C", str(tmp_path / d), "config", "user.name", name], check=True)
+    monkeypatch.chdir(tmp_path / "proj")
+    assert api.gui_author(tmp_path / "proj-notes") == "Person"
+
+
 def test_gui_author_falls_back_to_user(monkeypatch):
     monkeypatch.delenv("SYMBION_AUTHOR", raising=False)
-    monkeypatch.setattr(api, "_git_user_name", lambda: "")
+    monkeypatch.setattr(api, "_git_user_name", lambda cwd=None: "")
     assert api.gui_author() == "user"
 
 
@@ -139,7 +170,7 @@ def test_add_peels_a_commit_ref_under_the_lock(repo, tmp_path):
     full = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                           capture_output=True, text=True).stdout.strip()
     ctx = api.resolve(str(tmp_path))
-    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+    n = api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "project", "name": None},
                       "refs": [{"type": "commit", "name": full[:7]}]}, author="t")
     assert n.refs[0].name == full
 
@@ -147,9 +178,9 @@ def test_add_peels_a_commit_ref_under_the_lock(repo, tmp_path):
 def test_fields_from_row_stamps_provenance_on_checks_only(repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     check = api.fields_from_row(
-        ctx, {"kind": "check", "target": {"type": "project", "name": None}}, "t")
+        ctx, {"body": "stub", "kind": "check", "target": {"type": "project", "name": None}}, "t")
     note = api.fields_from_row(
-        ctx, {"kind": "note", "target": {"type": "project", "name": None}}, "t")
+        ctx, {"body": "stub", "kind": "note", "target": {"type": "project", "name": None}}, "t")
     assert check["provenance"] is not None and "sha" in check["provenance"]
     assert note["provenance"] is None
 
@@ -163,7 +194,7 @@ def test_add_canonicalizes_a_commit_target(repo, tmp_path):
     full = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                           capture_output=True, text=True).stdout.strip()
     ctx = api.resolve(str(tmp_path))
-    n = api.add(ctx, {"kind": "note", "target": {"type": "commit", "name": full[:7]}}, author="t")
+    n = api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "commit", "name": full[:7]}}, author="t")
     assert n.target.name == full
 
 
@@ -486,7 +517,7 @@ def test_arc_passthroughs_round_trip(repo, tmp_path):
 
 def test_commit_reports_nothing_to_commit_when_clean(repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
-    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}},
+    api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "project", "name": None}},
             author="t")
     assert api.commit(ctx, "first") is True
     assert api.commit(ctx, "again") is False
@@ -499,7 +530,7 @@ def test_commit_raises_with_the_hooks_words_when_a_hook_refuses(repo, tmp_path,
     token, and the caller heard that nothing had changed. The notes stay
     staged, so the next commit past the hook takes them."""
     ctx = api.resolve(str(tmp_path))
-    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}},
+    api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "project", "name": None}},
             author="t")
     words = refusing_hook(tmp_path)
     with pytest.raises(RuntimeError, match=words):
@@ -512,7 +543,7 @@ def test_commit_raises_when_git_cannot_stage(repo, tmp_path):
     """The other shape: `git add -A` fails (a held index.lock), stages
     nothing, and the empty index read as 'nothing to commit'."""
     ctx = api.resolve(str(tmp_path))
-    api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}},
+    api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "project", "name": None}},
             author="t")
     (tmp_path / ".git" / "index.lock").touch()
     with pytest.raises(RuntimeError, match="index.lock"):
@@ -528,18 +559,19 @@ def test_supersede_moves_an_entry_to_another_target(repo, tmp_path):
     full = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                           capture_output=True, text=True).stdout.strip()
     ctx = api.resolve(str(tmp_path))
-    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+    n = api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "project", "name": None},
                       "refs": ["item:x"]}, author="t")
     before = store.load(tmp_path)
 
     with pytest.raises(ValueError, match="unknown target type 'bogus'"):
         api.supersede(ctx, n.id, author="t", target={"type": "bogus", "name": "x"})
-    with pytest.raises(ValueError, match="own target"):
-        api.supersede(ctx, n.id, author="t", target="item:x")
     assert store.load(tmp_path) == before, "a refused supersede writes nothing"
 
     out = api.supersede(ctx, n.id, author="t", target={"type": "commit", "name": full[:7]})
     assert (out.target.type, out.target.name) == ("commit", full)
+    out = api.supersede(ctx, n.id, author="t", target="item:x")
+    assert (out.target.type, out.target.name, out.refs) == ("item", "x", ()), \
+        "a move onto one of its refs drops that ref"
 
 
 def test_a_moved_entry_is_stamped_with_its_new_files_blob(repo, tmp_path):
@@ -552,7 +584,7 @@ def test_a_moved_entry_is_stamped_with_its_new_files_blob(repo, tmp_path):
     blob = lambda p: subprocess.run(["git", "hash-object", p], cwd=repo,   # noqa: E731
                                     capture_output=True, text=True).stdout.strip()
     ctx = api.resolve(str(tmp_path))
-    n = api.add(ctx, {"kind": "note", "target": "file:f"}, author="t")
+    n = api.add(ctx, {"body": "stub", "kind": "note", "target": "file:f"}, author="t")
     assert n.target_blob == blob("f")
     assert api.supersede(ctx, n.id, author="t", body="edited").target_blob == blob("f")
     moved = api.supersede(ctx, n.id, author="t", target="file:g")
@@ -566,7 +598,7 @@ def test_an_edit_that_names_no_target_never_resolves_it_again(repo, tmp_path):
     resolve now would find `alpha2` by substring."""
     (tmp_path / "symbion.toml").write_text("""[catalogs]\nthing = 'printf "alpha\\n"'\n""")
     ctx = api.resolve(str(tmp_path))
-    n = api.add(ctx, {"kind": "task", "target": "thing:alpha"}, author="t")
+    n = api.add(ctx, {"body": "stub", "kind": "task", "target": "thing:alpha"}, author="t")
     (tmp_path / "symbion.toml").write_text("""[catalogs]\nthing = 'printf "alpha2\\n"'\n""")
     ctx = api.resolve(str(tmp_path))
     out = api.supersede(ctx, n.id, author="t", body="still here")
@@ -593,7 +625,7 @@ def test_supersede_canonicalizes_refs(repo, tmp_path):
     full = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                           capture_output=True, text=True).stdout.strip()
     ctx = api.resolve(str(tmp_path))
-    n = api.add(ctx, {"kind": "decision", "target": {"type": "project", "name": None}},
+    n = api.add(ctx, {"body": "stub", "kind": "decision", "target": {"type": "project", "name": None}},
                 author="t")
 
     out = api.supersede(ctx, n.id, author="t",
@@ -745,11 +777,11 @@ def test_ctx_carries_the_declared_kinds(repo, tmp_path):
 def test_fields_from_row_validates_against_the_ctx_table(repo, tmp_path):
     _declare(tmp_path, '[kinds]\nanomaly = { status = true }\n')
     ctx = api.resolve(str(tmp_path))
-    ok = api.fields_from_row(ctx, {"kind": "anomaly",
+    ok = api.fields_from_row(ctx, {"body": "stub", "kind": "anomaly",
                                    "target": {"type": "project", "name": None}}, "t")
     assert ok["kind"] == "anomaly"
     with pytest.raises(ValueError, match=r"unknown kind 'bug'.*anomaly.*\[kinds\]"):
-        api.fields_from_row(ctx, {"kind": "bug",
+        api.fields_from_row(ctx, {"body": "stub", "kind": "bug",
                                   "target": {"type": "project", "name": None}}, "t")
 
 
@@ -778,10 +810,10 @@ def test_resolving_a_prediction_restamps_provenance_and_keeps_the_commitment(rep
 def test_a_plain_correction_to_a_prediction_inherits_provenance(repo, tmp_path):
     _declare(tmp_path, PREREG)
     ctx = api.resolve(str(tmp_path))
-    p = api.add(ctx, {"kind": "prediction", "target": {"type": "project", "name": None}},
+    p = api.add(ctx, {"body": "stub", "checked": "pytest", "kind": "prediction", "target": {"type": "project", "name": None}},
                 author="ada")
     _commit_empty(repo, "moved on")
-    c = api.supersede(ctx, p.id, author="ada", body="sharpened the falsifier")
+    c = api.supersede(ctx, p.id, author="ada", append_body="sharpened the falsifier")
     assert c.provenance == p.provenance
     assert store.read_status(c) == "open"
 
@@ -822,12 +854,12 @@ def test_an_external_check_reads_external_whatever_the_tree_does(repo, tmp_path)
 def test_external_is_refused_off_a_verdict_kind_and_off_a_boolean(repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     with pytest.raises(ValueError, match="verdict"):
-        api.fields_from_row(ctx, {"kind": "note", "external": True,
+        api.fields_from_row(ctx, {"body": "stub", "kind": "note", "external": True,
                                   "target": {"type": "project", "name": None}}, "t")
     with pytest.raises(ValueError, match="true or false"):
-        api.fields_from_row(ctx, {"kind": "check", "external": "yes",
+        api.fields_from_row(ctx, {"body": "stub", "kind": "check", "external": "yes",
                                   "target": {"type": "project", "name": None}}, "t")
-    tree = api.fields_from_row(ctx, {"kind": "check", "external": False,
+    tree = api.fields_from_row(ctx, {"body": "stub", "kind": "check", "external": False,
                                      "target": {"type": "project", "name": None}}, "t")
     assert "sha" in tree["provenance"], "false is the default, a tree stamp"
 
@@ -837,7 +869,7 @@ def test_an_external_prediction_restamps_external_and_a_correction_inherits(repo
     turn into a tree stamp. A plain correction keeps the run's time."""
     _declare(tmp_path, PREREG)
     ctx = api.resolve(str(tmp_path))
-    assert api.fields_from_row(ctx, {"kind": "prediction", "external": True, "target":
+    assert api.fields_from_row(ctx, {"body": "stub", "checked": "pytest", "kind": "prediction", "external": True, "target":
                                      {"type": "project", "name": None}}, "t")["provenance"]["external"]
     # Written dated, since a stamp is to the second and the fixture is fast.
     p = store.add(tmp_path, kind="prediction", target={"type": "project", "name": None},
@@ -852,7 +884,7 @@ def test_an_external_prediction_restamps_external_and_a_correction_inherits(repo
 def test_resolving_a_prediction_without_a_result_is_refused_at_the_api(repo, tmp_path):
     _declare(tmp_path, PREREG)
     ctx = api.resolve(str(tmp_path))
-    p = api.add(ctx, {"kind": "prediction", "target": {"type": "project", "name": None}},
+    p = api.add(ctx, {"body": "stub", "checked": "pytest", "kind": "prediction", "target": {"type": "project", "name": None}},
                 author="ada")
     with pytest.raises(ValueError, match="--result"):
         api.supersede(ctx, p.id, author="ada", status="resolved")
@@ -922,21 +954,19 @@ def test_an_ambiguous_ref_says_it_is_the_ref(repo, tmp_path):
     assert str(e.value).startswith("ref '40.55' matches")
 
 
-def test_keep_refs_compares_the_refs_once_their_names_resolve(repo, tmp_path):
-    """Another spelling of a ref the entry holds is no drop: the refs are
-    compared after they resolve, under the lock. Both directions, and with
-    keep_refs off (the GUI's edit dialog) a replace still replaces."""
+def test_added_and_removed_refs_match_once_their_names_resolve(repo, tmp_path):
+    """Another spelling of a ref the entry holds adds nothing, and removes
+    it: `add_refs` and `rm_refs` resolve under the lock before they meet the
+    entry's refs. `refs` still replaces them (the GUI's edit dialog)."""
     ctx = api.resolve(str(reading_store(tmp_path)))
     api.add(ctx, _row("40.40"), author="t")
     n = api.add(ctx, _row("x", typ="item", refs=[{"type": "reading", "name": "40.40"}]),
                 author="t")
-    with pytest.raises(store.RefsDropped) as e:
-        api.supersede(ctx, n.id, author="t", keep_refs=True,
-                      refs=[{"type": "item", "name": "z"}])
-    assert [(r.type, r.name) for r in e.value.dropped] == [("reading", "40.40")]
-    got = api.supersede(ctx, n.id, author="t", keep_refs=True,
-                        refs=[{"type": "reading", "name": "40.45"}, {"type": "item", "name": "z"}])
+    got = api.supersede(ctx, n.id, author="t", add_refs=[{"type": "reading", "name": "40.45"},
+                                                         {"type": "item", "name": "z"}])
     assert [(r.type, r.name) for r in got.refs] == [("reading", "40.40"), ("item", "z")]
+    got = api.supersede(ctx, got.id, author="t", rm_refs=[{"type": "reading", "name": "40.45"}])
+    assert [(r.type, r.name) for r in got.refs] == [("item", "z")]
     got = api.supersede(ctx, got.id, author="t", refs=[{"type": "item", "name": "w"}])
     assert [(r.type, r.name) for r in got.refs] == [("item", "w")]
 
@@ -1076,7 +1106,7 @@ def test_the_catalog_runs_once_per_supersede_not_once_per_ref(repo, tmp_path):
     (store_dir / "symbion.toml").write_text(
         f'[catalogs]\nfile = "echo run >> {tmp_path.as_posix()}/cat.calls; echo src/parser.py; echo src/lexer.py"\n')
     ctx = api.resolve(str(store_dir))
-    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}}, author="t")
+    n = api.add(ctx, {"body": "stub", "kind": "note", "target": {"type": "project", "name": None}}, author="t")
     assert not (tmp_path / "cat.calls").exists(), "a project target runs no catalog"
 
     new = api.supersede(ctx, n.id, author="t",

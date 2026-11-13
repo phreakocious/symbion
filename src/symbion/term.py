@@ -263,7 +263,7 @@ def _head(n, *, status, state, due, subject, head, width, gui, since=None,
     return line + target + post + where + after + tail, indent
 
 
-def _teaser(n, faded: bool, indent: int, width: int, grep=None) -> Text | None:
+def _teaser(n, faded: bool, indent: int, width: int, grep=None, by_id=None) -> Text | None:
     """One line under the target: a check's result, else the body, else what
     it checked. Under `list --grep`, when neither that line nor the one above
     shows a match, the field that holds one, from shortly before the match."""
@@ -281,10 +281,10 @@ def _teaser(n, faded: bool, indent: int, width: int, grep=None) -> Text | None:
     cut = summ.clip(text, room()) if text is not None else None
     # ponytail: reads the head line's target, refs and tags as shown; a narrow
     # terminal cuts them. Pass the printed head here if a hidden match there matters.
-    hit = summ.unseen(n, grep, [cut] if cut else []) if grep is not None else None
+    hit = summ.unseen(n, grep, [cut] if cut else [], by_id) if grep is not None else None
     if hit:
         label = "" if hit == "body" else f"{hit}: "
-        cut = summ.excerpt(summ.clipped_fields(n)[hit], room(), grep)
+        cut = summ.excerpt(summ.clipped_fields(n, by_id)[hit], room(), grep)
     if cut is None:
         return None
     line = Text(" " * indent)
@@ -293,7 +293,7 @@ def _teaser(n, faded: bool, indent: int, width: int, grep=None) -> Text | None:
     return line
 
 
-def _details(n, head, state, written=None) -> list[Text]:
+def _details(n, head, state, written=None, by_id=None) -> list[Text]:
     """The full view's lines between the head and the body."""
     def labelled(label, value):
         t = Text("    ")
@@ -319,13 +319,14 @@ def _details(n, head, state, written=None) -> list[Text]:
     if n.measurements:
         out.append(labelled("measured: ", summ.measured(n.measurements)))
     if n.options:
-        out.append(labelled("options: ", summ.options_line(n.options)))
+        pick = summ.picked(n, by_id)
+        out.append(labelled("answered: ", pick) if pick else labelled("options: ", summ.options_line(n.options)))
     return out
 
 
 def print_note(n, *, status, state, due, subject, head, full, gui=None, since=None,
                seams=(), links=(), written=None, successor=None, side=None, phase=None,
-               arc=None, last=None, grep=None) -> None:
+               arc=None, last=None, grep=None, by_id=None) -> None:
     """`status` is the chain head's, `state` api.verdict_state's pair and
     `due` store.due_state's triple for an open row, all computed by the caller
     the same way for the pipe line. `gui` is the URL of a serve on the row's
@@ -341,12 +342,12 @@ def print_note(n, *, status, state, due, subject, head, full, gui=None, since=No
                          side=None if full else side, phase=phase, arc=arc)
     if not full:
         con.print(_fitted(line), no_wrap=True, overflow="ellipsis", crop=True)
-        teaser = _teaser(n, status == "resolved" or head is not None, indent, width, grep)
+        teaser = _teaser(n, status == "resolved" or head is not None, indent, width, grep, by_id)
         if teaser is not None:
             con.print(_fitted(teaser), no_wrap=True, overflow="ellipsis", crop=True)
         return
     con.print(_fitted(line))
-    for t in _details(n, head, state, written):
+    for t in _details(n, head, state, written, by_id):
         con.print(_fitted(t))
     for piece, seam in summ.at_seams(n.body, seams, last) if n.body else ():
         md = Markdown(piece, code_theme=_CodeTheme())

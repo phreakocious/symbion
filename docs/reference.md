@@ -100,9 +100,9 @@ where two separate adds would store both.
 - **Kinds are the project's.** Add or rename labels under `[kinds]` in
   `symbion.toml`; renaming one that has entries also takes a one-line `sed` over
   `notes.jsonl`, which `init` writes into the toml. A kind with both `status`
-  and `verdict` is a pre-registration, closed by `resolve --result`: the
-  default `prediction` is one, and a store whose table predates it adds
-  `prediction = { status = true, verdict = true }`. A kind
+  and `verdict` is a pre-registration, added with `--checked` and closed by
+  `resolve --result`: the default `prediction` is one, and a store whose table
+  predates it adds `prediction = { status = true, verdict = true }`. A kind
   can pick its colour by a palette name, `color = "teal"`, in the terminal
   and in `serve`; a declared kind without one shares lavender, and a name
   outside the palette is refused with the list. symbion 0.3.0 and older
@@ -289,7 +289,8 @@ refused, and a shared store with no `origin` says `no remote`.
   a passphrase with no agent fails rather than asking.
 - **A pull cut off** (the process killed) leaves a copy of the pending entries it
   set aside in the clone's git dir, `symbion-pull`. The next `pull` puts them back
-  first, and says so, and names a `symbion.toml` the cut-off pull's merge changed.
+  first, and says so, names a `symbion.toml` the cut-off pull's merge changed,
+  and names the entries someone else wrote in what it brought.
   A copy that is not whole is never applied: the pull stops, names the copy, and
   leaves it for you to compare with `notes.jsonl` and `arcs.jsonl` and remove.
 - **Reading.** Every query shows both sides, and an entry the other side raised
@@ -337,16 +338,31 @@ The specs in `docs/superpowers/specs/` are dated design records: why each
 decision was made. `SKILL.md` (in `src/symbion/data/skill/`, beside
 `adoption.md` and the hook) is what an agent reads; keep it short and its
 footgun list honest. If this clone is your installed symbion (an editable
-install), the plugin's stub and hooks, in Claude Code and in Antigravity, and
-Pi's extension reach that directory through `symbion skill`, and with `symbion init --yes --agent
+install), the plugin's stub and hooks, in Claude Code and in Antigravity, Pi's
+extension and Hermes's plugin reach that directory through `symbion skill`, and with `symbion init --yes --agent
 codex` or `--agent hermes`, `~/.agents/skills/symbion` or
 `~/.hermes/skills/symbion` link to it. So an edit there reaches every session on
 the machine at once, as an edit to `src/` reaches every `symbion` call. To try a
 change to `plugin/` itself, install it from the clone: `/plugin install symbion
 --marketplace /path/to/symbion`. A path source runs the plugin in place. agy
 copies it instead (`agy plugin install /path/to/symbion/plugin`), so install
-again after each change. `plugin/hooks.json` is agy's, in agy's format, and
+again after each change: from a clone, `symbion init --agent antigravity` lists
+each file where the copy differs from `plugin/`. `plugin/hooks.json` is agy's, in agy's format, and
 `plugin/hooks/hooks.json` is Claude Code's: each reads only its own. To try a
 change to the Pi extension, `pi install /path/to/symbion`: a local path loads
 in place, so a broken save there breaks every Pi session. Its helpers have
 Node tests, `plugin/pi/symbion.test.ts`, which pytest runs on Node 23.6 or later.
+To try a change to the Hermes plugin, link `$HERMES_HOME/plugins/symbion` to the
+clone's `plugin/` and restart Hermes's gateway: a linked directory loads in
+place. `plugin/__init__.py` imports only the standard library, and
+`tests/test_hermes_plugin.py` runs it with no Hermes installed.
+
+The plugin's upgrade keeps its state in `${CLAUDE_PLUGIN_DATA}/upgrade/`
+(`~/.claude/plugins/data/<plugin-id>/upgrade/`). `ok-<pv>` marks the plugin's
+version `<pv>` done. `hold-<pv>` is the lock of an attempt. A failed attempt
+keeps it, and so does a waiting one, where the upgrade ran but left a version
+older than `<pv>`: PyPI lacks it yet, or the install pins a version or an
+index. A session start retries once the hold is over an hour old. `wait-<pv>`
+dates a wait's start, and `told-<pv>` marks that the agent was told, once, of
+a failure or of a wait past a day. `log.jsonl` holds one object per attempt,
+and one per serve restart after an upgrade.

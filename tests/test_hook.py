@@ -421,7 +421,8 @@ GOTCHAS = HOOK.with_name("gotchas.sh")
 
 def _touch(env, payload):
     r = subprocess.run([SH, str(GOTCHAS)], input=payload if isinstance(payload, str)
-                       else json.dumps(payload), capture_output=True, text=True, env=env)
+                       else json.dumps(payload), capture_output=True, text=True,
+                       encoding="utf-8", env=env)   # Windows' default is cp1252
     assert r.returncode == 0 and r.stderr == "", r
     if not r.stdout:
         return ""
@@ -531,8 +532,8 @@ def test_an_edit_reprints_in_full_only_what_this_reader_never_got(git_repo, tmp_
         return _touch(env, {"session_id": sid, "tool_name": tool,
                             "tool_input": {"file_path": f"{git_repo}/{path}"}})
     assert "trap c" in call("s1", "Read", "src/y.py")
-    first, second, third = call("s1", "Edit", "src/x.py").split("\n")
-    sym = re.search(r"`(symbion --dir \S+) show", third)[1]
+    head, first, second, third = call("s1", "Edit", "src/x.py").split("\n")
+    sym = re.search(r"`(symbion --dir \S+) show", head)[1]
     assert "trap a" in first and "trap b" in second and third == _shown(c, sym=sym)
     assert call("s1", "Edit", "src/x.py") == ""
     said = call("s2", "Read", "src/x.py")
@@ -675,16 +676,18 @@ def test_a_gotcha_line_says_its_age_its_files_churn_and_how_to_retire_it(git_rep
         return _touch(env, {"session_id": "s1", "tool_name": "Read",
                             "tool_input": {"file_path": f"{git_repo}/{f}"}})
 
-    said = line("serve.py")
+    head, said = line("serve.py").split("\n")
+    # One header a call says the shared words in, then a short line per row:
+    # a full line was 2/3 wrapper, repeated in every row of a burst (2026-11-12).
+    assert head == ("symbion gotchas on what this call names (id, target, age, commits to "
+                    "the file since; `symbion show ID` prints one whole, `symbion supersede ID "
+                    "--add-tag retired` retires one that no longer holds):"), head
     # A stamp, not `just now`: the line is cached for the session, and an age froze.
-    assert re.search(r"is on file:serve\.py \(written \d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ; the file "
-                     r"has changed in 1 commit since\): serve\.py trap", said), said
-    assert said.endswith(f" (if it no longer holds: `symbion supersede {tails['serve.py']} "
-                         "--add-tag retired`)"), "a gotcha that fits has no more to show"
-    said = line("other.py")
-    assert re.search(r"is on file:other\.py \(written [-\d]+ [:\d]+Z\): other\.py trap", said), said
-    assert f"(`symbion show {tails['other.py']}` prints all of it; if it no longer holds: " \
-           f"`symbion supersede {tails['other.py']} --add-tag retired`)" in said, said
+    assert re.fullmatch(rf"- {tails['serve.py']} on file:serve\.py \(\d{{4}}-\d\d-\d\d "
+                        r"\d\d:\d\d:\d\dZ, 1 commit since\): serve\.py trap", said), said
+    head, said = line("other.py").split("\n")
+    assert re.fullmatch(rf"- {tails['other.py']} on file:other\.py \([-\d]+ [:\d]+Z\): "
+                        r"other\.py trap( detail)+…", said), "a clipped row ends in …"
 
 
 def test_a_gotcha_line_fired_by_a_ref_names_the_ref_and_counts_its_file(git_repo, tmp_path):
@@ -720,13 +723,13 @@ def test_a_gotcha_line_fired_by_a_ref_names_the_ref_and_counts_its_file(git_repo
                             "tool_input": {"file_path": f"{git_repo}/{f}"}})
 
     said = line("other.py", "s1")
-    assert re.search(r"is on file:serve\.py and refers to file:other\.py \(written [^;)]+; "
-                     r"other\.py has changed in 2 commits since\): shared trap", said), said
+    assert re.search(r"on file:serve\.py, refers to file:other\.py \([^,)]+, 2 commits to "
+                     r"other\.py since\): shared trap", said), said
     r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env,
                        input=json.dumps({"session_id": "s2", "hook_event_name": "SessionStart"}))
     assert r.returncode == 0, r
     said = line("serve.py", "s2")
-    assert re.search(r"is on file:serve\.py \(written [^;)]+\): shared trap", said), \
+    assert re.search(r"on file:serve\.py \([^,)]+\): shared trap", said), \
         "the target's own line: no ref named, and serve.py has not changed"
 
 
@@ -745,7 +748,7 @@ def test_a_gotcha_fires_on_a_path_never_on_a_name(git_repo, tmp_path):
     for cmd in ("deploy lynx -- python3 record.py", "ssh edge uptime", "python3 plot.py --label lynx"):
         assert bash(cmd) == "", cmd
     said = bash("sed -n 1p scan.py")
-    assert re.search(r"is on file:scan\.py \(written [^)]+\): scan trap", said), said
+    assert re.search(r"on file:scan\.py \([^)]+\): scan trap", said), said
     assert "conf trap" in bash("cat /etc/edge.conf")
 
 
@@ -806,12 +809,12 @@ CODEX_GOTCHAS = HOOK.with_name("codex_gotchas.py")
 BOTH = ["gotchas.sh", "codex"]
 
 
-def _both_hooks(tmp_path, rows):
+def _both_hooks(tmp_path, rows, head=None):
     """A call into gotchas.sh or the Codex hook, each against `rows` (id, name,
     text) written as `_list_gotchas` writes the list, LF on every platform:
     Windows text mode wrote CRLF, and the root, the last field, read as a
-    `\\r` no dir matches (2026-11-09). Each call is a fresh session: a fire
-    spends its row."""
+    `\\r` no dir matches (2026-11-09). `head`, the header file beside it.
+    Each call is a fresh session: a fire spends its row."""
     d = tmp_path / "c" / "symbion" / "gotchas"
     d.mkdir(parents=True)
     n = iter(range(1000))
@@ -821,6 +824,8 @@ def _both_hooks(tmp_path, rows):
         (d / sid).write_text("".join(f"{i}\t{name}\t{text}\t{''.join(root)}\n"
                                      for i, name, text, *root in rows),
                              encoding="utf-8", newline="\n")
+        if head is not None:
+            (d / f"{sid}.head").write_text(head, encoding="utf-8", newline="\n")
         event = {"session_id": sid, "tool_name": tool, "tool_input": args or {"command": cmd}}
         argv = [sh, str(GOTCHAS)] if hook == "gotchas.sh" else [sys.executable, str(CODEX_GOTCHAS)]
         env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path),
@@ -875,6 +880,18 @@ def test_both_gotcha_hooks_read_a_call_alike(tmp_path, hook, cmd, fires):
 
 
 @pytest.mark.parametrize("hook", BOTH)
+def test_both_gotcha_hooks_print_the_header_once_before_the_rows(tmp_path, hook):
+    """The words every row of a burst shared go in one header (2026-11-12),
+    which each hook prints before the call's first row, and only then."""
+    run = _both_hooks(tmp_path, [("id1", "src/x.py", "- x trap"), ("id2", "src/x.py", "- y trap"),
+                                 ("id3", "src/z.py", "- z trap")],
+                      head="gotchas (`symbion supersede ID --add-tag retired`):")
+    assert run(hook, "cat src/x.py") == \
+        "gotchas (`symbion supersede ID --add-tag retired`):\n- x trap\n- y trap"
+    assert run(hook, "ls") == ""
+
+
+@pytest.mark.parametrize("hook", BOTH)
 def test_both_gotcha_hooks_fire_in_a_linked_worktree(tmp_path, hook):
     """gotchas.sh fired on a file in a linked worktree named by absolute path
     (dogfood, 2026-11-04), and the Codex hook did not (audit, 2026-11-08). The
@@ -887,6 +904,9 @@ def test_both_gotcha_hooks_fire_in_a_linked_worktree(tmp_path, hook):
     assert run(hook, f"sed -n 1p {tmp_path}/wt/feature/src/x.py") == "x trap"
     assert run(hook, None, tool="Edit", args={
         "file_path": f"{tmp_path}/my work/feature/src/x.py"}) == "x trap"
+    # single quotes, and a line's start: gotchas.sh missed both (audit, 2026-11-12)
+    assert run(hook, f"cat '{tmp_path}/my work/feature/src/x.py'") == "x trap"
+    assert run(hook, f"cd /tmp\n{tmp_path}/wt/feature/src/x.py --help") == "x trap"
     for d in ("wt/stray", "plain"):
         assert run(hook, f"cat {tmp_path}/{d}/src/x.py") == "", d
 
@@ -908,6 +928,19 @@ def test_a_long_run_with_no_blank_stays_inside_the_hook_timeout(tmp_path, hook):
     start = time.monotonic()
     assert run(hook, "python3 -c 'print([" + ",".join(map(str, range(2000))) + "])'") == ""
     assert time.monotonic() - start < 5
+
+
+@pytest.mark.parametrize("hook", BOTH)
+def test_a_long_run_beside_a_rows_name_stays_inside_the_hook_timeout(tmp_path, hook):
+    """A call that lacks a row's name skips its patterns. One that holds it
+    tried each path pattern at every start of a run with no blank: 16 KB took
+    2.4 s in the Codex hook, 8 s under load, and the timeout is 5 s (audit,
+    2026-11-12). Each place the name occurs is read from its own word."""
+    run = _both_hooks(tmp_path, [("id1", "README.md", "x trap", "proj")])
+    start = time.monotonic()
+    assert run(hook, "cat docs/README.md; echo " + "a," * 16000) == ""
+    assert time.monotonic() - start < 5
+    assert run(hook, "cat /w/proj/README.md; echo " + "a," * 16000) == "x trap"
 
 
 @pytest.mark.parametrize("tool", ["Write", "Bash", "many", "lines"])

@@ -251,14 +251,14 @@ def is_overdue(note, now: datetime | None = None) -> bool:
     return read_status(note) == "open" and state is not None and state[0]
 
 
-def check_self_ref(target: dict, refs) -> None:
-    """A ref to the row's own target adds nothing, and `context --target`
-    reported the row twice. Checked on RESOLVED names: `file:cli` and
-    `file:src/cli.py` are one object once the catalog has run."""
+def without_self_ref(target: dict, refs) -> list:
+    """`refs` less a ref to the row's own target: it adds nothing, and
+    `context --target` reported the row twice. Refusing it cost a retyped
+    write each time (2026-11-12), so it is dropped. Compared on RESOLVED
+    names: `file:cli` and `file:src/cli.py` are one object once the catalog
+    has run."""
     own = (target["type"], target.get("name"))
-    if any((r["type"], r.get("name")) == own for r in refs or ()):
-        raise ValueError(f"a ref to the entry's own target ({own[0]}:{own[1] or ''}) "
-                         f"adds nothing; drop it")
+    return [r for r in refs or () if (r["type"], r.get("name")) != own]
 
 
 NULL_WORDS = ("None", "null")
@@ -1161,13 +1161,13 @@ def add_many(store, rows, target_types=None, canonicalize=None, refuse_twins=Fal
         # the ceiling stays until it hurts
         if canonicalize is not None:
             rows = canonicalize(rows)
-        for fields in rows:
-            check_self_ref(fields["target"], fields.get("refs"))
         existing = load(store)
         used = {n.id for n in existing}
         notes = []
         for fields in rows:
             fields = dict(fields)
+            if fields.get("refs"):
+                fields["refs"] = without_self_ref(fields["target"], fields["refs"])
             fields.setdefault("id", _mint_unique(used))
             fields.setdefault("created_at", _now_iso())
             fields.setdefault("author", "unknown")
@@ -1200,6 +1200,20 @@ class Twin(ValueError):
     def __init__(self, pairs):
         self.pairs = pairs
         super().__init__(f"identical to stored entry {pairs[0][1]}; nothing was written")
+
+
+class NoBody(ValueError):
+    """A write that would leave an entry with no body: `add`'s and an edit's
+    refusal, in the CLI's words. The GUI catches it and says it in its own."""
+
+
+def says_nothing(row) -> bool:
+    """A row with no body that is neither a run's record nor an arc's box.
+    A stray bodiless add fell out of undo's reach at the next write
+    (2026-10-31), and `--body "$X"` with X unset emptied an entry at exit 0
+    (2026-11-11). Every bodiless head in the field was a run or a box."""
+    return not (row.get("body") or "").strip() and not any(
+        row.get(k) for k in ("checked", "result", "measurements", "arc_id"))
 
 
 def _as_written(note) -> str:
@@ -1274,7 +1288,7 @@ def chain_tips(notes):
 
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
-                        prepend_body: str | None = None, replace_body=None,
+                        rm_refs=None, prepend_body: str | None = None, replace_body=None,
                         add_measurements=None, *, side, pending=None, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
@@ -1336,13 +1350,24 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         base["body"] = appended(prepend_body, old.body) if old.body else prepend_body
     if replace_body is not None:
         base["body"] = _replaced(old, replace_body)
-    if add_refs:
+    # A row bodiless already, from before the rule, may stay so.
+    if (old.body or "").strip() and says_nothing(base):
+        raise NoBody(f"no body: this edit would leave {old.id} without one; only a run's "
+                     f"record (--checked, --result, --measure) or an arc's box (--arc-id) "
+                     f"may go without one")
+    if add_refs or rm_refs:
         # Onto the TIP's refs, as append_body is onto its body; the
         # inherited ones are never re-resolved.
         have = list(base.get("refs") or ())
-        base["refs"] = have + [r for r in add_refs if r not in have]
+        if absent := [r for r in rm_refs or () if r not in have]:
+            label = lambda r: f"{r['type']}:{r.get('name') or ''}"     # noqa: E731
+            raise ValueError(f"--rm-ref {', '.join(map(label, absent))}: not one of its refs "
+                             f"({', '.join(map(label, have)) or 'it has none'}); "
+                             f"nothing was written")
+        have = [r for r in have if r not in (rm_refs or ())]
+        base["refs"] = have + [r for r in add_refs or () if r not in have]
     if "refs" in fields or add_refs or "target" in fields:
-        check_self_ref(base["target"], base["refs"])
+        base["refs"] = without_self_ref(base["target"], base["refs"])
     if add_measurements:
         # Onto the TIP's too: a name given replaces that name only.
         base["measurements"] = {**(base.get("measurements") or {}), **add_measurements}
@@ -1432,14 +1457,6 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     return note
 
 
-class RefsDropped(ValueError):
-    """A write that would drop refs the entry holds, under `keep_refs`.
-    `dropped` is the tip's Targets the new refs leave out."""
-    def __init__(self, dropped):
-        super().__init__("would drop " + ", ".join(f"{t.type}:{t.name}" for t in dropped))
-        self.dropped = dropped
-
-
 def _replaced(old: Note, pairs) -> str:
     """`old`'s body with each (was, now) swapped in turn. `was` must occur
     once: find twice, so an overlapping second match counts too."""
@@ -1450,9 +1467,13 @@ def _replaced(old: Note, pairs) -> str:
             body = body[:first] + now + body[first + len(was):]
             continue
         shown = was if len(was) <= 60 else was[:57] + "..."
+        held = [f for f in ("checked", "result") if was and was in (getattr(old, f) or "")]
         if first >= 0:
             why = (f"occurs more than once in {tail}'s body, and a replace swaps text that "
                    f"occurs exactly once: give more of it")
+        elif held:      # agents retried blind when the text sat in one (dogfood, 2026-11-10)
+            why = (f"is in {tail}'s {held[0]}, not its body: `--{held[0]} TEXT` rewrites "
+                   f"that field whole")
         elif was:
             why = f"is not in {tail}'s body: `symbion show {tail}` prints it as it is now"
         else:
@@ -1462,9 +1483,9 @@ def _replaced(old: Note, pairs) -> str:
 
 
 def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
-              append_body: str | None = None, add_refs=None,
+              append_body: str | None = None, add_refs=None, rm_refs=None,
               prepend_body: str | None = None, add_measurements=None, target_types=None,
-              keep_refs: bool = False, replace_body=None, **fields) -> Note:
+              replace_body=None, **fields) -> Note:
     """Append a correction superseding old_id -- the single-row public entry
     point. One outer `_lock` spans load -> fast-forward -> mint -> write; see
     `_supersede_unlocked` for what happens inside it.
@@ -1484,9 +1505,8 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
     built: a new target or new refs resolve against the store as it is now;
     an inherited target or ref is never in `fields`. `target_types`,
     when given, checks the names this write brings: a new target or ref,
-    never an inherited one. `keep_refs` refuses new refs that leave out one
-    the tip holds (RefsDropped), compared once the names resolve: a writer
-    who meant to add a ref dropped the others (more than once by 2026-10-15)."""
+    never an inherited one. `add_refs` and `rm_refs` resolve the same way,
+    so another spelling of a ref the tip holds matches it."""
     require_store(store)
     side = shared_side(store)
     with _lock(store):
@@ -1495,15 +1515,12 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
             fields = canonicalize(fields)
             if add_refs:
                 add_refs = canonicalize({"refs": add_refs})["refs"]
+            if rm_refs:
+                rm_refs = canonicalize({"refs": rm_refs})["refs"]
         check_types([o for o in (fields.get("target"), *(fields.get("refs") or ()),
                                  *(add_refs or ())) if o], target_types)
-        if keep_refs and fields.get("refs") is not None:
-            now = {(r.type, r.name) if isinstance(r, Target) else (r["type"], r.get("name"))
-                   for r in fields["refs"]}
-            if gone := [r for r in chain_tip(notes, old_id).refs if (r.type, r.name) not in now]:
-                raise RefsDropped(gone)
         return _supersede_unlocked(store, notes, old_id, author=author, side=side,
-                                   append_body=append_body, add_refs=add_refs,
+                                   append_body=append_body, add_refs=add_refs, rm_refs=rm_refs,
                                    prepend_body=prepend_body, replace_body=replace_body,
                                    add_measurements=add_measurements, **fields)
 
@@ -1623,12 +1640,19 @@ def _state_dir(store, make: bool = False) -> Path:
 
 def session_key() -> str | None:
     """The agent session this process runs in, when its runtime names one.
-    Codex, Antigravity and Pi before Claude Code: one launched from Claude Code
-    inherits its key, and the innermost agent is the one writing (as in
-    api.author_default). A Claude Code launched from Pi inherits PI_SESSION_ID,
-    so it counts only while AI_AGENT names Pi."""
+    Codex, Hermes, Antigravity and Pi before Claude Code: one launched from
+    Claude Code inherits its key, and the innermost agent is the one writing (as
+    in api.author_default). A Claude Code launched from Pi inherits PI_SESSION_ID,
+    so it counts only while AI_AGENT names Pi. Under Hermes, the plugin's
+    SYMBION_HERMES_SESSION names the root session, so a delegate_task child's
+    writes are its parent's; with neither Hermes variable there is no key, never
+    an outer agent's."""
+    if os.environ.get("CODEX_THREAD_ID"):
+        return os.environ["CODEX_THREAD_ID"]
+    if os.environ.get("HERMES_AGENT"):
+        return os.environ.get("SYMBION_HERMES_SESSION") or os.environ.get("HERMES_SESSION_ID") or None
     pi = os.environ.get("PI_SESSION_ID") if os.environ.get("AI_AGENT") == "pi" else None
-    return (os.environ.get("CODEX_THREAD_ID") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+    return (os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
             or pi or os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
 
 
@@ -1655,29 +1679,33 @@ def _sessions_path(store) -> Path | None:
 
 
 def _record_session(store, note_id: str, kept_id: str | None = None,
-                    prior: str | None = None) -> list[str]:
+                    prior: str | None = None, took: str | None = None) -> list[str]:
     """`note_id` is this session's now. An edit's `kept_id` stays with the
-    session that wrote the version it holds (`prior`), and an edit outside
-    any session takes the row from the session that had it. Returns the
-    lines written, so a sweep keeps the record without reading it again."""
+    session that wrote the version it holds (`prior`, or `took` when a commit
+    took that version), and an edit outside any session takes the row from
+    the session that had it. Returns the lines written, so a sweep keeps the
+    record without reading it again."""
     key = session_key()
-    lines = ([f"{kept_id}\t{prior}"] if kept_id and prior else []) + \
-        ([f"{note_id}\t{key or ''}"] if key or prior else [])
+    kept = [f"{kept_id}\t{prior}"] if prior else [f"{kept_id}\t{took}\tc"] if took else []
+    lines = (kept if kept_id else []) + \
+        ([f"{note_id}\t{key or ''}"] if key or prior or took else [])
     path = lines and _state_dir(store, make=True) / SESSIONS_FILE
     for line in lines if path else []:
         _append_line_unlocked(path, line)
     return lines
 
 
-def sessions(store) -> dict:
-    """{row id: session key} for the pending rows an agent session wrote."""
+def sessions(store, committed: bool = False) -> dict:
+    """{row id: session key} for the pending rows an agent session wrote;
+    with `committed`, also for the rows a commit took in the last week."""
     path = _sessions_path(store)
     try:
         text = path.read_text(encoding="utf-8") if path else ""
     except FileNotFoundError:
         return {}
     known = dict(ln.split("\t", 1) for ln in text.splitlines() if "\t" in ln)
-    return {i: k for i, k in known.items() if k}
+    # A third field marks a row a commit took (_forget_committed).
+    return {i: k.split("\t")[0] for i, k in known.items() if k and (committed or "\t" not in k)}
 
 
 def own_rows(store, author: str):
@@ -1691,15 +1719,21 @@ def own_rows(store, author: str):
 
 
 def _forget_committed(store) -> None:
-    """Keep the session of each row still pending, and no other."""
-    known = sessions(store)
+    """Keep the session of each row still pending, and for a week that of
+    each row a commit took, marked: the news of a write reads it, so a row a
+    session wrote in the user's words is not someone else's after another
+    process commits it (2026-11-11). A version an edit kept keeps its mark."""
+    known, pending = sessions(store, committed=True), sessions(store)
     committed = _committed_lines(store) if known else None
     if committed is None:
         return
     live = {_line_id(ln) for ln in jsonl_lines(notes_path(store).read_text(encoding="utf-8"))
             if ln and ln not in committed}
-    _replace_atomically(_state_dir(store, make=True) / SESSIONS_FILE,
-                        "".join(f"{i}\t{k}\n" for i, k in known.items() if i in live))
+    week = (_utcnow() - timedelta(days=7)).strftime("%Y%m%d-%H%M%S")
+    _replace_atomically(_state_dir(store, make=True) / SESSIONS_FILE, "".join(
+        f"{i}\t{k}\n" if i in live and i in pending else f"{i}\t{k}\tc\n"
+        for i, k in known.items()
+        if (i in live and i in pending) or (i[:8].isdigit() and i[:15] >= week)))
 
 
 def _rewrite_notes_unlocked(store, edits) -> None:
@@ -1725,9 +1759,10 @@ def _rewrite_notes_unlocked(store, edits) -> None:
     # ponytail: if the rewrite below then fails, each note.id's record names
     # this session while its line is still the prior version; restore the
     # records if a failed rewrite is ever seen.
-    known = sessions(store)
+    known, took = sessions(store), sessions(store, committed=True)
     for note, kept_id in edits:
-        lines = _record_session(store, note.id, kept_id, known.get(note.id) or None)
+        lines = _record_session(store, note.id, kept_id, known.get(note.id) or None,
+                                took.get(note.id))
         known.update(ln.split("\t", 1) for ln in lines)
         for i in where.get(note.id, ()):
             raws[i] = _dumps({**json.loads(raws[i]), "id": kept_id})
@@ -1791,7 +1826,9 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
     if target_name is not None:
         out = [n for n in out if n.target.name == target_name]
     if kind is not None:
-        out = [n for n in out if n.kind == kind]
+        # A tuple is several kinds: `list --kind task,bug`.
+        kinds = (kind,) if isinstance(kind, str) else kind
+        out = [n for n in out if n.kind in kinds]
     if status is not None:
         out = [n for n in out if read_status(n) == status]
     if arc_id is not None:
@@ -1851,8 +1888,8 @@ def _rename_unlocked(store, notes, kinds, target_type, old, new, author,
         target = now if note.target == was else note.target
         # dict.fromkeys: a row that already REF'd `new` keeps one entry. A ref
         # equal to the row's target is dropped: a legacy self-edge, or one
-        # this rename would make (target old, ref new); either would trip
-        # check_self_ref partway through the sweep.
+        # this rename would make (target old, ref new); either adds nothing
+        # (without_self_ref).
         refs = tuple(r for r in dict.fromkeys(now if r == was else r for r in note.refs)
                      if r != target)
         fields = {}
@@ -2271,7 +2308,7 @@ def discard(store, mine, author: str, apply: bool = True, expect=None) -> dict:
                     if _line_id(h) in drop and _line_id(h) not in back.values()}
         out = {"removed": [], "restored": [], "returned": [], "arcs": [], "kept": [],
                "kept_arcs": [], "arcs_changed": []}
-        lines = []
+        lines, restored = [], {}
         for raw in raws:
             row = loads(raw) if raw else {}
             if row.get("id") in drop:
@@ -2282,6 +2319,7 @@ def discard(store, mine, author: str, apply: bool = True, expect=None) -> dict:
             elif raw and raw not in held and (h := put_back.pop(_sans_id(row), None)):
                 lines.append(h)
                 out["restored"].append(loads(h))
+                restored[row.get("id")] = _line_id(h)
             else:
                 lines.append(raw)
         out["kept"] = [r for r in pending if own(r) and theirs(r) and r["id"] not in back]
@@ -2316,8 +2354,8 @@ def discard(store, mine, author: str, apply: bool = True, expect=None) -> dict:
             if gone:
                 left = [r for r in araws if r and loads(r).get("id") not in gone]
                 _replace_atomically(apath, "".join(r + "\n" for r in left))
-            known = sessions(store)
-            for b, i in back.items():           # the id goes back to the version's session
+            known = sessions(store, committed=True)    # _forget_committed marks it again
+            for b, i in {**back, **restored}.items():    # the id goes back to the version's session
                 _append_line_unlocked(_state_dir(store, make=True) / SESSIONS_FILE,
                                       f"{i}\t{known.get(b, '')}")
             _forget_committed(store)
@@ -2478,14 +2516,29 @@ def _read_aside(store, aside: Path) -> tuple:
     return sha, saved, renames
 
 
-def _keep_sessions(store, old: dict, now: dict, splits: list) -> None:
-    """A pending head under a new id stays its session's, for its `commit`."""
+def _keep_sessions(store, old: dict, now: dict, splits: list, texts: dict) -> None:
+    """A pending head under a new id stays its session's, for its `commit`.
+    A committed row the other clone edited keeps its id for that clone's
+    version, and the version this clone had takes the id the edit gave it:
+    the mark goes with it. Left on the id, it read the other clone's answer
+    as the asking session's own, and no write named it (audit, 2026-11-12)."""
+    def mark(line):
+        _append_line_unlocked(_state_dir(store, make=True) / SESSIONS_FILE, line)
     known = sessions(store)
     held = {_line_id(ln) for ln in set(now[NOTES_FILE]) - set(old[NOTES_FILE])}
     for was, new in splits:
         if was in held and known.get(was):
-            _append_line_unlocked(_state_dir(store, make=True) / SESSIONS_FILE,
-                                  f"{new}\t{known[was]}")
+            mark(f"{new}\t{known[was]}")
+    took = {i: k for i, k in sessions(store, committed=True).items() if i not in known}
+    had = {i: json.loads(ln) for ln in old[NOTES_FILE] if took and (i := _line_id(ln)) in took}
+    merged = jsonl_lines(texts[NOTES_FILE]) if had else []
+    moved = [i for ln in merged if (i := _line_id(ln)) in had and json.loads(ln) != had[i]]
+    fresh = [json.loads(ln) for ln in set(merged) - set(old[NOTES_FILE])
+             if moved and _line_id(ln)]
+    for i in moved:
+        mark(f"{i}\t")
+        if to := next((f["id"] for f in fresh if {**f, "id": i} == had[i]), None):
+            mark(f"{to}\t{took[i]}\tc")
 
 
 def _recover_unlocked(store) -> tuple:
@@ -2508,7 +2561,7 @@ def _recover_unlocked(store) -> tuple:
     texts, splits = _pending_back(old, now, {f: _body_lines(b) for f, b in _on_disk(store).items()},
                                   renames, dropped)
     _put(store, texts)
-    _keep_sessions(store, old, now, splits)
+    _keep_sessions(store, old, now, splits, texts)
     _drop_aside(aside)
     _forget_undo(store)
     return ("a pull was cut off before it put back the pending entries it had set aside: "
@@ -2622,7 +2675,7 @@ def merge_upstream(store, upstream: str, until: float | None = None) -> dict:
                 # already back under its new id is not put back again.
                 _replace_atomically(aside / "splits.json", json.dumps(dict(moved)))
                 _put(store, texts)
-                _keep_sessions(store, old, now, moved)
+                _keep_sessions(store, old, now, moved, texts)
                 _drop_aside(aside)
                 splits += moved
                 _forget_undo(store)                  # a pull ends the undo level, as a commit does

@@ -137,6 +137,9 @@ which an older CLI lacks.
 - The install in setup is unpinned. *(The builder's call: a pin to the plugin's
   version fails between a release's cut and its PyPI upload.)*
 
+*Changed 2026-11-11:* a plugin update now brings the matching symbion by itself,
+through a worker the hooks launch; see the plugin-upgrade design of that date.
+
 ### 3. `/symbion:setup`
 
 A plugin command (`commands/setup.md`). Its steps live in that file, not in
@@ -257,6 +260,12 @@ and the stub is the path that fills the schema in. The package-path fallback is
 dropped. Its one case, a plugin-only install, is that case. An older decision
 also holds: with no link and no plugin, the summary names no skill, since a
 model once read a skill's path as the place to load it from.
+
+*Changed 2026-11-11:* under Antigravity the hint names the package's `SKILL.md`,
+as Pi's does. It had named the plugin's copy, which is the stub: agy's `read_file`
+returns its `` !`cmd` `` line unrun, and its `run_command` cuts `symbion skill`'s
+12 KB in the middle past about 10 KB. `read_file` returns the package's file
+whole, and `init --agent antigravity`'s rules already let it read there.
 
 ### 6. Docs and the maintainer's checkout
 

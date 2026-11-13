@@ -64,9 +64,10 @@ These three look alike on a card. They do different jobs.
 
 The **target** is the one thing an entry is about. An entry has exactly
 one. Click it to open the target's page: every entry on it or pointing at
-it, open work first. The Targets page lists every target that has entries.
-The Docs page lists every markdown file an entry is on or points at, the
-project's and the store's `docs/`, the most named first, each with a
+it, open work first; a `project` chip lists the project-wide entries. The Targets page lists every target that has entries.
+The Docs page lists every file in the store's `docs/` an entry is on, of
+any type, and every markdown file of the project's an entry is on or
+points at, the most named first, each with a
 button that opens it.
 The Map page draws the entries as tiles, grouped on up to three of target,
 tag, kind, status, author, arc and the week written. A tile's area is its
@@ -77,20 +78,20 @@ hold every word typed.
 
 A target has a type and a name:
 
-- `file: src/app.py` is a file in the project. The name is checked against
+- `file:src/app.py` is a file in the project. The name is checked against
   the project's files, so part of a path finds the whole one. The `<>`
   button beside the chip opens the file, from the default branch when the
   branch checked out lacks it. The card counts the commits that changed the
   file since the entry was written: a high count means the entry may be out
   of date. Click the count to see those commits and what they changed in
   the file, and to read the file as the entry saw it.
-- `doc: recipe.md` is a file in the store's own `docs/` folder, where an
+- `doc:recipe.md` is a file in the store's own `docs/` folder, where an
   entry's long detail goes. The name is its path inside `docs/`. The button
   beside the chip opens it, as it does a file.
-- `item: login flow` is anything without a list of its own: a feature, a
+- `item:login flow` is anything without a list of its own: a feature, a
   host, a test. The exact name is the key, so `login flow` and `login-flow`
   are two items. The name field suggests the names already in use.
-- `commit: 3f2a1c9` is one of the project's commits. The name field offers
+- `commit:3f2a1c9` is one of the project's commits. The name field offers
   the newest commits first, each with its subject. The commit's page shows
   its message, and each file it changed with the entries on that file. The
   button beside the chip, and the one on the page, show its diff. A merge's

@@ -50,8 +50,8 @@ A kind is a label on three bits, and the bits are all symbion knows:
   run is a new entry.
 - **`status` + `verdict`**: a pre-registration. It reads `pending` until
   `resolve --result` closes it, stamped at the commit it was judged at, or
-  with `--external` at the time. Its body and `--checked` as registered are
-  fixed: a supersede may only add below them.
+  with `--external` at the time. Its body and `--checked`, which `add`
+  requires, are fixed as registered: a supersede may only add below them.
 - No bits: a plain entry. `symbion context` with no target lists every plain
   entry; `supersede <id> --add-tag retired` takes one out of it, and out of the
   gotcha hook.
@@ -162,7 +162,7 @@ under the store's `docs/`; the entry names it by its path there
 
 A trap, such as a test that passes alone and fails in its file's run or a step
 that must come before an edit, goes on its file tagged `gotcha`: in Claude Code,
-Codex and Pi, the first non-symbion call in each session or subagent that names
+Codex, Pi and Hermes, the first non-symbion call in each session or subagent that names
 the file prints its first 200 characters, so the trap and its fix fit in them. One
 trap is one entry; a how-to is a plain note.
 

@@ -12,7 +12,7 @@ from nicegui.testing import User            # noqa: E402
 from nicegui.testing.user_interaction import UserInteraction   # noqa: E402
 
 from symbion import api, store              # noqa: E402
-from symbion.gui.notes import changes, diff_blocks, edited, render_note   # noqa: E402
+from symbion.gui.notes import changes, diff_blocks, edited, preview, render_note   # noqa: E402
 
 from _cards import bodies, button, not_see, part, parts, template   # noqa: E402
 
@@ -60,8 +60,8 @@ async def test_a_row_with_no_body_leads_with_its_target(user: User, repo, tmp_pa
     led with an empty line and put the target in a chip below. Both
     directions: a row with a body keeps its target chip and no headline."""
     ctx = api.resolve(str(tmp_path))
-    bare = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "alpha"}},
-                   author="ada")
+    bare = store.add(ctx.store_dir, kind="task", target={"type": "item", "name": "alpha"},
+                     author="ada")       # add refuses a bodiless task off an arc
     said = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": "beta"},
                          "body": "words"}, author="ada")
 
@@ -866,11 +866,11 @@ def test_supersede_can_attach_an_existing_note_to_an_arc(repo, tmp_path):
     assert out.target == n.target, "target is still inherited"
 
 
-async def test_a_project_target_links_to_the_note_itself(user: User, repo, tmp_path):
+async def test_a_project_target_filters_by_project(user: User, repo, tmp_path):
     """The other direction of the target link. `project` has no object page --
-    /object redirects when name is empty -- so before /notes?id= this row was a
-    dead label, and a project note filed under an arc rendered on the
-    arc page with nothing to click."""
+    /object redirects when name is empty -- so its chip filters the list by
+    it, as a kind's chip does, and on that list it is a label. It linked to
+    the entry itself, which the id does (a browser agent's review, 2026-11-11)."""
     ctx = api.resolve(str(tmp_path))
     n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
                       "body": "b"}, author="ada")
@@ -879,9 +879,25 @@ async def test_a_project_target_links_to_the_note_itself(user: User, repo, tmp_p
     def page():
         render_note(ctx, n, lambda: None, author="ada", show_target=True)
 
+    @ui.page("/u")
+    def page_u():
+        render_note(ctx, n, lambda: None, author="ada", show_target=True,
+                    base={"type": "project"})
+
     await user.open("/t")
     link = parts(user, "note-target").pop()
-    assert link.props["href"] == f"/notes?id={n.id}"
+    assert (link.text, link.props["href"]) == ("project", "/notes?type=project")
+    await user.open("/u")
+    assert parts(user, "note-target").pop().props.get("href") is None
+
+
+def test_a_clipped_body_shows_its_code_and_keeps_an_id_whole():
+    """The clip is flat text: its code spans print with backticks and an id
+    broke at its hyphen (a browser agent's review, 2026-11-11). Everything
+    else is escaped, a hit marked, and a span the clip cut keeps its tick."""
+    got = preview("run `a<b` on 123456-abc, then `cut", ["then"])
+    assert got == ('run <code>a&lt;b</code> on <span class="sb-nobr">123456-abc</span>, '
+                   '<mark>then</mark> `cut')
 
 
 async def test_edit_dialog_corrects_a_check_verdict(user: User, repo, tmp_path):
@@ -993,7 +1009,7 @@ async def test_resolve_button_on_a_prediction_opens_the_dialog_instead_of_resolv
     """Both directions: the click does not resolve; saving with a result does."""
     _declare(tmp_path, PREREG)
     ctx = api.resolve(str(tmp_path))
-    p = api.add(ctx, {"kind": "prediction", "target": {"type": "project", "name": None},
+    p = api.add(ctx, {"kind": "prediction", "checked": "pytest", "target": {"type": "project", "name": None},
                       "body": "falsified if"}, author="ada")
 
     @ui.page("/t")
@@ -1874,6 +1890,40 @@ async def test_a_bang_alone_is_an_empty_note(user: User, repo, tmp_path):
     user.find(marker="note-add").click()
     await user.should_see("empty entry")
     assert not store.heads(store.load(tmp_path))
+
+
+@pytest.mark.parametrize("form", ["composer", "edit"])
+async def test_an_entry_with_nothing_to_say_is_refused_in_the_guis_words(user: User, repo,
+                                                                          tmp_path, form):
+    """The rule for an entry with no body is the store's, and the GUI said it
+    in CLI flags: a check added with nothing typed, or an edit that emptied a
+    body, read "give --body TEXT" (audit, 2026-11-12)."""
+    from symbion.gui.notes import add_form
+    ctx = api.resolve(str(tmp_path))
+    if form == "composer":
+        @ui.page("/t")
+        def page():
+            add_form(ctx, "project", None, lambda: None, author="ada")
+
+        await user.open("/t")
+        user.find(marker="note-kind-select").elements.pop().set_value("check")
+        user.find(marker="note-add").click()
+        await user.should_see("empty entry")
+        assert not store.heads(store.load(tmp_path))
+    else:
+        n = api.add(ctx, {"kind": "task", "target": {"type": "project", "name": None},
+                          "body": "first"}, author="ada")
+        assert (await _append_in_dialog(user, ctx, n, "", body="")).body == "first"
+        await user.should_see("no text")
+    assert not any("--" in m for m in user.notify.messages), user.notify.messages
+
+
+def test_a_search_snippet_shows_a_match_past_a_long_word():
+    """A word longer than the snippet's lead filled it before the match (audit,
+    2026-11-12): it reads `summary.excerpt`, as `list --grep` does."""
+    from symbion.gui.notes import snippet
+    assert "needle2" in snippet("See /" + "seg/" * 60 + " then needle2 after the path.",
+                                ["needle2"])
 
 
 async def test_a_since_chip_lists_the_commits_it_counts(user: User, repo, tmp_path):

@@ -39,7 +39,7 @@ export default {
       <div v-else-if="p.k === 'seam'" class="sb-seam"><div :data-tip="p.tip">{{ p.t }}</div></div>
       <div v-else-if="p.k === 'meas'" class="nicegui-row row gap-3 flex-wrap"><div v-for="x in p.items" class="sb-note-meta">{{ x }}</div></div>
       <div v-else-if="p.k === 'answer'" class="sb-answer">
-        <q-btn v-for="o in p.options" outline dense no-caps class="px-2" :label="o.t" :icon="o.icon || undefined" :data-tip="o.tip" @click="act('answer', o.t)" />
+        <q-btn v-for="o in p.options" outline dense no-caps class="px-2" :label="o.t" :aria-label="o.t" :icon="o.icon || undefined" :data-tip="o.tip" @click="act('answer', o.t)" />
         <q-input :model-value="typed" @update:model-value="type" outlined dense class="sb-answer-field" placeholder="or answer in your words · Enter" aria-label="answer this question" @keydown.enter="answer" />
       </div>
       <div v-else-if="p.k === 'options'" class="sb-note-meta">{{ p.t }}</div>
