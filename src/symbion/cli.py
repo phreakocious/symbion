@@ -28,7 +28,7 @@ import time
 import tomllib
 from collections import Counter
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from . import api, catalog, config, gitref, kinds as K, merge, store
@@ -207,12 +207,13 @@ def _claude_plugin_notes(merge: bool) -> bool:
     remove it, and none is removed, since settings.json is the user's. With the
     plugin enabled, the note on auto-update for the symbion marketplace says that
     auto-update brings plugin updates and the plugin's hooks bring the matching
-    symbion with each (spec 2026-11-11). Nothing here is a change init makes, so
-    it returns False."""
+    symbion with each (spec 2026-11-11). A CLI run from a git checkout gets no
+    such note: no plugin update upgrades it. Nothing here is a change init
+    makes, so it returns False."""
     if not _claude_plugin_enabled():
         print(f"note: on Claude Code the symbion plugin carries the skill and the hooks: "
               f"{PLUGIN_INSTALL}, then /symbion:setup")
-    else:
+    elif not gitref.own_commit(Path(__file__).parent):
         # ponytail: init cannot read whether auto-update is on, so every run says it;
         # read Claude Code's state if one is found.
         print("note: turn on auto-update for the symbion marketplace, so plugin updates arrive "
@@ -1291,8 +1292,9 @@ One flag covers the file and the pipe: '-' is stdin, as it is for
     except OSError as e:
         # SystemExit(str) so main() prints it unprefixed and exits 1, the same
         # shape as every other bad-input refusal here. Uncaught, an OSError
-        # reaches no handler in main() and the user gets a traceback.
-        raise SystemExit(f"{flag}: {e}")
+        # reaches no handler in main() and the user gets a traceback. The verb
+        # leads, as on every other refusal: a log reader counts `VERB: ` lines.
+        raise SystemExit(f"{args.cmd}: {flag}: {e}")
     if not args.body.strip():
         # A producer that failed upstream of a pipe with no pipefail: supersede
         # replaced a long body with "" at exit 0 (2026-10-03). An addition
@@ -1300,7 +1302,7 @@ One flag covers the file and the pipe: '-' is stdin, as it is for
         adds = getattr(args, "append", False) or getattr(args, "prepend", False)
         hint = ("; to blank the body on purpose, pass --body ''"
                 if args.cmd == "supersede" and not adds else "")
-        raise SystemExit(f"{flag} {args.body_file}: read nothing but whitespace, so "
+        raise SystemExit(f"{args.cmd}: {flag} {args.body_file}: read nothing but whitespace, so "
                          f"nothing was written; check the file or the command feeding it{hint}")
 
 
@@ -1922,11 +1924,17 @@ def _since(v):
 
 
 def _due_by(v):
-    """(as typed, date) for `list --due-by`."""
+    """(as typed, date) for `list --due-by`: a date, or days or weeks from
+    today (`1d`, `2w`). The filter counts whole days, so no hours."""
+    if m := re.fullmatch(r"(\d+)([dw])", v.strip()):
+        days = int(m[1]) * (7 if m[2] == "w" else 1)
+        return v, store.now_shown().date() + timedelta(days=days)
     try:
         return v, date.fromisoformat(v.strip())
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{v!r} is not a date: use YYYY-MM-DD") from None
+        raise argparse.ArgumentTypeError(
+            f"{v!r} is not a date: use YYYY-MM-DD, or days or weeks from today (1d, 2w)"
+        ) from None
 
 
 def _kind_choice(kinds, store_dir):
@@ -2112,6 +2120,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="only open entries past their --due date")
     li.add_argument("--due-by", default=None, metavar="DATE", type=_due_by,
                     help="only entries due on or before DATE, past due included; "
+                         "DATE is YYYY-MM-DD, or days or weeks from today (1d, 2w); "
                          "with --status open, what is still owed by then")
     li.add_argument("--since", default=None, metavar="WHEN", type=_since,
                     help="only entries written since WHEN: 30m, 2h, 3d, 1w, a date or an "

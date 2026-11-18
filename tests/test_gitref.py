@@ -589,6 +589,63 @@ def test_a_catalog_miss_says_when_the_path_is_on_the_default_branch(repo, capsys
     assert "taken as typed\n" in err and "worktree" not in err, err
 
 
+def test_the_default_branch_is_listed_once_a_tip(repo, monkeypatch):
+    """A GUI card asked `cat-file -e` once for each target that is no file in
+    this worktree, and an item's title or a host name never is: most of a
+    page's build (2026-11-17). The answers come from one listing of the
+    branch's tip and match cat-file's, a directory's and a submodule's too."""
+    base = _run(repo, "rev-parse", "HEAD")
+    (repo / "d").mkdir()
+    (repo / "d" / "x.py").write_text("x")
+    (repo / "only_main.py").write_text("x")
+    _run(repo, "add", "-A")
+    _run(repo, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},sub")
+    _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main-only")
+    _run(repo, "checkout", "-q", "-b", "wip", base)
+
+    cfg = Config(project_root=repo)
+    names = ["only_main.py", "./only_main.py", "only_main.py/", "d", "d/", "d/x.py",
+             "d/../only_main.py", "sub", "f0", "nowhere.py", "an item's title"]
+    want = {n: None if (repo / n).exists() or subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", f"main:{n}"],
+                capture_output=True).returncode else "main" for n in names}
+    assert [n for n in names if want[n]] == ["only_main.py", "./only_main.py", "d", "d/", "d/x.py"]
+    asked, real = [], gitref._run
+    monkeypatch.setattr(gitref, "_run", lambda root, args, *a: asked.append(args[0]) or real(root, args, *a))
+    with gitref.heads_once():
+        assert {n: gitref.only_on_default_branch(cfg, n) for n in names} == want
+    assert asked == ["rev-parse", "ls-tree"], asked
+
+    asked.clear()
+    assert gitref.only_on_default_branch(cfg, "only_main.py") == "main"
+    assert asked == ["rev-parse"], "the same tip, listed once"
+    m = repo.parent / "m"
+    _run(repo, "worktree", "add", "-q", str(m), "main")
+    (m / "later.py").write_text("x")
+    _run(m, "add", "-A")
+    _run(m, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "later")
+    asked.clear()
+    assert gitref.only_on_default_branch(cfg, "later.py") == "main"
+    assert asked == ["rev-parse", "ls-tree"], "a new tip, listed again"
+
+    asked.clear()
+    assert gitref.only_on_default_branch(Config(project_root=repo, default_branch="gone"),
+                                         "later.py") is None
+    assert asked == ["rev-parse"], "no such branch: nothing to list"
+
+    def ls_tree_fails(root, args, *a):
+        asked.append(args[0])
+        return subprocess.CompletedProcess(args, 128, "", "") if args[0] == "ls-tree" \
+            else real(root, args, *a)
+    monkeypatch.setattr(gitref, "_BRANCH_PATHS", {})
+    monkeypatch.setattr(gitref, "_run", ls_tree_fails)
+    asked.clear()
+    assert gitref.only_on_default_branch(cfg, "later.py") is None
+    monkeypatch.setattr(gitref, "_run", lambda root, args, *a: asked.append(args[0]) or real(root, args, *a))
+    assert gitref.only_on_default_branch(cfg, "later.py") == "main"
+    assert asked == ["rev-parse", "ls-tree"] * 2, "a failed listing is not kept"
+
+
 def test_a_catalog_miss_names_the_worktree_that_holds_the_path(repo, capsys, monkeypatch):
     """A catalog lists the checkout you stand in, so `file:spec.md`,
     committed only in a linked `feat` worktree, read as a typo from the main

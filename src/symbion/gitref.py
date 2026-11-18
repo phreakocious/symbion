@@ -180,7 +180,49 @@ def only_on_default_branch(cfg, name) -> str | None:
     if not root or not name or Path(root, name).exists():
         return None
     b = cfg.default_branch
-    return b if _git(cfg, "cat-file", "-e", f"{b}:{name}").returncode == 0 else None
+    return b if re.sub(r"^(?:\./)+", "", name) in _branch_paths(cfg, b) else None
+
+
+# (repo, branch) -> (tip, paths). A commit's tree never changes, so a serve
+# lists a branch once a tip.
+# ponytail: the whole tree, 0.13 s at 100,000 paths where one cat-file took
+# 7 ms, so a CLI catalog miss there pays it once a process; probe by name
+# when nothing is held if a large repo shows it.
+_BRANCH_PATHS: dict = {}
+
+
+def _branch_paths(cfg, branch) -> frozenset:
+    """Each path `branch` holds as `git cat-file -e BRANCH:PATH` finds one:
+    a file, a directory with or without its `/`, never a submodule, whose
+    commit is no object here. A GUI card ran cat-file once for each target
+    that is no file in this worktree, and an item's title or a host name
+    never is: most of a page's build once such a name read as viewable text
+    (2026-11-17). Inside heads_once the tip is read once a page."""
+    key = (str(_root(cfg)), branch)
+    seen = _HEADS.get()
+    tip = seen.get(key) if seen is not None else None
+    if tip is None:
+        tip = _git(cfg, "rev-parse", "--verify", "-q", f"{branch}^{{commit}}").stdout.strip()
+        if seen is not None:
+            seen[key] = tip
+    if not tip:
+        return frozenset()
+    held = _BRANCH_PATHS.get(key)
+    if held and held[0] == tip:
+        return held[1]
+    r = _git(cfg, "ls-tree", "-r", "-t", "-z", tip, errors="replace", keep=False)
+    if r.returncode != 0:
+        return frozenset()                  # not kept: the next ask tries again
+    paths = set()
+    for rec in r.stdout.split("\0"):
+        meta, _, path = rec.partition("\t")  # "<mode> <type> <object>\t<path>"
+        kind = meta.split(" ")[1:2]
+        if kind == ["blob"]:
+            paths.add(path)
+        elif kind == ["tree"]:
+            paths.update((path, path + "/"))
+    _BRANCH_PATHS[key] = (tip, frozenset(paths))
+    return _BRANCH_PATHS[key][1]
 
 
 def other_worktree(cfg, name) -> str | None:
@@ -529,7 +571,8 @@ _HEADS: ContextVar[dict | None] = ContextVar("symbion_heads", default=None)
 
 @contextmanager
 def heads_once():
-    """Within it, check_state reads each repo's HEAD once. A page of checks
+    """Within it, check_state reads each repo's HEAD once, and
+    only_on_default_branch each default branch's tip. A page of checks
     stamped in a repo the serve does not stand in read that repo's HEAD per
     row: a home page of 200 took 2.07 s against 0.16 s (2026-10-14). A
     scope, not a TTL: a read outside one is fresh, as an in-process test

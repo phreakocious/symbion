@@ -80,14 +80,20 @@ AUTO_UPDATE = ("note: turn on auto-update for the symbion marketplace, so plugin
                "Enable auto-update")
 
 
-def test_init_with_the_plugin_enabled_names_auto_update(repo, tmp_path, capsys):
-    """Auto-update is what makes a plugin update bring the package (spec 2026-11-11)."""
+def test_init_with_the_plugin_enabled_names_auto_update(repo, tmp_path, capsys,
+                                                        monkeypatch):
+    """Auto-update is what makes a plugin update bring the package (spec 2026-11-11).
+    A CLI run from a git checkout is upgraded by hand, so the note is noise there:
+    setup had to explain it away on each run (2026-11-13). The checkout
+    is pinned both ways: this suite runs from a checkout and from an sdist."""
     settings = _home() / ".claude/settings.json"
     settings.parent.mkdir(parents=True)
-    for on in (True, False):
+    for on, sha, told in ((True, None, True), (False, None, False),
+                          (True, "abc1234", False)):
+        monkeypatch.setattr(cli.gitref, "own_commit", lambda *a, sha=sha: sha)
         settings.write_text(json.dumps({"enabledPlugins": {"symbion@symbion": on}}))
         assert run("init", "--yes", store_dir=tmp_path / "store") == 0
-        assert (AUTO_UPDATE in capsys.readouterr().out) is on
+        assert (AUTO_UPDATE in capsys.readouterr().out) is told, (on, sha)
 
 
 OLD_START ={"matcher": "startup|resume|clear|compact", "hooks": [

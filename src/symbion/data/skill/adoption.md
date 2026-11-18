@@ -65,7 +65,7 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
    done
    ```
 
-   The bootstrap reads each store that answers non-zero without `--json`: a
+   The bootstrap reads each store that answers non-zero without `--json`: an
    entry there that belongs here comes over with that entry as its source. The
    second lists the sibling paths tracked files name, absolute and relative,
    and the siblings that share the repo's name. A `../` path is relative to
@@ -198,7 +198,7 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
      the project uses it. The bootstrap copies migrated topic files to
      `<store>/archive/claude-memory/`, puts them on the delete list, and
      removes their `MEMORY.md` lines. `MEMORY.md` then states the split: memory
-     keeps how to work with the user and context no object holds; the rest is a
+     keeps how to work with the user and context no object holds; the rest is an
      entry. Auto-memory stays on. A memory dir copied when this repo was carved
      from another holds that project's files too, and a pair may have drifted:
      the bootstrap compares each pair with `cmp`, archives the superset, and

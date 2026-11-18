@@ -3202,7 +3202,7 @@ async def test_a_page_of_check_badges_reads_head_once(user: User, repo, tmp_path
     build_page(ctx, author="ada")
     calls = []
     real = gitref._git
-    monkeypatch.setattr(gitref, "_git", lambda c, *a: calls.append(a) or real(c, *a))
+    monkeypatch.setattr(gitref, "_git", lambda c, *a, **k: calls.append(a) or real(c, *a, **k))
     for page in ("/", "/notes", "/object?type=item&name=widget", f"/arc?id={aid}",
                  f"/notes?id={last}"):
         calls.clear()
@@ -3213,6 +3213,39 @@ async def test_a_page_of_check_badges_reads_head_once(user: User, repo, tmp_path
         heads = [a for a in calls if a[:4] == ("rev-parse", "--verify", "-q", "HEAD")]
         walks = [a for a in calls if a[:2] == ("rev-list", "--left-right")]
         assert len(heads) == 1 and len(walks) <= 1, (page, calls)
+
+
+async def test_no_git_call_on_home_or_notes_grows_with_the_cards(user: User, repo, tmp_path,
+                                                                  monkeypatch):
+    """A card whose target is no file in this worktree ran `git cat-file` on
+    each render, most of a page's build, and the head-once test above counts
+    HEAD reads and walks only, so the suite stayed green (2026-11-17). Every git
+    call counts here, after a warm-up open fills what a page holds once a tip.
+    /arc is left out: its redraw still reads git once a card."""
+    ctx = api.resolve(str(tmp_path))
+    def cards(lo, hi):
+        for i in range(lo, hi):
+            api.add(ctx, {"kind": "task", "target": {"type": "item", "name": f"widget {i}"},
+                          "body": f"open card {i}"}, author="ada")
+    cards(0, 3)
+    build_page(ctx, author="ada")
+    calls = []
+    real = gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda c, *a, **k: calls.append(a) or real(c, *a, **k))
+    pages = ("/", "/notes")
+    for page in pages:
+        await user.open(page)
+    seen = {}
+    for n in (3, 12):
+        cards(3, n)
+        for page in pages:
+            calls.clear()
+            await user.open(page)
+            await user.should_see(f"open card {n - 1}")
+            seen[page, n] = list(calls)
+    grew = {page: (len(seen[page, 3]), len(seen[page, 12])) for page in pages
+            if len(seen[page, 12]) > len(seen[page, 3])}
+    assert not grew, (grew, seen)
 
 
 async def test_targets_page_boards_each_target_open_work_first(user: User, repo, tmp_path):

@@ -93,8 +93,8 @@ where two separate adds would store both.
   prints, terminal against pipe, and store commits are in the skill's
   [mechanics.md](../src/symbion/data/skill/mechanics.md).
 - **Parked means parked.** An `idea` never prints in `arc todo` or `context`,
-  and prints in `summary` only when its `--due` date is near or past, or when
-  someone other than the reader wrote it (`from <author>`). Close one with
+  and prints in `summary` only from its `--due` date on, when it is starred,
+  or when someone other than the reader wrote it (`from <author>`). Close one with
   `resolve <id> --add-tag adopted --body "why"` or `--add-tag retired`.
   `list --kind idea` is the shelf.
 - **Kinds are the project's.** Add or rename labels under `[kinds]` in
@@ -114,7 +114,9 @@ where two separate adds would store both.
 - **Due dates.** `--due 2026-10-01` (or an ISO datetime) on any status entry. An
   open entry past due or due within 7 days leads the session-start summary
   (`overdue 2d`, `due in 3d`; within a day of a datetime, `due in 3h`, `overdue 40m`), and a parked one from its due date on. `list --overdue` lists those past due, `list
-  --due-by DATE` those due by then, past due included, and `supersede <id>
+  --due-by DATE` those due by then, past due included (`--due-by 1d`: by
+  tomorrow), resolved ones too: add `--status open` for what is still owed.
+  `supersede <id>
   --due ''` clears one.
 - **Untouched entries.** An open entry no one has edited through 5 active days,
   days on which anyone wrote an entry in the store, prints in the summary, up to

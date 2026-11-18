@@ -3716,6 +3716,8 @@ def test_a_body_file_that_reads_nothing_writes_nothing(tmp_path, capsys, monkeyp
     assert run(*args, "--body-file", "-", store_dir=tmp_path) == 1
     err = capsys.readouterr().err
     assert "--body-file" in err and "nothing was written" in err
+    # The verb leads the line: a log reader counts a refusal by it.
+    assert f"\n{verb}: --body-file -: read nothing" in "\n" + err, err
     assert ("--body ''" in err) == (verb == "supersede")
     assert store.load(tmp_path) == before
 
@@ -3730,9 +3732,10 @@ def test_a_mode_file_that_reads_nothing_names_its_own_flag(tmp_path, capsys, mon
     monkeypatch.setattr("sys.stdin", io.StringIO(" \n"))
     assert run("supersede", nid, flag, "-", store_dir=tmp_path) == 1
     err = capsys.readouterr().err
-    assert f"{flag} -: read nothing but whitespace" in err and "--body ''" not in err, err
+    assert f"\nsupersede: {flag} -: read nothing but whitespace" in "\n" + err, err
+    assert "--body ''" not in err, err
     assert run("supersede", nid, flag, str(tmp_path / "missing.md"), store_dir=tmp_path) == 1
-    assert f"{flag}: " in capsys.readouterr().err
+    assert f"\nsupersede: {flag}: " in "\n" + capsys.readouterr().err
 
 
 @pytest.mark.parametrize("verb", ["resolve", "supersede"])
@@ -8483,6 +8486,26 @@ def test_list_due_by_takes_rows_due_through_that_day(repo, tmp_path, capsys):
     assert want[0] not in text and want[1] in text, text
     assert run("list", "--due-by", "soon", store_dir=tmp_path) == 2
     assert "--due-by: 'soon' is not a date: use YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_list_due_by_takes_days_or_weeks_from_today(repo, tmp_path, capsys, monkeypatch):
+    """`list --due-by 1d` was refused while `--since 70m` took a span, so a
+    loop asking what was due by tomorrow computed a date first (dogfood,
+    2026-11-13). A span counts forward from today; the filter counts whole
+    days, so an hour is refused."""
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T10:00:00Z")    # far from any real today
+    def task(name, due):
+        return _add(tmp_path, capsys, "--kind", "task", "--type", "item", "--name", name,
+                    "--due", due, "--body", f"stub {name}")
+    today, tomorrow = task("today", "2026-01-10"), task("tomorrow", "2026-01-11")
+    in_a_week = task("in a week", "2026-01-17")
+    task("later", "2026-01-18")
+    for span, want in (("0d", [today]), ("1d", [today, tomorrow]),
+                       ("1w", [today, tomorrow, in_a_week]), ("7d", [today, tomorrow, in_a_week])):
+        assert run("list", "--due-by", span, "--json", store_dir=tmp_path) == 0
+        assert sorted(r["id"] for r in json.loads(capsys.readouterr().out)) == sorted(want), span
+    assert run("list", "--due-by", "3h", store_dir=tmp_path) == 2
+    assert "or days or weeks from today (1d, 2w)" in capsys.readouterr().err
 
 
 def test_a_due_with_an_hour_reads_in_hours_or_minutes_within_a_day(repo, tmp_path, capsys,

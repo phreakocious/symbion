@@ -217,6 +217,9 @@ not change, and its byte cap is not touched (my call). The user does it in
 `/plugin`. Nothing writes a settings file: `init` treats Claude Code's
 `settings.json` as the user's.
 
+2026-11-17: `init` leaves the note out when the CLI runs from a git checkout. No
+plugin update upgrades that install, so the note only made setup explain it away.
+
 ### 5. Release order
 
 The release order already does what this needs: PyPI first, then `main`. A cut to

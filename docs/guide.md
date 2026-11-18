@@ -68,8 +68,11 @@ The core's four dependencies serve a person at a terminal: `rich` and
 
 Run `command -v symbion` from another directory to check that it is on PATH.
 The SessionStart hook finds `symbion` through PATH. Without it, the hook
-prints one line in a project that adopted symbion, and nothing elsewhere:
-`symbion: cannot read store at … because 'symbion' is not on PATH`.
+prints one line in a project that adopted symbion, and nothing elsewhere.
+Codex's prints `symbion: cannot read store at … because 'symbion' is not on
+PATH`; the plugins' hook (Antigravity, Pi, Hermes Agent) prints `symbion: this
+project has a symbion store, but the symbion CLI is not installed or does not
+run`, with what to do next.
 
 **TAB completion.** Add your shell's line to its rc file:
 
