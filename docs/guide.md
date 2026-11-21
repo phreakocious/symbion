@@ -70,9 +70,10 @@ Run `command -v symbion` from another directory to check that it is on PATH.
 The SessionStart hook finds `symbion` through PATH. Without it, the hook
 prints one line in a project that adopted symbion, and nothing elsewhere.
 Codex's prints `symbion: cannot read store at … because 'symbion' is not on
-PATH`; the plugins' hook (Antigravity, Pi, Hermes Agent) prints `symbion: this
-project has a symbion store, but the symbion CLI is not installed or does not
-run`, with what to do next.
+PATH`; the plugins' hook (Antigravity, Pi) prints `symbion: this project has a
+symbion store, but the symbion CLI is not installed or does not run`, with what
+to do next, and Hermes Agent's names the gateway's PATH and how to restart the
+gateway.
 
 **TAB completion.** Add your shell's line to its rc file:
 
@@ -173,7 +174,10 @@ session's call names a file that an entry tagged `gotcha` is on, a symbion
 command aside, and again the first time it edits that file, the agent
 gets that entry's lead, its age, how many commits have changed the file since,
 and the command that retires it: a gotcha has no status, and the agent in
-the file is the one placed to judge whether it still holds. At the edit, an
+the file is the one placed to judge whether it still holds. A read whose new
+entries lie on more than two files lists each by its id and target instead,
+once; a later call that names one or two of those files prints theirs in full.
+At the edit, an
 entry the agent already got in full comes back as one line of ids, with the
 `symbion show` command that prints them: the hook answers after the edit. It reads a list
 the session-start hook writes under
@@ -302,6 +306,7 @@ print as plain text, from either hook.
 | `symbion --dir ../other-notes: open outside arcs: …` | working, on a store this repo's tree does not name (`--dir`, `SYMBION_DIR`, or a cwd inside a store); the header names it, so two summaries in one session can be told apart |
 | either, then `  N entries not yet in the store's git (symbion commit)` | working; `/symbion:wrap` at session end commits them |
 | either, then `… (symbion commit --all once their session has ended, the newest written 2h ago)` | the entries are another session's, and `symbion commit` takes only yours: `--all` takes them once that session has ended. The age is the only clue to whether it has: an idle session that is still open writes nothing either |
+| either, then `… (symbion commit --author ada now, as no agent session wrote them)` | the entries are ada's, written outside any agent session (a script, `serve`, a terminal), so nothing they wait on can end: `--author ada` takes them now |
 | `symbion: cannot read store at … because 'symbion' is not on PATH` | see [Install](#install) |
 | `symbion: this project has a symbion store, but the symbion CLI is not installed or does not run: run /symbion:setup.` | the plugin's hook, with no `symbion` that runs: `/symbion:setup` installs it. In Antigravity the line ends `see Install at https://github.com/phreakocious/symbion`, and in Pi `run /symbion-setup.` In Hermes Agent with no `symbion` on the gateway's PATH, it names that PATH and the `hermes gateway` command that restarts the gateway with yours |
 | `symbion: no store at …; run \`symbion init\`` | no store yet, or `.symbion`/`SYMBION_DIR` names a missing path |
@@ -404,7 +409,10 @@ then, so a session that changed only the repo still leaves its handoff. The firs
 `commit` takes your entries: in an agent session (Claude Code, Codex, Antigravity, Pi, Hermes Agent),
 the ones that session wrote; at a plain terminal, your author's. Two sessions on one store each commit
 their own. It names the entries it left and the newest one's age, and `commit --all`
-takes them too, for a session that ended without committing. From another project's
+takes them too, for a session that ended without committing. `commit --author NAME`
+takes NAME's entries that no agent session wrote: a script's, or yours from `serve` or
+a terminal. Such an entry is whole once written, so the lines that name it say to take
+it now. From another project's
 tree, as with `--dir ../other-notes`, it takes no file but the new docs your entries
 name: the store's other changed files are its own project's work, and it names them.
 A line the last commit holds that is gone from `notes.jsonl`, with no copy an edit
@@ -546,7 +554,8 @@ to an entry stays good (`serve` prints it, and `--port` picks another). It has:
   or its text goes in at the cursor;
 - a page per note: a rule in its body marks each amendment that joined it at
   a line break, with who added it and when, and its earlier versions show an
-  edit as a diff; a tag index;
+  edit as a diff. Every card that shows an entry's text whole marks its
+  amendments the same way, in lists and boards too; a tag index;
 - an arc's page, as a checklist you tick or as a board: drag a box to another
   column or along one, or move it with its arrows. A drop on done resolves the
   box, and a drag out of done reopens it. Edit arc sets the columns;
@@ -632,7 +641,8 @@ it read: a new kind or catalog type shows after a restart. After an upgrade or
 a `symbion.toml` edit, `symbion serve --restart`, run from anywhere, restarts
 every one in place: in its own terminal, on its own port, and its open tabs
 reload. It prints the version each now runs, or in a checkout the commit, and
-ends with a count (`restarted 3 of 3 serves`). `--stop` stops them all.
+ends with a count (`restarted 3 of 3 serves`). `--stop` stops them all. With
+`--port N`, either acts on the serve on port N alone.
 Neither works on Windows: there, Ctrl-C each one and start it again.
 `symbion serve --list`, from anywhere and on Windows too, prints each running
 serve's store, URL, pid, and the commit or version it runs.

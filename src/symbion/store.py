@@ -73,11 +73,17 @@ class Note:
     options: tuple | None = None      # question: its answers, the default first (check_fields)
     target_blob: str | None = None    # the target file's blob id when written (gitref.target_blob)
     side: str | None = None           # shared store: the writing clone's git user.name
+    # {name, at}: who ran the write (an agent's name, gui or cli), and a copy of
+    # created_at that ties it to this version (writer_name).
+    writer: dict | None = None
     extra: dict | None = None         # a newer symbion's fields, written back as read (_ROW_KEYS)
     spec: K.Kind = K.Kind()           # the kind's bits, set at read time; NEVER serialized
     # Its chain's first created_at, set at read time on a revision; NEVER
     # serialized. A revision is no re-reading of the target (see target_blob).
     first_written: str | None = field(default=None, compare=False)
+    # The agent that wrote this version under another author's name, set at
+    # read time from the stored author; NEVER serialized (_via).
+    via: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -105,7 +111,7 @@ class Arc:
 # symbion's field, kept through an edit, or the row loses it at an older
 # install's edit (the user, 2026-10-19). A key this symbion took out
 # is not carried: every row written before 2026-10-09 holds `"evidence": []`.
-_ROW_KEYS = frozenset(f.name for f in dc_fields(Note)) - {"spec", "first_written", "extra"}
+_ROW_KEYS = frozenset(f.name for f in dc_fields(Note)) - {"spec", "first_written", "via", "extra"}
 _RETIRED_KEYS = frozenset({"evidence"})
 _ARC_KEYS = frozenset(f.name for f in dc_fields(Arc)) - {"extra"}
 
@@ -443,9 +449,35 @@ def note_from_dict(d: dict, target_types=None, kinds=None) -> Note:
         options=tuple(o) if (o := d.get("options")) else None,
         target_blob=d.get("target_blob"),
         side=d.get("side"),
+        writer=d.get("writer"),
         extra={k: v for k, v in d.items() if k not in _ROW_KEYS | _RETIRED_KEYS} or None,
         spec=kinds[d["kind"]],
+        via=_via(d),
     )
+
+
+def writer_name(stamp, created_at) -> str | None:
+    """A version's writer: its stamp's name where the stamp's `at` is the
+    version's own created_at, else None (unknown). An older install's edit
+    keeps a key it does not know (Note.extra), so its version carries the
+    stamp it found, at the earlier version's time."""
+    if isinstance(stamp, dict) and stamp.get("at") == created_at \
+            and isinstance(stamp.get("name"), str):
+        return stamp["name"]
+    return None
+
+
+def writer_of(note) -> str | None:
+    """writer_name for a Note: what `list --json` gives as `writer`."""
+    return writer_name(note.writer, note.created_at)
+
+
+def _via(d: dict) -> str | None:
+    """The agent that wrote a version under another author's name, else None:
+    for an unknown writer, `gui`, `cli`, and an agent writing as itself. From
+    the stored author: summary.seen_from later names a side in it."""
+    name = writer_name(d.get("writer"), d["created_at"])
+    return name if name not in (None, "gui", "cli", d.get("author", "unknown")) else None
 
 
 def read_dict(note: Note) -> dict:
@@ -470,6 +502,7 @@ def note_to_dict(note: Note) -> dict:
         "options": list(note.options) if note.options is not None else None,
         "target_blob": note.target_blob,
         **({"side": note.side} if note.side is not None else {}),
+        **({"writer": note.writer} if note.writer is not None else {}),
         **(note.extra or {}),
     }
 
@@ -1155,6 +1188,7 @@ def add_many(store, rows, target_types=None, canonicalize=None, refuse_twins=Fal
         check_fields(fields["kind"], spec, fields)
     require_store(store)
     side = shared_side(store)                # before the first line: a refusal writes nothing
+    writer = _writer()
     with _lock(store):                       # outer: covers canonicalize + mint + write
         # ponytail: lock held across canonicalize = rows x command_timeout worst
         # case; a per-row release would let a neighbour mint between rows, so
@@ -1172,6 +1206,7 @@ def add_many(store, rows, target_types=None, canonicalize=None, refuse_twins=Fal
             fields.setdefault("created_at", _now_iso())
             fields.setdefault("author", "unknown")
             fields.setdefault("body", "")
+            fields["writer"] = {"name": writer, "at": fields["created_at"]}
             if side is not None:
                 fields["side"] = side
             if fields.get("due") is not None:
@@ -1222,8 +1257,9 @@ def _as_written(note) -> str:
     d = note_to_dict(note)
     for k in ("id", "created_at", "supersedes"):
         del d[k]
-    if d["provenance"]:
-        d["provenance"] = {k: v for k, v in d["provenance"].items() if k != "at"}
+    for stamp in ("provenance", "writer"):
+        if isinstance(d.get(stamp), dict):
+            d[stamp] = {k: v for k, v in d[stamp].items() if k != "at"}
     return json.dumps(d, sort_keys=True)
 
 
@@ -1289,7 +1325,8 @@ def chain_tips(notes):
 def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
                         rm_refs=None, prepend_body: str | None = None, replace_body=None,
-                        add_measurements=None, *, side, pending=None, **fields) -> Note:
+                        add_measurements=None, rm_measurements=None, *, side, pending=None,
+                        **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
     multi-row aggregate (`rename_target`, `apply_reconciliation`) can hold
@@ -1368,6 +1405,12 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
         base["refs"] = have + [r for r in add_refs or () if r not in have]
     if "refs" in fields or add_refs or "target" in fields:
         base["refs"] = without_self_ref(base["target"], base["refs"])
+    if rm_measurements:
+        have = base.get("measurements") or {}
+        if absent := [k for k in rm_measurements if k not in have]:
+            raise ValueError(f"--rm-measure {', '.join(absent)}: not one of its measurements "
+                             f"({', '.join(have) or 'it has none'}); nothing was written")
+        base["measurements"] = {k: v for k, v in have.items() if k not in rm_measurements} or None
     if add_measurements:
         # Onto the TIP's too: a name given replaces that name only.
         base["measurements"] = {**(base.get("measurements") or {}), **add_measurements}
@@ -1446,6 +1489,7 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     # correction, not by the person being corrected. The row gets a fresh
     # timestamp; a stale author beside it is incoherent.
     base["author"] = author or "unknown"
+    base["writer"] = {"name": _writer(), "at": base["created_at"]}
     if side is not None:                    # the edit is the editor's
         base["side"] = side
     note = note_from_dict(base, kinds=kinds)
@@ -1485,7 +1529,7 @@ def _replaced(old: Note, pairs) -> str:
 def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
               append_body: str | None = None, add_refs=None, rm_refs=None,
               prepend_body: str | None = None, add_measurements=None, target_types=None,
-              replace_body=None, **fields) -> Note:
+              replace_body=None, rm_measurements=None, **fields) -> Note:
     """Append a correction superseding old_id -- the single-row public entry
     point. One outer `_lock` spans load -> fast-forward -> mint -> write; see
     `_supersede_unlocked` for what happens inside it.
@@ -1516,13 +1560,22 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
             if add_refs:
                 add_refs = canonicalize({"refs": add_refs})["refs"]
             if rm_refs:
-                rm_refs = canonicalize({"refs": rm_refs})["refs"]
+                # One the tip holds as typed goes as typed: a name stored before
+                # the catalog listed it may resolve elsewhere now (audit, 2026-11-21).
+                try:
+                    held = note_to_dict(chain_tip(notes, old_id))["refs"]
+                except (KeyError, ValueError):      # _supersede_unlocked says which
+                    held = []
+                typed = [r for r in rm_refs if r not in held]
+                rm_refs = [r for r in rm_refs if r in held] + \
+                    (canonicalize({"refs": typed})["refs"] if typed else [])
         check_types([o for o in (fields.get("target"), *(fields.get("refs") or ()),
                                  *(add_refs or ())) if o], target_types)
         return _supersede_unlocked(store, notes, old_id, author=author, side=side,
                                    append_body=append_body, add_refs=add_refs, rm_refs=rm_refs,
                                    prepend_body=prepend_body, replace_body=replace_body,
-                                   add_measurements=add_measurements, **fields)
+                                   add_measurements=add_measurements,
+                                   rm_measurements=rm_measurements, **fields)
 
 
 def _committed_floor(store, notes, tip: Note) -> str:
@@ -1638,6 +1691,45 @@ def _state_dir(store, make: bool = False) -> Path:
     return d
 
 
+def agent_marker() -> str | None:
+    """The agent whose shell runs this, by the marker it sets there, else
+    None. Codex, Hermes, Antigravity and Pi before Claude Code: one launched
+    from Claude Code inherits CLAUDECODE, and the innermost agent is the one
+    writing. api.shell_author names the author by it, and _writer the writer."""
+    if os.environ.get("CODEX_THREAD_ID"):
+        return "codex"
+    if os.environ.get("HERMES_AGENT"):
+        return "hermes"
+    # agy's hooks get ANTIGRAVITY_CONVERSATION_ID but not ANTIGRAVITY_AGENT, which
+    # only its shell commands get (agy 1.4.12, 2026-10-30).
+    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
+        return "antigravity"
+    # Pi sets AI_AGENT=pi and Claude Code its own value: it names the inner one.
+    if os.environ.get("AI_AGENT") == "pi":
+        return "pi"
+    if os.environ.get("CLAUDECODE"):
+        return "claude"
+    return None
+
+
+_GUI = False     # this process is `symbion serve`: write_as_gui
+
+
+def write_as_gui() -> None:
+    """Stamp this process's writes `gui`, whatever the shell that started it
+    holds: `symbion serve` calls it in each process it runs. A flag in the
+    process, not the environment, so no child of the serve (an editor, a file
+    manager, a terminal opened from either) passes it to an agent."""
+    global _GUI
+    _GUI = True
+
+
+def _writer() -> str:
+    """Who runs this write, for its stamp: `gui` in `symbion serve`, else the
+    agent marker, else `cli`. No flag or variable sets it."""
+    return "gui" if _GUI else agent_marker() or "cli"
+
+
 def session_key() -> str | None:
     """The agent session this process runs in, when its runtime names one.
     Codex, Hermes, Antigravity and Pi before Claude Code: one launched from
@@ -1708,11 +1800,12 @@ def sessions(store, committed: bool = False) -> dict:
     return {i: k.split("\t")[0] for i, k in known.items() if k and (committed or "\t" not in k)}
 
 
-def own_rows(store, author: str):
+def own_rows(store, author: str, sessionless: bool = False):
     """keep() for `commit`: the caller's own pending rows. In an agent
     session, the rows it wrote, as whoever (a row in the user's words is written as the
-    person); with no session, the author's rows that no session wrote."""
-    known, key = sessions(store), session_key()
+    person); with no session, or `sessionless` (`commit --author`), the author's rows
+    that no session wrote."""
+    known, key = sessions(store), None if sessionless else session_key()
     if key:
         return lambda r: known.get(r.get("id")) == key
     return lambda r: r.get("author") == author and r.get("id") not in known
@@ -1800,7 +1893,7 @@ def stored_names(notes, target_type) -> set:
 
 def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
           status=None, arc_id=None, tag=None, author=None, grep=None,
-          overdue=None, since=None, due_by=None):
+          overdue=None, since=None, due_by=None, undated=None):
     """Filter raw notes by any combination of fields. Callers compose heads()
     when they want current state (see data-flow in the spec).
 
@@ -1852,6 +1945,8 @@ def query(notes, *, id=None, target_type=None, target_name=None, kind=None,
         left = (due_by - now.date()).days
         out = [n for n in out if (s := due_state(n.due, now) if n.due else None)
                and s[1] <= left]
+    if undated:
+        out = [n for n in out if read_status(n) == "open" and not n.due]
     return out
 
 
@@ -2905,7 +3000,8 @@ def arc_last_change(notes, act: Arc) -> tuple[str, str]:
     """(stamp, author) of the arc's newest change: the latest version of any
     entry filed in it, or a move on its board, else its creation. A rename or a
     phase edit does not count: until 2026-11-09 the arc's own line held no time."""
-    marks = [(n.created_at, n.author) for n in heads(notes) if n.arc_id == act.id]
+    marks = [(n.created_at, n.author + (f" via {n.via}" if n.via else ""))  # summary.byline
+             for n in heads(notes) if n.arc_id == act.id]
     marks += [(p["at"], p.get("by") or "") for p in act.placement or () if p.get("at")]
     return max([(act.created_at, act.author), *marks], key=lambda m: written_at(None, m[0]))
 
@@ -3136,7 +3232,7 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
         raise ValueError(f"kind {kind!r} cannot be seeded: it has the verdict bit, "
                          f"and seed stamps no provenance and writes no falsifier")
     require_store(store)
-    side = shared_side(store)
+    side, writer = shared_side(store), _writer()
     with _lock(store):                       # outer: load + mint + append
         notes = load(store)
         if canonicalize is not None:
@@ -3149,12 +3245,13 @@ def seed_arc(store, arc_id, target_type, names, author="unknown", kind="task", _
         for name in names:
             if (target_type, name) in members:
                 continue
+            at = _now_iso()
             note = note_from_dict({
                 "id": _mint_unique(used, _gen), "kind": kind,
                 "target": {"type": target_type, "name": name},
-                "created_at": _now_iso(), "author": author, "body": "",
+                "created_at": at, "author": author, "body": "",
                 "status": "open", "arc_id": arc_id, "target_blob": blobs.get(name),
-                "side": side,
+                "side": side, "writer": {"name": writer, "at": at},
             }, kinds=kinds)
             _append_note_unlocked(store, note)
             created.append(note)

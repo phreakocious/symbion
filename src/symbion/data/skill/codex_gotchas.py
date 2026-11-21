@@ -192,7 +192,7 @@ def main():
         mark += f".{listing.stat().st_mtime_ns}.{key}"
     gate = Path(mark + (".edit" if edit else ".seen"))
     seen = set(gate.read_text(encoding="utf-8").splitlines()) if gate.exists() else set()
-    output = []
+    hits = []
     # Not splitlines(): it splits at U+2028 too, which a row's text may hold.
     for row in filter(None, listing.read_text(encoding="utf-8").split("\n")):
         ident, name, text, root = row.split("\t")[:4]    # a field added to the list is dropped here
@@ -200,11 +200,29 @@ def main():
             continue
         if not named(call, name, root) and not (root and in_worktree(call, name, root)):
             continue
-        output.append(json.loads('"' + text + '"'))
+        hits.append((ident, name, json.loads('"' + text + '"')))
         seen.add(ident)
-        for suffix in ((".seen", ".edit") if edit else (".seen",)):
-            with Path(mark + suffix).open("a", encoding="utf-8") as stream:
-                stream.write(ident + "\n")
+    # A read over more than two such files lists each row by id and target, once, as
+    # gotchas.sh does (dogfood, 2026-11-20). A call naming one or two prints theirs in full.
+    files = {name for _, name, _ in hits}
+    output = []
+    if not edit and len(files) > 2:
+        listed = Path(mark + ".listed")
+        done = set(listed.read_text(encoding="utf-8").splitlines()) if listed.exists() else set()
+        new = [(ident, text) for ident, _, text in hits if ident not in done]
+        output = [text.split(" (", 1)[0] for _, text in new]
+        with listed.open("a", encoding="utf-8") as stream:
+            stream.writelines(ident + "\n" for ident, _ in new)
+        if output:
+            output.append(f"symbion: this call names {len(files)} files that have gotchas, so each is "
+                          f"listed by id and target only; it prints in full at a call that names its "
+                          f"file alone or with one other.")
+    else:
+        for ident, _, text in hits:
+            output.append(text)
+            for suffix in ((".seen", ".edit") if edit else (".seen",)):
+                with Path(mark + suffix).open("a", encoding="utf-8") as stream:
+                    stream.write(ident + "\n")
     if output:
         # The words every row shares, written beside the list: once, before the first row.
         head = Path(str(listing) + ".head")

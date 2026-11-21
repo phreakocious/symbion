@@ -35,7 +35,7 @@ app = "../terraform-app"
 
 Each value is the repo's main checkout, relative to the store (`~` expands).
 Each name is a target type (`net:modules/vpc/main.tf`), and may not be
-`commit`, `item`, `project`, `arc` or `file`. Its catalog is every file git
+`commit`, `item`, `project`, `arc`, `doc` or `file`. Its catalog is every file git
 lists in that repo; a `[catalogs]` entry of the same name replaces it, and
 runs in the repo's root. `[resolvers]` and `[renames]` entries of that name
 work as for any type.

@@ -176,16 +176,25 @@ def picked(n, by_id) -> str | None:
     """The option a question's body gives on a line of its own, below its
     first line: an answer button writes the option's words alone. None when
     no option, or more than one, has such a line; no answered question had
-    two (2026-11-11). Only a line added since the first version counts, each
-    as often as it was added: a default the question stated on a line of its
-    own read as its answer (audit, 2026-11-12). None with no chain, `by_id`."""
+    two (2026-11-11). Only a line a later version added counts, each as often
+    as it was added: a default the question stated on a line of its own read
+    as its answer (audit, 2026-11-12). The asker's own later lines are its
+    text, a default appended later included, except in the version that
+    resolves it: an agent relays the user's answer there (audit, 2026-11-21).
+    None with no chain, `by_id`."""
     if by_id is None:
         return None
 
     def key(s):
         return s.strip().rstrip(".").casefold()
-    asked = Counter(key(line) for line in (_root(by_id, n).body or "").splitlines())
-    lines = Counter(key(line) for line in (n.body or "").splitlines()[1:]) - asked
+
+    def added(new, old):
+        return Counter(map(key, (new.body or "").splitlines())) - Counter(map(key, (old.body or "").splitlines()))
+    chain = list(_chain(by_id, n))
+    answers = sum((added(new, old) for new, old in pairwise(chain)
+                   if new.author != chain[-1].author
+                   or S.read_status(new) == "resolved" and S.read_status(old) != "resolved"), Counter())
+    lines = Counter(key(line) for line in (n.body or "").splitlines()[1:]) & answers
     found = [o for o in n.options or () if key(o) in lines]
     return found[0] if len(found) == 1 else None
 
@@ -303,16 +312,38 @@ def wrote_it(reader, author) -> bool:
     return reader is not None and author not in (reader, "unknown")
 
 
+def byline(n) -> str:
+    """n's author as every surface prints it: `phreakocious via claude` where
+    an agent wrote the version under another name (store._via)."""
+    return n.author + (f" via {n.via}" if n.via else "")
+
+
+def _by(key: str, n) -> dict:
+    """`{key: author}`, and `{key}_via` where n's `via` prints: `--json` keeps
+    each name string as it is, so a consumer comparing `from == NAME` matches."""
+    return {key: n.author, **({f"{key}_via": n.via} if n.via else {})}
+
+
+def _named(r: dict, key: str) -> str:
+    """byline for a summary dict's `key`, read back from its `_by` pair."""
+    return r[key] + (f" via {r[key + '_via']}" if r.get(key + "_via") else "")
+
+
 def who(reader, raised, last) -> dict:
     """The labels a row prints with: `from` who raised it, and `last` who
     wrote its newest version when that is someone else. Labelled by the head
     alone, an amendment relabelled a request: the user's task, amended by
     Codex, printed `from codex`, and one the reader amended lost its label
     (the user's call, 2026-10-02: name both). A row only the reader touched
-    has no label: `last by` the reader on a row of no one else's is noise."""
-    by = {"from": raised} if wrote_it(reader, raised) else {}
-    if last not in (raised, "unknown") and (by or wrote_it(reader, last)):
-        by["last"] = last
+    has no label: `last by` the reader on a row of no one else's is noise.
+    `raised` and `last` are the chain's first and newest versions. One an
+    agent wrote under another name labels for every reader, the person at a
+    terminal and the one whose name it used included (the writer stamp's
+    design, 2026-11-20), and differs from a version by that name alone."""
+    by = _by("from", raised) if wrote_it(reader, raised.author) or raised.via else {}
+    if last.author != "unknown" and (last.author, last.via) != (raised.author, raised.via) \
+            and (by or wrote_it(reader, last.author) or last.via):
+        by |= _by("last", last)
     return by
 
 
@@ -393,6 +424,9 @@ def empty_summary() -> dict:
         "open": {},
         "open_in_arcs": 0,
         "parked": 0,
+        "parked_undated": 0,
+        "parked_undated_days": None,
+        "parked_undated_kinds": [],
         "arcs": [],
         "arcs_elided": 0,
         "priority": [],
@@ -448,7 +482,7 @@ def row_digest(by_id, n, chars, reader, active=frozenset(), now=None) -> dict:
             **({"parked": True} if n.spec.parked else {}),
             **({"arc": n.arc_id} if n.arc_id in active else {}),
             **({"waits": True} | changed(by_id, n) if waits(reader, by_id, n) else {}),
-            **who(reader, root.author, n.author),
+            **who(reader, root, n),
             **({"registered": S.shown(root.created_at)[:10]}
                if n.spec.status and n.spec.verdict else {}),
             **({"amendments": k} if (k := _amendments(by_id, n)) else {}),
@@ -551,6 +585,7 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
     kinds = K.read_kinds(store_dir)
     open_counts = {label: len(open_outside_arcs(notes, label, active))
                    for label, k in kinds.items() if k.status and not k.parked}
+    undated = [n for n in notes if n.spec.parked and S.read_status(n) == "open" and not n.due]
     # Each row prints once: in the due block, else the priority block, else
     # the heads. Otherwise priority rows repeat among the heads.
     # The rows that wait on the reader lead, as their own block under their
@@ -660,7 +695,9 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
         # dead one reads the same (measured 2026-09-20).
         rows.append({"id": a.id, "done": done, "total": total,
                      "name": clip(a.name, NAME_CHARS), "open": total - done,
-                     "created_at": a.created_at, "age_days": age_days(a.created_at, _now)}
+                     "created_at": a.created_at, "age_days": age_days(a.created_at, _now),
+                     # An age alone made a quiet arc read like a moving one (2026-11-08).
+                     "last_change_days": age_days(S.arc_last_change(scope, a)[0], _now)}
                     | ({"phases": phase_counts(scope, a)} if a.phases else {}))
     rows.sort(key=lambda r: (-r["open"], r["id"]))
 
@@ -701,6 +738,13 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
         # Parked is quiet, not hidden: fresh agents found no sign one existed
         # until its date (2026-10-14). The user: a count is enough.
         "parked": sum(n.spec.parked and S.read_status(n) == "open" for n in notes),
+        # One with no date shows at no session start of its writer's, and
+        # agents filed them past add's note (2026-11-20): count them, and age
+        # the oldest from its first version.
+        "parked_undated": len(undated),
+        "parked_undated_days": max((age_days(n.first_written or n.created_at, _now) for n in undated),
+                                   default=None),
+        "parked_undated_kinds": sorted({n.kind for n in undated}),
         "arcs": rows[:a_cap],
         "arcs_elided": max(0, len(rows) - a_cap),
         "priority": [digest(n, BODY_CHARS) for n in priority[:p_cap]],
@@ -711,9 +755,9 @@ def summary(store_dir, cfg, full=False, _now=None, reader=None, side=None,
                      **({"due": n.due, "past": st[0], "days": st[1], "phrase": due_phrase(st)}
                         if (st := due_of.get(n.id)) else {})} for n in waiting[:w_cap]],
         "waiting_elided": max(0, len(waiting) - w_cap),
-        "people": [{**digest(n, HEAD_CHARS), "author": n.author} for n in people[:o_cap]],
+        "people": [{**digest(n, HEAD_CHARS), **_by("author", n)} for n in people[:o_cap]],
         "people_elided": max(0, len(people) - o_cap),
-        "closed": [{**digest(n, HEAD_CHARS), "closed_by": (c := _closer(by_id, n)).author,
+        "closed": [{**digest(n, HEAD_CHARS), **_by("closed_by", c := _closer(by_id, n)),
                     "closed_at": c.created_at} for n in closed[:c_cap]],
         "closed_elided": max(0, len(closed) - c_cap),
         # The people block names an author only for the rows no other block
@@ -789,14 +833,14 @@ def wrap_changes(loaded, by_id, w) -> list[dict]:
         was, now = S.read_status(then), S.read_status(h)
         if now == "resolved" and was != "resolved":
             c = _closer(by_id, h)
-            out.append({"id": t, "what": "resolved", "by": c.author, "at": c.created_at})
+            out.append({"id": t, "what": "resolved", **_by("by", c), "at": c.created_at})
             continue
         fields = [f for f in _CHANGED if getattr(h, f) != getattr(then, f)]
         what = ("reopened" if was == "resolved" else
                 "added to" if h.body != then.body and h.body.startswith(then.body) else
                 "edited" if h.body != then.body or not fields else
                 f"{', '.join(fields)} changed")
-        out.append({"id": t, "what": what, "by": h.author, "at": h.created_at})
+        out.append({"id": t, "what": what, **_by("by", h), "at": h.created_at})
     return out
 
 
@@ -823,14 +867,14 @@ def written(by_id, n) -> list[str]:
     chain = list(_chain(by_id, n))
     b = next((new for new, old in pairwise(chain) if new.body != old.body), chain[-1])
     root = chain[-1]
-    out = [f"written {S.shown(b.created_at)} by {b.author}"] if root.author == b.author else [
-        f"written {S.shown(root.created_at)} by {root.author}",
-        f"body changed {S.shown(b.created_at)} by {b.author}"]
+    out = [f"written {S.shown(b.created_at)} by {byline(b)}"] if byline(root) == byline(b) else [
+        f"written {S.shown(root.created_at)} by {byline(root)}",
+        f"body changed {S.shown(b.created_at)} by {byline(b)}"]
     if b is not n:
         prev = by_id[n.supersedes]
         what = ", ".join(f for f in _CHANGED if getattr(n, f) != getattr(prev, f)) or "edited"
         out.append(f"{what}{' changed' if what != 'edited' else ''} "
-                   f"{S.shown(n.created_at)} by {n.author}")
+                   f"{S.shown(n.created_at)} by {byline(n)}")
     return out
 
 
@@ -838,8 +882,8 @@ def _starred_at(by_id, n) -> str:
     """When n's star went on: the oldest row of its chain that carries it
     unbroken up to the head. A star on a row with no status never expires,
     so its age is what shows a stale one (2026-09-24: most of one store's
-    stars were results starred while they were news). An uncommitted edit rewrites
-    its row in place, keeping that row's time."""
+    stars were results starred while they were news). Every edit keeps the
+    version it replaces, so the star's first version holds its time."""
     at = n.created_at
     for row in _chain(by_id, n):
         if "priority" not in row.tags:
@@ -877,14 +921,14 @@ def seams(by_id, n) -> list[tuple[int, str, str, bool, bool]]:
             continue
         i = new.body.find(old.body)
         if i < 0:
-            out = _edit_seams(old.body, new.body, out, new.author, new.created_at)
+            out = _edit_seams(old.body, new.body, out, byline(new), new.created_at)
             continue
         end = i + len(old.body)
         # A side that added only whitespace has no seam: there is no text to mark.
-        out = ([(i, new.author, new.created_at, True, False)]
+        out = ([(i, byline(new), new.created_at, True, False)]
                if new.body[:i].strip() and _at_break(new.body, i) else []) \
             + [(at + i, *s) for at, *s in out] \
-            + ([(end, new.author, new.created_at, False, False)]
+            + ([(end, byline(new), new.created_at, False, False)]
                if new.body[end:].strip() and _at_break(new.body, end) else [])
     return out
 
@@ -898,7 +942,7 @@ def _at_break(text: str, at: int) -> bool:
 _WORD = re.compile(r"\S+")
 
 
-def _edit_seams(old: str, new: str, out, author: str, created_at: str):
+def _edit_seams(old: str, new: str, out, who: str, created_at: str):
     """seams() across a link that edited the old body, by a word diff as
     gui.notes.edited() reads one. A seam stays beside the kept words next to
     it. Text after the last kept words that starts a paragraph is the link's
@@ -926,7 +970,7 @@ def _edit_seams(old: str, new: str, out, author: str, created_at: str):
         _, j, size = blocks[-1]
         j += size                               # the first new word after the last kept run
         if j < len(nw) and new.count("\n", nw[j - 1].end(), nw[j].start()) >= 2:
-            moved[nw[j - 1].end()] = [author, created_at, False, True]
+            moved[nw[j - 1].end()] = [who, created_at, False, True]
     out = sorted((at, *s) for at, s in moved.items())
     # A seam whose side the edit emptied marks no text.
     cuts = [0, *(at for at, *_ in out), len(new)]
@@ -1038,15 +1082,16 @@ def added(by_id, n, reader, chars) -> dict:
 
     `added_earlier`: the same for each other author before the newest, oldest
     first. The user answered `approved.`, a reviewer appended a relay, and
-    the agent's summary printed the relay alone (2026-10-14)."""
+    the agent's summary printed the relay alone (2026-10-14). An author's
+    words an agent relayed count apart from that author's own (byline)."""
     rewritten, out, seen = False, [], set()
     lead = clip(n.body, chars)
     for new, old in pairwise(_chain(by_id, n)):
-        if wrote_it(reader, new.author) and new.author not in seen:
+        if wrote_it(reader, new.author) and byline(new) not in seen:
             was = set(old.body.splitlines())
             fresh = [ln for ln in new.body.splitlines() if ln.strip() and ln not in was]
             if fresh:
-                seen.add(new.author)
+                seen.add(byline(new))
                 # The first new line the lead does not show: a user who
                 # trimmed the lead's last sentence and answered below it
                 # changed the lead first, and the answer never printed
@@ -1054,7 +1099,7 @@ def added(by_id, n, reader, chars) -> dict:
                 line = next((ln for ln in fresh
                              if ln in n.body and clip(ln, chars) not in lead), None)
                 if line:
-                    out.append({"added": clip(line, chars), "added_by": new.author,
+                    out.append({"added": clip(line, chars), **_by("added_by", new),
                                 "added_at": new.created_at, "lead_rewritten_since": rewritten,
                                 "edited": not _seamed(by_id, n, new, line)})
         rewritten |= clip(new.body, chars) != clip(old.body, chars)
@@ -1074,7 +1119,7 @@ def changed(by_id, n) -> dict:
     if prev is None or n.body != prev.body:
         return {}
     what = change_words(prev, n)
-    return {"changed": what, "changed_by": n.author, "changed_at": n.created_at} if what else {}
+    return {"changed": what, **_by("changed_by", n), "changed_at": n.created_at} if what else {}
 
 
 def change_words(prev, n) -> str:
@@ -1104,7 +1149,7 @@ def _seamed(by_id, n, link, line) -> bool:
         return True
     i, ss = n.body.find(line), seams(by_id, n)
     cuts = [0, *(at for at, *_ in ss), len(n.body)]
-    return any((who, when) == (link.author, link.created_at)
+    return any((who, when) == (byline(link), link.created_at)
                and (cuts[k] <= i < at if above else at <= i < cuts[k + 2])
                for k, (at, who, when, above, _) in enumerate(ss))
 
@@ -1115,7 +1160,7 @@ def added_label(a) -> str:
     the link's own holds."""
     since = ", lead rewritten since" if a["lead_rewritten_since"] else ""
     verb = "edited" if a.get("edited") else "added"
-    return f"{a['added_by']} {verb} {when_added(a['added_at'])}{since}:"
+    return f"{_named(a, 'added_by')} {verb} {when_added(a['added_at'])}{since}:"
 
 
 def json_row(n, by_id, since, state=None) -> dict:
@@ -1127,9 +1172,11 @@ def json_row(n, by_id, since, state=None) -> dict:
     by `created_at`, a row amended today read as filed today (2026-10-12).
     Both stamps in UTC: a consumer's string sort misordered an import's
     local offsets (2026-10-22). `state` is a verdict row's
-    `api.verdict_state` pair."""
+    `api.verdict_state` pair. `writer` is the stamp's verdict, a name or
+    null (store.writer_of): the raw stamp stays in notes.jsonl."""
     root = _root(by_id, n)
-    return S.read_dict(n) | {"created_at": S.utc_stamp(n.created_at), "commits_since": since,
+    return S.read_dict(n) | {"writer": S.writer_of(n),
+                             "created_at": S.utc_stamp(n.created_at), "commits_since": since,
                              "raised_by": root.author, "raised_at": S.utc_stamp(root.created_at)} \
         | ({"state": state[0], "distance": state[1]} if state else {})
 
@@ -1174,7 +1221,8 @@ def _labelled(paint, r, first=None) -> str:
     labels."""
     by = ", ".join([*([first] if first else []), *([paint("waits on you", "warn")]
                                                    if r.get("waits") else []),
-                    *(f"{label} {r[k]}" for label, k in (("from", "from"), ("last by", "last"))
+                    *(f"{label} {_named(r, k)}" for label, k in (("from", "from"),
+                                                                 ("last by", "last"))
                       if r.get(k))])
     reg = (", parked" if r.get("parked") else "") + \
         (f", arc {r['arc']}" if r.get("arc") else "") + \
@@ -1189,9 +1237,17 @@ def _labelled(paint, r, first=None) -> str:
     if r.get("options"):          # a question's answers, whole: the body clipped
         line += f"\n    {paint('options:', 'meta')} {paint(options_line(r['options']), 'body')}"
     if r.get("changed"):
-        line += "\n    " + paint(f"{r['changed_by']} {r['changed']} {when_added(r['changed_at'])}",
-                               "meta")
+        line += "\n    " + paint(f"{_named(r, 'changed_by')} {r['changed']} "
+                                 f"{when_added(r['changed_at'])}", "meta")
     return line
+
+
+def _last_change(paint, r) -> str:
+    """`  (last change 7d ago)`, or nothing for a row without it."""
+    if "last_change_days" not in r:
+        return ""
+    k = r["last_change_days"]
+    return "  " + paint(f"(last change {f'{k}d ago' if k else 'today'})", "meta")
 
 
 def render_summary(d: dict, paint=plain, person: bool = False) -> str:
@@ -1201,6 +1257,10 @@ def render_summary(d: dict, paint=plain, person: bool = False) -> str:
     # `bug 0` beside a bug filed in an arc read as bug-free (2026-09-27).
     in_arcs = f"; {d['open_in_arcs']} open in arcs" if d.get("open_in_arcs") else ""
     in_arcs += f"; {d['parked']} parked" if d.get("parked") else ""
+    in_arcs += (f", {d['parked_undated']} with no due date (oldest {d['parked_undated_days']}d: "
+                + (f"symbion {d['named_store']} " if d.get("named_store") else "")
+                + f"list --kind {','.join(d['parked_undated_kinds'])} --undated)"
+                if d.get("parked_undated") else "")
     named = f" {d['named_store']}" if d.get("named_store") else ""
     named += f" (for {d['reader']})" if d.get("reader") else ""
     # Session start's pull said these first: a failed fetch, or what it merged.
@@ -1233,7 +1293,7 @@ def render_summary(d: dict, paint=plain, person: bool = False) -> str:
         out.append(f"  {paint(r['id'].ljust(w), 'text')} "
                    f"{paint(prog.ljust(pw), 'good' if r['done'] == r['total'] else 'meta')}  "
                    f"{paint(age.rjust(4), 'meta')}  {paint(r['name'], 'body')}"
-                   + phases_text(paint, r.get("phases")))
+                   + phases_text(paint, r.get("phases")) + _last_change(paint, r))
     # Each elided line names the flag that lifts it, as list's header does
     # with `(--all)`: a bare `+21 more open` sent a reader off to
     # `list --status open --json` and back (reported 2026-09-22).
@@ -1249,9 +1309,10 @@ def render_summary(d: dict, paint=plain, person: bool = False) -> str:
         out.append("  " + paint(f"+{d['priority_elided']} more priority (--full)", "meta"))
     for c in d.get("closed", ()):
         # `closed by` names the closer, so a `last by` the same name says it twice.
+        twice = _named(c, "last") == _named(c, "closed_by") if c.get("last") else False
         out.append("  " + _labelled(paint, {k: v for k, v in c.items()
-                                            if k != "last" or v != c["closed_by"]},
-                                    first=paint("closed by " + c["closed_by"], "good")))
+                                            if not (twice and k in ("last", "last_via"))},
+                                    first=paint("closed by " + _named(c, "closed_by"), "good")))
     if d.get("closed_elided"):
         out.append("  " + paint(f"+{d['closed_elided']} more closed (--full)", "meta"))
     for p in d.get("people", ()):
@@ -1325,7 +1386,7 @@ def render_summary(d: dict, paint=plain, person: bool = False) -> str:
         out.extend("    " + paint(ln, "body") for ln in w["body"].splitlines())
         if changed := w.get("changed"):
             # ponytail: six, since the hook's cap counts this line; `--json` has all
-            said = "; ".join(f"{c['id']} {c['what']} by {c['by']} {when_added(c['at'])}"
+            said = "; ".join(f"{c['id']} {c['what']} by {_named(c, 'by')} {when_added(c['at'])}"
                              for c in changed[:6])
             more = f"; +{len(changed) - 6} more (--json)" if len(changed) > 6 else ""
             out.append("    " + paint(f"since the wrap: {said}{more}", "warn"))

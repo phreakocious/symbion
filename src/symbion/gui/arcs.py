@@ -140,19 +140,29 @@ def _when(stamp: str) -> str:
     return "just now" if t == "now" else t if len(t) == 10 and t[4] == "-" else f"{t} ago"
 
 
-def when_line(line, notes, act) -> None:
+def when_line(line, notes, act, *, focus: bool = True) -> str:
     """Fill `line` with the arc's age and its last change, each with its full
     stamp as the tip, so a glance at Arcs tells a moving arc from a quiet one.
-    A last change that is the arc's creation is not said twice."""
+    A last change that is the arc's creation is not said twice. A screen
+    reader hears each stamp after its age (`.sb-age`); with `focus` each age
+    takes focus for a keyboard, and without, the caller puts the stamps this
+    returns on a link beside it, as a card's id carries its age's."""
     at, by = S.arc_last_change(notes, act)
+    ages = [(f"started {_when(act.created_at)} by {act.author}", act.created_at, "started")]
+    if (at, by) != (act.created_at, act.author):
+        ages.append((f"last change {_when(at)}" + (f" by {by}" if by else ""), at, "last change"))
     line.clear()
     with line:
-        ui.label(f"started {_when(act.created_at)} by {act.author}") \
-            ._props["data-tip"] = S.shown(act.created_at)
-        if (at, by) != (act.created_at, act.author):
-            ui.label("·").classes("sb-sep")
-            ui.label(f"last change {_when(at)}" + (f" by {by}" if by else "")) \
-                .mark("arc-last-change")._props["data-tip"] = S.shown(at)
+        for i, (text, stamp, _) in enumerate(ages):
+            if i:
+                ui.label("·").classes("sb-sep")
+            el = ui.label(text).classes("sb-age")
+            el._props["data-tip"] = S.shown(stamp)
+            if focus:
+                el._props["tabindex"] = "0"
+            if i:
+                el.mark("arc-last-change")
+    return "\n".join(f"{what} {S.shown(stamp)}" for _, stamp, what in ages)
 
 
 def redraw_box(ctx, arc_id: str, nid: str, refresh, *, author: str) -> None:
@@ -286,7 +296,7 @@ def _box(ctx, act, fu, col, refresh, *, author: str, mixed: bool, placed=None) -
     card = {"main": main, "foot": foot, "grip": grip,
             "move": None if placed is None or done else _moves(act, fu, col, placed),
             # the tick's row: its author ticked it, then
-            "by": {"t": fu.author, "h": href(author=fu.author)} if done else None,
+            "by": {"t": summ.byline(fu), "h": href(author=fu.author)} if done else None,
             "age": {"t": ago(fu.created_at), "tip": S.shown(fu.created_at)} if done else None,
             "sid": {"t": short_id(fu.id), "h": href(id=fu.id),     # its age's stamp, as notes.py's
                     "tip": f"{fu.id}\n" + (f"written {S.shown(fu.created_at)}\n" if done else "")
@@ -410,13 +420,14 @@ def index(ctx, *, author: str) -> None:
         with ui.element("div").classes("sb-card sb-arc sb-filterable w-full" +
                                        (" sb-done" if finished else "")).mark("arc-card"):
             with ui.row().classes("items-baseline gap-2 w-full"):
-                ui.link(a.name, f"/arc?id={quote(a.id)}").classes("sb-arc-name")
+                arc_link = ui.link(a.name, f"/arc?id={quote(a.id)}").classes("sb-arc-name")
                 scope_chip(a)
                 ui.space()
                 ui.label(f"{done}/{total}" + (" done" if finished else "")).classes("sb-count") \
                     .mark("arc-count")
             phase_bar(ui.element("div").classes("sb-phase-bar").mark("arc-bar"), notes, a)
-            when_line(ui.row().classes("sb-arc-when sb-note-meta").mark("arc-when"), notes, a)
+            arc_link._props["data-tip"] = when_line(
+                ui.row().classes("sb-arc-when sb-note-meta").mark("arc-when"), notes, a, focus=False)
             if a.description:
                 ui.label(a.description).classes("sb-subtitle")
 

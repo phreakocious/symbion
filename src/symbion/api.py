@@ -171,21 +171,9 @@ def author_default() -> str:
 
 def shell_author() -> str:
     """author_default without $SYMBION_AUTHOR: the agent whose shell runs
-    this, else the git user. A reader that differs from it was set by hand."""
-    if os.environ.get("CODEX_THREAD_ID"):
-        return "codex"
-    if os.environ.get("HERMES_AGENT"):
-        return "hermes"
-    # agy's hooks get ANTIGRAVITY_CONVERSATION_ID but not ANTIGRAVITY_AGENT, which
-    # only its shell commands get (agy 1.4.12, 2026-10-30).
-    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
-        return "antigravity"
-    # Pi sets AI_AGENT=pi and Claude Code its own value: it names the inner one.
-    if os.environ.get("AI_AGENT") == "pi":
-        return "pi"
-    if os.environ.get("CLAUDECODE"):
-        return "claude"
-    return _git_user_name() or "user"
+    this (store.agent_marker), else the git user. A reader that differs from
+    it was set by hand."""
+    return store.agent_marker() or _git_user_name() or "user"
 
 
 def gui_author(store_dir=None) -> str:
@@ -984,8 +972,8 @@ def kind_losses(n: store.Note, kind: str, spec) -> list[str]:
 
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
               add_refs=None, rm_refs=None, prepend_body: str | None = None,
-              add_measurements=None, external: bool = False, replace_body=None,
-              **fields) -> store.Note:
+              add_measurements=None, rm_measurements=None, external: bool = False,
+              replace_body=None, **fields) -> store.Note:
     """Target, provenance and target_blob are INHERITED from the superseded row
     and never re-resolved (a tag added later is no re-reading of the file), so
     an edit that names no target needs no canonicalization -- a departed
@@ -1057,7 +1045,8 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
     return store.supersede(ctx.store_dir, note_id, author=author, append_body=append_body,
                            add_refs=add_refs, rm_refs=rm_refs, prepend_body=prepend_body,
                            replace_body=replace_body,
-                           add_measurements=add_measurements, canonicalize=canonicalize,
+                           add_measurements=add_measurements, rm_measurements=rm_measurements,
+                           canonicalize=canonicalize,
                            target_types=ctx.target_types, **fields)
 
 
@@ -1130,8 +1119,12 @@ def reopen_and_place(ctx: Ctx, entry_id: str, *, phase=None, before=None, after=
                                   after=after, top=top, author=author)
 
 
-def own_rows(ctx: Ctx):
-    """keep() for the CLI's `commit`: this session's pending rows (store.own_rows)."""
+def own_rows(ctx: Ctx, author: str | None = None):
+    """keep() for the CLI's `commit`: this session's pending rows (store.own_rows);
+    with `author` (`commit --author`), that author's rows no agent session wrote,
+    whoever runs it."""
+    if author:
+        return store.own_rows(ctx.store_dir, author, sessionless=True)
     return store.own_rows(ctx.store_dir, author_default())
 
 
@@ -1175,7 +1168,7 @@ def docs_named(ctx: Ctx, keep) -> list[str]:
 
 
 def commit(ctx: Ctx, message: str, *, author: str | None = None,
-           everyone: bool = False, wrap: bool = False) -> bool:
+           everyone: bool = False, wrap: bool = False, as_author: str | None = None) -> bool:
     """A commit is not off this disk until a push, and a bare `git push`
     needs an upstream: set it here when the store has an origin, so the
     push hint the CLI prints works on the first try. With `author` (the
@@ -1183,12 +1176,14 @@ def commit(ctx: Ctx, message: str, *, author: str | None = None,
     they name: a doc saved from the GUI had no other way in. With `everyone`,
     every row and file; else the caller's own rows (store.own_rows) and every
     file, or from another project (`elsewhere`) the new docs/ files they name.
-    `wrap` marks a session's end: the message is the next session's handoff."""
+    `as_author` (`commit --author`) takes that author's rows no agent session
+    wrote in place of the caller's. `wrap` marks a session's end: the message
+    is the next session's handoff."""
     keep = (None if everyone else (lambda r: r.get("author") == author) if author
-            else own_rows(ctx))
+            else own_rows(ctx, as_author))
     named = bool(author) or (not everyone and elsewhere(ctx))
     ok = store.commit(ctx.store_dir, message, ctx.cfg, keep=keep, files=not named,
-                      wrap=(author or author_default()) if wrap else None,
+                      wrap=(author or as_author or author_default()) if wrap else None,
                       paths=docs_named(ctx, keep) if named else ())
     gitref.set_upstream(ctx.store_dir)
     return ok

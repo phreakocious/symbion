@@ -291,7 +291,9 @@ def _wrap_board(ctx, wrap: dict) -> None:
     with ui.element("section").classes("sb-board").mark("board"):
         with ui.element("div").classes("sb-board-head"):
             heading(2, "last wrap").classes("sb-board-title").mark("board-title")
-            ui.label(ago(wrap["at"])).classes("sb-count").tooltip(S.shown(wrap["at"]))
+            # No link beside it to carry the stamp, as a card's id does: it takes focus itself
+            age = ui.label(ago(wrap["at"])).classes("sb-count sb-age").mark("wrap-age")
+            age._props["data-tip"], age._props["tabindex"] = S.shown(wrap["at"]), "0"
             if wrap["commits_since"] is not None:
                 ui.label(f"· {summ._count(wrap['commits_since'], 'commit')} since") \
                     .classes("sb-board-aside")
@@ -465,6 +467,17 @@ def build_page(ctx, *, author: str) -> None:
                     ui.label(f"{ABOUT} Each new agent session starts with what is open, "
                              f"from plain JSONL in a git repo beside yours.") \
                         .classes("text-emph")
+                    # What it costs and how to get it, asked for by an AI review of
+                    # this page (the user, 2026-11-09).
+                    ui.label("Free and open source (MIT). It runs on your machine, with no "
+                             "server, account or database.").classes("text-body")
+                    with ui.element("div").classes("text-body").mark("demo-intro-install"):
+                        ui.label("In Claude Code: ").classes("inline")
+                        ui.label("/plugin install symbion --marketplace phreakocious/symbion") \
+                            .classes("inline sb-mono")
+                        ui.label(", then ").classes("inline")
+                        ui.label("/symbion:setup").classes("inline sb-mono")
+                        ui.label(".").classes("inline")
                     with ui.element("div").classes("text-body"):
                         ui.label(f"This is {store_name(ctx)}'s store, as its agents and owner "
                                  f"keep it. You see what its owner sees; nothing you click "
@@ -617,24 +630,21 @@ def build_page(ctx, *, author: str) -> None:
                         chip._props["aria-label"] = f"take off the filter {k} {v}"
                     ui.link("clear all", "/notes").classes("sb-board-aside").mark("clear-filters")
             since = gitref.commits_since(ctx.cfg, shown, git_head)
-            by_id = rd.by_id
             for n in shown:
                 # Held to its card: in the page's gap it read as the last one's.
                 with ui.column().classes("w-full gap-1") if n.id in via else nullcontext():
                     for was in via.get(n.id, ()):
                         ui.label(f"{was} was superseded; this is its current entry") \
                             .classes("text-notable").mark("superseded-by")
-                    # A row's own page marks where each amendment joined its body.
                     render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
                                 show_target=True, base=base, compact="id" not in kwargs,
                                 hit=q.split(), git_head=git_head, since=since[n.id],
-                                seams=summ.seams(by_id, n) if "id" in kwargs else (),
                                 seen=rd)
             if len(shown) < len(rows) and not S.read_only():
                 ui.link(f"+{len(rows) - len(shown)} older not shown — show all",
                         filters.href(**base, all="1")).classes("text-body").mark("show-all")
             if "id" in kwargs and len(rows) == 1:
-                history(ctx, every, rows[0], author, git_head)
+                history(ctx, rd, rows[0], author, git_head)
 
     @ui.page("/targets")
     @gitref.heads_once()           # each repo's HEAD once a page
@@ -1088,8 +1098,9 @@ def build_page(ctx, *, author: str) -> None:
                     git_head = gitref.head_sha(ctx.cfg)
                     since = gitref.commits_since(ctx.cfg, about, git_head)
                     for n in about:
-                        render_note(ctx, n, body.refresh, author=author, git_head=git_head,
-                                    since=since[n.id], seen=rd)
+                        # a reload, as every page's card: its write is the page's own
+                        render_note(ctx, n, lambda: ui.navigate.reload(), author=author,
+                                    git_head=git_head, since=since[n.id], seen=rd)
 
             body()
 

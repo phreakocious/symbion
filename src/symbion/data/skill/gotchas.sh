@@ -224,14 +224,39 @@ seen=$(cat "$gate" 2>/dev/null)
 shown=
 [ "$gate" = "$mark.seen" ] || shown=$(cat "$mark.seen" 2>/dev/null)
 # The words every row shares, said once before the call's first row; and from
-# it, `symbion` or `symbion --dir D` for the ids line below.
-hdr=$(cat "$list.head" 2>/dev/null)
+# it, `symbion` or `symbion --dir D` for the ids line below. A builtin: a
+# `cat` here forked on every call (audit, 2026-11-21).
+hdr=; { IFS= read -r hdr < "$list.head"; } 2>/dev/null
 sym=${hdr%' supersede '*}; sym=${sym##*\`}; sym=${sym:-symbion}
-out= tails= n=0
+# The rows this call names that its gate has not spent, and the files they are on.
+hits= files= nf=0
 while IFS="$tab" read -r id name text root; do
   names "$call" "$name" "$root" || continue
   case "$nl$seen$nl" in *"$nl$id$nl"*) continue ;; esac
   seen="$seen$nl$id"
+  hits="$hits$id$tab$text$nl"
+  case "$nl$files$nl" in *"$nl$name$nl"*) ;; *) files="$files$nl$name" nf=$((nf + 1)) ;; esac
+done < "$list"
+# A read over more than two such files lists each row by id and target, once: one
+# read-only grep over five source files printed every gotcha on them, and none
+# bore on it (dogfood, 2026-11-20). A call naming one or two prints theirs in full.
+wide=
+[ "$gate" = "$mark.seen" ] && [ "$nf" -gt 2 ] && { wide=1 listed=$(cat "$mark.listed" 2>/dev/null); }
+# $hits split once on newlines, globbing off: a cut of one record at a time read
+# all of $hits each time in bash under a UTF-8 locale, and 400 rows took 6.6 s
+# against the 5 s timeout; a `read` from a pipe, byte by byte, cost 2 s on
+# OpenBSD (2026-11-20).
+out= tails= n=0
+set -f; IFS=$nl
+for rec in $hits; do
+  id=${rec%%"$tab"*} text=${rec#*"$tab"}
+  if [ -n "$wide" ]; then
+    case "$nl$listed$nl" in *"$nl$id$nl"*) continue ;; esac
+    printf '%s\n' "$id" >> "$mark.listed"
+    [ -n "$out" ] || out=$hdr
+    out="$out${out:+\\n}${text%%' ('*}"
+    continue
+  fi
   [ "$gate" = "$mark.seen" ] || printf '%s\n' "$id" >> "$gate"
   case "$nl$shown$nl" in
     *"$nl$id$nl"*)
@@ -241,7 +266,10 @@ while IFS="$tab" read -r id name text root; do
       [ -n "$out" ] || out=$hdr
       out="$out${out:+\\n}$text" ;;
   esac
-done < "$list"
+done
+[ -n "$wide" ] && [ -n "$out" ] && out="$out\\nsymbion: this call names $nf files that have gotchas, \
+so each is listed by id and target only; it prints in full at a call that names its file alone or \
+with one other."
 if [ "$n" -gt 0 ]; then
   if [ "$n" = 1 ]; then w="gotcha${tails} was" it=it; else w="gotchas${tails} were" it=them; fi
   out="$out${out:+\\n}symbion: this file's $w shown in full earlier in this session (\`$sym show$tails\` prints $it again)."

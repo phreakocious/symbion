@@ -1120,6 +1120,27 @@ def _file_catalog(store_dir):
     (store_dir / "symbion.toml").write_text(f'[catalogs]\nfile = "{config.FILE_CATALOG}"\n')
 
 
+def test_a_ref_held_as_typed_is_removed_as_typed(repo, tmp_path):
+    """A ref stored before any file had its name, or to a file since
+    deleted, resolves to another file once a live path holds its name:
+    `rm_refs` resolved it there and refused (audit, 2026-11-21)."""
+    _file_catalog(tmp_path)
+    (repo / "x.py").write_text("x")
+    ctx = api.resolve(str(tmp_path))
+    n = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None}, "body": "b",
+                      "refs": [{"type": "file", "name": "notes.md"},
+                               {"type": "file", "name": "x.py"}]}, author="t")
+    assert [r.name for r in n.refs] == ["notes.md", "x.py"]
+    (repo / "docs").mkdir()
+    (repo / "docs" / "notes.md").write_text("n")
+    (repo / "x.py").unlink()
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_x.py").write_text("t")
+    for name in ("notes.md", "x.py"):
+        n = api.supersede(ctx, n.id, author="t", rm_refs=[{"type": "file", "name": name}])
+    assert n.refs == ()
+
+
 def test_object_path_keeps_a_name_inside_its_root(repo, tmp_path):
     ctx = api.resolve(str(tmp_path))
     assert api.object_path(ctx, "file", "f") == (repo / "f").resolve()

@@ -46,6 +46,7 @@ ALLOWED_STORE_READS = {
     "now_shown",                                 # the clock, which SYMBION_NOW can stop
     "zone",                                      # the zone `shown` prints in: the map's weeks
     "read_only", "ReadOnly",                     # serve --read-only, and its refusal
+    "write_as_gui",                              # serve: its writes' writer is `gui`
     "Untrusted",                                 # a pulled symbion.toml's refusal
     "read_side", "NoSide",                       # a shared store's reader, and a write's refusal
     "shared",                                    # a shared store's buttons pull, then push

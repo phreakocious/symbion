@@ -1110,10 +1110,16 @@ def test_worker_outlives_a_kill_of_the_hooks_process_group(tmp_path):
         f": > '{started}'\nsleep 2\necho \"$1\" >> '{tmp_path / 'stub.runs'}'\n")
     p = subprocess.Popen(cmd, cwd=proj, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
-    p.stdin.write(stdin)
-    p.stdin.close()
+    # The start shim reads no stdin and may be gone before the write, as in _shims_async
+    # (an OpenBSD run under load, 2026-11-21).
+    with contextlib.suppress(BrokenPipeError):
+        p.stdin.write(stdin)
+    with contextlib.suppress(BrokenPipeError):
+        p.stdin.close()
     _wait_for(started.exists)
-    with contextlib.suppress(ProcessLookupError):
+    # A gone hook leaves only itself, unreaped, in its group: macOS answers EPERM. A worker
+    # left in the group is a live member, so the kill still reaches it.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(p.pid, 9)
     p.wait(timeout=10)
     _wait_for(lambda: _stub_runs(tmp_path) == ["0.16.0"], timeout=6)
@@ -1223,6 +1229,20 @@ def test_unadopted_project_still_gets_the_package_line_unchanged(tmp_path):
     data = _data(tmp_path, ok="0.16.0", result="symbion: upgraded")
     r = _shim(tmp_path, "gotchas", pv="0.16.0", data=data, project=_project(tmp_path), stdin="{}")
     assert (r.stdout, r.stderr) == (line + "\n", "") and (data / "upgrade/result").exists()
+
+
+def test_a_linked_worktree_of_an_adopted_project_reads_as_adopted(tmp_path):
+    """The store sits beside the main checkout, and a linked worktree's root
+    holds a `.git` file: the lib asks git for the main worktree. A break that
+    skipped the ask failed no test (audit, 2026-11-21)."""
+    p = _adopted_project(tmp_path)
+    _git(p, "commit", "-q", "--allow-empty", "-m", "i")
+    _git(p, "worktree", "add", "-q", str(p / ".worktrees" / "feat"), "-b", "feat")
+    for root in (p, p / ".worktrees" / "feat"):
+        r = subprocess.run(["sh", "-c", '. "$1"; symbion_adopted "$2"', "sh", str(LIB), str(root)],
+                           env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)},
+                           capture_output=True, text=True, timeout=30)
+        assert (r.returncode, r.stderr) == (0, ""), root
 
 
 def test_a_waiting_result_asks_git_nothing_at_a_projects_root(tmp_path):

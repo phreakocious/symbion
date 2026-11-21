@@ -18,6 +18,7 @@ import tempfile
 import time
 import zlib
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def _dir() -> Path:
@@ -112,13 +113,15 @@ def _a_serve(pid: int) -> bool:
                                    for a in argv)
 
 
-def signal_all(restart: bool, timeout: float = 30.0) -> list[tuple[str, dict]]:
-    """Restart (SIGUSR1) or stop (SIGINT) every serve this user runs, and
-    wait for each: (what happened, its record). A restart is done when the
-    serve has recorded itself again, a stop when its record is gone."""
+def signal_all(restart: bool, timeout: float = 30.0, port=None) -> list[tuple[str, dict]]:
+    """Restart (SIGUSR1) or stop (SIGINT) every serve this user runs, or the
+    one on `port`, and wait for each: (what happened, its record). A restart is
+    done when the serve has recorded itself again, a stop when its record is gone."""
     path = lambda r: _dir() / f"{r['pid']}.json"            # noqa: E731
     sent = []
     for r in live():
+        if port is not None and urlsplit(r["url"]).port != port:
+            continue
         try:
             if not _a_serve(r["pid"]):
                 raise ProcessLookupError

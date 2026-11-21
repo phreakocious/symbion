@@ -49,6 +49,9 @@ def _isolated_home(tmp_path_factory, monkeypatch):
               "SYMBION_HOST", "AI_AGENT", "PI_SESSION_ID", "HERMES_SESSION_ID",
               "SYMBION_HERMES_SESSION"):
         monkeypatch.delenv(k, raising=False)
+    # Nor a serve run in-process before it: its flag is the process's.
+    from symbion import store
+    monkeypatch.setattr(store, "_GUI", False)
 
 
 @pytest.fixture(autouse=True)

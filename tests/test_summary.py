@@ -413,7 +413,35 @@ def test_summary_counts_every_non_parked_status_kind_under_its_label(tmp_path):
     assert d["open"] == {"anomaly": 1}
     assert "open_bugs" not in d
     assert summary.render_summary(d).splitlines()[0] == \
-        "symbion: open outside arcs: anomaly 1; 1 parked", "a parked kind is counted apart"
+        "symbion: open outside arcs: anomaly 1; 1 parked, 1 with no due date (oldest 0d: " \
+        "list --kind shelf --undated)", "a parked kind is counted apart"
+
+
+def test_the_parked_count_names_those_with_no_due_date_and_the_oldest(tmp_path, monkeypatch):
+    """No session start shows a reader's own parked entry before its date, so
+    one with none never shows; agents filed them past add's note, and a review
+    found most open ideas undated (2026-11-20). The header counts them, ages
+    the oldest from its first version, and names the list that shows them."""
+    cfg = Config(project_root=tmp_path)
+    t0 = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    p = {"type": "project", "name": None}
+    old = store.add(tmp_path, kind="idea", target=p, body="old", created_at=t0.isoformat())
+    monkeypatch.setattr(store, "_now_iso", lambda: (t0 + timedelta(days=3)).isoformat())
+    store.supersede(tmp_path, old.id, body="old, edited")
+    store.add(tmp_path, kind="idea", target=p, body="dated", due="2026-12-01",
+              created_at=(t0 + timedelta(days=5)).isoformat())
+    new = store.add(tmp_path, kind="idea", target=p, body="new",
+                    created_at=(t0 + timedelta(days=10)).isoformat())
+    store.add(tmp_path, kind="idea", target=p, body="done", status="resolved",
+              created_at=(t0 - timedelta(days=30)).isoformat())
+    d = summary.summary(tmp_path, cfg, _now=t0 + timedelta(days=12, hours=1))
+    assert (d["parked"], d["parked_undated"], d["parked_undated_days"]) == (3, 2, 12)
+    assert summary.render_summary(d).splitlines()[0].endswith(
+        "; 3 parked, 2 with no due date (oldest 12d: list --kind idea --undated)")
+    for n in (old, new):
+        store.supersede(tmp_path, store.chain_tips(store.load(tmp_path))(n.id).id, due="2026-12-01")
+    d = summary.summary(tmp_path, cfg, _now=t0 + timedelta(days=12, hours=1))
+    assert summary.render_summary(d).splitlines()[0].endswith("; 3 parked")
 
 
 def test_summary_open_counts_rows_outside_arcs_only(tmp_path):
@@ -680,6 +708,22 @@ def test_arc_rows_carry_an_age(tmp_path):
     assert summary.summary(tmp_path, cfg)["arcs"][0]["age_days"] == 0
 
 
+def test_arc_rows_say_when_the_arc_last_changed(tmp_path):
+    """An age alone made a quiet arc read like a moving one; the user asked to
+    see which arcs have gone quiet (2026-11-08). The last change is the GUI's:
+    the newest version of an entry filed in it, or a board move."""
+    cfg = Config(project_root=tmp_path)
+    a = store.create_arc(tmp_path, "Quiet", "", "item")
+    created = datetime.fromisoformat(a.created_at)
+    store.add(tmp_path, kind="task", target={"type": "item", "name": "x"}, arc_id=a.id,
+              created_at=(created + timedelta(days=5)).isoformat())
+    data = summary.summary(tmp_path, cfg, _now=created + timedelta(days=12, hours=3))
+    assert data["arcs"][0]["last_change_days"] == 7
+    assert summary.render_summary(data).splitlines()[1].endswith("Quiet  (last change 7d ago)")
+    data = summary.summary(tmp_path, cfg, _now=created + timedelta(days=5, hours=3))
+    assert summary.render_summary(data).splitlines()[1].endswith("(last change today)")
+
+
 def test_age_days_reads_an_offset_free_stamp_as_local():
     from datetime import datetime, timedelta
     now = datetime(2026, 9, 20, 12, 0).astimezone()
@@ -911,7 +955,7 @@ def test_the_due_block_is_capped_and_says_how_many_it_hid(tmp_path):
 def _versions(*versions):
     """A supersede chain of (author, body), oldest first: by_id and its head."""
     rows = [SimpleNamespace(id=f"r{i}", supersedes=f"r{i - 1}" if i else None, author=a,
-                            created_at=f"2026-10-0{i + 1}T00:00:00+00:00", body=b)
+                            created_at=f"2026-10-0{i + 1}T00:00:00+00:00", body=b, via=None)
             for i, (a, b) in enumerate(versions)]
     return {r.id: r for r in rows}, rows[-1]
 
@@ -1327,7 +1371,7 @@ def test_summary_arc_line_shows_phase_counts_past_the_first(tmp_path):
     assert d["arcs"][0]["phases"] == [["review", 2]]
     assert "0/3" in (line := next(l for l in summary.render_summary(d).splitlines()
                                   if "board" in l))
-    assert line.endswith("board  review 2"), line
+    assert line.endswith("board  review 2  (last change today)"), line
 
 
 def test_summary_arc_line_without_phases_is_unchanged(tmp_path):
@@ -1337,7 +1381,7 @@ def test_summary_arc_line_without_phases_is_unchanged(tmp_path):
     d = summary.summary(tmp_path, cfg)
     assert "phases" not in d["arcs"][0]
     assert next(l for l in summary.render_summary(d).splitlines()
-                if "flat" in l).endswith("flat")
+                if "flat" in l).endswith("flat  (last change today)")
     _phased(tmp_path, [None, None])               # all in the first phase: no counts either
     d = summary.summary(tmp_path, cfg)
     assert next(r for r in d["arcs"] if r["name"] == "board")["phases"] == []
@@ -1349,8 +1393,8 @@ def test_picked_is_the_one_option_on_a_line_of_its_own_below_the_question():
 
     def pick(body, options=opts, asked="Which?"):
         """`body` as the head of a question first written as `asked`."""
-        first = Q(id="a", supersedes=None, body=asked, options=options)
-        head = Q(id="b", supersedes="a", body=body, options=options)
+        first = Q(id="a", supersedes=None, body=asked, options=options, author="claude")
+        head = Q(id="b", supersedes="a", body=body, options=options, author="human")
         return summary.picked(head, {"a": first, "b": head})
     assert pick("Which?\n\n-- below --\nmove it.") == "Move it"
     assert pick("Leave it\nor not?", asked="Leave it") is None    # the question's own first line
@@ -1366,3 +1410,20 @@ def test_picked_is_the_one_option_on_a_line_of_its_own_below_the_question():
     first = Q(id="a", supersedes=None, body=asked, options=["ship", "hold"])
     assert summary.picked(first, {"a": first}) is None
     assert summary.picked(Q(id="b", supersedes="a", body="Which?\nMove it", options=opts), None) is None
+    # The asker's own later lines are its text: a default appended later is
+    # no answer, and does not hide one given after it (audit, 2026-11-21)
+    def chain(*versions):
+        """Each (author, status, added text) as the next version of one question."""
+        rows, body = [], "Ship 0.16 today?"
+        for i, (who, status, more) in enumerate((("claude", "open", ""), *versions)):
+            body += more
+            rows.append(Q(id=str(i), supersedes=str(i - 1) if i else None, body=body,
+                          options=["ship", "hold"], author=who, status=status, spec=Q(status=True)))
+        return summary.picked(rows[-1], {r.id: r for r in rows})
+    default = ("claude", "open", "\nMy default, if no answer by Friday:\nhold")
+    assert chain(default) is None
+    assert chain(default, ("human", "open", "\nship")) == "ship"
+    assert chain(default, ("human", "open", "\nship"), ("claude", "open", "\nnoted")) == "ship"
+    # ... but the version that resolves it relays the user's answer
+    assert chain(("claude", "resolved", "\nhold")) == "hold"
+    assert chain(("claude", "resolved", ""), ("claude", "resolved", "\nship")) is None

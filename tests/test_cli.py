@@ -503,10 +503,26 @@ def test_add_names_the_open_heads_already_on_its_target(tmp_path, capsys):
 
     run("add", "note", "--target", "item:x", "--body", "stub", store_dir=tmp_path)
     err = capsys.readouterr().err
-    assert "1 open on item:x; " in err and "supersede" in err and f"\n  {task}  stub\n" in err, err
+    assert "1 open on item:x; " in err and "supersede" in err and f"\nnote:   {task}  stub\n" in err, err
     for target in ("item:fresh", "project"):
         run("add", "task", "--target", target, "--body", "stub", store_dir=tmp_path)
         assert "open on" not in capsys.readouterr().err, target
+
+
+def test_the_open_rows_note_lists_the_entries_the_body_cites_first(tmp_path, capsys):
+    """A check citing the open task it revised got a note that showed three
+    other entries and hid that one under `+1 more` (dogfood, 2026-11-12). A
+    filter that drops the note's lines drops its rows too: each starts
+    `note:` (dogfood, 2026-11-15)."""
+    ids = []
+    for i in range(4):
+        run("add", "task", "--target", "item:x", "--body", f"stub {i}", store_dir=tmp_path)
+        ids.append(capsys.readouterr().out.strip())
+    run("add", "check", "--target", "item:x", "--checked", "c", "--external",
+        "--body", f"revises {ids[0][-10:]}", store_dir=tmp_path)
+    rows = [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("note:   ")]
+    assert rows == [f"note:   {ids[0]}  stub 0", f"note:   {ids[3]}  stub 3",
+                    f"note:   {ids[2]}  stub 2", "note:   +1 more"], rows
 
 
 def test_the_open_rows_note_lists_a_target_once_a_session(tmp_path, capsys, monkeypatch):
@@ -525,7 +541,7 @@ def test_the_open_rows_note_lists_a_target_once_a_session(tmp_path, capsys, monk
     for _ in range(2):
         assert "if this entry settles or revises one" in add("item:x")[1], "no session: each time"
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
-    assert f"\n  {first}  b0" in add("item:x")[1]
+    assert f"\nnote:   {first}  b0" in add("item:x")[1]
     out, err = add("item:x")
     assert out and "open on item:x" not in err and first not in err, err
     add("item:y")
@@ -571,6 +587,8 @@ def test_the_clip_note_comes_once_a_session_then_for_a_dated_opening(tmp_path, c
     assert "first 100 chars" not in err(plain, "item:b"), "once a session"
     said = err(dated, "item:c")
     assert "opens on a date" in said and "IDEA (user" in said, said
+    # each row opens `note:`, so a filter on the note drops its rows too (dogfood, 2026-11-15)
+    assert any(ln.startswith("note:   ") and "IDEA (user" in ln for ln in said.splitlines()), said
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
     assert "check that they carry" in err(plain, "item:d"), "another session hears it"
 
@@ -620,6 +638,19 @@ def test_a_compaction_lets_the_once_a_session_notes_speak_again(
     assert whole in err("add", "prediction", "--target", "project", "--checked", "c", "--body", "p3")
 
 
+def test_session_start_clears_the_gotcha_hooks_marks(tmp_path, monkeypatch):
+    """A compacted session no longer holds what the gotcha hook printed, nor
+    the ids a wide read listed: session start clears each mark (2026-11-20)."""
+    run("add", "note", "--target", "project", "--body", "stub", store_dir=tmp_path)
+    d = cli._session_cache()
+    d.mkdir(parents=True, exist_ok=True)
+    for m in ("seen", "edit", "listed"):
+        (d / f"s1.{m}").write_text("x\n")
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"session_id": "s1"}')))
+    assert run("summary", "--hook", store_dir=tmp_path) == 0
+    assert [m for m in ("seen", "edit", "listed") if (d / f"s1.{m}").exists()] == []
+
+
 def test_session_start_clears_every_note_a_session_hears_once():
     """A heard-once mark left off the list session start clears stays silent
     after a compaction, when the agent no longer holds the note."""
@@ -643,6 +674,9 @@ def test_a_write_whose_text_runs_past_500_chars_says_so(tmp_path, capsys, monkey
     assert said not in err("add", "prediction", "--target", "item:p", "--checked", "the run",
                            "--body", "p" * 900), \
         "a registration's body is the contract its resolve is scored on: it cannot move to docs/"
+    pid = next(n.id for n in store.load(tmp_path) if n.kind == "prediction")
+    assert said not in err("supersede", pid, "--append", "--body", "q" * 700), \
+        "an amendment to a registration states the rule it binds, as the registration does"
     assert said in err("supersede", nid, "--append", "--body", "z" * 600)
     assert said not in err("supersede", nid, "--append", "--body", "a short addition")
     assert said not in err("supersede", nid, "--add-tag", "t"), "no text, however long the body"
@@ -2897,6 +2931,25 @@ def test_resolve_and_supersede_measure_merge_onto_the_inherited_ones(repo, tmp_p
     assert set(head.tags) == {"t"}
 
 
+def test_supersede_rm_measure_drops_a_name_and_refuses_one_it_lacks(tmp_path, capsys):
+    """A corrected count needed new names, and the old name stayed with its
+    old meaning: `--measure` could set a name, never drop one (2026-11-12).
+    An empty value stays refused, as an unset shell variable."""
+    run("add", "note", "--target", "item:n", "--measure", "a=1", "--measure", "b=8",
+        "--body", "stub", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    # --add-tag alone takes a tags-only path; --rm-measure beside it must not drop there
+    assert run("supersede", nid, "--rm-measure", "a", "--add-tag", "t", store_dir=tmp_path) == 0
+    capsys.readouterr()
+    head = store.heads(store.load(tmp_path))[0]
+    assert (head.measurements, head.tags) == ({"b": 8}, ("t",))
+    n = len(store.load(tmp_path))
+    assert run("supersede", nid, "--rm-measure", "z", store_dir=tmp_path) == 1
+    err = capsys.readouterr().err
+    assert "--rm-measure z: not one of its measurements (b); nothing was written" in err, err
+    assert len(store.load(tmp_path)) == n
+
+
 @pytest.mark.parametrize("verb", ["resolve", "supersede"])
 def test_resolve_and_supersede_refuse_the_measures_add_refuses(tmp_path, capsys, verb):
     run("add", "task", "--target", "item:x", "--measure", "n=1", store_dir=tmp_path)
@@ -3212,6 +3265,15 @@ def test_serve_list_runs_outside_any_project(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path / "away")
     assert cli.main(["serve", "--list"]) == 0
     assert capsys.readouterr().out == "no symbion serve is running\n"
+    # So does a prefix argparse takes for it (audit, 2026-11-21)
+    for flag in ("--lis", "--sto"):
+        rc = cli.main(["serve", flag])
+        out, err = capsys.readouterr()
+        if flag == "--sto" and os.name == "nt":     # --stop needs POSIX signals: no store read
+            assert rc == 1 and "need POSIX signals" in err, err
+            continue
+        assert rc == 0, err
+        assert out.startswith("no symbion serve is running"), flag
 
 
 def test_the_target_list_prints_is_one_context_accepts(tmp_path, capsys):
@@ -3485,6 +3547,19 @@ def test_list_id_resolves_a_superseded_row_and_reports_a_miss(tmp_path, capsys):
                    "a1b; list --grep TEXT searches the entries)\n"), err
     assert run("resolve", "no-such-id", store_dir=tmp_path) == 1
     assert "list --grep TEXT searches" in capsys.readouterr().err, "same helper on every miss"
+
+
+def test_a_full_id_that_misses_names_the_one_entry_its_tail_names(tmp_path, capsys):
+    """An agent took a 10-character tail from symbion's output and guessed
+    the date around it, twice; each `no entry found` cost a call (2026-11-18).
+    A tail that names one entry is that entry."""
+    run("add", "note", "--target", "project", "--body", "stub", store_dir=tmp_path)
+    nid = capsys.readouterr().out.strip()
+    guess = "20000101-000000-" + nid[-10:]
+    assert run("show", guess, store_dir=tmp_path) == 1
+    assert f"did you mean {nid}?" in capsys.readouterr().err
+    assert run("show", "20000101-000000-000000-abc", store_dir=tmp_path) == 1
+    assert "did you mean" not in capsys.readouterr().err
 
 
 def test_show_into_a_pipe_indents_every_line_of_a_body(tmp_path, capsys):
@@ -4126,7 +4201,7 @@ def test_a_bare_value_set_flag_names_its_values(tmp_path, capsys):
     _declare(tmp_path, _VOCAB)
     for argv, legal in ((["add", "--type"], "arc, commit, doc, file, item, project"),
                         (["add", "--kind"], "anomaly, note"),
-                        (["list", "--status"], "open, resolved")):
+                        (["list", "--status"], "open, resolved, all")):
         assert run(*argv, store_dir=tmp_path) == 2
         assert capsys.readouterr().err.endswith(
             f"argument {argv[-1]}: expected one argument (choose from {legal})\n")
@@ -4728,6 +4803,11 @@ def test_supersede_takes_append_file_and_prepend_file(tmp_path, capsys, monkeypa
     (["supersede", "x", "--prepend", "new lead"], 'text goes in --prepend --body "…"'),
     (["supersede", "x", "--ref", "item:login", "page"], 'needs quotes: --ref "item:a b"'),
     (["supersede", "x", "--target", "item:login", "page"], 'needs quotes: --target "item:a b"'),
+    # a pattern that starts with `-` reads as a flag, and `--` is no help after one (2026-11-12)
+    (["list", "--grep", "--ref|x"], "a value that starts with - goes after =: '--grep=--ref|x'"),
+    (["list", "--grep", "--", "--ref|x"], "a value that starts with - goes after =: '--grep=--ref|x'"),
+    (["arc", "show", "abc"], "no `arc show`: `list --arc ID` lists an arc's entries, "
+                             "`arc todo ID` its open boxes"),
     # reported as `symbion list: error: argument --id` (2026-10-09 review)
     (["show"], "symbion show: error: the following arguments are required: id"),
     (["show", "--json"], "symbion show: error: the following arguments are required: id"),
@@ -4967,6 +5047,56 @@ def test_a_new_item_a_letter_off_a_stored_one_says_did_you_mean(tmp_path, capsys
     assert "did you mean 'nightly run 2099-01-07'?" in capsys.readouterr().err, "case is no series"
 
 
+def test_a_new_item_that_differs_in_separators_says_did_you_mean(tmp_path, capsys):
+    """A space, `-` and `_` fold as case does: `item:RUN_2099_01_05` beside a
+    stored `item:run 2099-01-05` scored 0.79 and said nothing."""
+    run("add", "task", "--target", "item:run 2099-01-05", "--body", "stub", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("add", "task", "--target", "item:RUN_2099_01_05", "--body", "stub2", store_dir=tmp_path) == 0
+    assert "item:RUN_2099_01_05; did you mean 'run 2099-01-05'?" in capsys.readouterr().err
+    assert run("add", "task", "--target", "item:run_2099_01_06", "--body", "stub3", store_dir=tmp_path) == 0
+    assert "did you mean" not in capsys.readouterr().err, "a series still"
+
+
+def test_arc_rename_and_describe_take_creates_flags(tmp_path, capsys):
+    """`arc rename ID --name X` and `arc describe ID --desc X`, as `arc create`
+    spells them, failed `unrecognized arguments` (dogfood, 2026-11-20)."""
+    run("arc", "create", "--name", "a", store_dir=tmp_path)
+    aid = capsys.readouterr().out.strip()
+    assert run("arc", "rename", "--name", "b", aid, store_dir=tmp_path) == 0
+    assert run("arc", "describe", aid, "--desc", "for b", store_dir=tmp_path) == 0
+    (a,) = store.load_arcs(tmp_path)
+    assert (a.name, a.description) == ("b", "for b")
+    capsys.readouterr()
+    assert run("arc", "rename", aid, store_dir=tmp_path) == 2
+    assert "arc rename ID NAME, or --name NAME" in capsys.readouterr().err
+    assert run("arc", "describe", aid, store_dir=tmp_path) == 2
+    assert "arc describe ID TEXT, or --desc TEXT" in capsys.readouterr().err
+
+
+def test_arc_create_and_describe_take_description_for_desc(tmp_path, capsys):
+    """`--description`, a first guess, failed `unrecognized arguments` on both
+    (dogfood, 2026-11-21)."""
+    assert run("arc", "create", "--name", "a", "--description", "first", store_dir=tmp_path) == 0
+    aid = capsys.readouterr().out.strip()
+    assert store.load_arcs(tmp_path)[0].description == "first"
+    assert run("arc", "describe", aid, "--description", "second", store_dir=tmp_path) == 0
+    assert store.load_arcs(tmp_path)[0].description == "second"
+
+
+def test_no_store_at_a_directory_names_the_file_it_lacks(tmp_path, capsys):
+    """A repo holding only symbion.toml read `no store at DIR; run symbion
+    init`, which named no file it lacked (2026-11-17)."""
+    d = tmp_path / "bare-notes"
+    d.mkdir()
+    (d / "symbion.toml").write_text("")
+    assert run("list", store_dir=d) == 1
+    assert capsys.readouterr().err.splitlines()[-1].endswith(
+        "bare-notes is a directory but no store: it has no notes.jsonl, which init writes")
+    assert run("list", store_dir=tmp_path / "nowhere") == 1
+    assert "is a directory" not in capsys.readouterr().err
+
+
 def test_an_add_identical_to_a_stored_entry_writes_nothing(tmp_path, capsys, monkeypatch):
     """A shell command whose `$(...)` failed after its add ran was retried,
     and the store held the entry twice (2026-10-15); `undo` reaches only the
@@ -5055,21 +5185,6 @@ def test_a_pre_registration_says_resolve_closes_it_whole(tmp_path, capsys):
         assert "closes a" not in capsys.readouterr().err, kind
 
 
-def test_a_parked_row_with_no_due_says_its_writer_will_not_see_it(tmp_path, capsys, monkeypatch):
-    """A parked row prints at session start only when due soon or written
-    by someone else than the reader: most of one store's open ideas were
-    the agent's own, undated, and no session of its saw them again
-    (2026-10-12). Filed as another author, or with a date, it reaches one."""
-    monkeypatch.setenv("SYMBION_AUTHOR", "agent")
-    assert run("add", "idea", "--target", "project", "--body", "x", store_dir=tmp_path) == 0
-    assert "note: no --due on this idea entry" in capsys.readouterr().err
-    for extra in (["--due", "2099-01-01"], ["--author", "human"], []):
-        kind = "task" if not extra else "idea"
-        assert run("add", kind, "--target", "project", "--body", "x", *extra,
-                   store_dir=tmp_path) == 0
-        assert "no --due" not in capsys.readouterr().err, extra
-
-
 def test_a_due_date_already_past_at_the_write_says_so(tmp_path, capsys):
     """A trial agent registered a prediction with the date the user gave,
     after it: the row read overdue at once, and nothing said so
@@ -5109,6 +5224,47 @@ def test_a_time_ahead_of_the_writes_clock_says_so(tmp_path, capsys, monkeypatch)
                               "Seen 04:20Z 01-09.", "Seen 2026-01-09 04:20Z.", "At 03:04:14Z.")):
         assert run("add", "note", "--target", "project", "--body", body, store_dir=tmp_path) == 0
         assert "is later than this write's clock" not in capsys.readouterr().err, body
+    # Past midnight with no date, and a span read as a date (audit, 2026-11-21)
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T23:55:30+00:00")
+    for body, tok in (("Ran ~00:0xZ.", "~00:0xZ"), ("Starts 00:05Z 10-15 minutes.", "00:05Z")):
+        assert run("add", "note", "--target", "project", "--body", body, store_dir=tmp_path) == 0
+        assert f"note: {tok} is later than this write's clock, 23:55Z" in capsys.readouterr().err, body
+
+
+def test_a_pre_registration_with_a_time_ahead_of_the_clock_is_refused_once(tmp_path, capsys,
+                                                                           monkeypatch):
+    """A pre-registration took '~19:3xZ' typed at 19:24Z: its text is fixed
+    once written, and a commit chained after it locked the wrong time in
+    (dogfood, 2026-11-17). In an agent session its add refuses the first time,
+    and the same command again writes it, for a planned time. With no session,
+    and for any other kind, the note after the write stays."""
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T19:24:30+00:00")     # far from any real today
+
+    def add(kind, body):
+        extra = ("--checked", "c") if kind == "prediction" else ()
+        rc = run("add", kind, "--target", "project", *extra, "--body", body, store_dir=tmp_path)
+        return rc, capsys.readouterr().err
+    rc, err = add("prediction", "Ran ~19:3xZ.")
+    assert rc == 0 and "later than this write's clock" in err, "no session: the note"
+    # A refusal it cannot mark refused every retry (audit, 2026-11-21): the note
+    (tmp_path / "file").write_text("")
+    for key, cache in (("a.b", None), ("s0", tmp_path / "file")):    # a key no mark takes, a cache in a file
+        with monkeypatch.context() as m:
+            m.setenv("CLAUDE_CODE_SESSION_ID", key)
+            if cache:
+                m.setenv("XDG_CACHE_HOME", str(cache))
+            rc, err = add("prediction", f"Ran ~19:3xZ, unmarked {key}.")
+            assert rc == 0 and "later than this write's clock" in err, (key, err)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    n = len(store.load(tmp_path))
+    rc, err = add("prediction", "Ran ~19:3xZ, again.")
+    assert rc == 1 and "add: nothing was written: ~19:3xZ is later than the clock, 19:24Z" in err
+    assert "a planned one: run the same command again" in err, err
+    assert len(store.load(tmp_path)) == n
+    assert add("prediction", "Ran ~19:3xZ, again.")[0] == 0
+    assert len(store.load(tmp_path)) == n + 1
+    rc, err = add("task", "Ran ~19:3xZ, a task.")
+    assert rc == 0 and "later than this write's clock" in err, "a task: the note"
 
 
 def test_a_write_names_what_others_wrote_since_the_writers_last(tmp_path, capsys, monkeypatch):
@@ -5558,12 +5714,12 @@ def test_a_project_row_that_repeats_an_open_rows_first_line_names_it(tmp_path, c
     _, err = add("The cache never expires on RESTART.\n\nrevised detail")
     assert "note: 1 open on project: with this title; " in err, err
     # each row with its lead, so a duplicate shows without a `show` (2026-10-07)
-    assert f"\n  {first}  The cache never expires on restart. detail one\n" in err, err
+    assert f"\nnote:   {first}  The cache never expires on restart. detail one\n" in err, err
     # The measured pair: a bold title with its detail on the same line, then
     # the same title alone. The title is the bold lead, else the first sentence.
     lead, _ = add("**Handoffs keep symbion workarounds after the fix.** one handoff still says X.")
     _, err = add("**Handoffs keep symbion workarounds after the fix.**\n\nDone: a, b.")
-    assert f"\n  {lead}  Handoffs keep symbion workarounds" in err, err
+    assert f"\nnote:   {lead}  Handoffs keep symbion workarounds" in err, err
 
 
 def test_context_on_a_commit_git_does_not_know_says_so(repo, tmp_path, capsys):
@@ -5798,8 +5954,11 @@ def test_the_line_someone_else_added_prints_below_the_lead(tmp_path, capsys, mon
     answer the reader had already acted on read as a fresh answer to the new
     lead (2026-10-07). An append, `noted`, is no rewrite of the lead."""
     monkeypatch.setenv("SYMBION_AUTHOR", "claude")
+    sec = iter(range(60))
 
     def w(*argv):
+        # one second per write: under load, real time passed a minute and `just now` read `1m ago`
+        monkeypatch.setenv("SYMBION_NOW", f"2026-01-10T10:00:{next(sec):02d}+00:00")
         assert run(*argv, store_dir=tmp_path) == 0
         nid = capsys.readouterr().out.strip()
         _commit(tmp_path, capsys)             # each edit its own row
@@ -5938,8 +6097,11 @@ def test_each_other_author_keeps_a_line_below_the_lead(tmp_path, capsys, monkeyp
     newest line prints, oldest first; an author whose newest line the lead
     shows prints none, and does not hide an earlier author's."""
     monkeypatch.setenv("SYMBION_AUTHOR", "claude")
+    sec = iter(range(60))
 
     def w(*argv):
+        # one second per write: under load, real time passed a minute and `just now` read `1m ago`
+        monkeypatch.setenv("SYMBION_NOW", f"2026-01-10T10:00:{next(sec):02d}+00:00")
         assert run(*argv, store_dir=tmp_path) == 0
         nid = capsys.readouterr().out.strip()
         _commit(tmp_path, capsys)
@@ -7164,6 +7326,47 @@ def test_commit_takes_this_sessions_rows_and_names_the_ones_it_leaves(
     assert store.pending_rows(tmp_path) == []
 
 
+def test_commit_author_takes_the_entries_no_session_wrote(tmp_path, capsys, monkeypatch):
+    """A script with no agent session wrote `--author nightly`, and a plain
+    `commit` left the entry pending as another writer's, with no error
+    (2026-11-17). An answer the user gave in serve stayed out of git through
+    a wrap told `--all once their session has ended`, with no session to
+    wait on (2026-11-19). Rows no session wrote are whole once written:
+    `--author NAME` takes them now, and the hints name it."""
+    run("add", "note", "--target", "project", "--body", "w", store_dir=tmp_path)
+    run("commit", "--all", store_dir=tmp_path)
+    run("add", "note", "--target", "project", "--body", "feed", "--author", "nightly",
+        store_dir=tmp_path)
+    assert re.search(r"none of them yours: symbion --dir \S+ commit --author nightly takes "
+                     r"them now, as no agent session wrote them\n", capsys.readouterr().err)
+    run("commit", store_dir=tmp_path)
+    assert re.search(r": symbion --dir \S+ commit --author nightly takes them now",
+                     capsys.readouterr().out)
+    assert run("commit", "--author", "nightly", store_dir=tmp_path) == 0
+    assert store.pending_rows(tmp_path) == []
+    # In a session: ada's sessionless answer is named, and --author ada leaves the session's own.
+    run("add", "question", "--target", "project", "--body", "q", "--author", "ada",
+        store_dir=tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    run("add", "note", "--target", "project", "--body", "mine", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("commit", "--author", "ada", store_dir=tmp_path) == 0
+    assert [r["body"] for r in store.pending_rows(tmp_path)] == ["mine"]
+    run("commit", store_dir=tmp_path)
+    # A live session's row beside a sessionless one: no --author, as --all waits.
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    run("add", "note", "--target", "project", "--body", "again", "--author", "ada",
+        store_dir=tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s2")
+    run("add", "note", "--target", "project", "--body", "s2's", "--author", "ada",
+        store_dir=tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    capsys.readouterr()
+    run("summary", store_dir=tmp_path)
+    assert "commit --all once their session has ended" in capsys.readouterr().out
+    assert run("commit", "--all", "--author", "ada", store_dir=tmp_path) == 2
+
+
 def test_every_line_that_names_other_sessions_entries_says_how_old_the_newest_is(
         tmp_path, capsys, monkeypatch):
     """Only a plain `commit` said how old the left entries were. A session
@@ -8109,7 +8312,8 @@ def test_the_summary_header_counts_what_the_arcs_hold(tmp_path, capsys):
 def test_the_summary_header_counts_parked_entries(tmp_path, capsys):
     """After parking a task as an idea, fresh agents found no sign in the
     summary that a parked entry exists until its date (2026-10-14). The
-    user: a count is enough. A resolved one is not counted."""
+    user: a count is enough. A resolved one is not counted. The command it
+    names reads the store the summary read (audit, 2026-11-21)."""
     for body in ("a", "b", "c"):
         run("add", "idea", "--target", "project", "--body", body, store_dir=tmp_path)
     run("resolve", capsys.readouterr().out.split()[-1], store_dir=tmp_path)
@@ -8117,7 +8321,8 @@ def test_the_summary_header_counts_parked_entries(tmp_path, capsys):
     run("summary", store_dir=tmp_path)
     head = capsys.readouterr().out.splitlines()[0]
     assert head.endswith(": open outside arcs: bug 0, task 0, question 0, prediction 0; "
-                         "2 parked"), head
+                         "2 parked, 2 with no due date (oldest 0d: symbion --dir "
+                         f"../{tmp_path.name} list --kind idea --undated)"), head
     run("summary", "--json", store_dir=tmp_path)
     assert json.loads(capsys.readouterr().out)["parked"] == 2
 
@@ -8371,6 +8576,58 @@ def test_list_overdue_is_open_and_past_due_only(repo, tmp_path, capsys):
     assert "due=2000-01-01 (overdue " in text
 
 
+def test_add_takes_the_target_after_the_kind(tmp_path, capsys):
+    """`add check file:x` reads natural beside a positional KIND, and two
+    surveyed sessions and a maintainer's each lost a call to it (2026-11-06,
+    11-18, 11-20). One stray TYPE:NAME, or `project`, with no target given is
+    the target; given beside --target, it refuses."""
+    assert run("add", "task", "item:foo", "--body", "stub a", store_dir=tmp_path) == 0
+    assert run("add", "task", "--body", "stub b", "project", store_dir=tmp_path) == 0
+    capsys.readouterr()
+    rows = {n.body: (n.target.type, n.target.name) for n in store.load(tmp_path)}
+    assert rows == {"stub a": ("item", "foo"), "stub b": ("project", None)}
+    assert run("add", "task", "item:foo", "--target", "item:bar", "--body", "stub c",
+               store_dir=tmp_path) == 2
+    assert "unrecognized arguments: item:foo" in capsys.readouterr().err
+    assert len(store.load(tmp_path)) == 2
+
+
+def test_list_status_all_is_no_status_filter(tmp_path, capsys):
+    """An agent guessed `--status all` and got a bare argparse error (2026-11-12)."""
+    run("add", "note", "--target", "project", "--body", "stub", store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("list", "--status", "all", "--json", store_dir=tmp_path) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 1
+
+
+def test_a_flag_value_hint_skips_the_verbs_own_flags(tmp_path, capsys):
+    """`--type --json` is a missing value, not a value that starts with -."""
+    assert run("list", "--type", "--json", store_dir=tmp_path) == 2
+    assert "goes after =" not in capsys.readouterr().err
+
+
+def test_list_undated_is_open_status_entries_with_no_due_date(repo, tmp_path, capsys):
+    """The list the summary's parked count names. A dated row, a resolved
+    undated one and a row of a kind with no status are left out."""
+    idea = _add(tmp_path, capsys, "--kind", "idea", "--type", "item", "--name", "shelf",
+                "--body", "stub a")
+    task = _add(tmp_path, capsys, "--kind", "task", "--type", "item", "--name", "todo",
+                "--body", "stub b")
+    _add(tmp_path, capsys, "--kind", "idea", "--type", "item", "--name", "dated",
+         "--due", "2999-01-01", "--body", "stub c")
+    _add(tmp_path, capsys, "--kind", "note", "--type", "item", "--name", "fact", "--body", "stub d")
+    done = _add(tmp_path, capsys, "--kind", "idea", "--type", "item", "--name", "done",
+                "--body", "stub e")
+    run("resolve", done, store_dir=tmp_path)
+    capsys.readouterr()
+    assert run("list", "--undated", "--json", store_dir=tmp_path) == 0
+    assert sorted(r["id"] for r in json.loads(capsys.readouterr().out)) == sorted([idea, task])
+    assert run("list", "--kind", "idea", "--undated", store_dir=tmp_path) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "match --kind idea --undated" in lines[0]
+    assert [ln for ln in lines if "stub" in ln] == [ln for ln in lines if "stub a" in ln] != []
+
+
 def test_add_names_a_row_resolved_at_a_commit_this_branch_lacks(repo, tmp_path, capsys,
                                                                 monkeypatch):
     """A fix on an unmerged branch read as done: an agent on main searched
@@ -8402,7 +8659,7 @@ def test_add_names_a_row_resolved_at_a_commit_this_branch_lacks(repo, tmp_path, 
     fix = store.heads(store.load(tmp_path))
     sha = next(r.name for n in fix if n.id == fixed for r in n.refs)
     assert (f"note: {fixed} on item:lint was resolved at {sha[:7]}, which fix holds and "
-            f"this branch lacks: if this entry is the same fault, its fix is there\n  ruff fails"
+            f"this branch lacks: if this entry is the same fault, its fix is there\nnote:   ruff fails"
             ) in err, err
     assert old not in err and gone not in err, err
     with monkeypatch.context() as m:
@@ -9115,6 +9372,29 @@ def test_an_answered_question_names_its_pick(tmp_path, capsys):
             assert "answered: hold, for now" in out and "options:" not in out, args
 
 
+def test_a_resolve_that_names_no_option_says_the_question_reads_unanswered(
+        tmp_path, capsys, monkeypatch):
+    """A resolve that relayed the user's pick as a paraphrase left the
+    question reading unanswered, and only a `show` caught it (2026-11-21).
+    A note says so and names the undo; once a session, as free text may be
+    meant, and never on a pick."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    ids = []
+    for q in ("one?", "two?", "three?"):
+        run("add", "question", "--target", "project", "--body", q, "--option", "ship",
+            "--option", "hold", store_dir=tmp_path)
+        ids.append(capsys.readouterr().out.strip())
+    assert run("resolve", ids[0], "--body", "ship", store_dir=tmp_path) == 0
+    assert "reads unanswered" not in capsys.readouterr().err
+    assert run("resolve", ids[1], "--body", "the user said to ship it", store_dir=tmp_path) == 0
+    err = capsys.readouterr().err
+    assert (f"note: {ids[1][-10:]} reads unanswered: no line of the body is one option's words "
+            f"(ship | hold). If the answer is one of them, `symbion undo {ids[1][-10:]}`") in err, err
+    assert run("undo", ids[1][-10:], store_dir=tmp_path) == 0
+    assert run("resolve", ids[2], "--body", "neither, in prose", store_dir=tmp_path) == 0
+    assert "reads unanswered" not in capsys.readouterr().err, "once a session"
+
+
 def test_option_refuses_a_fourth_and_any_kind_but_question(tmp_path, capsys):
     assert run("add", "question", "--target", "project", "--body", "?", "--option", "a",
                "--option", "b", "--option", "c", "--option", "d", store_dir=tmp_path) == 1
@@ -9130,6 +9410,36 @@ def test_option_refuses_a_fourth_and_any_kind_but_question(tmp_path, capsys):
                store_dir=tmp_path) == 1
     assert "option 1 is empty" in capsys.readouterr().err
     assert store.load(tmp_path) == []
+
+
+def test_the_askers_new_text_names_the_options_it_keeps(tmp_path, capsys, monkeypatch):
+    """`supersede` without --option keeps a question's options, and the GUI
+    draws them as the user's answer buttons: an asker's later appends moved its
+    ask while the first version's options stayed on offer (dogfood,
+    2026-11-19). The asker's text edit names them and the version that set
+    them. Quiet on someone else's answer, with --option, on an edit with no
+    text, once closed, and with no options left."""
+    def edit(m, *args):
+        monkeypatch.setenv("SYMBION_NOW", f"2026-01-10T10:{m:02d}:00+00:00")  # far from any real today
+        assert run("supersede", nid, *args, store_dir=tmp_path) == 0, args
+        return capsys.readouterr().err
+    monkeypatch.setenv("SYMBION_NOW", "2026-01-10T10:00:00+00:00")
+    assert run("add", "question", "--target", "project", "--body", "Ship it?",
+               "--option", "ship", "--option", "hold", store_dir=tmp_path) == 0
+    nid = capsys.readouterr().out.strip()
+    said = f"note: question {nid[-10:]} still offers the user the options set "
+    assert said + "2026-01-10 10:00:00Z: ship | hold. " in edit(1, "--append", "--body", "Or half?")
+    assert said + "2026-01-10 10:00:00Z: " in edit(2, "--replace", "half", "a half")
+    for m, args in enumerate((["--append", "--body", "hold", "--author", "human"],
+                              ["--add-tag", "x"], ["--due", "2026-02-01"],
+                              ["--append", "--body", "Half or all?", "--option", "half",
+                               "--option", "all"],
+                              ["--status", "resolved", "--append", "--body", "Done."]), 3):
+        assert said not in edit(m, *args), args
+    assert said + "2026-01-10 10:06:00Z: half | all. " in edit(8, "--status", "open",
+                                                               "--prepend", "--body", "All?")
+    assert said not in edit(9, "--append", "--body", "In prose.", "--option", "")
+    assert said not in edit(10, "--append", "--body", "Still prose.")
 
 
 def test_add_help_gives_the_option_cap_the_write_enforces(tmp_path, capsys):

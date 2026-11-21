@@ -283,7 +283,7 @@ def _repos(d: dict, store: Path, p: Path) -> dict:
     for name, v in raw.items():
         if not isinstance(v, str):
             raise ValueError(f"[repos] in {p} has {name} = {v!r}: a path is a quoted string")
-        if name in NON_CANONICAL_TYPES | {"file"}:
+        if name in NON_CANONICAL_TYPES | {"file", "doc"}:
             raise ValueError(f"[repos] in {p} names {name!r}: a repo's name is its target "
                              f"type, and {name!r} is taken; name it after the repo")
         path = (store / Path(v).expanduser()).resolve()

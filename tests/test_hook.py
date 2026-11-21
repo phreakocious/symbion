@@ -814,13 +814,13 @@ def _both_hooks(tmp_path, rows, head=None):
     text) written as `_list_gotchas` writes the list, LF on every platform:
     Windows text mode wrote CRLF, and the root, the last field, read as a
     `\\r` no dir matches (2026-11-09). `head`, the header file beside it.
-    Each call is a fresh session: a fire spends its row."""
+    Each call is a fresh session, unless `sid` names one: a fire spends its row."""
     d = tmp_path / "c" / "symbion" / "gotchas"
     d.mkdir(parents=True)
     n = iter(range(1000))
 
-    def run(hook, cmd, *, sh=SH, tool="Bash", args=None, env=()):
-        sid = f"s{next(n)}"
+    def run(hook, cmd, *, sh=SH, tool="Bash", args=None, env=(), sid=None):
+        sid = sid or f"s{next(n)}"
         (d / sid).write_text("".join(f"{i}\t{name}\t{text}\t{''.join(root)}\n"
                                      for i, name, text, *root in rows),
                              encoding="utf-8", newline="\n")
@@ -892,6 +892,43 @@ def test_both_gotcha_hooks_print_the_header_once_before_the_rows(tmp_path, hook)
 
 
 @pytest.mark.parametrize("hook", BOTH)
+def test_a_read_naming_more_than_two_files_lists_their_gotchas_by_id(tmp_path, hook):
+    """One read-only grep over five source files printed every gotcha on them,
+    and none bore on it (dogfood, 2026-11-20). A read whose unspent gotchas lie
+    on more than two files lists each by id and target, once; a call that names
+    one or two of those files prints theirs in full."""
+    rows = [(f"2026-{i}", f"src/{f}.py", f"- {i}-tail on file:src/{f}.py (1d ago): {f} trap {i}")
+            for i, f in enumerate("aabc")]
+    run = _both_hooks(tmp_path, rows, head="gotchas:")
+    listed = ("gotchas:\n- 0-tail on file:src/a.py\n- 1-tail on file:src/a.py\n"
+              "- 2-tail on file:src/b.py\n- 3-tail on file:src/c.py\n"
+              "symbion: this call names 3 files that have gotchas, so each is listed by id and "
+              "target only; it prints in full at a call that names its file alone or with one other.")
+    wide = "grep -n x src/a.py src/b.py src/c.py"
+    assert run(hook, wide, sid="w") == listed
+    assert run(hook, wide, sid="w") == "", "listed once"
+    assert run(hook, "cat src/a.py", sid="w") == \
+        "gotchas:\n- 0-tail on file:src/a.py (1d ago): a trap 0\n- 1-tail on file:src/a.py (1d ago): a trap 1"
+    assert run(hook, "grep x src/a.py src/b.py src/c.py src/d.py", sid="w") == \
+        "gotchas:\n- 2-tail on file:src/b.py (1d ago): b trap 2\n- 3-tail on file:src/c.py (1d ago): c trap 3", \
+        "a.py is spent, so two files are left: in full"
+    assert run(hook, "grep x src/a.py src/b.py") == "gotchas:\n- 0-tail on file:src/a.py (1d ago): a trap 0\n" \
+        "- 1-tail on file:src/a.py (1d ago): a trap 1\n- 2-tail on file:src/b.py (1d ago): b trap 2"
+
+
+def test_a_codex_patch_over_more_than_two_files_prints_their_gotchas_in_full(tmp_path):
+    """An edit is never cut to ids: its traps land before the edit they are
+    for. A patch is the one edit that names many files (audit, 2026-11-21)."""
+    rows = [(f"id{f}", f"src/{f}.py", f"- {f}-tail on file:src/{f}.py (1d ago): {f} trap")
+            for f in "abc"]
+    run = _both_hooks(tmp_path, rows, head="gotchas:")
+    patch = "*** Begin Patch\n" + "".join(f"*** Update File: src/{f}.py\n@@\n-x\n+y\n"
+                                          for f in "abc") + "*** End Patch"
+    assert run("codex", None, tool="apply_patch", args={"command": patch}) == \
+        "\n".join(["gotchas:", *(text for *_, text in rows)])
+
+
+@pytest.mark.parametrize("hook", BOTH)
 def test_both_gotcha_hooks_fire_in_a_linked_worktree(tmp_path, hook):
     """gotchas.sh fired on a file in a linked worktree named by absolute path
     (dogfood, 2026-11-04), and the Codex hook did not (audit, 2026-11-08). The
@@ -941,6 +978,22 @@ def test_a_long_run_beside_a_rows_name_stays_inside_the_hook_timeout(tmp_path, h
     assert run(hook, "cat docs/README.md; echo " + "a," * 16000) == ""
     assert time.monotonic() - start < 5
     assert run(hook, "cat /w/proj/README.md; echo " + "a," * 16000) == "x trap"
+
+
+@pytest.mark.parametrize("hook", BOTH)
+def test_a_wide_read_over_many_gotchas_stays_inside_the_hook_timeout(tmp_path, hook):
+    """The rows a call names are gathered, then printed. Cut from one string a
+    record at a time, 400 rows on 40 files took 6.6 s in bash under a UTF-8
+    locale, and the timeout is 5 s (2026-11-20). That cost grows with the rows
+    times their bytes; 200 long rows keep it and leave a 1-CPU box room."""
+    rows = [(f"2026{i:06d}", f"src/pkg/mod{i % 40}.py",
+             f"- {i:06d}-abc on file:src/pkg/mod{i % 40}.py (3w ago): " + "trap \u00e9 " * 200)
+            for i in range(200)]
+    run = _both_hooks(tmp_path, rows)
+    start = time.monotonic()
+    said = run(hook, "grep -n x " + " ".join(f"src/pkg/mod{i}.py" for i in range(40)),
+               sh="/bin/sh" if Path("/bin/sh").exists() else SH, env={"LC_ALL": "en_US.UTF-8"})
+    assert said.count("\n") == 200 and time.monotonic() - start < 5
 
 
 @pytest.mark.parametrize("tool", ["Write", "Bash", "many", "lines"])

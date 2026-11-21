@@ -399,11 +399,13 @@ def did_you_mean(query: str, candidates) -> str:
     typo of, else ''. 0.9: a typo scored 0.97 to 0.98 against its file in
     this repo, and a new file 0.84 against its siblings, which share its
     directory. Case is folded: 'load balancer' scored 0.85 against 'Load
-    Balancer'. Names that differ only in digits are a series, not a typo:
-    `PR #7` and `PR #8` scored 0.92."""
-    q, folded = query.casefold(), {}
+    Balancer'. A space, `-` and `_` fold too: 'RUN_2099_01_05' scored 0.79
+    against 'run 2099-01-05'. Names that differ only in digits are a series,
+    not a typo: `PR #7` and `PR #8` scored 0.92."""
+    fold = lambda s: re.sub(r"[\s_-]", " ", s.casefold())   # one for one: scores keep their length
+    q, folded = fold(query), {}
     for c in candidates:
-        f = c.casefold()
+        f = fold(c)
         if f == q or re.sub(r"\d", "", f) != re.sub(r"\d", "", q):
             folded.setdefault(f, []).append(c)
     near = [c for f in difflib.get_close_matches(q, list(folded), n=3, cutoff=0.9)

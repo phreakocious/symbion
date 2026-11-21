@@ -15,10 +15,10 @@ from nicegui import ElementFilter, ui   # noqa: E402
 from nicegui.testing import User        # noqa: E402
 from nicegui.testing.user_interaction import UserInteraction  # noqa: E402
 
-from symbion import api, gitref, store  # noqa: E402
+from symbion import api, gitref, store, summary  # noqa: E402
 from symbion.gui.pages import build_page  # noqa: E402
 
-from _cards import cards, drawn, part, parts, see, not_see, template   # noqa: E402
+from _cards import _until, cards, drawn, part, parts, see, not_see, template   # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
 
@@ -153,14 +153,6 @@ async def test_the_git_buttons_follow_commits_and_pushes_made_elsewhere(
     assert "1" in [e.text for e in button.default_slot.children], "sam's is not ada's"
 
 
-async def _until(cond, seconds: float = 3.0) -> None:
-    for _ in range(int(seconds / 0.02)):
-        if cond():
-            return
-        await asyncio.sleep(0.02)
-    assert cond()
-
-
 async def test_a_page_has_one_h1_its_boards_h2_and_a_skip_link_first(user: User,
                                                                       ctx_with_notes):
     """A screen reader moves through a page by its headings, and every title
@@ -253,8 +245,7 @@ async def test_a_write_elsewhere_shows_a_reload_button(user: User, ctx_with_note
         await user.should_not_see("alpha body")
     await user.should_see(marker="stale-button")                # the page is as it was
     user.find(marker="drift-reload").click()
-    await asyncio.sleep(0.3)
-    await user.should_not_see(marker="stale-button")
+    await user.should_not_see(marker="stale-button", retries=60)     # 3 s: the reload lands in a task
 
 
 async def _arc_board(user, ctx, monkeypatch):
@@ -270,6 +261,23 @@ async def _arc_board(user, ctx, monkeypatch):
     await user.should_see(marker="board-column")
     return act, ids
 
+
+
+async def test_the_reload_buttons_tip_names_the_agent_that_wrote_under_another_name(
+        user: User, ctx_with_notes, monkeypatch):
+    """Its tip read the author alone where every card said `sam via claude`
+    (audit, 2026-11-21)."""
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    await user.open("/notes")
+    await asyncio.sleep(0.3)                                    # a few ticks
+    with monkeypatch.context() as m:
+        m.setenv("CLAUDECODE", "1")
+        n = api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
+                                     "body": "relayed"}, author="sam")
+    await _until(lambda: _stale(user) != [])
+    assert f"sam via claude · new · note {n.id[-10:]} · relayed" in \
+        (await _hover(user, "stale-button")).splitlines()
 
 def _stale(user) -> list:
     with user:
@@ -399,6 +407,37 @@ async def test_a_write_in_the_older_of_two_tabs_lights_the_newer_only(
         _emit(user, next(c for c in cards(user) if c.props["data-id"] == ids["one"]), "star")
     await _until(lambda: _stale(tab) != [])
     await _until(lambda: _stale(user) == [])
+
+
+@pytest.mark.parametrize("act", ["star", "resolve", "answer"])
+async def test_a_write_on_an_entry_about_the_arc_lights_nothing(user: User, ctx_with_notes,
+                                                               monkeypatch, act):
+    """An "entries about this arc" card redrew the page's body after its
+    write, as no other page's card does, and its own write lit the reload
+    button (audit, 2026-11-21)."""
+    from _cards import _emit
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    ctx = ctx_with_notes
+    a = api.create_arc(ctx, "camp", "d", "item", author="ada")
+    about = api.add(ctx, {"kind": "question", "target": {"type": "arc", "name": a.id},
+                          "body": "Ship it?", "options": ["ship", "hold"]}, author="claude") \
+        if act == "answer" else \
+        api.add(ctx, {"kind": "bug", "target": {"type": "arc", "name": a.id},
+                      "body": "about the arc"}, author="ada")
+    await user.open(f"/arc?id={a.id}")
+    await asyncio.sleep(0.3)                                    # a few ticks
+    assert _stale(user) == []
+    (card,) = [c for c in cards(user) if c.props["data-id"] == about.id]
+    _emit(user, card, *((act, "ship") if act == "answer" else (act,)))
+
+    def landed():
+        head = store.chain_tip(store.load(ctx.store_dir), about.id)
+        return {"star": "priority" in head.tags, "resolve": head.status == "resolved",
+                "answer": head.body.endswith("ship")}[act]
+    await _until(landed)
+    await asyncio.sleep(0.3)                                    # a few ticks, and the reload
+    assert _stale(user) == []
 
 
 async def test_a_tick_that_reads_between_the_pages_write_and_its_mark_lights_nothing(
@@ -726,10 +765,27 @@ async def test_earlier_versions_show_their_target(user: User, ctx_with_notes):
     await user.should_see("old-name")
 
 
+async def test_an_earlier_version_that_holds_the_answer_names_its_pick(user: User, ctx_with_notes):
+    """An earlier version's card is drawn from its own chain: drawn without
+    the rows, the answered version printed its options (audit, 2026-11-21)."""
+    ctx = ctx_with_notes
+    q = api.add(ctx, {"kind": "question", "target": {"type": "project", "name": None},
+                      "body": "Ship it?", "options": ["ship", "hold"]}, author="claude")
+    api.supersede(ctx, q.id, author="ada", append_body="ship")
+    api.supersede(ctx, q.id, author="claude", status="resolved")
+    await user.open(f"/notes?id={q.id}")
+    user.find(marker="history").click()
+    await user.should_see("earlier versions (2)")
+    # the head, then its versions newest first: the answered one, the asked one
+    assert [e.text for e in sorted(parts(user, "options"), key=lambda e: e.id)] == [
+        "answered: ship", "answered: ship", "options: ship | hold"]
+
+
 async def test_a_rows_page_marks_each_amendment_with_who_added_it(user: User, ctx_with_notes):
     """A seam, not a diff: most supersedes are appends, and a diff of one is
-    the whole old body unchanged (the user, 2026-10-08). On the row's page
-    only, for now."""
+    the whole old body unchanged (the user, 2026-10-08). On every card that
+    shows the body whole: the row's own page, a target's (2026-11-19), a list
+    and the boards (the user, 2026-11-20)."""
     ctx = ctx_with_notes
     first = next(n.id for n in store.load(ctx.store_dir) if n.body == "beta body")
     api.commit(ctx, "c", everyone=True)
@@ -746,9 +802,44 @@ async def test_a_rows_page_marks_each_amendment_with_who_added_it(user: User, ct
     await user.should_see("earlier versions (2)")
     await not_see(user, "diff-del")
     await not_see(user, "diff-ins")
-    await user.open("/notes")
-    await not_see(user, "seam")
+    await user.open("/object?type=item&name=widget")
+    assert {e.text for e in parts(user, "seam")} == {
+        "kim added the above just now", "sam added just now"}
+    for page in ("/notes", "/"):
+        await user.open(page)
+        assert {e.text for e in parts(user, "seam")} == {
+            "kim added the above just now", "sam added just now"}, page
 
+
+async def test_a_clipped_card_never_works_out_its_seams(user: User, ctx_with_notes,
+                                                        monkeypatch):
+    """A long chain's seams take tens of ms, and a clipped body shows none."""
+    ctx = ctx_with_notes
+    long = api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
+                         "body": "word " * 100}, author="ada").id
+    api.commit(ctx, "c", everyone=True)
+    long = api.supersede(ctx, long, author="sam", append_body="a later line").id
+    asked = []
+    real = summary.seams
+    monkeypatch.setattr(summary, "seams", lambda by_id, n: asked.append(n.id) or real(by_id, n))
+    await user.open("/notes")
+    await user.should_see("alpha body")
+    assert asked and long not in asked, asked
+
+
+async def test_a_target_page_marks_the_answer_on_a_short_resolved_card(user: User, repo,
+                                                                       tmp_path):
+    """A resolved entry is a compact card there, and a short one shows its body
+    whole: the answer below a question read as part of it (2026-11-20)."""
+    ctx = api.resolve(str(tmp_path))
+    q = api.add(ctx, {"kind": "question", "target": {"type": "item", "name": "widget"},
+                      "body": "keep it?"}, author="ada").id
+    api.commit(ctx, "c", everyone=True)
+    api.supersede(ctx, q, author="sam", status="resolved", append_body="yes, keep it")
+    build_page(ctx, author="ada")
+    await user.open("/object?type=item&name=widget")
+    await user.should_see("yes, keep it")
+    assert {e.text for e in parts(user, "seam")} == {"sam added just now"}
 
 async def test_earlier_versions_show_an_edit_as_a_diff(user: User, ctx_with_notes):
     """A replacement (an old-style resolve's "Fixed in …") stays the old
@@ -810,7 +901,7 @@ async def test_a_search_result_shows_and_marks_a_hit_past_the_clip(user: User, r
 async def test_the_header_search_keeps_the_filters_in_view(user: User, ctx_with_notes):
     await user.open("/notes?kind=bug")
     user.find(marker="search").type("widget").trigger("keydown.enter")
-    await user.should_see("Bugs matching “widget”")
+    await user.should_see("Bugs matching “widget”", retries=40)
     assert _count(user).startswith("1 of 1 entry match")
 
 
@@ -1478,6 +1569,40 @@ async def test_a_reconnect_leaves_a_kept_peek_where_the_person_moved_it(
     assert not any("sbPeekHash" in code for code in sent), sent
 
 
+async def test_a_reconnect_leaves_the_drift_list_in_the_peek(user: User, ctx_with_notes,
+                                                             monkeypatch):
+    """The drift list leaves the last peek's #peek= in the URL, and a
+    reconnect read it: the peek showed that entry over the list (audit,
+    2026-11-21; seen in headless Chrome)."""
+    from nicegui.outbox import Outbox
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    sent, emit = [], Outbox._emit
+
+    async def record(self, message):
+        if message[1] == "run_javascript" and "sbPeek" in message[2]["code"]:
+            sent.append(message[2]["code"])
+        await emit(self, message)
+
+    monkeypatch.setattr(Outbox, "_emit", record)
+    note = next(n.id for n in store.heads(store.load(ctx_with_notes.store_dir)) if n.kind == "note")
+    await user.open("/notes")
+    _peek(user, note)
+    await _until(lambda: f'sbPeekHash("{note}")' in sent)
+    del sent[:]
+    await _reconnect(user.client)
+    assert sent == ["sbPeekFromHash()"], sent          # a peek's own: the URL names it
+    api.add(ctx_with_notes, {"kind": "note", "target": {"type": "project", "name": None},
+                             "body": "from elsewhere"}, author="sam")
+    await _until(lambda: _stale(user) != [])
+    user.find(marker="stale-button").click()
+    with user.scope(marker="peek"):
+        await user.should_see("from elsewhere")
+    del sent[:]
+    await _reconnect(user.client)
+    assert sent == [], sent
+
+
 async def test_a_write_in_the_peek_reloads_the_page_and_peeks_again(user: User, ctx_with_notes,
                                                                     tmp_path):
     """The user, 2026-10-16: a question answered in the peek stayed on the
@@ -1543,6 +1668,9 @@ async def test_the_summary_shows_the_last_wrap(user: User, ctx_with_notes):
     assert "last wrap" in _board_ids(user)
     await user.should_see("Wrapped the importer")
     await user.should_see("Next: the dry run.")
+    (age,) = user.find(marker="wrap-age").elements    # no link beside it: it takes focus itself
+    assert "sb-age" in age.classes and age.props["tabindex"] == "0"
+    assert age.props["data-tip"] and age.props["data-tip"] != age.text
 
 
 async def test_arc_page_hides_the_seed_button_without_an_eligible_task(user: User, repo, tmp_path):
@@ -1674,7 +1802,7 @@ async def test_a_chip_or_a_search_on_a_notes_own_page_starts_a_filter(
     assert _hrefs(user, "note-kind") == {"/notes?kind=bug"}
     assert _hrefs(user, "tag-blue") == {"/notes?tag=blue"}
     user.find(marker="search").type("alpha").trigger("keydown.enter")
-    await user.should_see("Entries matching “alpha”")   # the new page; then the whole title
+    await user.should_see("Entries matching “alpha”", retries=40)   # the new page; then the whole title
     assert {e.text for e in user.find(marker="page-title").elements} == {"Entries matching “alpha”"}
 
 
@@ -1717,6 +1845,19 @@ async def test_a_note_under_an_arc_links_to_it_and_the_arc_page_lists_its_notes(
     await user.open(f"/arc?id={aid}")
     await user.should_see("about the arc itself")
     await user.should_see("refs the arc")
+
+
+async def test_an_entry_on_an_arcs_page_marks_each_amendment(user: User, repo, tmp_path):
+    """The arc's page shows its entries whole, as the row's own page does."""
+    ctx = api.resolve(str(tmp_path))
+    aid = api.create_arc(ctx, "Release", "", "mixed", author="ada").id
+    nid = api.add(ctx, {"kind": "decision", "target": {"type": "arc", "name": aid},
+                        "body": "about the arc itself"}, author="ada").id
+    api.commit(ctx, "c", everyone=True)
+    api.supersede(ctx, nid, author="sam", append_body="a later word")
+    build_page(ctx, author="ada")
+    await user.open(f"/arc?id={aid}")
+    assert {e.text for e in parts(user, "seam")} == {"sam added just now"}
 
 
 # ---- seen in the browser, 2026-09-27: what a human reads ----
@@ -2971,6 +3112,10 @@ async def test_a_since_chip_opens_the_commits_and_the_files_diff_since_the_entry
     part(user, "note-since").click()
     await user.should_see(marker="commit-list", retries=40)
     assert len(user.find(marker="commit-row").elements) == 2
+    # the age takes no focus: a keyboard reads its stamp in the sha's tip
+    assert all("\ncommitted " in e.props["data-tip"] for e in user.find(marker="commit-row").elements)
+    ages = [e for e in user.find(kind=ui.label).elements if "sb-commits-age" in e.classes]
+    assert len(ages) == 2 and all("sb-age" in e.classes and e.props["data-tip"] for e in ages)
     await user.should_see("shout two")
     await user.should_see("f, as this entry saw it, against the file now")
     view = _newest(user, "diff-view")
@@ -3127,7 +3272,7 @@ async def test_typing_in_the_search_box_does_not_leave_the_page(user: User, ctx_
     user.find(marker="search").type("beta")
     await user.should_not_see(marker="result-count")
     user.find(marker="search").trigger("keydown.enter")
-    await user.should_see(marker="result-count")
+    await user.should_see(marker="result-count", retries=40)
     assert _count(user).startswith("1 of 2 entries match")
 
 
@@ -3148,7 +3293,7 @@ async def test_a_filter_that_hides_every_card_searches_the_store(user: User, ctx
             assert went == [], path
     await user.open("/")
     user.find(marker="search").trigger("update:value", "beta")
-    await user.should_see(marker="result-count")
+    await user.should_see(marker="result-count", retries=40)
     assert _count(user).startswith("1 of 2 entries match")
     went = []
     monkeypatch.setattr(ui.navigate, "to", went.append)
@@ -3248,6 +3393,44 @@ async def test_no_git_call_on_home_or_notes_grows_with_the_cards(user: User, rep
     assert not grew, (grew, seen)
 
 
+async def test_no_git_call_in_the_peek_grows_with_its_cards(user: User, repo, tmp_path,
+                                                            monkeypatch):
+    """The peek redraws outside its page's scope, and each card read HEAD
+    again: one call a version in a peek, one an entry in the drift list
+    (audit, 2026-11-21)."""
+    from symbion.gui import chrome
+    monkeypatch.setattr(chrome, "_GIT_EVERY", 0.05)
+    ctx = api.resolve(str(tmp_path))
+    build_page(ctx, author="ada")
+    real = gitref._git
+
+    async def count(act, shows):
+        """rev-parse calls until the peek shows `shows`: the poll's status and remote ride along."""
+        calls = []
+        with monkeypatch.context() as m:
+            m.setattr(gitref, "_git", lambda c, *a, **k: calls.append(a) or real(c, *a, **k))
+            act()
+            with user.scope(marker="peek"):
+                await user.should_see(shows, retries=40)
+        return sum(a[0] == "rev-parse" for a in calls)
+    peeks, drifts = {}, {}
+    for k in (2, 12):
+        n = api.add(ctx, {"kind": "task", "target": {"type": "item", "name": f"widget {k}"},
+                          "body": "v0"}, author="ada")
+        for i in range(1, k):
+            api.supersede(ctx, n.id, author="ada", body=f"v{i}")
+        await user.open("/notes")
+        peeks[k] = await count(lambda: _peek(user, n.id), f"v{k - 1}")
+        await user.open("/notes")
+        for i in range(k):
+            api.add(ctx, {"kind": "task", "target": {"type": "item", "name": f"thing {k}-{i}"},
+                          "body": f"from sam {k}-{i}"}, author="sam")
+        await _until(lambda: _stale(user) != [])
+        drifts[k] = await count(lambda: user.find(marker="stale-button").click(),
+                                f"from sam {k}-{k - 1}")
+    assert peeks[12] <= peeks[2] and drifts[12] <= drifts[2], (peeks, drifts)
+
+
 async def test_targets_page_boards_each_target_open_work_first(user: User, repo, tmp_path):
     """One board per target, as the notebook has one per kind: its open rows
     as cards, its title a link to the object, and the aside counting what
@@ -3344,23 +3527,23 @@ async def test_the_undo_button_asks_with_what_it_takes_back(user: User, repo, tm
     await user.open("/notes")
     await user.should_not_see(marker="undo-button")       # a commit ends the level
     part(user, "note-resolve").click()
-    await user.should_see(marker="undo-button")
+    await user.should_see(marker="undo-button", retries=40)
     user.find(marker="undo-button").click()
     await user.should_see("resolved → open")
     assert store.read_status(head()) == "resolved", "asking writes nothing"
     user.find(marker="undo-confirm").click()
-    await user.should_see(f"undone: the edit of {n.id} by ada")
+    await user.should_see(f"undone: the edit of {n.id} by ada", retries=40)
     assert store.read_status(head()) == "open"
     await user.should_not_see(marker="undo-button")       # one level
 
     user.find(marker="new-note").click()
     user.find(marker="note-body").type("wrong store").trigger("keydown.meta.enter")
-    await user.should_see(marker="undo-button")
+    await user.should_see(marker="undo-button", retries=40)
     nid = next(r.id for r in store.load(tmp_path) if r.body == "wrong store")
     user.find(marker="undo-button").click()
     await user.should_see(f"removes {nid[-10:]}")
     user.find(marker="undo-confirm").click()
-    await user.should_see(f"undone: the add of {nid} by ada")
+    await user.should_see(f"undone: the add of {nid} by ada", retries=40)
     assert "wrong store" not in {r.body for r in store.load(tmp_path)}
 
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")    # an agent's write
@@ -3435,6 +3618,12 @@ async def test_a_read_only_page_says_so_and_links_the_readme(user: User, ctx_wit
     await user.should_see("symbion is a notebook and ticket registry")
     name = build_page.__globals__["store_name"](ctx_with_notes)
     await user.should_see(f"This is {name}'s store")
+    # What it costs and how to install it, on the card (the user, 2026-11-09).
+    await user.should_see("Free and open source (MIT)")
+    (install,) = user.find(marker="demo-intro-install").elements
+    assert [c.text for c in install.default_slot.children] == [
+        "In Claude Code: ", "/plugin install symbion --marketplace phreakocious/symbion",
+        ", then ", "/symbion:setup", "."]
     # Each link to the source goes by /go/github, which 302s to the readme: the
     # demo's access log then counts clicks out, and names the link (the user,
     # 2026-11-03). /go/github itself is in test_gui_serve.py.

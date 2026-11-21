@@ -116,13 +116,15 @@ name. The session-start summary sets someone else's entries apart, and leaves
 your parked entries out until they come due.
 
 An entry in the user's words is theirs: `--author "$(git config user.name)"`.
-One you write is yours, even with their results in it. A subagent, or another
+symbion stamps who ran each write: an entry an agent wrote under another name
+reads `NAME via claude`. One you write is yours, even with their results in it. A subagent, or another
 model you hand work to, writes under its own name (`--author sonnet-review`).
 
 ## Saving
 
 A write is pending until `symbion commit`, and on this disk only until
-`symbion push`. `commit` takes the entries this session wrote, under any author,
+`symbion push`. `commit` takes the entries this session wrote, under any author
+(`--author NAME` takes NAME's written outside any session),
 and the store's changed files (from another project's tree, only `arcs.jsonl` and
 the new docs they name); `--all` takes every entry and file, `--dry-run` lists what it would take. Each write and each commit says what is
 still pending or unpushed.
@@ -163,14 +165,14 @@ under the store's `docs/`; the entry names it by its path there
 A trap, such as a test that passes alone and fails in its file's run or a step
 that must come before an edit, goes on its file tagged `gotcha`: in Claude Code,
 Codex, Pi and Hermes, the first non-symbion call in each session or subagent that names
-the file prints its first 200 characters, so the trap and its fix fit in them. One
+the file, alone or with one other, prints its first 200 characters, so the trap and its fix fit in them. One
 trap is one entry; a how-to is a plain note.
 
 A `check` reaches no open view, so a running job also needs a `task` due at
-its end, resolved with the result. A result the user reports from this tree
-is your `check`, and its `--checked` names who ran what; one from another tree or day is a `note`
-on its commit. A pre-registration whose window closes unrun takes a new
-`--due`, not a resolve.
+its end, to the hour (`--due 2026-11-10T16:30`), resolved with the result. A
+result the user reports from this tree is your `check`, and its `--checked`
+names who ran what; one from another tree or day is a `note` on its commit. A
+pre-registration whose window closes unrun takes a new `--due`, not a resolve.
 
 An open `question` holds the work only if the user's instructions say so. One
 whose answers fit in three gives them as `--option`, the default first, and its

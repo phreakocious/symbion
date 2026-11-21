@@ -14,7 +14,7 @@ from nicegui.testing.user_interaction import UserInteraction   # noqa: E402
 from symbion import api, store              # noqa: E402
 from symbion.gui.notes import changes, diff_blocks, edited, preview, render_note   # noqa: E402
 
-from _cards import bodies, button, not_see, part, parts, template   # noqa: E402
+from _cards import _until, bodies, button, not_see, part, parts, template   # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("tmp_store")
 
@@ -2102,9 +2102,10 @@ async def test_a_saved_edit_draws_the_page_again(user: User, repo, tmp_path, cap
     await user.should_see(marker="edit-append")
     user.find(marker="edit-append").type("one more line")
     user.find(marker="edit-save").click()
-    await asyncio.sleep(0.5)
+    # The save reloads the page, and the User opens it again in a background
+    # task: on a loaded CPU that took past a fixed 0.5 s (2026-11-20).
+    await _until(lambda: any("one more line" in b for b in bodies(user)))
     assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == []
-    assert any("one more line" in b for b in bodies(user))
 
 
 @pytest.mark.parametrize("how", ["archived", "gone"])
@@ -2137,3 +2138,33 @@ async def test_an_entry_in_an_arc_the_select_lacks_opens_its_edit_dialog(user: U
     user.find(marker="edit-save").click()
     head = store.chain_tip(store.load(tmp_path), n.id)
     assert (head.body, head.arc_id) == ("do the thing\n\nmore", act.id)
+
+
+async def test_a_card_names_the_agent_that_wrote_under_another_name(user: User, repo, tmp_path,
+                                                                     monkeypatch):
+    ctx = api.resolve(str(tmp_path))
+    monkeypatch.setenv("CLAUDECODE", "1")
+    n = store.add(tmp_path, kind="note", target={"type": "item", "name": "x"}, author="ada",
+                  body="the lead")
+    monkeypatch.setattr(store, "_now_iso", lambda: "2099-01-01T00:00:01+00:00")
+    n = store.supersede(tmp_path, n.id, author="ada", append_body="relayed")
+
+    @ui.page("/t")
+    def page():
+        render_note(ctx, n, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("relayed")
+    card = user.find(marker="note-row").elements.pop()
+    assert card._props["card"]["by"]["t"] == "ada via claude"
+    assert part(user, "seam").text.startswith("ada via claude added")
+    # An earlier version's card, as the history draws it (audit, 2026-11-21)
+    old = next(m for m in store.load(tmp_path) if m.id == n.supersedes)
+
+    @ui.page("/old")
+    def old_page():
+        render_note(ctx, old, lambda: None, author="ada", actions=False, diff_to=n, seams=())
+
+    await user.open("/old")
+    await user.should_see("the lead")
+    assert part(user, "changes").text.startswith("ada via claude edited this")

@@ -69,13 +69,15 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
    entry there that belongs here comes over with that entry as its source. The
    second lists the sibling paths tracked files name, absolute and relative,
    and the siblings that share the repo's name. A `../` path is relative to
-   its file.
+   its file. That sweep counts per file: read one file's lines with
+   `git grep -n -F '../' -- FILE`, and skip a data file (a run's output, a
+   fixture).
 
    ```bash
    r=$(git rev-parse --show-toplevel)
    d=$(dirname "$r" | sed 's/[][\.*^$(){}?+|]/\\&/g')
    git grep -h -o -I -E "$d/[^/\"' )\`]+" -- :/ | grep -v -x -F "$r" | sort | uniq -c
-   git grep -n -I -F '../' -- :/
+   git grep -c -I -F '../' -- :/
    ls -d "$r"*
    ```
 
@@ -95,7 +97,8 @@ another) share one store that lists them under `[repos]` (`catalogs.md`).
      report. symbion stamps a `check` when it is written, so a late one reads
      `current` against today's HEAD.
    - What needs the user's call, not work, is a `question`; `resolve <id>
-     --body "decided: …"` closes it with the answer.
+     --body "decided: …"` closes it with the answer. On a question with
+     options, the chosen option's words go on a line of their own.
    - A bootstrap reads a `task` from a scratch file against the rest of that
      file: a ruling in its preamble goes into the task as the
      counter-position, or the bootstrap does not mint the task.

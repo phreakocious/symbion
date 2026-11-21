@@ -56,6 +56,26 @@ async def test_ticking_a_row_resolves_its_task(user: User, seeded):
     assert (done, total) == (1, 2)
 
 
+async def test_a_done_box_names_the_agent_that_ticked_it_under_another_name(
+        user: User, seeded, monkeypatch):
+    """The box read the author alone where its card elsewhere said `ada via
+    claude` (audit, 2026-11-21)."""
+    ctx, act = seeded
+    item = store.arc_items(store.load(ctx.store_dir), act.id)[0]
+    with monkeypatch.context() as m:
+        m.setenv("CLAUDECODE", "1")
+        api.supersede(ctx, item.id, author="ada", status="resolved")
+
+    @ui.page("/t")
+    def page():
+        checklist(ctx, act, lambda: None, author="ada")
+
+    await user.open("/t")
+    await user.should_see("one")
+    (box,) = [c for c in cards(user) if c._props["data-id"] == item.id]
+    assert box._props["card"]["by"]["t"] == "ada via claude"
+
+
 async def test_ticking_a_done_row_reopens_it(user: User, seeded):
     """The other direction. A toggle asserted only on the way to resolved
     passes on a button hardwired to resolve."""
@@ -1007,6 +1027,13 @@ async def test_arcs_sorts_by_last_change_and_says_it(user: User, repo, tmp_path,
     assert texts == ["started 4h ago by ada · last change 2h ago by bo", "started 3h ago by ada"]
     (change,) = [e for e in user.find(marker="arc-last-change").elements]
     assert change.props["data-tip"] == store.shown("2026-01-10T03:00:00+00:00")
+    # A screen reader hears each stamp (.sb-age); a keyboard reads both in the
+    # name link's tip, so the list's ages take no focus (the GUI review, 2026-11-07).
+    ages = lambda w: [e for e in w.default_slot.children if e.text != "·"]
+    assert all("sb-age" in e.classes and "tabindex" not in e.props for w in lines for e in ages(w))
+    name = cards_[0].default_slot.children[0].default_slot.children[0]
+    assert name.props["data-tip"] == (f"started {store.shown('2026-01-10T01:00:00+00:00')}\n"
+                                      f"last change {store.shown('2026-01-10T03:00:00+00:00')}")
     api.set_phases(ctx, old.id, ["todo", "doing"], author="user")
     await _board(user, old)
     at("06")
@@ -1015,6 +1042,7 @@ async def test_arcs_sorts_by_last_change_and_says_it(user: User, repo, tmp_path,
     (head,) = user.find(marker="arc-when").elements
     assert " ".join(c.text for c in head.default_slot.children) == \
         "started 5h ago by ada · last change just now by ada"
+    assert all(e.props.get("tabindex") == "0" and "sb-age" in e.classes for e in ages(head))
 
 
 async def test_a_box_id_reaches_the_page_script_as_a_string(user: User, phased, monkeypatch):

@@ -743,12 +743,34 @@ def test_restart_ends_with_a_count_so_a_cut_pipe_shows(monkeypatch, capsys):
     from symbion.gui import servers
     r = {"store": "/s", "url": "http://127.0.0.1:1", "pid": 7}
     monkeypatch.setattr(servers, "signal_all",
-                        lambda restart: [("restarted", r), ("restarted", r), ("timeout", r)])
+                        lambda restart, port=None: [("restarted", r), ("restarted", r), ("timeout", r)])
     assert cli._serve_all(restart=True) == 1
     assert capsys.readouterr().out.splitlines()[-1] == "restarted 2 of 3 serves"
-    monkeypatch.setattr(servers, "signal_all", lambda restart: [("stopped", r)])
+    monkeypatch.setattr(servers, "signal_all", lambda restart, port=None: [("stopped", r)])
     assert cli._serve_all(restart=False) == 0
     assert capsys.readouterr().out.splitlines()[-1] == "stopped 1 of 1 serve"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="--stop refuses on Windows")
+def test_stop_with_a_port_signals_only_the_serve_on_it(monkeypatch, capsys):
+    """To stop one scratch serve beside the user's others, a session reached
+    for `lsof` and `kill -INT`: `serve --stop` stopped every serve (dogfood,
+    2026-11-10). With --port N, only the one on that port."""
+    from symbion import cli
+    from symbion.gui import servers
+    recs = [{"store": f"/s{i}", "url": f"http://127.0.0.1:{8000 + i}", "pid": 100 + i,
+             "started": f"t{i}"} for i in range(3)]
+    sent = []
+    monkeypatch.setattr(servers, "live", lambda: recs)
+    monkeypatch.setattr(servers, "_a_serve", lambda pid: True)
+    monkeypatch.setattr(servers, "_read", lambda path: None)
+    monkeypatch.setattr(servers.os, "kill", lambda pid, sig: sent.append(pid))
+    assert cli.main(["serve", "--stop", "--port", "8001"]) == 0
+    assert sent == [101]
+    assert capsys.readouterr().out.splitlines() == ["stopped /s1: http://127.0.0.1:8001",
+                                                    "stopped 1 of 1 serve"]
+    assert cli.main(["serve", "--stop", "--port", "9999"]) == 0
+    assert capsys.readouterr().out == "no symbion serve is running on port 9999\n"
 
 
 def test_read_only_is_set_before_the_page_is_built(tmp_path, monkeypatch):

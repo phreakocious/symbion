@@ -897,7 +897,7 @@ def _list_gotchas(ctx, sid: str, deadline: float) -> None:
         with contextlib.suppress(FileNotFoundError):
             if f.stat().st_mtime < week:
                 f.unlink(missing_ok=True)
-    for spent in ("seen", "edit"):              # what gotchas.sh has printed
+    for spent in ("seen", "edit", "listed"):    # what gotchas.sh has printed
         (d / f"{sid}.{spent}").unlink(missing_ok=True)
     lines = []
     side = store.read_side(ctx.store_dir)
@@ -1037,6 +1037,22 @@ def _name_long_text(sized) -> None:
           f"(--ref doc:NAME.md)", file=sys.stderr)
 
 
+def _name_unpicked(store_dir, note) -> None:
+    """A resolve whose body gives no option on a line of its own leaves a
+    question with options reading unanswered (`options:`, not `answered:`),
+    and said nothing: a resolve relaying the user's pick as a paraphrase
+    showed no pick until a `show` (2026-11-21). Once per agent session, as a
+    free-text answer may be meant. Only the resolving version counts the
+    asker's lines (summary.picked), so the fix is an undo, not an append."""
+    if not note.options or summ.picked(note, {n.id: n for n in store.load(store_dir)}) \
+            or not _first_in_session("note", "unpicked resolve"):
+        return
+    print(f"note: {note.id[-10:]} reads unanswered: no line of the body is one option's words "
+          f"({summ.options_line(note.options)}). If the answer is one of them, `symbion undo "
+          f"{note.id[-10:]}` and resolve again with it on a line of its own; a free-text answer "
+          f"stays as written", file=sys.stderr)
+
+
 def _text_added(old: str, new: str) -> int:
     """Characters a rewrite adds, by words: counted whole, a 60-character fix
     inside a long body read as 1256 (2026-10-16)."""
@@ -1080,17 +1096,17 @@ def _serve_list() -> int:
     return 0
 
 
-def _serve_all(*, restart: bool) -> int:
+def _serve_all(*, restart: bool, port=None) -> int:
     """`serve --restart` and `serve --stop`: one line per serve, exit 1 if
-    any did not."""
+    any did not. With `port`, only the serve on it (dogfood, 2026-11-10)."""
     if os.name == "nt":
         print("error: serve --restart and --stop need POSIX signals; on Windows, "
               "Ctrl-C each serve and start it again", file=sys.stderr)
         return 1
     from .gui import servers
-    results = servers.signal_all(restart)
+    results = servers.signal_all(restart, port=port)
     if not results:
-        print("no symbion serve is running")
+        print("no symbion serve is running" + (f" on port {port}" if port is not None else ""))
     for what, r in results:
         if what == "restarted":
             print(f"restarted {r['store']}: {r['url']}"
@@ -1200,7 +1216,7 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
     if full:
         # A row in full says when, by whom, and its earlier version: the id is a
         # timestamp no human reads as one (newcomer walk-through, 2026-09-26).
-        print("    " + "; ".join(written or [f"written {store.shown(n.created_at)} by {n.author}"])
+        print("    " + "; ".join(written or [f"written {store.shown(n.created_at)} by {summ.byline(n)}"])
               + (f"; earlier version saved as {n.supersedes}" if n.supersedes else ""))
     chars = summ.LIST_BODY_CHARS
     tail = [a["added"] for a in summ.added_lines(added)] if added and not full else []
@@ -1435,7 +1451,7 @@ def _rows_from_json(path):
         elif bad := sorted(set(row) - _ROW_KEYS):
             errors.append((i, f"line {i}: unexpected key(s) {bad}; an entry takes only "
                               f"{', '.join(_ROW_KEY_ORDER)}. symbion mints id, created_at, "
-                              f"provenance and target_blob itself"))
+                              f"provenance, target_blob and writer itself"))
         else:
             rows.append((i, row))
     if not rows and not errors:
@@ -1552,6 +1568,8 @@ class _Parser(argparse.ArgumentParser):
             message = f"no verb {bad[1]!r}: {bad[1]!r} is a kind: `add {bad[1]} --target TYPE:NAME`"
         elif bad and bad[1] in _VERB_HINTS:      # the usage line lists the verbs
             message = f"no verb {bad[1]!r}: {_VERB_HINTS[bad[1]]}"
+        if re.match(r"argument acmd: invalid choice: 'show'", message):    # dogfood, 2026-11-12
+            message = "no `arc show`: `list --arc ID` lists an arc's entries, `arc todo ID` its open boxes"
         if "--status: invalid choice: 'parked'" in message and hasattr(self, "parked_kinds"):
             # the summary counts `parked`, and no flag lists every parked kind (2026-10-30)
             message += "; 'parked' is a kind bit, not a status: " + (
@@ -1578,6 +1596,15 @@ class _Parser(argparse.ArgumentParser):
             legal = action and (action.choices or getattr(action.type, "choices", None))
             if legal:
                 message += f" (choose from {', '.join(legal)})"
+            # `--grep '--ref|x'` read the pattern as a flag, and `--` does not help
+            # after an option (dogfood, 2026-11-12): name the = form.
+            argv, opts = self._argv, set(action.option_strings if action else ())
+            k = next((k for k, x in enumerate(argv) if x in opts and k + 1 < len(argv)), None)
+            v = argv[k + 1] if k is not None else None
+            if v == "--":
+                v = argv[k + 2] if k + 2 < len(argv) else None
+            if v and v.startswith("-") and v.split("=")[0] not in self._option_string_actions:
+                message += f"; a value that starts with - goes after =: {shlex.quote(f'{argv[k]}={v}')}"
         need = re.fullmatch(r"the following arguments are required: (--[\w-]+)", message)
         if need and not self._get_positional_actions():
             # `arc create "Adoption"` said only that --name is required, and
@@ -1594,6 +1621,10 @@ class _Parser(argparse.ArgumentParser):
         parser owns everything after its name, so it reports them itself."""
         self._argv = list(args or [])            # error() reads where KIND sat
         ns, extras = super().parse_known_args(args, namespace)
+        if (self.prog == "symbion add" and len(extras) == 1 and not (ns.target or ns.type)
+                and re.fullmatch(r"[a-z][\w-]*:\S.*|project", extras[0])):
+            # `add check file:x` beside a positional KIND (dogfood, 2026-11-06 to 11-20)
+            ns.target, extras = extras[0], []
         if extras and self._subparsers is None:
             # The first guess this verb takes: `list --text` said `use --body`,
             # which `list` lacks, and the next try failed too (dogfood, 2026-10-14).
@@ -1734,7 +1765,8 @@ _VERB_HINTS = {
     **dict.fromkeys(("new", "create", "note"), "`add KIND --target TYPE:NAME --body …`"),
     **dict.fromkeys(("status", "todo", "open"), "`summary`, or `list --status open`"),
     "ls": "`list`",
-    "due": "`list --overdue` (past due), `list --due-by DATE`, or `summary` (due within 7 days)",
+    "due": "`list --overdue` (past due), `list --due-by DATE`, `list --undated` (no date), "
+           "or `summary` (due within 7 days)",
     "recent": "`list --since 2h`",
 }
 _FLAG_HINTS = {"--open": ("--status open",), "--closed": ("--status resolved",),
@@ -2082,7 +2114,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                    help="repeatable")
     a.add_argument("--ref", dest="refs", action="append", default=[], metavar="TYPE:NAME",
                    help="secondary target this entry also implicates (repeatable), as TYPE:NAME")
-    a.add_argument("--author", default=None, help=_AUTHOR_HELP)
+    a.add_argument("--author", default=None, help=_ROW_AUTHOR_HELP)
 
     li = sub.add_parser("list", help="list entries, newest first; filter by kind, target, tag, "
                                      "arc or --grep text")
@@ -2100,8 +2132,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     li.add_argument("--kind", default=None, type=_kinds_choice(kinds, store_dir),
                     help="only entries of this kind, or of any in a comma list (task,bug)")
     # `--open`, the guess agents made most (2026-09-21..29), is _LIST_ALTS'
-    li.add_argument("--status", default=None, choices=sorted(store.STATUSES),
-                    help="only open, or only resolved, entries of a status kind")
+    li.add_argument("--status", default=None, choices=[*sorted(store.STATUSES), "all"],
+                    help="only open, or only resolved, entries of a status kind; all, as "
+                         "with no --status, is every entry")
     li.parked_kinds = [k for k, s in kinds.items() if s.parked]     # for _Parser.error
     li.add_argument("--tag", default=None, help="only entries carrying this tag")
     li.add_argument("--arc", "--arc-id", dest="arc_id", default=None, metavar="ID",
@@ -2118,6 +2151,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="take --grep as a literal string, not a regex")
     li.add_argument("--overdue", action="store_true",
                     help="only open entries past their --due date")
+    li.add_argument("--undated", action="store_true",
+                    help="only open entries with no --due date: a parked one of yours "
+                         "prints at no session start")
     li.add_argument("--due-by", default=None, metavar="DATE", type=_due_by,
                     help="only entries due on or before DATE, past due included; "
                          "DATE is YYYY-MM-DD, or days or weeks from today (1d, 2w); "
@@ -2147,7 +2183,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                          "a project entry's `target.name` is null. A "
                          "verdict kind adds `state` and `distance`, a `rewritten` one "
                          "`successor`, `successor_state` and `same_tree`, and a superseded entry "
-                         "(`--all`) `head`")
+                         "(`--all`) `head`. `writer` names who ran the write: an agent, `gui` "
+                         "or `cli`, null when unknown")
 
     # Parsed only for -h: main() rewrites `show ID` to `list --id ID` first.
     # Listed so -h and the invalid-choice error name the verb, and with its
@@ -2191,7 +2228,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                          "database): stamp the resolve with its time, not HEAD")
     rs.add_argument("--measure", dest="measures", action="append", default=[],
                     metavar="KEY=VALUE", help=_MEASURE_MERGE_HELP)
-    rs.add_argument("--author", default=None, help=_AUTHOR_HELP)
+    rs.add_argument("--author", default=None, help=_ROW_AUTHOR_HELP)
 
     sp = sub.add_parser("supersede", help="record a correction to an entry")
     sp.add_argument("id")
@@ -2225,6 +2262,8 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="check: correct the verdict")
     sp.add_argument("--measure", dest="measures", action="append", default=[],
                     metavar="KEY=VALUE", help=_MEASURE_MERGE_HELP)
+    sp.add_argument("--rm-measure", dest="rm_measures", action="append", default=[],
+                    metavar="KEY", help="remove a measurement from the inherited set (repeatable)")
     sp.add_argument("--option", dest="options", action="append", default=[], metavar="TEXT",
                     help="question: replace its answers (repeatable, up to three), the "
                          "default first; `--option \"\"` alone clears them")
@@ -2250,7 +2289,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     help="file this entry under an arc ('' detaches it)")
     sp.add_argument("--due", default=None, metavar="DATE",
                     help="set the due date: YYYY-MM-DD or an ISO datetime ('' clears it)")
-    sp.add_argument("--author", default=None, help=_AUTHOR_HELP)
+    sp.add_argument("--author", default=None, help=_ROW_AUTHOR_HELP)
 
     cm = sub.add_parser("commit", help="commit your pending entries and every changed file")
     cm.add_argument("-m", "--message", default=None,
@@ -2261,10 +2300,14 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     cm.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="list each pending entry (its id's tail, author, kind and lead) "
                          "and each other changed file; commit nothing")
-    cm.add_argument("--all", dest="everyone", action="store_true",
-                    help="take every pending entry and file: by default a commit takes the entries "
-                         "this agent session wrote, or with no session, your author's, and from "
-                         "another project's tree no file but arcs.jsonl and the new docs they name")
+    who = cm.add_mutually_exclusive_group()
+    who.add_argument("--all", dest="everyone", action="store_true",
+                     help="take every pending entry and file: by default a commit takes the entries "
+                          "this agent session wrote, or with no session, your author's, and from "
+                          "another project's tree no file but arcs.jsonl and the new docs they name")
+    who.add_argument("--author", default=None, metavar="NAME",
+                     help="take NAME's pending entries that no agent session wrote (a script's, "
+                          "or the user's in serve or at a terminal) in place of yours")
     sub.add_parser("push", help="git push the store to its remote; commit first")
     sub.add_parser("pull", help="fetch a shared store's origin and merge it; pending entries "
                                 "stay pending, each its session's")
@@ -2293,7 +2336,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                     type=_catalog_choice(target_types, "type", store_dir, kinds),
                     help="move the object to this type too (default: --type); "
                          "project:NAME entries from 0.1.0 move with --type project --to-type item")
-    rn.add_argument("--author", default=None, help=_AUTHOR_HELP)
+    rn.add_argument("--author", default=None, help=_ROW_AUTHOR_HELP)
 
     sv = sub.add_parser("serve", help="local web UI (requires: pip install 'symbion[gui]')")
     sv.add_argument("--port", type=int, default=None,
@@ -2319,10 +2362,11 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     every.add_argument("--restart", action="store_true",
                        help="restart every serve you run on this machine, each in its own "
                             "terminal and on its own port, so an upgrade or a code change "
-                            "reaches it; then exit. Needs no store")
+                            "reaches it; then exit. Needs no store. With --port N, only "
+                            "the serve on port N")
     every.add_argument("--stop", action="store_true",
                        help="stop every serve you run on this machine, as Ctrl-C does; "
-                            "then exit. Needs no store")
+                            "then exit. Needs no store. With --port N, only the serve on port N")
     every.add_argument("--list", action="store_true",
                        help="print every serve you run on this machine: its store, URL, pid "
                             "and the commit it runs; then exit. Needs no store")
@@ -2383,7 +2427,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     says = "start an arc; prints its id"
     ac = asub.add_parser("create", help=says, description=says)
     ac.add_argument("--name", required=True, help="the arc's name, as the summary prints it")
-    ac.add_argument("--desc", default="", help="what the arc is for; arc list prints it")
+    ac.add_argument("--desc", "--description", default="", help="what the arc is for; arc list prints it")
     ac.add_argument("--scope", default="mixed", metavar="SCOPE",
                     type=_catalog_choice(arc_scopes, "scope", store_dir),
                     help="what the arc's entries are about (default mixed): item, project, "
@@ -2397,7 +2441,11 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
 
     ar = asub.add_parser("rename", help="give an arc a new name; its id stays")
     ar.add_argument("id")
-    ar.add_argument("new_name")
+    # create's --name spells it too; SUPPRESS keeps a bare id from undoing a --name before it.
+    ar.add_argument("new_name", nargs="?", default=argparse.SUPPRESS, metavar="NAME",
+                    help="the arc's new name")
+    ar.add_argument("--name", dest="new_name", default=None, metavar="NAME",
+                    help="NAME as `arc create` spells it")
     ar.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     says = "take an arc off the summary; its open entries then list outside arcs"
@@ -2411,7 +2459,10 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     aun.add_argument("--author", default=None, help=_AUTHOR_HELP)
     adesc = asub.add_parser("describe", help="give an arc a new description; arc list prints it")
     adesc.add_argument("id")
-    adesc.add_argument("description")
+    adesc.add_argument("description", nargs="?", default=argparse.SUPPRESS, metavar="TEXT",
+                       help="the arc's new description")
+    adesc.add_argument("--desc", "--description", dest="description", default=None, metavar="TEXT",
+                       help="TEXT as `arc create` spells it")
     adesc.add_argument("--author", default=None, help=_AUTHOR_HELP)
 
     says = ("set the columns of an arc's board, left to right; each open box sits in one "
@@ -2446,7 +2497,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                      help="print the resolved names and count; create nothing")
     asd.add_argument("--kind", default="task", help="the kind to mint (default task); "
                      "it needs the status bit and neither parked nor verdict")
-    asd.add_argument("--author", default=None, help=_AUTHOR_HELP)
+    asd.add_argument("--author", default=None, help=_ROW_AUTHOR_HELP)
 
     atd = asub.add_parser(
         "todo",
@@ -2465,7 +2516,7 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
                      help="re-target renamed tasks onto the live name")
     rc.add_argument("--resolve-stale", dest="resolve_stale", action="store_true",
                      help="also close tasks with no live target and no rename evidence")
-    rc.add_argument("--author", default=None, help=_AUTHOR_HELP)
+    rc.add_argument("--author", default=None, help=_ROW_AUTHOR_HELP)
     rc.add_argument("--json", action="store_true",
                     help="the report entries as a JSON array; --apply counts go to stderr")
 
@@ -2551,6 +2602,8 @@ def _list_header(total: int, shown: int, hidden: list[str],
 _NEIGHBOUR_CAP = 3
 _AUTHOR_HELP = ("who writes it (default: $SYMBION_AUTHOR, else the agent whose shell "
                 "runs this, else git user.name)")
+_ROW_AUTHOR_HELP = _AUTHOR_HELP + (". The agent, gui or cli that ran the write is "
+                                   "stamped beside it")
 _ERROR_CAP = 10
 
 
@@ -2608,6 +2661,10 @@ def _name_open_neighbours(store_dir, written) -> None:
                                                           target_name=t.name, status="open")
                                    if h.id not in new and not h.spec.parked
                                    and (title is None or _title(h.body) == title))
+        # The ones this entry cites first: a check citing the task it revised
+        # saw three others listed and that one hidden (dogfood, 2026-11-12).
+        toks = _CITED.findall(n.body or "")
+        open_.sort(key=lambda h: not any(_held([h.id], tok) for tok in toks))
         if open_:
             where = shlex.quote(f"{t.type}:{t.name or ''}")
             which = " with this title" if title else ""
@@ -2615,9 +2672,11 @@ def _name_open_neighbours(store_dir, written) -> None:
                 continue
             # Each with its lead: by id alone, a duplicate showed only after
             # a `show` (dogfood, 2026-10-07).
-            rows = "".join(f"\n  {h.id}  {summ.clip(h.body or '', 80)}".rstrip()
+            # Each line opens `note:`: a filter that dropped the head kept the
+            # rows, bare ids with no sign of what they were (dogfood, 2026-11-15).
+            rows = "".join(f"\nnote:   {h.id}  {summ.clip(h.body or '', 80)}".rstrip()
                            for h in open_[:_NEIGHBOUR_CAP])
-            more = (f"\n  +{len(open_) - _NEIGHBOUR_CAP} more"
+            more = (f"\nnote:   +{len(open_) - _NEIGHBOUR_CAP} more"
                     if len(open_) > _NEIGHBOUR_CAP else "")
             print(f"note: {len(open_)} open on {t.type}:{t.name or ''}{which}; if this entry "
                   f"settles or revises one, resolve or supersede that one "
@@ -2652,7 +2711,7 @@ def _name_unmerged_fixes(cfg, store_dir, written) -> None:
                                      json.dumps([str(Path(store_dir).resolve()), h.id])):
             print(f"note: {h.id} on {h.target.type}:{h.target.name or ''} was resolved at "
                   f"{sha[:7]}, which {away[sha]} holds and this branch lacks: if this entry is "
-                  f"the same fault, its fix is there\n  {summ.clip(h.body or '', 80)}".rstrip(),
+                  f"the same fault, its fix is there\nnote:   {summ.clip(h.body or '', 80)}".rstrip(),
                   file=sys.stderr)
 
 
@@ -2724,9 +2783,9 @@ def _name_unknown_ids(store_dir, texts, where="the body") -> None:
 
 
 # A clock time, HH:MMZ or HH:MxZ, with a date before or after it or none; not
-# the MM:SS of an HH:MM:SSZ.
+# the MM:SS of an HH:MM:SSZ, nor a span after it (`19:30Z 10-15 minutes`).
 _CLOCK = re.compile(r"(?:(\d{4})-)?(?:(\d\d)-(\d\d)[ T])?~?(?<![:\d])([01]?\d|2[0-3]):([0-5])([\dx])Z\b"
-                    r"(?: (\d\d)-(\d\d)\b)?")
+                    r"(?: (\d\d)-(\d\d)\b(?! ?(?:min|minutes?|h|hours?|s|sec|seconds?)\b))?")
 
 
 def _name_future_times(texts, stamp) -> None:
@@ -2738,6 +2797,14 @@ def _name_future_times(texts, stamp) -> None:
     and a note, never a refusal: a stamp that is not ISO reads as the oldest
     time, which no token is ahead of."""
     now = store.written_at(None, stamp).astimezone(timezone.utc)
+    if toks := _future_times(texts, now):
+        print(f"note: {', '.join(toks)} {'is' if len(toks) == 1 else 'are'} later than this write's "
+              f"clock, {now:%H:%M}Z: a time meant as now is wrong (`date -u`); a planned one is fine",
+              file=sys.stderr)
+
+
+def _future_times(texts, now) -> list[str]:
+    """The clock times in `texts` 2 to 15 minutes ahead of `now`, each once."""
     ahead = []
     for text in texts:
         for m in _CLOCK.finditer(text or ""):
@@ -2750,13 +2817,11 @@ def _name_future_times(texts, stamp) -> None:
                 continue
             t = datetime(day.year, day.month, day.day, int(hh), int(m1) * 10 + (0 if m2 == "x" else int(m2)),
                          tzinfo=timezone.utc)
+            if not mo and t < now - timedelta(hours=12):
+                t += timedelta(days=1)          # `~00:0xZ` typed at 23:55Z
             if 2 <= (t - now).total_seconds() / 60 < 16:
                 ahead.append(m.group(0).strip())
-    if ahead:
-        toks = list(dict.fromkeys(ahead))
-        print(f"note: {', '.join(toks)} {'is' if len(toks) == 1 else 'are'} later than this write's "
-              f"clock, {now:%H:%M}Z: a time meant as now is wrong (`date -u`); a planned one is fine",
-              file=sys.stderr)
+    return list(dict.fromkeys(ahead))
 
 
 _GUESS_CAP = 20
@@ -2891,21 +2956,6 @@ def _name_dirty(ctx, written) -> None:
           f"is a new entry. A run outside the repo takes --external", file=sys.stderr)
 
 
-def _name_undated(written) -> None:
-    """A parked row prints at session start only from its due date on, or when
-    written by someone other than the reader: most of one store's open ideas
-    were the agent's own and undated, and no session of its saw them again
-    (2026-10-12). Filed as someone else, it reaches the reader's session."""
-    miss = [n for n in written if n.spec.parked and n.spec.status and not n.due
-            and n.author == api.author_default()]
-    if not miss:
-        return
-    what = (f"this {miss[0].kind} entry" if len(miss) == 1 else
-            f"{len(miss)} entries ({', '.join(sorted({n.kind for n in miss}))})")
-    print(f"note: no --due on {what}: it is parked, so no session start of yours "
-          f"prints it again; --due DATE sets a revisit", file=sys.stderr)
-
-
 def _name_past_due(written) -> None:
     """A due date already past at the write: a trial agent registered a
     prediction with the date the user gave, after it, and the skill said
@@ -2916,6 +2966,26 @@ def _name_past_due(written) -> None:
             print(f"note: --due {n.due} has passed: {n.id[-10:]} reads overdue "
                   f"at every session start from now; give a later date if that "
                   f"window is still open", file=sys.stderr)
+
+def _name_kept_options(store_dir, old, note) -> None:
+    """`supersede` without --option keeps a question's options, and the GUI
+    draws them as the user's answer buttons: an asker's later appends moved
+    its ask while the first version's options stayed on offer (dogfood,
+    2026-11-19). Named on the asker's text edit, with the version that set
+    them: symbion cannot tell whether the text changed the ask."""
+    if not note.options or store.read_status(note) != "open" or old is None \
+            or old.body == note.body:
+        return
+    chain = list(summ._chain({n.id: n for n in store.load(store_dir)}, note))
+    if summ.wrote_it(note.author, chain[-1].author):
+        return                                     # an answer, not the asker
+    set_by = next(n for n, older in zip(chain, chain[1:] + [None])
+                  if older is None or older.options != note.options)
+    print(f"note: question {note.id[-10:]} still offers the user the options set "
+          f"{store.shown(set_by.created_at)}: {summ.options_line(note.options)}. If your "
+          f"text changed the ask, give its own with --option (repeatable, the default "
+          f"first), or --option \"\" for none", file=sys.stderr)
+
 
 def _name_dropped(old, note, *, refs: bool, tags: bool) -> None:
     """`supersede --ref ''` and `--tag` replace, while every other `--ref`
@@ -2976,14 +3046,15 @@ def _echo_clipped_heads(store_dir, written) -> None:
         print(f"note: session start shows an open entry's first {summ.HEAD_CHARS} chars; a lead "
               f"that opens on a date often holds context, not the claim or ask:", file=sys.stderr)
     for n in cut:
-        print(f"  {n.id}  {summ.clip(n.body, summ.HEAD_CHARS)}", file=sys.stderr)
+        # Each row opens `note:`, as the open-entries note's do (fe83484)
+        print(f"note:   {n.id}  {summ.clip(n.body, summ.HEAD_CHARS)}", file=sys.stderr)
 
 
 # The notes a session hears once (_first_in_session, and `clip`): session start
 # clears them, as a compaction drops them from the agent's context. `unmerged`
 # was left off, and a compacted session filed a bug again whose fix sat on
 # another branch (audit, 2026-11-08).
-_HEARD_ONCE = ("open", "alt", "clip", "note", "unmerged")
+_HEARD_ONCE = ("open", "alt", "clip", "note", "unmerged", "future")
 
 
 def _mark_read(ctx, sid: str, at: str) -> None:
@@ -3040,12 +3111,14 @@ def _first_listing(store_dir, target) -> bool:
     return _first_in_session("open", json.dumps([str(Path(store_dir).resolve()), *target]))
 
 
-def _first_in_session(suffix: str, line: str) -> bool:
+def _first_in_session(suffix: str, line: str, unmarked: bool = True) -> bool:
     """False once this agent session's `suffix` mark holds `line`; true, and
-    marked, the first time. With no session key, every time."""
+    marked, the first time. With no session key, or a mark it cannot write,
+    `unmarked`: true for a note, every time; false for a refusal that the
+    same command again must pass (audit, 2026-11-21)."""
     mark = _session_mark(suffix)
     if mark is None:
-        return True
+        return unmarked
     try:
         if line in mark.read_text(encoding="utf-8").splitlines():
             return False
@@ -3056,7 +3129,7 @@ def _first_in_session(suffix: str, line: str) -> bool:
         with open(mark, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:                  # a cache it cannot write costs the quiet, not the note
-        pass
+        return unmarked
     return True
 
 
@@ -3119,9 +3192,13 @@ def _no_note(note_id: str, store_dir=None) -> None:
         return
     print(f"no entry found: {note_id} (an id, or its tail after a dash: 123456-a1b, a1b; "
           f"list --grep TEXT searches the entries)", file=sys.stderr)
+    # A tail copied from output with its date guessed missed (dogfood, 2026-11-18).
+    tok = store.id_tail(note_id)
+    if store_dir and tok.count("-") == 3 and \
+            len(own := _held([n.id for n in store.load(store_dir)], tok[-10:])) == 1:
+        print(f"  did you mean {own[0]}?", file=sys.stderr)
     # A project's session looked up the rows it had filed in another
     # project's store, and each miss took a second call (2026-10-25).
-    tok = store.id_tail(note_id)
     for p, ids in _sibling_ids(store_dir) if store_dir else ():
         if len(hits := _held(ids, tok)) == 1:
             where = shlex.quote(_from_here(p))
@@ -3161,12 +3238,26 @@ def _newest(rows) -> str:
     return f", the newest written {summ.when_added(newest)}" if newest else ""
 
 
+def _sessionless_author(ctx, rows, left) -> str | None:
+    """The one author of `left`, pending rows a commit leaves, when no agent
+    session wrote any of them: a script's, or the user's in serve or at a
+    terminal. Such a row is whole once written, so `commit --author NAME`
+    may take it now. An answer the user gave in serve stayed out of git
+    through a wrap that read `--all once their session has ended` and had
+    no session to wait on (2026-11-19)."""
+    names = {r.get("author") for r in left}
+    if len(names) != 1 or not (name := names.pop()):
+        return None
+    keep = store.with_bases(rows, api.own_rows(ctx, name))
+    return name if all(map(keep, left)) else None
+
+
 _ELSEWHERE = "as the store is another project's"   # why a commit left its files (api.elsewhere)
 _NO_COPY = "as no entry keeps a copy"     # why a commit left a line HEAD holds (store.lost_rows)
 _REMOVED = "{} removed from notes.jsonl"  # gitref.committed says it alike
 
 
-def _commit_files(ctx, everyone: bool) -> tuple[list[str], list[str]]:
+def _commit_files(ctx, everyone: bool, author=None) -> tuple[list[str], list[str]]:
     """The store's changed files but notes.jsonl, split as `commit` takes and
     leaves them: from another project's tree (api.elsewhere) it takes only
     arcs.jsonl and the new docs its entries name. Each file, as `commit`
@@ -3181,7 +3272,7 @@ def _commit_files(ctx, everyone: bool) -> tuple[list[str], list[str]]:
                    - {store.NOTES_FILE})
     if everyone or not api.elsewhere(ctx):
         return files, []
-    take = {store.ARCS_FILE} | (new & set(api.docs_named(ctx, api.own_rows(ctx))))
+    take = {store.ARCS_FILE} | (new & set(api.docs_named(ctx, api.own_rows(ctx, author))))
     return [f for f in files if f in take], [f for f in files if f not in take]
 
 
@@ -3390,6 +3481,8 @@ def _commit_hint(ctx, rows=None) -> str:
     rows = store.pending_rows(ctx.store_dir) if rows is None else rows
     keep = store.with_bases(rows, api.own_rows(ctx))
     if rows and not any(keep(r) for r in rows):
+        if name := _sessionless_author(ctx, rows, rows):
+            return f"{cmd} --author {shlex.quote(name)} now, as no agent session wrote them"
         return f"{cmd} --all once their session has ended{_newest(rows)}"
     return cmd
 
@@ -3415,7 +3508,9 @@ def _say_pending(ctx) -> None:
     if rows:
         print(f"note: {summ._count(len(store.entries(rows)), 'entry')} not committed "
               f"({store.rows_by_author(rows)}){_newest(rows)}, none of them yours: "
-              f"{cmd} --all takes them"
+              + (f"{cmd} --author {shlex.quote(name)} takes them now, as no agent session "
+                 "wrote them" if (name := _sessionless_author(ctx, rows, rows))
+                 else f"{cmd} --all takes them")
               + (f"; arcs.jsonl changed too: {cmd} takes it" if arcs else ""),
               file=sys.stderr)
     elif arcs:
@@ -3523,9 +3618,11 @@ def _print_news(header, news, by_id, reader, more, file) -> None:
     print(header, file=file)
     for h in news[:_NEWS_CAP]:
         r = summ.row_digest(by_id, h, summ.HEAD_CHARS, reader)
-        closer = summ._closer(by_id, h).author if store.read_status(h) == "resolved" else None
-        if closer and r.get("last") == closer:
+        closer = summ.byline(summ._closer(by_id, h)) \
+            if store.read_status(h) == "resolved" else None
+        if closer and r.get("last") and summ._named(r, "last") == closer:
             del r["last"]
+            r.pop("last_via", None)
         print("  " + summ._labelled(summ.plain, r, first=closer and f"closed by {closer}"),
               file=file)
     if len(news) > _NEWS_CAP:
@@ -3676,6 +3773,16 @@ def _orphan_note(ctx) -> str:
             f"`echo {point} > .symbion` points this repo at {them}, instead of init")
 
 
+def _bare_note(ctx) -> str:
+    """A second line for `no store at` a directory that exists: a git repo
+    holding only symbion.toml read as a store, and the line above named no
+    file it lacked (2026-11-17)."""
+    if not Path(ctx.store_dir).is_dir():
+        return ""
+    return (f"\nnote: {ctx.store_dir} is a directory but no store: it has no "
+            f"{store.notes_path(ctx.store_dir).name}, which init writes")
+
+
 def _pointer_note(ctx) -> str:
     """A second line for `no store at` when the repo's `.symbion` names that
     path: a person whose clones sit in another layout reads a committed
@@ -3709,7 +3816,7 @@ def _dispatch(args, ctx) -> int:
         print(argcomplete.shellcode(["symbion"], shell=args.shell), end="")
         return 0
     if args.cmd == "serve" and (args.restart or args.stop):
-        return _serve_all(restart=args.restart)
+        return _serve_all(restart=args.restart, port=args.port)
     if args.cmd == "serve" and args.list:
         return _serve_list()
     if args.cmd == "skill":                      # the plugin loads it before a store exists
@@ -3724,7 +3831,8 @@ def _dispatch(args, ctx) -> int:
     # line: stdout, exit 0. A read's --json keeps its always-valid shape,
     # and summary --json its `store: null` gate.
     if not store.exists(store_dir):
-        msg = f"symbion: no store at {store_dir}; run `symbion init`" + _orphan_note(ctx) + _pointer_note(ctx)
+        msg = (f"symbion: no store at {store_dir}; run `symbion init`" + _orphan_note(ctx)
+               + _pointer_note(ctx) + _bare_note(ctx))
         read = args.cmd in _READS or args.cmd == "arc" and args.acmd in _ARC_READS
         if read and getattr(args, "json", False):
             # The shape stays, for the parser; a bare `[]` at exit 0 read as
@@ -3808,6 +3916,21 @@ def _dispatch(args, ctx) -> int:
                 print(f"add: {f'+{more} more failing lines; ' if more > 0 else ''}"
                       f"nothing was written", file=sys.stderr)
             return 1
+        # A pre-registration's text is fixed once written, and a commit chained
+        # after one locked in a time typed ahead of the clock (dogfood,
+        # 2026-11-17). In an agent session the first try refuses; the same
+        # command again writes, for a planned time.
+        pre = [f for f in fields if (k := ctx.kinds.get(f.get("kind"))) and k.status
+               and k.verdict] if store.session_key() else []
+        now = store.written_at(None, store._now_iso()).astimezone(timezone.utc) if pre else None
+        ahead = list(dict.fromkeys(t for f in pre for t in _future_times(
+            [f.get("body"), f.get("checked"), f.get("result")], now)))
+        if ahead and _first_in_session("future", json.dumps(ahead), unmarked=False):
+            print(f"add: nothing was written: {', '.join(ahead)} "
+                  f"{'is' if len(ahead) == 1 else 'are'} later than the clock, {now:%H:%M}Z, and a "
+                  f"pre-registration's text cannot change after the write. A time meant as now is "
+                  f"wrong (`date -u`); a planned one: run the same command again", file=sys.stderr)
+            return 1
         try:
             written = api.add_fields(ctx, fields)
         except store.Twin as e:
@@ -3833,7 +3956,6 @@ def _dispatch(args, ctx) -> int:
         _name_unchecked(written)
         _name_whole_resolve(ctx, written)
         _name_dirty(ctx, written)
-        _name_undated(written)
         _name_past_due(written)
         _name_archived_arcs(store_dir, written)
         if len(written) > 1:
@@ -3847,6 +3969,8 @@ def _dispatch(args, ctx) -> int:
         return 0
 
     if args.cmd == "list":
+        if args.status == "all":                # a guess that fails (dogfood, 2026-11-12)
+            args.status = None
         if args.arc_id and not any(a.id == args.arc_id
                                         for a in store.load_arcs(store_dir)):
             _no_arc(store_dir, args.arc_id)
@@ -3941,7 +4065,7 @@ def _dispatch(args, ctx) -> int:
                     kind=tuple(args.kind.split(",")) if args.kind else None, tag=args.tag, arc_id=args.arc_id, author=args.author,
                     grep=grep, overdue=args.overdue or None,
                     since=args.since[1] if args.since else None,
-                    due_by=args.due_by[1] if args.due_by else None)
+                    due_by=args.due_by[1] if args.due_by else None, undated=args.undated or None)
         notes = store.query(base, status=args.status, **filt)
         if grep is not None:
             # An id is not text the pattern reads, so a cited tail read `0 of
@@ -4048,6 +4172,8 @@ def _dispatch(args, ctx) -> int:
                 given.append("-F")
             if args.overdue:
                 given.append("--overdue")
+            if args.undated:
+                given.append("--undated")
             if args.since:
                 given.append(f"--since {shlex.quote(args.since[0])}")
             if args.due_by:
@@ -4183,6 +4309,7 @@ def _dispatch(args, ctx) -> int:
             _name_dirty(ctx, [note])                 # a pre-registration's resolve is stamped anew
         if args.body:
             _name_long_text([(note.id, len(args.body.strip()))])
+            _name_unpicked(store_dir, note)
         return 0
 
     if args.cmd == "supersede":
@@ -4229,7 +4356,7 @@ def _dispatch(args, ctx) -> int:
                 and args.status is None and args.kind is None \
                 and args.arc_id is None and args.checked is None and args.target is None \
                 and args.result is None and args.due is None and not measures \
-                and opts is None:
+                and not args.rm_measures and opts is None:
             try:
                 note = api.retag(ctx, args.id, add=args.add_tags, rm=args.rm_tags,
                                  author=_resolved_author(args))
@@ -4275,7 +4402,8 @@ def _dispatch(args, ctx) -> int:
             note = api.supersede(ctx, args.id, author=_resolved_author(args),
                                  add_refs=[] if replace_refs else _refs_from_flags(args.refs or ()),
                                  rm_refs=_refs_from_flags(args.rm_refs),
-                                 add_measurements=measures, **fields)
+                                 add_measurements=measures,
+                                 rm_measurements=args.rm_measures or None, **fields)
         except KeyError:
             _no_note(args.id, store_dir)
             return 1
@@ -4290,6 +4418,8 @@ def _dispatch(args, ctx) -> int:
         _name_new_items(store_dir, [note], tip.refs if tip else ())
         _say_dropped(tip, note)
         _name_dropped(tip, note, refs=replace_refs, tags=args.tags is not None)
+        if opts is None:
+            _name_kept_options(store_dir, tip, note)
         if by_id is not None:
             _say_body_dropped(store_dir, by_id, tip, note)
         # --append keeps the lead it adds after, so the note asked about text
@@ -4298,7 +4428,9 @@ def _dispatch(args, ctx) -> int:
                 and not (args.append and tip is not None and tip.body):
             _echo_clipped_heads(store_dir, [note])
         _echo_gotcha_notes([note], ctx)
-        if args.body or args.replace:
+        # An amendment to a registration states the rule it binds, as the
+        # registration does at add, and long ones kept their length (2026-11-14).
+        if (args.body or args.replace) and not (note.spec.status and note.spec.verdict):
             _name_long_text([(note.id, _text_added(tip.body or "", note.body or "")
                               if (replacing or args.replace) and tip
                               else len(args.body.strip()))])
@@ -4309,9 +4441,9 @@ def _dispatch(args, ctx) -> int:
         # writer's pending rows (dogfood, 2026-10-06).
         rows, lost = store.pending_rows(store_dir), store.lost_rows(store_dir)
         keep = (lambda r: True) if args.everyone else \
-            store.with_bases(rows, api.own_rows(ctx))
+            store.with_bases(rows, api.own_rows(ctx, args.author))
         mine, left = [r for r in rows if keep(r)], [r for r in rows if not keep(r)]
-        files, away = _commit_files(ctx, args.everyone)
+        files, away = _commit_files(ctx, args.everyone, args.author)
         def listed(rows, mark=""):
             for r in rows:
                 print(f"  {mark}{(r.get('id') or '?')[-10:]}  {r.get('author') or '?'}  "
@@ -4356,25 +4488,28 @@ def _dispatch(args, ctx) -> int:
         # Before the commit: it clears the record of what this session wrote.
         news = _news(ctx, (), commit=True)
         ok = api.commit(ctx, args.message or "update entries", everyone=args.everyone,
-                        wrap=args.wrap)
+                        wrap=args.wrap, as_author=args.author)
         print(gitref.committed(store_dir) if ok else "nothing to commit")
         # A row left here may be a live session's, or one a session left
         # when it ended: the newest's age tells them apart.
         left = store.pending_rows(store_dir)
-        cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit", "--all"]))
+        cmd = " ".join(filter(None, ["symbion", _named_store(ctx), "commit"]))
         if left:
+            name = _sessionless_author(ctx, left, left)
+            take = (f"{cmd} --author {shlex.quote(name)} takes them now, as no agent session "
+                    "wrote them" if name else f"{cmd} --all takes them")
             print(f"left pending, {_others()}': entries {store.rows_by_author(left)}"
-                  f"{_newest(left)}: {cmd} takes them")
+                  f"{_newest(left)}: {take}")
         if lost := store.lost_rows(store_dir):
             ids = ", ".join((r.get("id") or "?")[-10:] for r in lost[:3])
             more = f", +{len(lost) - 3} more" if len(lost) > 3 else ""
             print(f"left uncommitted, {_NO_COPY}: {_REMOVED.format(summ._count(len(lost), 'line'))}"
-                  f": {ids}{more}; {cmd} takes the removal")
+                  f": {ids}{more}; {cmd} --all takes the removal")
         away = _commit_files(ctx, True)[0] if not args.everyone and api.elsewhere(ctx) else []
         if away:
             more = f", +{len(away) - 3} more" if len(away) > 3 else ""
             print(f"left uncommitted, {_ELSEWHERE}: {summ._count(len(away), 'file')}: "
-                  f"{', '.join(away[:3])}{more}; {cmd} takes them")
+                  f"{', '.join(away[:3])}{more}; {cmd} --all takes them")
         _say_ignored_archive(store_dir)
         if news:
             _print_news(*news, file=sys.stdout)
@@ -4703,6 +4838,12 @@ def _dispatch_arc(args, ctx) -> int:
                 print(paint(f"+{hidden} archived (arc list --all)", "meta"))
         return 0
 
+    for cmd, dest, flag, what in (("rename", "new_name", "--name", "NAME"),
+                                  ("describe", "description", "--desc", "TEXT")):
+        if args.acmd == cmd and getattr(args, dest) is None:
+            print(f"arc {cmd}: give the {what.lower()}: arc {cmd} ID {what}, or {flag} {what}",
+                  file=sys.stderr)
+            return 2
     # The id prints either way; a no-op read as a change (dogfood, 2026-10-28).
     was = next((a for a in store.load_arcs(store_dir) if a.id == getattr(args, "id", None)), None)
     if args.acmd == "rename":
@@ -5099,9 +5240,11 @@ def _main(argv) -> int:
         # named store to the project that owns it. `completion` runs from a
         # shell's rc file, wherever the shell starts, and reads no store: the
         # cwd stands in as one, as for `-h` below. So does `serve --restart`,
-        # `--stop` and `--list`, which act on every store's serve.
+        # `--stop` and `--list`, which act on every store's serve, or a prefix
+        # argparse takes for one: `--lis` said 'not a git repository' (audit, 2026-11-21).
         storeless = (rest[:1] == ["completion"]
-                     or rest[:1] == ["serve"] and bool({"--restart", "--stop", "--list"} & set(rest)))
+                     or rest[:1] == ["serve"] and any(len(a) > 2 and f.startswith(a) for a in rest
+                                                      for f in ("--restart", "--stop", "--list")))
         if storeless:
             dir_value = os.getcwd()
         no_store = unreadable = None

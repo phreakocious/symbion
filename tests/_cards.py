@@ -129,6 +129,14 @@ def bodies(user: User, card=None) -> list:
             for p in c._props["card"]["main"] if p["k"] == "md"]
 
 
+async def _until(cond, seconds: float = 3.0) -> None:
+    for _ in range(int(seconds / 0.02)):
+        if cond():
+            return
+        await asyncio.sleep(0.02)
+    assert cond()
+
+
 def template() -> str:
     """card.js beside these tests: what a test of a button's name or place
     reads. A path, not an import: the `user` fixture drops page modules."""

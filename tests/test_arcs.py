@@ -545,3 +545,7 @@ def test_an_arcs_last_change_is_its_newest_entry_version_or_move(repo, tmp_path,
     assert last() == (4, "cy")
     at("06"); api.move_box(ctx, two.id, author="dee", phase="doing")
     assert last() == (6, "dee")
+    # An agent's write under another name says so, as the box's card does (audit, 2026-11-21)
+    monkeypatch.setenv("CLAUDECODE", "1")
+    at("07"); api.supersede(ctx, two.id, author="ada", status="resolved")
+    assert last() == (7, "ada via claude")

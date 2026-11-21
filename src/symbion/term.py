@@ -301,7 +301,7 @@ def _details(n, head, state, written=None, by_id=None) -> list[Text]:
         t.append(value, BODY)
         return t
     who = Text(f"    {n.id} · " + " · ".join(
-        written or [f"written {store.shown(n.created_at)} by {n.author}"]), META)
+        written or [f"written {store.shown(n.created_at)} by {summ.byline(n)}"]), META)
     if n.supersedes:
         who.append(f" · earlier version saved as {n.supersedes}", META)
     out = [who]

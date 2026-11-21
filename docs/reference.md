@@ -113,7 +113,9 @@ where two separate adds would store both.
   its age.
 - **Due dates.** `--due 2026-10-01` (or an ISO datetime) on any status entry. An
   open entry past due or due within 7 days leads the session-start summary
-  (`overdue 2d`, `due in 3d`; within a day of a datetime, `due in 3h`, `overdue 40m`), and a parked one from its due date on. `list --overdue` lists those past due, `list
+  (`overdue 2d`, `due in 3d`; within a day of a datetime, `due in 3h`, `overdue 40m`), and a parked one from its due date on. `list --overdue` lists those past due, `list --undated` those with no date
+  (the summary counts the parked ones; one of yours, unstarred, prints at no
+  session start), `list
   --due-by DATE` those due by then, past due included (`--due-by 1d`: by
   tomorrow), resolved ones too: add `--status open` for what is still owed.
   `supersede <id>
@@ -176,6 +178,16 @@ where two separate adds would store both.
   copied in to keep (`adoption.md`); `commit` names any path there git ignores.
   An edit keeps a field this symbion does not know, such as a newer release's,
   on the entry or arc as written.
+- **Writer:** each version holds `"writer": {"name": NAME, "at": TIME}`: who ran
+  the write (an agent, by its shell's marker; `gui` for `symbion serve`; `cli`
+  otherwise), and a copy of the version's `created_at`. The stamp counts only
+  where the two times match: a release before the stamp keeps the key through
+  its own edit, at the earlier version's time, and that version's writer reads
+  unknown. `list --json` gives `writer` as the name, or null when unknown.
+  `summary --json` keeps each name as it is, and beside a label that prints
+  `via` adds a key that names the agent: `from_via`, `last_via`,
+  `closed_by_via`, `added_by_via`, `changed_by_via`, `people[].author_via`
+  and `wrap.changed[].by_via`. `add --from-json` refuses a `writer` key.
 - **Settings:** besides the tables above, `symbion.toml` takes
   `default_branch`, `local_only = true` (no remote on purpose: `commit` stops
   saying "no remote"), `shared = true` (experimental: two people's agents on one store; see

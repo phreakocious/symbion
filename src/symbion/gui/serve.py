@@ -32,6 +32,7 @@ from nicegui import app, ui
 from nicegui.helpers import format_url
 
 from .. import gitref
+from .. import store as S
 from . import servers
 from .pages import build_page
 from .theme import FAVICON
@@ -158,6 +159,18 @@ def pick_free_port(preferred: int, host: str = "127.0.0.1") -> int:
         return s.getsockname()[1]
 
 
+def as_gui(env) -> None:
+    """The serve's own process, set before anything renders; main runs again
+    in --reload's worker and after a restart's re-exec. The person's rows
+    belong to no agent session, though the shell that started the serve may
+    run in one (the store's session_key), and their writer is `gui`, ahead of
+    the CLAUDECODE and AI_AGENT left in `env`."""
+    for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID",
+              "PI_SESSION_ID", "HERMES_AGENT", "SYMBION_HERMES_SESSION", "HERMES_SESSION_ID"):
+        env.pop(k, None)
+    S.write_as_gui()
+
+
 def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False,
          argv=(), host: str = "127.0.0.1", allow=(), read_only: bool = False) -> int:
     """`argv` is the CLI's own, `--dir` included: --reload re-runs it.
@@ -166,11 +179,7 @@ def main(ctx, *, author: str, port=None, show: bool = True, reload: bool = False
     set before anything renders so --reload's worker inherits it."""
     if read_only:
         os.environ["SYMBION_READ_ONLY"] = "1"
-    # The person's rows belong to no agent session, though the shell that
-    # started the serve may run in one (store.session_key).
-    for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID",
-              "PI_SESSION_ID", "HERMES_AGENT", "SYMBION_HERMES_SESSION", "HERMES_SESSION_ID"):
-        os.environ.pop(k, None)
+    as_gui(os.environ)
     if not loopback(host) and not allow:
         print(f"error: --host {host} lets other machines connect, and the GUI writes "
               "with no login: name the ones that may with --allow (an address or a "

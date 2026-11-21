@@ -974,6 +974,7 @@ def _peek_panel(ctx, author: str, drawer, kept: str | None = None):
     key = (str(ctx.store_dir), author)
 
     @ui.refreshable
+    @gitref.heads_once()            # a redraw is a page: each card's probe reads the tip once
     def body():
         if shown[0] is _DRIFT:
             seen, arcs, _ = _page_seen(key)
@@ -1019,7 +1020,9 @@ def _peek_panel(ctx, author: str, drawer, kept: str | None = None):
                 ui.run_javascript(f"sbCards().find(c => c.dataset.id === {json.dumps(nid)})"
                                   "?.classList.add('sb-picked'); sbHold()")
                 show(nid, built=True)       # the page came with it drawn
-            else:
+            # The drift list leaves the last peek's #peek= in the URL: read, it
+            # put that entry back over the list (audit, 2026-11-21).
+            elif shown[0] is not _DRIFT:
                 ui.run_javascript("sbPeekFromHash()")   # a link with #peek=, or no cookie came
     client.on_connect(again)
     return lambda: show(_DRIFT)
@@ -1521,7 +1524,7 @@ def _drift_tip(drawn: dict, now, arcs: bool) -> str:
     """The stale button's tip: each entry written since the page was drawn,
     who wrote it and what they did, newest first. Its count alone said
     little: we know what changed (the user, 2026-11-07)."""
-    lines = [_tip_line(n, _did(drawn.get(n.id), n), n.author)
+    lines = [_tip_line(n, _did(drawn.get(n.id), n), summ.byline(n))
              for n in S.newest_first([n for n in now if drawn.get(n.id) != n])]
     lines += [_tip_line(drawn[i], "taken back") for i in drawn.keys() - {n.id for n in now}]
     return "\n".join(["since this page was drawn:", *_capped(lines),

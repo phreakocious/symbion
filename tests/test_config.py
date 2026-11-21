@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from pathlib import Path
 import pytest
@@ -80,6 +81,23 @@ def test_load_reads_command_timeout(repo, tmp_path):
     (store / "symbion.toml").write_text("command_timeout = 5\n")
     cfg = config.load(store, project_root=repo)
     assert cfg.command_timeout == 5
+    # Under a second is a timeout too: `<= 1` in place of `<= 0` passed (2026-11-19).
+    (store / "symbion.toml").write_text("command_timeout = 0.5\n")
+    assert config.load(store, project_root=repo).command_timeout == 0.5
+
+
+def test_load_reads_the_git_identity_and_default_branch(repo, tmp_path):
+    """No test read these back: dropping `git_name=` from `load` passed the
+    whole suite (2026-11-19)."""
+    store = tmp_path / "myproj-notes"
+    store.mkdir()
+    cfg = config.load(store, project_root=repo)
+    assert (cfg.git_name, cfg.git_email, cfg.default_branch) == (
+        "symbion-notes", "symbion-notes@local", "main")
+    (store / "symbion.toml").write_text(
+        'git_name = "n"\ngit_email = "n@n"\ndefault_branch = "trunk"\n')
+    cfg = config.load(store, project_root=repo)
+    assert (cfg.git_name, cfg.git_email, cfg.default_branch) == ("n", "n@n", "trunk")
 
 
 # ---- work_root: separate from project_root, per-worktree by definition ----
@@ -214,7 +232,8 @@ def test_shared_with_local_only_is_refused(tmp_store):
 @pytest.mark.parametrize("line", ['provenance = "python3 stamp.py"', 'renames = ["git"]',
                                   'catalogs = "git ls-files"', 'resolvers = 1',
                                   "project_root = 5", "work_root = true",
-                                  "default_branch = 1", "git_name = []"])
+                                  "default_branch = 1", "git_name = []", "git_email = 5",
+                                  "stale_target_noun = []"])
 def test_a_wrong_typed_key_is_named(tmp_store, line):
     """`provenance = "python3 stamp.py"` crashed every command, the hook
     included, on `'str' object has no attribute 'get'` (audit 2026-10-28)."""
@@ -360,7 +379,20 @@ def test_a_pointer_that_is_a_link_is_refused_with_the_fix(repo, monkeypatch, tar
     if target == "a store":
         (repo.parent / "elsewhere").mkdir()
     symlink(repo / ".symbion", "../elsewhere", directory=True)
-    with pytest.raises(config.PointerError, match=r"link to \.\./elsewhere.*echo \.\./elsewhere >"):
+    with pytest.raises(config.PointerError,
+                       match=r"link to \.\./elsewhere.*echo \.\./elsewhere >") as e:
+        config.store_dir(repo)
+    # The fix names the pointer both times: a blank path passed (2026-11-19).
+    rm, echo = re.search(r"rm (\S+) && echo \S+ > (\S+)$", str(e.value)).groups()
+    assert rm == echo and rm.endswith("/.symbion"), str(e.value)
+
+
+def test_a_pointer_that_is_a_directory_is_refused_by_name(repo, monkeypatch):
+    """Read as a link, a directory raised readlink's bare OSError (2026-11-19)."""
+    monkeypatch.delenv("SYMBION_DIR", raising=False)
+    (repo / ".symbion").mkdir()
+    with pytest.raises(config.PointerError, match=r"^cannot read .*\.symbion \(.+\); "
+                       r"\.symbion is a file whose first line names the store$"):
         config.store_dir(repo)
 
 
@@ -467,3 +499,10 @@ def test_a_store_owner_is_none_unless_the_project_names_that_store(repo, tmp_pat
     elif shape == "pointer elsewhere":
         (repo / ".symbion").write_text("../other-notes\n")
     assert config.store_owner(s) is None
+
+
+
+def test_uncomment_hint_is_none_with_no_commented_line(tmp_store):
+    """Only a found line was tested: a hint naming no line passed (2026-11-19)."""
+    (tmp_store / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n# tool = "x"\n')
+    assert config.uncomment_hint(tmp_store, "file") is None

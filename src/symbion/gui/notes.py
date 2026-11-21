@@ -924,9 +924,10 @@ def commit_list(ctx, cfg, rows, total: int) -> None:
     its subject on one line, and a button that opens it in the viewer."""
     with ui.element("div").classes("sb-commits").mark("commit-list"):
         for sha, date, subject in rows:
+            # the age takes no focus: a keyboard reads its stamp in the sha's tip
             ui.link(sha[:7], target_href("commit", sha)).classes("sb-commits-sha") \
-                .mark("commit-row")
-            ui.label(ago(date)).classes("sb-commits-age").tooltip(S.shown(date))
+                .mark("commit-row")._props["data-tip"] = f"{sha}\ncommitted {S.shown(date)}"
+            ui.label(ago(date)).classes("sb-commits-age sb-age")._props["data-tip"] = S.shown(date)
             ui.label(subject).classes("sb-commits-sub").tooltip(subject)
             view_button(ctx, sha, ttype="commit") or ui.element("span")
     if total > len(rows):
@@ -1069,7 +1070,7 @@ def _head(url: str, kind: str, text: str, *marks) -> dict:
 def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
                 base: dict | None = None, compact: bool = False, hit=(),
                 actions: bool = True, git_head: str | None = None,
-                since: int | None = None, seams=(), diff_to=None,
+                since: int | None = None, seams=None, diff_to=None,
                 seen: Reading | None = None) -> None:
     """One note row: a card. What it says first, then one line of where it
     points and what it is, the resolve ring on its left and star and edit
@@ -1082,7 +1083,10 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     edit made from it would land on the current row. `git_head` is
     gitref.head_sha's, read once by a page of many check badges, and `since`
     the row's gitref.commits_since, counted once by a page of many cards.
-    `seams` are summary.seams' for the body. `diff_to` is the row that
+    `seams` are summary.seams' for the body; given none, a card that shows
+    its body whole works them out from `seen`, on every page (the user,
+    2026-11-20), and a clipped one never does: a long chain's take tens of
+    ms. `diff_to` is the row that
     superseded this one: the card says what it changed, marks the words of a
     changed checked or result, and shows a rewritten body as a diff. `seen` is
     the page's reading of the store, made once: a card makes its own when the
@@ -1108,7 +1112,9 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
     cls = f"sb-note w-full {kind_class(n.kind)}"
     if actions:
         cls += " sb-has-actions" + (" sb-starred" if has_pri else "")
-    main, sources = _card_main(ctx, n, compact, hit, show_target, seams, diff_to)
+    seams_of = (lambda: seams) if seams is not None else \
+        (lambda: summ.seams((seen or reading(ctx)).by_id, n))
+    main, sources = _card_main(ctx, n, compact, hit, show_target, seams_of, diff_to)
     if answering:
         tip = f"added below the question, as {author}"
         main.append({"k": "answer", "m": "answer-row", "options": [
@@ -1123,7 +1129,7 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
         main.append({"k": "options", "m": "options",
                      "t": f"answered: {pick}" if pick else f"options: {summ.options_line(n.options)}"})
     foot, hover, views = _card_foot(ctx, n, status, narrow, show_target, git_head, since)
-    card = {"main": main, "foot": foot, "by": {"t": n.author, "h": narrow(author=n.author)},
+    card = {"main": main, "foot": foot, "by": {"t": summ.byline(n), "h": narrow(author=n.author)},
             "age": {"t": ago(n.created_at), "tip": S.shown(n.created_at)},
             # The age takes no focus: a keyboard reads its stamp in the id's tip
             # (the GUI review, 2026-11-07), a screen reader in the age's own words.
@@ -1236,7 +1242,7 @@ def toggle_star(ctx, n, refresh, *, author: str) -> None:
         refresh()
 
 
-def _card_main(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
+def _card_main(ctx, n, compact: bool, hit, show_target: bool = False, seams_of=lambda: (),
                diff_to=None) -> list:
     """The body, the verdict and measurements: what the row says, and the
     markdown each body piece was made from. A bare row says its target, or
@@ -1250,7 +1256,7 @@ def _card_main(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
     if diff_to:
         what = changes(n, diff_to)
         main.append({"k": "changes", "m": "changes", "tip": diff_to.created_at,
-                     "t": f"{diff_to.author} edited this {summ.when_added(diff_to.created_at)}"
+                     "t": f"{summ.byline(diff_to)} edited this {summ.when_added(diff_to.created_at)}"
                           + (f": {', '.join(what)}" if what else "")})
     if bare(n):
         if show_target:
@@ -1299,7 +1305,7 @@ def _card_main(ctx, n, compact: bool, hit, show_target: bool = False, seams=(),
         # Each piece on its own, a rule in the kind's colour between: an
         # append's text after its seam, a prepend's before.
         start = 0
-        for at, who, when, above, rewrote in seams:
+        for at, who, when, above, rewrote in seams_of():
             md(n.body[start:at])
             main.append({"k": "seam", "m": "seam", "tip": when,
                          "t": f"{who} {'edited the text above and ' if rewrote else ''}added "
@@ -1378,11 +1384,11 @@ def _card_foot(ctx, n, status, narrow, show_target: bool, git_head, since=None):
     return foot, hover, views
 
 
-def history(ctx, every, head, author: str, git_head=None) -> None:
+def history(ctx, rd, head, author: str, git_head=None) -> None:
     """The rows `head` superseded, newest first: the store keeps every
     version, and the GUI showed only the last. Read-only: an edit made from
     an old version lands on the current row."""
-    by_id = {n.id: n for n in every}
+    by_id = rd.by_id
     chain, cur = [], head
     while cur.supersedes in by_id and by_id[cur.supersedes] not in chain:
         cur = by_id[cur.supersedes]
@@ -1393,8 +1399,10 @@ def history(ctx, every, head, author: str, git_head=None) -> None:
             .mark("history"):
         for old, new in zip(chain, [head, *chain]):
             # with its target: a rename is a version that changed nothing else
+            # no seams: earlier versions keep none; `seen` for picked's chain
             render_note(ctx, old, lambda: None, author=author, actions=False,
-                        git_head=git_head, show_target=True, diff_to=new)
+                        git_head=git_head, show_target=True, diff_to=new, seams=(),
+                        seen=rd)
 
 
 def peek_entry(ctx, note_id: str, author: str, refresh) -> None:
@@ -1411,8 +1419,8 @@ def peek_entry(ctx, note_id: str, author: str, refresh) -> None:
     git_head = gitref.head_sha(ctx.cfg)
     render_note(ctx, n, refresh, author=author, show_target=True, git_head=git_head,
                 since=gitref.commits_since(ctx.cfg, [n], git_head).get(n.id),
-                seams=summ.seams(rd.by_id, n), seen=rd)
-    history(ctx, every, n, author, git_head)
+                seen=rd)
+    history(ctx, rd, n, author, git_head)
 
 
 _SAID = "sb-said"
@@ -1708,7 +1716,7 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             tip = S.chain_tip(S.load(ctx.store_dir), n.id)
             edited = body.value != base[0]
             if edited and tip.body != base[0]:
-                ui.notify(f"{short_id(n.id)} changed since this dialog opened ({tip.author} "
+                ui.notify(f"{short_id(n.id)} changed since this dialog opened ({summ.byline(tip)} "
                           f"wrote to it): copy your text, then reopen the entry to edit its "
                           f"newest version", type="warning", multi_line=True)
                 return

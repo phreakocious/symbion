@@ -21,6 +21,20 @@ In `notes.jsonl` an edit appends the new version under the entry's id, and the
 version it replaces stays on its own line under its new id. Of a committed
 line, only that id ever changes.
 
+Each version also names who ran its write, its writer: an agent, by the marker
+its shell carries (`codex`, `hermes`, `antigravity`, `pi`, `claude`), `gui` for
+`symbion serve`, or `cli` for a shell no agent marked (a person, a script, or
+an agent symbion has no marker for). `$SYMBION_AUTHOR` and `--author` change
+the author, never the writer. Where an agent wrote a version under another
+name, each line that names its author adds the agent: `written … by ada via
+claude`, `-- ada via claude added below … --`, and the summary's `from`, `last
+by`, `closed by` and `added` lines. `from` and `last by` print it for every
+reader, `ada` included. It changes no rule of whose an entry is. A version written before the stamp
+existed has an unknown writer, and so does one an older symbion edited: that
+edit copies the earlier version's stamp, which then no longer matches the
+version's time. The stamp catches mistakes, not intent: any process can set an
+agent's marker, or reach `symbion serve`.
+
 `undo ID` puts back the whole of the store's last write, a batch too: each
 write first copies `notes.jsonl`, `arcs.jsonl` and the sessions file into
 `.symbion-state/` in the store, which git never sees. It works when ID is an
@@ -91,7 +105,9 @@ the summary below reads the local store`).
 
 1. `open outside arcs:` the open count of each status kind that is not
    parked, then `; N open in arcs` when arcs hold any, and `; N parked` when
-   any open entry is parked. A parked entry and an entry in an arc are not
+   any open entry is parked. `, N with no due date (oldest 40d: list --kind idea
+   --undated)` follows when some have no date: no session start shows such an
+   entry of yours. A parked entry and an entry in an arc are not
    in the per-kind counts, so each says so in its brackets (`[idea,
    parked]`, `[task, arc release]`). `arc todo` on a phased arc labels a box with
    its phase, `[task, doing]`.
@@ -108,7 +124,8 @@ the summary below reads the local store`).
    parked one from its due date on (`overdue 2d`, `due in 3d`). Within a
    day of a due with an hour, it counts hours or minutes (`due in 3h`,
    `overdue 40m`).
-5. A line per arc: its id, done/total, age and name.
+5. A line per arc: its id, done/total, age, name and last change (the newest
+   version of an entry filed in it, or a board move).
 6. `priority`: each unresolved entry tagged `priority` that no block above
    printed, with `starred Nd ago` from a day on.
 7. `closed by <author>`: an entry you raised or closed that someone else then
@@ -164,7 +181,8 @@ An entry's line reads `[labels] [kind, …] TYPE:NAME  lead  id`:
 
 - `priority`: the entry is starred, in whichever block prints it.
 - `from <author>`: someone else raised it. `last by <author>`: someone else
-  wrote its newest version. Both print when both hold.
+  wrote its newest version. Both print when both hold. `<author> via
+  <agent>`: that agent wrote the version under the author's name.
 - In the brackets: `parked`, `arc <id>`, a pre-registration's `registered
   <date>`, `+N amendments`, and a star's age.
 - The lead is the body's first 100 characters, flattened to one line; the due
@@ -187,7 +205,7 @@ model, since no harness tells its shell which model runs: a review by another
 model passes `--author` to read apart. A person typing `! symbion add …` in a
 session is recorded as the agent unless they pass `--author`. At a terminal the
 reader is the person, so no entry is someone else's and none of these labels
-prints.
+prints, except on a version an agent wrote under another name (`NAME via AGENT`).
 
 ## Between session starts
 
@@ -201,14 +219,20 @@ previous commit, whichever came later.
 `add` also prints a `note:` line on stderr for the open entries already on its
 target, an id in the body that matches no entry, a catalog name stored as
 typed, a verdict entry with no `--checked` or stamped on a dirty tree (a
-pre-registration's add refuses the first and skips the second), and a
-parked entry of yours with no `--due`. In an agent session, it lists a
-target's open entries at your first add there and not again until the next
-session start. `add`, `resolve` and `supersede` say when
+pre-registration's add refuses the first and skips the second). In an agent
+session, it lists a target's open entries at your first add there and not again
+until the next session start. `add`, `resolve` and `supersede` say when
 the text they write runs past 500 characters: in an agent session, once until
-the next session start. A pre-registration's body does not count. A
+the next session start. A pre-registration's body, or a supersede's addition to
+one, does not count; its resolve `--body` does. A
 pre-registration's add says that `resolve --result` closes it whole: in an agent
-session, also once until the next session start. Each write
+session, also once until the next session start. A write whose text holds a
+clock time 2 to 15 minutes ahead (`~19:3xZ` at 19:24Z) gets a note; in an agent
+session a pre-registration's add refuses instead, and the same command again
+writes it, for a planned time. A `resolve --body` on a question with options
+whose body gives no option on a line of its own says the question reads
+unanswered and names the undo: in an agent session, once until the next
+session start. Each write
 ends with the count of entries not yet committed; an arc write with none
 pending says `arcs.jsonl not committed`. Where some are another session's, it
 says how old the newest of those is: an old one suggests that session has ended.
@@ -243,7 +267,8 @@ store, or a tail two entries share, names no entry.
 ## Store commits
 
 `symbion commit` takes the entries this agent session wrote, under any author
-(with no session, your author's), and every changed file in the store. From
+(with no session, your author's), and every changed file in the store;
+`--author NAME` takes NAME's entries that no agent session wrote instead. From
 another project's tree (`--dir` from outside the store's project) it takes no
 file but `arcs.jsonl` and the new docs those entries name, and names each file
 it left. An edit of another session's uncommitted entry brings that entry into
@@ -252,7 +277,8 @@ commit never holds an edit without the version it edits. Its
 commit message ends with a `Rows: claude 3` trailer naming them by author. When
 arcs.jsonl changed, an `Arcs: ada 1, unknown 1` trailer follows: a new arc
 counts for its author, a moved box for its mover, any other edit of an arc
-for its writer, and a change no writer stamped (a hand edit) as `unknown`.
+for the author it records, and a change that records none (a hand edit) as
+`unknown`.
 `commit --wrap -m MSG` adds `Wrap: <author>`: that message is the handoff
 `summary` prints as `last wrap by`. With nothing pending, a wrap commits the
 message alone, where a plain `commit` exits 1. The store's git log is the

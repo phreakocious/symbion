@@ -13,7 +13,9 @@ This page explains what you see. Press `?` for the keyboard shortcuts.
 Everything here is an **entry**: a dated piece of writing, signed by its
 author, about one thing. Each card is one entry. Its chips say what kind it
 is, whether it is open, what it is about, what else it points at, and its
-tags. Its author, age and id sit at the right.
+tags. Its author, age and id sit at the right. Where an agent wrote an entry
+under someone else's name, as when it relays your words, the author reads
+`NAME via claude`, NAME being yours.
 
 Every chip is a link. Click one to list every entry that shares it; click
 another on that list to narrow it. Click an entry's id to open it alone,
@@ -176,6 +178,8 @@ chip says how that commit relates to the project now:
 - `current`: no commit has landed since the run.
 - `behind 5`: five commits have landed since. The run may no longer
   describe the code.
+- `ahead 3`: this checkout is three commits short of the run's commit, as
+  when the run was on a newer clone.
 - `diverged`: the run was on another branch.
 - `rewritten as 4e1a9c2`: an amend or a rebase moved the run's commit, and
   the chip goes on with the new commit's state. The new code may differ.
@@ -185,6 +189,8 @@ chip says how that commit relates to the project now:
   This never clears.
 - `external`, with its age: the run was on something outside the project,
   such as a server. Only time makes it stale.
+- `unstamped`, with its age: written before symbion stamped checks, so no
+  commit is known for it.
 - `pending`: a prediction not yet judged.
 
 Hover a state chip to see the commit, and for `behind`, the commits since.
@@ -193,10 +199,10 @@ the commits.
 
 ## Nothing committed is deleted
 
-Once the store is committed, no entry in it is deleted, and an edit keeps
-the earlier version: open the entry and expand "earlier versions" to see
-each change. Until then, editing an entry you just wrote changes it in
-place. Resolving an entry closes it; the newest closed entries show under
+Once the store is committed, no entry in it is deleted. Every edit keeps
+the earlier version, before a commit or after: open the entry and expand
+"earlier versions" to see each change. Until a commit, undo or Discard can
+still take back what you wrote. Resolving an entry closes it; the newest closed entries show under
 RECENTLY CLOSED in the sidebar. A record that no longer holds is retired,
 not removed.
 

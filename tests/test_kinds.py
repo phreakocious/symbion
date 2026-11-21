@@ -72,6 +72,11 @@ def test_a_non_table_value_is_refused():
         K.parse_kinds({"bug": True})
 
 
+def test_a_non_string_when_is_refused_by_kind():
+    with pytest.raises(ValueError, match=r"^\[kinds\] 'anomaly': when must be a string$"):
+        K.parse_kinds({"anomaly": {"when": 5}})
+
+
 def test_read_kinds_with_no_toml_is_the_defaults(tmp_path):
     assert K.read_kinds(tmp_path) == K.DEFAULT_KINDS
     assert K.is_declared(tmp_path) is False
@@ -119,3 +124,9 @@ def test_render_toml_round_trips_a_declared_when_with_quotes():
     kinds = {"prediction": K.Kind(status=True, verdict=True,
                                   when='say "falsified if" and a \\ path\tand a tab')}
     assert K.parse_kinds(tomllib.loads(K.render_toml(kinds))["kinds"]) == kinds
+
+
+def test_render_toml_writes_a_non_ascii_when_as_itself():
+    # `schema --toml` prints it for the user to paste: `é` round-trips but reads badly.
+    text = K.render_toml({"anomaly": K.Kind(status=True, when="café — 検証 ✓")})
+    assert 'when = "café — 検証 ✓"' in text

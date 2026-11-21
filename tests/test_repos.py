@@ -93,6 +93,7 @@ def test_a_linked_worktree_stands_in_its_repo(ws, monkeypatch):
 @pytest.mark.parametrize("toml, says", [
     ('[repos]\nitem = "../ansible"\n', "'item' is taken"),
     ('[repos]\nfile = "../ansible"\n', "'file' is taken"),
+    ('[repos]\ndoc = "../ansible"\n', "'doc' is taken"),
     ('[repos]\nnet = 3\n', "a path is a quoted string"),
     ('[repos]\nnet = "../tf-net"\nnet2 = "../tf-net/"\n', "one repo is one type"),
     ('repos = "../tf-net"\n', "a table of NAME"),
