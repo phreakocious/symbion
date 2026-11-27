@@ -183,6 +183,9 @@ def _state(n, state, successor=None) -> tuple[str, str]:
     st, dist = state
     if st == "rewritten" and successor is not None:   # a rewrite moved the run's commit
         return f"{st} {api.rewritten_words(successor)}", WARN
+    if st == "committed" and successor is not None:   # a commit holds the dirty run's tree
+        return (f"{st} {api.rewritten_words(successor)}",
+                GOOD if successor.state == "current" else WARN)
     if st == "unverifiable":
         return f"unverifiable ({api.why_unverifiable(n.provenance)})", BAD
     if st == "dangling":           # on no branch: the run must be redone

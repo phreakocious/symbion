@@ -142,6 +142,8 @@ CLI_STORE_CALLS = ALLOWED_STORE_READS | {
                                                           # the sync a hook and a commit run
     "Busy",                                               # the lock's refusal: a hook's pull
                                                           # gives up on a store held too long
+    "missing_ignores",                                    # read: the .gitignore lines init
+                                                          # names before ensure_store adds them
     "ensure_store", "apply_reconciliation",               # the two writes
 }
 

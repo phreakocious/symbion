@@ -1041,11 +1041,26 @@ def ensure_store(store) -> bool:
             said = (r.stderr + r.stdout).strip() or f"exit {r.returncode}, no output"
             raise RuntimeError(f"git init failed in {store}; git said:\n{said}")
         created = True
-    ignore = store / ".gitignore"
-    if not ignore.exists():
-        ignore.write_text(f"{LOCK_FILE}\n.tmp.*\n", encoding="utf-8", newline="\n")
+    missing = missing_ignores(store)
+    if missing:
+        # Append, never rewrite: a repo adopted as the store keeps its own lines.
+        ignore = store / ".gitignore"
+        text = ignore.read_text(encoding="utf-8", errors="replace") if ignore.exists() else ""
+        lead = "\n" if text and not text.endswith("\n") else ""
+        with open(ignore, "a", encoding="utf-8", newline="\n") as f:
+            f.write(lead + "".join(ln + "\n" for ln in missing))
         created = True
     return created
+
+
+def missing_ignores(store) -> list:
+    """The lines a store's `.gitignore` needs and lacks: the lock and a write's
+    temp files, which `commit`'s `git add -A` would otherwise take."""
+    # shortcut: exact lines; a broader pattern that covers one still gets it appended.
+    ignore = Path(store) / ".gitignore"
+    have = ignore.read_text(encoding="utf-8", errors="replace").splitlines() \
+        if ignore.exists() else []
+    return [ln for ln in (LOCK_FILE, ".tmp.*") if ln not in (h.strip() for h in have)]
 
 
 # ---- notes I/O ----
@@ -1326,7 +1341,7 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
                         kinds=None, append_body: str | None = None, add_refs=None,
                         rm_refs=None, prepend_body: str | None = None, replace_body=None,
                         add_measurements=None, rm_measurements=None, *, side, pending=None,
-                        **fields) -> Note:
+                        options_seen=None, **fields) -> Note:
     """The guts of `supersede`, assuming the caller already holds `_lock` and
     passes in a `notes` list loaded under that same lock. Extracted so a
     multi-row aggregate (`rename_target`, `apply_reconciliation`) can hold
@@ -1362,7 +1377,11 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     pre-registration refuses it, since its registered text stays on top.
     `replace_body`, (old, new) pairs, swaps each old span of it, in order,
     and refuses one that does not occur exactly once: changing one phrase
-    took a read, a script and a whole new body (2026-11-04)."""
+    took a read, a script and a whole new body (2026-11-04).
+
+    `options_seen`, given, makes an `options` in **fields apply only while
+    the TIP's options are still those: an answer that passed over a
+    question's options drops them, never ones its asker set since."""
     sources = [s for s in (append_body, prepend_body, replace_body) if s is not None]
     if len(sources) > 1 or (sources and "body" in fields):
         raise ValueError("body, append_body, prepend_body and replace_body are sources "
@@ -1380,6 +1399,8 @@ def _supersede_unlocked(store, notes, old_id: str, author: str | None = None,
     old = chain_tip(notes, old_id)
     kinds = K.read_kinds(store) if kinds is None else kinds
     base = note_to_dict(old)
+    if options_seen is not None and tuple(old.options or ()) != tuple(options_seen):
+        fields = {k: v for k, v in fields.items() if k != "options"}
     base.update(fields)
     if append_body is not None:
         base["body"] = appended(old.body, append_body)
@@ -1529,7 +1550,7 @@ def _replaced(old: Note, pairs) -> str:
 def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
               append_body: str | None = None, add_refs=None, rm_refs=None,
               prepend_body: str | None = None, add_measurements=None, target_types=None,
-              replace_body=None, rm_measurements=None, **fields) -> Note:
+              replace_body=None, rm_measurements=None, options_seen=None, **fields) -> Note:
     """Append a correction superseding old_id -- the single-row public entry
     point. One outer `_lock` spans load -> fast-forward -> mint -> write; see
     `_supersede_unlocked` for what happens inside it.
@@ -1575,7 +1596,8 @@ def supersede(store, old_id: str, author: str | None = None, canonicalize=None,
                                    append_body=append_body, add_refs=add_refs, rm_refs=rm_refs,
                                    prepend_body=prepend_body, replace_body=replace_body,
                                    add_measurements=add_measurements,
-                                   rm_measurements=rm_measurements, **fields)
+                                   rm_measurements=rm_measurements, options_seen=options_seen,
+                                   **fields)
 
 
 def _committed_floor(store, notes, tip: Note) -> str:
@@ -1623,9 +1645,10 @@ def _undo_anew(store, notes, old: Note) -> str:
 
 def _committed_lines(store) -> set | None:
     """The lines of notes.jsonl in the store's last commit: none before the
-    first one. None when git cannot say."""
+    first one, or while HEAD lacks the file (a repo adopted as the store).
+    None when git cannot say."""
     git = ["git", "-C", str(store)]
-    if subprocess.run([*git, "rev-parse", "-q", "--verify", "HEAD"],
+    if subprocess.run([*git, "rev-parse", "-q", "--verify", f"HEAD:{NOTES_FILE}"],
                       capture_output=True).returncode:
         return set()
     r = subprocess.run([*git, "show", f"HEAD:{NOTES_FILE}"], capture_output=True, text=True,
@@ -2212,11 +2235,13 @@ def lost_rows(store) -> list[dict]:
 
 def _notes_diff(store) -> str:
     """notes.jsonl's diff from HEAD, or every line added before the first
-    commit. Plumbing: a porcelain `git diff` rewrites the index under
+    commit to hold it: diff-index reads no diff for a file HEAD lacks and git
+    does not track, so a repo adopted as the store read nothing pending.
+    Plumbing: a porcelain `git diff` rewrites the index under
     index.lock when a file's stat data is stale, and a `symbion commit`'s
     `git add` beside it refused while the GUI polled this (2026-10-16)."""
     git = ["git", "-C", str(store)]
-    if subprocess.run([*git, "rev-parse", "-q", "--verify", "HEAD"],
+    if subprocess.run([*git, "rev-parse", "-q", "--verify", f"HEAD:{NOTES_FILE}"],
                       capture_output=True).returncode:
         f = Path(store) / NOTES_FILE
         text = f.read_text(encoding="utf-8") if f.exists() else ""
@@ -2226,7 +2251,7 @@ def _notes_diff(store) -> str:
 
 
 def commit(store, message: str, cfg, keep=None, files: bool = False,
-           wrap: str | None = None, paths=()) -> bool:
+           wrap: str | None = None, paths=(), edits=()) -> bool:
     """git add -A + commit the store. Hermetic identity so it works in CI/tmp.
     The lock is here because `add -A` would otherwise stage whatever another
     writer has half-written. Returns True on a commit, False when nothing
@@ -2238,7 +2263,8 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
     and the registry; every other row stays pending (_stage_kept), and so
     does every other file unless `files`. `paths`, store-relative, are
     the docs a GUI commit's rows name: those no commit has taken and git
-    does not ignore are staged too. `wrap` names who ends a session
+    does not ignore are staged too. `edits` are tracked docs whose change is
+    staged as well (api.docs_brought). `wrap` names who ends a session
     with this commit: a `Wrap:` line in the one trailer block (a second
     `-m` would put `Rows:` outside it), and summary reads the newest. A
     wrap commits even with nothing staged. In a shared store the commit is
@@ -2277,6 +2303,10 @@ def commit(store, message: str, cfg, keep=None, files: bool = False,
             if r.returncode == 0 and new:
                 r = subprocess.run([*git, "--literal-pathspecs", "add", "--", *new],
                                    capture_output=True, text=True, encoding="utf-8")
+        if r.returncode == 0 and edits:
+            # Edits the caller vouches for: a doc its session brought in (api.docs_brought).
+            r = subprocess.run([*git, "--literal-pathspecs", "add", "--", *edits],
+                               capture_output=True, text=True, encoding="utf-8")
         if r.returncode == 0:
             r = subprocess.run([*git, "diff", "--cached", "--quiet"],
                                capture_output=True, text=True, encoding="utf-8")

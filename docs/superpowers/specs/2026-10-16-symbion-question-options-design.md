@@ -150,6 +150,14 @@ as a typed answer does; the question stays open for its asker to act on and reso
 as SKILL.md has it. The `_SAY` regex and the `default` test on the first 100
 characters go.
 
+> 2026-11-24: a typed answer that gives no option on a line of its own drops the
+> options in the same write (the user, 2026-11-23): the asker's next addition drew
+> the buttons the person had passed over. The earlier version keeps them. An
+> option's words typed are a pick, as a click is, and keep them. Text added in
+> the edit dialog of a question whose card takes the person's answer is that
+> answer too, with a resolve beside it or not. Only the options the card drew
+> go: ones the asker set since stay (the store's `options_seen`).
+
 - A question without options draws the field alone. Every open question written
   under the old convention is one of these: its prose stays, and there is no
   migration. The `Default: … Flip:` prefix reads as the question's own words, and the
@@ -158,7 +166,8 @@ characters go.
   answered, a resolved one), the card shows the options as a quiet meta row, as it
   shows measurements: the answer below then reads against its alternatives, and the
   card shows what `show` prints. Where the buttons draw, they are the options, and no
-  row doubles them.
+  row doubles them. (2026-11-24: an answer typed past the options has none left to
+  read against; see the note above.)
 - The peek's version diff names a change to the options between two versions, as it
   names a measurement's; untaught, a corrected option list would read as no change.
 - The row renders the same way on the Summary, the lists and in the peek, because

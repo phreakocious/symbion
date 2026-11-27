@@ -219,7 +219,12 @@ previous commit, whichever came later.
 `add` also prints a `note:` line on stderr for the open entries already on its
 target, an id in the body that matches no entry, a catalog name stored as
 typed, a verdict entry with no `--checked` or stamped on a dirty tree (a
-pre-registration's add refuses the first and skips the second). In an agent
+pre-registration's add refuses the first and skips the second). The dirty-tree
+note names the paths, and says the entry reads `committed as SHA` once one
+commit holds the tree as it was at the write. With an assume-unchanged or
+skip-worktree entry, a sparse checkout, a dirty submodule, a dirty file with a
+clean filter (git-lfs) or over 20 MB of changed and new files, no tree is hashed, and
+the note says the entry stays `unverifiable (dirty tree)`. In an agent
 session, it lists a target's open entries at your first add there and not again
 until the next session start. `add`, `resolve` and `supersede` say when
 the text they write runs past 500 characters: in an agent session, once until
@@ -258,6 +263,12 @@ when (`-- ada added below, 2026-10-10 04:22:11Z --`); an amendment that went
 on with a line is unmarked. `--last N` keeps the first text and the newest N
 amendments, and a line counts the rest. `--json` gives the body as stored.
 
+A write prints its id on stdout and its notes on stderr. Where one pipe takes
+both, as in an agent's shell (not on Windows or OpenBSD, whose pipes carry no
+file id), the id prints last, and its line counts the notes
+above it, the `not committed` line aside: `20261126-160744-202532-189  (2 lines
+of notes above)`. Read them: `2>&1 | tail -1` keeps the id's line alone.
+
 `show` ends an entry with a line for each entry of this store its body cites,
 by whole id or its 10- or 17-character tail, read through that entry's head
 (`cites 412907-3be -> 520114-a1b bug [resolved]: …`), then a line for each
@@ -268,10 +279,10 @@ store, or a tail two entries share, names no entry.
 
 `symbion commit` takes the entries this agent session wrote, under any author
 (with no session, your author's), and every changed file in the store;
-`--author NAME` takes NAME's entries that no agent session wrote instead. From
-another project's tree (`--dir` from outside the store's project) it takes no
-file but `arcs.jsonl` and the new docs those entries name, and names each file
-it left. An edit of another session's uncommitted entry brings that entry into
+`--author NAME` takes NAME's entries that no agent session wrote too. From
+another project's tree (`--dir` or `$SYMBION_DIR` from outside the store's project) it takes no
+file but `arcs.jsonl` and the docs those entries name that are new or first
+committed by this session, and names each file it left. An edit of another session's uncommitted entry brings that entry into
 your commit: a
 commit never holds an edit without the version it edits. Its
 commit message ends with a `Rows: claude 3` trailer naming them by author. When
@@ -279,7 +290,7 @@ arcs.jsonl changed, an `Arcs: ada 1, unknown 1` trailer follows: a new arc
 counts for its author, a moved box for its mover, any other edit of an arc
 for the author it records, and a change that records none (a hand edit) as
 `unknown`.
-`commit --wrap -m MSG` adds `Wrap: <author>`: that message is the handoff
+`commit --wrap -m MSG` adds `Wrap: <your author>`, with `--author NAME` or without: that message is the handoff
 `summary` prints as `last wrap by`. With nothing pending, a wrap commits the
 message alone, where a plain `commit` exits 1. The store's git log is the
 journal: `git -C <store> log --grep '^Wrap: '`.

@@ -752,6 +752,61 @@ def test_a_gotcha_fires_on_a_path_never_on_a_name(git_repo, tmp_path):
     assert "conf trap" in bash("cat /etc/edge.conf")
 
 
+def test_a_doc_gotcha_fires_on_the_docs_path_in_its_store(git_repo, tmp_path):
+    """A doc's name is under the store's docs/ dir, and the list gave the store
+    alone as its root: the hook matched `<store>/NAME`, where no doc is, and a
+    read of `<store>/docs/NAME` drew nothing (2026-11-24)."""
+    bash = _gotcha_session(git_repo, tmp_path, None, [
+        ({"type": "doc", "name": "trial-notes.md"}, [], "doc trap")])
+    s = tmp_path / "proj-notes"
+    assert "doc trap" in bash(f"cat {s}/docs/trial-notes.md")
+    assert bash(f"cat {s}/trial-notes.md", sid="s2") == ""
+
+
+def test_a_gotcha_the_session_edits_reaches_its_hook_as_edited(git_repo, tmp_path):
+    """The hook printed a gotcha this session had just edited with its old lead,
+    and the agent took the write for a failure (2026-11-24): the list was
+    written at session start. The session's write rebuilds it and keeps what
+    the hook has shown; a write to another store leaves it. A write from a
+    linked worktree keeps the main checkout as each line's root: the
+    worktree's name matched none of the main checkout's paths."""
+    s = tmp_path / "proj-notes"
+    store.ensure_store(s)
+    f = {"type": "file", "name": "src/trap.py"}
+    trap = store.add(s, kind="note", target=f, author="ann", tags=["gotcha"], body="old lead")
+    store.add(s, kind="note", target={"type": "file", "name": "src/keep.py"}, author="ann",
+              tags=["gotcha"], body="kept trap")
+    env = {**SRC_ENV, "PATH": TOOLS, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path / "c"),
+           "CLAUDE_CODE_SESSION_ID": "s1"}
+    r = subprocess.run([SH, str(HOOK)], cwd=git_repo, capture_output=True, text=True, env=env,
+                       input=json.dumps({"session_id": "s1", "hook_event_name": "SessionStart"}))
+    assert r.returncode == 0, r
+
+    def read(name):
+        return _touch(env, {"session_id": "s1", "tool_name": "Read",
+                            "tool_input": {"file_path": f"{git_repo}/src/{name}"}})
+
+    def sy(*a, cwd=git_repo):
+        r = subprocess.run([str(Path(SYMBION_BIN) / "symbion"), *a], cwd=cwd, env=env,
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        assert r.returncode == 0 and "from a bug in symbion" not in r.stderr, r
+
+    assert "kept trap" in read("keep.py")
+    _git(git_repo, "worktree", "add", "-q", str(tmp_path / "feature"))
+    sy("supersede", trap.id, "--prepend", "--body", "new lead.", cwd=tmp_path / "feature")
+    said = read("trap.py")
+    assert "new lead." in said and "kept trap" not in said, said
+    assert read("keep.py") == "", "a rebuild keeps what the hook has shown"
+    listed = tmp_path / "c" / "symbion" / "gotchas" / "s1"
+    before = listed.read_text(encoding="utf-8")
+    other = tmp_path / "other-notes"
+    store.ensure_store(other)
+    (other / "symbion.toml").write_text('[catalogs]\nfile = "git ls-files"\n')
+    sy("--dir", str(other), "add", "note", "--target", "file:src/elsewhere.py", "--tag", "gotcha",
+       "--body", "another store's trap")
+    assert listed.read_text(encoding="utf-8") == before
+
+
 def _gotcha_session(git_repo, tmp_path, toml, rows):
     """A store holding `rows` (target, refs, body), every one a #gotcha, and a
     Bash call into the gotcha hook; each session id starts its session first."""
@@ -946,6 +1001,16 @@ def test_both_gotcha_hooks_fire_in_a_linked_worktree(tmp_path, hook):
     assert run(hook, f"cd /tmp\n{tmp_path}/wt/feature/src/x.py --help") == "x trap"
     for d in ("wt/stray", "plain"):
         assert run(hook, f"cat {tmp_path}/{d}/src/x.py") == "", d
+
+
+@pytest.mark.parametrize("hook", BOTH)
+def test_both_gotcha_hooks_read_a_doc_root_of_two_dirs(tmp_path, hook):
+    """A doc row's root is `<store>/docs`: each hook matches it as a path's tail,
+    so another store's or a repo's docs/ dir does not count."""
+    run = _both_hooks(tmp_path, [("id1", "trial-notes.md", "doc trap", "proj-notes/docs")])
+    assert run(hook, f"cat {tmp_path}/proj-notes/docs/trial-notes.md") == "doc trap"
+    for d in ("proj-notes", "proj/docs", "other-notes/docs"):
+        assert run(hook, f"cat {tmp_path}/{d}/trial-notes.md") == "", d
 
 
 @pytest.mark.parametrize("hook", BOTH)

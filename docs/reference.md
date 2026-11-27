@@ -174,7 +174,9 @@ where two separate adds would store both.
 - **Files:** `notes.jsonl` (the entries and their versions), `arcs.jsonl`
   (an arc's row, which may add `phases`, its column names in order, and `placement`,
   one `{id, phase, by, at}` per box moved, with `from`, the phase it left, when the move changed it, or `{id, phase}` when only its order is kept), `symbion.toml`, and the
-  `README.md` and `.gitignore` that `init` writes. `archive/` holds files
+  `README.md` and `.gitignore` that `init` writes. Run on a repo that has files
+  and history, `init` makes it a store and keeps both, and an existing
+  `.gitignore` gets the `.lock` and `.tmp.*` lines it lacks. `archive/` holds files
   copied in to keep (`adoption.md`); `commit` names any path there git ignores.
   An edit keeps a field this symbion does not know, such as a newer release's,
   on the entry or arc as written.
@@ -203,7 +205,10 @@ where two separate adds would store both.
   With `"dirty": true`, a `dirty_count` and a `dirty_paths` list let the write
   name the uncommitted paths, as the built-in stamp does. With `author_date`
   (git's `%ad --date=raw`), `subject` and `tree`, a stamp whose commit git
-  has pruned still follows a rewrite. Any other key reads as unset, and each
+  has pruned still follows a rewrite. With `dirty_tree` (a tree id), a dirty
+  stamp reads `committed as SHA` once a commit since the stamp has that tree;
+  the built-in stamp hashes it at a dirty write, but for the cases mechanics.md
+  lists, over 20 MB of changed and new files among them. Any other key reads as unset, and each
   command names it on stderr with its near miss
   (`local_onyl (local_only?)`); the session-start hook puts the note in its text.
 - **Trust:** the commands in `[catalogs]`, `[resolvers]`, `[renames]` and

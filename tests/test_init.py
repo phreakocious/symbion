@@ -633,6 +633,71 @@ def test_init_without_yes_on_a_set_up_project_has_nothing_to_change(repo, tmp_pa
                 and not ln.startswith("will keep")], out
 
 
+@pytest.mark.parametrize("ignore, added, after", [
+    ("cache/\n", ".lock, .tmp.*", "cache/\n.lock\n.tmp.*\n"),
+    ("cache/", ".lock, .tmp.*", "cache/\n.lock\n.tmp.*\n"),   # no final newline: cache/ stays whole
+    (".lock\n", ".tmp.*", ".lock\n.tmp.*\n"),
+])
+def test_init_makes_an_existing_repo_a_store_and_says_so(repo, tmp_path, capsys, ignore, added,
+                                                         after):
+    """A user adopting a repo that holds files and commits (a notes vault) read
+    `created DIR (the store: a git repo)`: init created neither, and kept the
+    history. Its `.gitignore`, which init wrote only when absent, lacked the
+    lock, so the next `commit` took `.lock` (2026-11-26). init says it makes
+    the repo a store, adds each missing line, and leaves files and history."""
+    s = tmp_path / "vault"
+    s.mkdir()
+    _git(s, "init", "-q", "-b", "main")
+    (s / "a.md").write_text("mine\n")
+    (s / ".gitignore").write_text(ignore)
+    _git(s, "add", "-A")
+    _git(s, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "v0")
+    head = subprocess.run(["git", "-C", str(s), "rev-parse", "HEAD"], capture_output=True,
+                          text=True).stdout
+    adopt = f"{s} a store: its git repo, files and history stay"
+    add = f"{added} to {s / '.gitignore'}"
+    assert run("init", store_dir=s) == 1
+    out = capsys.readouterr().out
+    assert f"will make {adopt}" in out and f"will add {add}" in out, out
+    assert "will create" not in out and (s / ".gitignore").read_text() == ignore
+    assert run("init", "--yes", store_dir=s) == 0
+    out = capsys.readouterr().out
+    assert f"made {adopt}" in out and f"added {add}" in out, out
+    assert (s / ".gitignore").read_text() == after and (s / "a.md").read_text() == "mine\n"
+    assert subprocess.run(["git", "-C", str(s), "rev-parse", "HEAD"], capture_output=True,
+                          text=True).stdout == head
+    for name in (".lock", ".tmp.notes.jsonl"):
+        assert subprocess.run(["git", "-C", str(s), "check-ignore", "-q", name]).returncode == 0
+    assert run("init", store_dir=s) == 0
+    assert "will add" not in capsys.readouterr().out
+    # HEAD holds no notes.jsonl, and diff-index reads no diff for it: the
+    # write read as committed, and commit --dry-run listed no entry.
+    assert run("add", "note", "--target", "project", "--body", "first", store_dir=s) == 0
+    assert "1 entry not committed" in capsys.readouterr().err
+    assert [r["body"] for r in store.pending_rows(s)] == ["first"]
+    assert store._committed_lines(s) == set()
+
+
+def test_init_makes_a_dir_with_files_a_store_and_says_so(repo, tmp_path, capsys):
+    s = tmp_path / "vault"
+    s.mkdir()
+    (s / "a.md").write_text("mine\n")
+    assert run("init", store_dir=s) == 1
+    out = capsys.readouterr().out
+    assert f"will make {s} a store: git init there, and its files stay" in out, out
+    assert "will create" not in out and "will add" not in out
+
+
+def test_a_write_adds_the_lines_a_store_gitignore_lacks(tmp_path):
+    """Every write runs ensure_store, so a store made before init appended
+    them gets the lock and temp lines at its next write, and only once."""
+    store.ensure_store(tmp_path)
+    (tmp_path / ".gitignore").write_text("cache/\n")
+    assert store.ensure_store(tmp_path) is True
+    assert (tmp_path / ".gitignore").read_text() == "cache/\n.lock\n.tmp.*\n"
+    assert store.ensure_store(tmp_path) is False
+
+
 def _bare_push(store_dir):
     return subprocess.run(["git", "-C", str(store_dir), "push"],
                           capture_output=True, text=True)

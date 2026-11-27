@@ -695,6 +695,7 @@ def test_the_viewer_reads_a_file_only_its_repos_default_branch_holds(ws, monkeyp
     base = _git(net, "rev-parse", "HEAD")
     (net / "modules" / "dns").mkdir(parents=True)
     (net / "modules" / "dns" / "main.tf").write_text('resource "dns_zone" "z" {}\n')
+    (net / "modules" / "dns" / "map.pdf").write_bytes(b"%PDF")
     _commit(net, "dns")
     _git(net, "checkout", "-q", "-b", "wip", base)
     monkeypatch.chdir(ws / "tf-app")
@@ -703,6 +704,7 @@ def test_the_viewer_reads_a_file_only_its_repos_default_branch_holds(ws, monkeyp
     assert "dns_zone" in gitref.blob_text(ctx.cfg.for_type("net"), "main", "modules/dns/main.tf")
     assert view_path(ctx, "modules/dns/main.tf", "app") is None, "another repo's main lacks it"
     assert view_path(ctx, "modules/nowhere.tf", "net") is None
+    assert view_path(ctx, "modules/dns/map.pdf", "net") is None, "/pdf reads from disk only"
 
 
 def test_a_check_tip_lists_the_commits_of_its_repo(ws, sym, monkeypatch):
@@ -733,6 +735,26 @@ def test_a_rewritten_stamp_is_looked_up_in_its_own_repo(ws, sym, monkeypatch):
     row = json.loads(out)[0]
     assert (row["state"], row.get("successor_state"), row.get("same_tree")) == (
         "rewritten", "current", False), err
+
+
+def test_a_dirty_stamp_is_hashed_and_followed_in_its_own_repo(ws, sym, monkeypatch):
+    """Written from another repo, a check on a dirty repo's file hashes that
+    repo's tree, and follows the commit that holds it there (the
+    dirty-stamps design, 2026-11-26)."""
+    net = ws / "tf-net"
+    (net / "x.tf").write_text("x\n")
+    nid = _check(sym, "net:main.tf", at="ansible")
+    _git(net, "add", "-A")
+    _git(net, "commit", "-q", "-m", "x")
+    held = _git(net, "rev-parse", "HEAD")
+    monkeypatch.chdir(ws / "ansible")
+    ctx, n = api.resolve(), _heads(ws)[0]
+    assert n.provenance["dirty"] and n.provenance["repo"] == "net"
+    assert gitref.check_state(ctx.cfg, n.provenance) == ("committed", 0)
+    rc, out, err = sym("show", nid, "--json", at="ansible")
+    row = json.loads(out)[0]
+    assert (row["state"], row.get("successor"), row.get("successor_state")) == (
+        "committed", held, "current"), err
 
 
 def test_a_scope_reads_each_repos_head_once(ws, sym, monkeypatch):

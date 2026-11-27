@@ -361,6 +361,211 @@ def test_a_dirty_stamp_on_an_amended_commit_stays_unverifiable(repo):
     assert gitref.check_state(cfg, prov) == ("unverifiable", None)
 
 
+def _commit(repo, *paths, msg="c"):
+    _run(repo, "add", *(paths or ["-A"]))
+    _run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg)
+    return _run(repo, "rev-parse", "HEAD")
+
+
+def _dirty_stamp(cfg):
+    return gitref.provenance_stamp(cfg, K.DEFAULT_KINDS["check"])
+
+
+def test_a_dirty_check_follows_the_commit_that_holds_its_tree(repo):
+    """A check written on uncommitted changes read `unverifiable (dirty
+    tree)` for good, so an agent committed first and wrote after, and its
+    check took a commit no run saw (2026-11-26). Once a commit holds the
+    write's exact tree, a file new at the write included, the row names it.
+    In one process, the read before the commit and the one after differ."""
+    cfg = Config(project_root=repo)
+    (repo / "f0").write_text("y")
+    (repo / "new").write_text("n")
+    prov = _dirty_stamp(cfg)
+    assert prov["dirty"] and prov["dirty_tree"]
+    assert gitref.check_state(cfg, prov) == ("unverifiable", None)
+    c = _commit(repo)
+    assert gitref.check_state(cfg, prov) == ("committed", 0)
+    assert gitref.committed_as(cfg, prov) == gitref.Successor(c, "current", 0, None)
+    (repo / "f1").write_text("z")
+    _commit(repo)
+    assert gitref.check_state(cfg, prov) == ("committed", 1)
+    assert gitref.committed_as(cfg, prov)[:3] == (c, "behind", 1)
+
+
+def test_a_dirty_check_follows_only_a_commit_of_its_exact_tree(repo):
+    """The fix committed in two commits: the first leaves out a file new at
+    the write, and reads unverifiable; the second holds the tree. An edit
+    between the write and the commit matches nothing."""
+    cfg = Config(project_root=repo)
+    (repo / "f0").write_text("y")
+    (repo / "new").write_text("n")
+    prov = _dirty_stamp(cfg)
+    _commit(repo, "f0", msg="part 1")
+    assert gitref.check_state(cfg, prov) == ("unverifiable", None)
+    second = _commit(repo, msg="part 2")
+    assert gitref.check_state(cfg, prov) == ("committed", 0)
+    assert gitref.committed_as(cfg, prov).sha == second
+    (repo / "f1").write_text("at the write")
+    later = _dirty_stamp(cfg)
+    (repo / "f1").write_text("edited after the write")
+    _commit(repo)
+    assert gitref.check_state(cfg, later) == ("unverifiable", None)
+
+
+def test_a_dirty_check_amended_into_its_own_commit_follows_the_amend(repo):
+    """`commit --amend` folds the change into the stamp's commit: the old
+    object still exists, and the amend is in STAMP..HEAD."""
+    cfg = Config(project_root=repo)
+    (repo / "f0").write_text("y")
+    prov = _dirty_stamp(cfg)
+    _run(repo, "add", "-A")
+    new = _amend(repo)
+    assert gitref.check_state(cfg, prov) == ("committed", 0)
+    assert gitref.committed_as(cfg, prov).sha == new
+
+
+def test_a_dirty_stamp_without_a_tree_reads_as_before_at_no_git_call(repo, monkeypatch):
+    """Every dirty stamp written before the design, and one whose hash
+    failed or was refused."""
+    cfg = Config(project_root=repo)
+    prov = {"sha": _run(repo, "rev-parse", "HEAD"), "dirty": True}
+    calls, real = [], gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda *a, **k: calls.append(a) or real(*a, **k))
+    assert gitref.check_state(cfg, prov) == ("unverifiable", None)
+    assert calls == []
+
+
+def _git_dir_files(repo):
+    return {p: p.read_bytes() for p in (repo / ".git").rglob("*") if p.is_file()}
+
+
+def test_the_tree_hash_leaves_the_repos_git_dir_as_it_was(repo):
+    """The hash runs in a copy of the index with a throwaway object
+    directory. With a split index, `git add` there left a new sharedindex
+    file in the repo's .git until it ran with core.splitIndex=false
+    (2026-11-26)."""
+    _run(repo, "config", "core.splitIndex", "true")
+    _run(repo, "update-index", "--split-index")
+    (repo / "f0").write_text("y")
+    (repo / "new").write_text("n")
+    before = _git_dir_files(repo)
+    tree = gitref._dirty_tree(Config(project_root=repo))
+    assert _git_dir_files(repo) == before
+    _commit(repo)
+    assert tree == _run(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_the_tree_hash_keeps_a_same_size_edit_made_in_the_index_second(repo):
+    """git re-reads an entry whose mtime is not older than the index's. A
+    copy of the index dated now trusted the stat of a same-size edit made in
+    that second, and the tree lacked an edit `git status` showed (10 of 10
+    runs, 2026-11-26). Built here by hand, in a past second, so a copy dated
+    now is not racy: the entry, the edit and the index share that mtime,
+    and ctime is not trusted."""
+    _run(repo, "config", "core.trustctime", "false")
+    when = 1_000_000_000 * 10**9
+    os.utime(repo / "f0", ns=(when, when))
+    _run(repo, "update-index", "--refresh")          # the entry takes that mtime
+    (repo / "f0").write_text("y")                    # the size of "x"
+    os.utime(repo / "f0", ns=(when, when))
+    os.utime(repo / ".git" / "index", ns=(when, when))
+    cfg = Config(project_root=repo)
+    assert gitref._dirty_paths(cfg) == ["f0"]
+    tree = gitref._dirty_tree(cfg)
+    _commit(repo)
+    assert tree == _run(repo, "rev-parse", "HEAD^{tree}")
+
+
+def _submodule(repo, tmp_path):
+    sub = tmp_path / "sub"
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "s").write_text("s")
+    _commit(sub)
+    _run(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sub")
+    _commit(repo)
+    (repo / "sub" / "s").write_text("edited inside")
+
+
+@pytest.mark.parametrize("case", ["assume-unchanged", "skip-worktree", "sparse", "submodule",
+                                  "filter"])
+def test_the_tree_hash_refuses_where_add_skips_an_edit_or_writes_to_git(repo, tmp_path, case):
+    """`git add -A` skips an assume-unchanged or skip-worktree path's edit,
+    and an out-of-cone one's, so the tree matched a commit that lacks an
+    edit the run saw (2026-11-26). A gitlink holds the submodule's commit,
+    not its edits. A clean filter may write: git-lfs kept a copy of the file
+    under .git/lfs."""
+    (repo / "f0").write_text("y")
+    if case in ("assume-unchanged", "skip-worktree"):
+        _run(repo, "update-index", f"--{case}", "f1")
+    elif case == "sparse":
+        _run(repo, "sparse-checkout", "set", "--cone")
+    elif case == "submodule":
+        _submodule(repo, tmp_path)
+    else:
+        (repo / ".gitattributes").write_text("*.bin filter=demo\n")
+        _run(repo, "config", "filter.demo.clean", "cat")
+        _commit(repo)
+        (repo / "f0").write_text("unfiltered")
+        assert gitref._dirty_tree(Config(project_root=repo)), "a filter on no dirty path"
+        (repo / "a.bin").write_text("filtered")
+    assert gitref._dirty_tree(Config(project_root=repo)) is None
+
+
+def test_a_hash_that_raises_or_runs_past_its_cap_stamps_without_a_tree(repo, monkeypatch):
+    """A failure stamps without `dirty_tree`, as a failed `tree` does: the
+    write lands. Past DIRTY_TREE_BYTES of changed and new files no hash
+    runs: `add -A` reads each file in full, and 150 MB of new files
+    took a write 4.2 s (2026-11-26)."""
+    import tempfile
+    cfg = Config(project_root=repo)
+    (repo / "f0").write_text("y")
+
+    def no_temp(*a, **k):
+        raise OSError("no temp dir")
+    with monkeypatch.context() as m:
+        m.setattr(tempfile, "TemporaryDirectory", no_temp)
+        prov = _dirty_stamp(cfg)
+    assert prov["dirty"] and "dirty_tree" not in prov
+    monkeypatch.setattr(gitref, "DIRTY_TREE_BYTES", 1)
+    (repo / "f0").write_text("yy")
+    assert gitref._dirty_tree(cfg) is None
+    monkeypatch.setattr(gitref, "DIRTY_TREE_BYTES", 2)
+    assert gitref._dirty_tree(cfg)
+
+
+def test_unmatched_dirty_stamps_in_one_scope_walk_the_history_once(repo, monkeypatch):
+    """Each unmatched row walked STAMP..HEAD, and 200 took `list` from 0.16 s
+    to 2.5 s (2026-11-26). In a scope, one walk lists HEAD's trees; a row
+    whose tree is in none asks git nothing more. A matched row still finds
+    its commit."""
+    cfg = Config(project_root=repo)
+    head = _run(repo, "rev-parse", "HEAD")
+    rows = [{"sha": head, "dirty": True, "dirty_tree": f"{i:040x}"} for i in range(20)]
+    (repo / "f0").write_text("y")
+    held = _dirty_stamp(cfg)
+    c = _commit(repo)
+    logs, real = [], gitref._git
+    monkeypatch.setattr(gitref, "_git", lambda c_, *a, **k: (
+        logs.append(a) if a[:1] == ("log",) else None) or real(c_, *a, **k))
+    with gitref.heads_once():
+        assert {gitref.check_state(cfg, p) for p in rows} == {("unverifiable", None)}
+        assert len(logs) == 1, logs
+        assert gitref.committed_as(cfg, held).sha == c
+
+
+def test_the_tree_hash_reads_a_linked_worktrees_own_index(repo, tmp_path):
+    """In a linked worktree `.git` is a file: the index and the objects are
+    where `git rev-parse --git-path` says."""
+    wt = tmp_path / "wt"
+    _run(repo, "worktree", "add", "-q", str(wt))
+    (wt / "f0").write_text("y")
+    before = _git_dir_files(repo)
+    tree = gitref._dirty_tree(Config(project_root=wt))
+    assert _git_dir_files(repo) == before
+    _commit(wt)
+    assert tree == _run(wt, "rev-parse", "HEAD^{tree}")
+
+
 def test_a_stamp_still_on_a_backup_branch_reads_diverged(repo):
     """The old line is live: the lookup is for a stamp no branch holds."""
     cfg = Config(project_root=repo)
@@ -889,20 +1094,22 @@ def test_uncommitted_is_zero_on_a_clean_store(tmp_path):
     assert gitref.uncommitted(tmp_path) == (0, False)
 
 
-def test_the_reads_never_rewrite_an_index(tmp_path, repo):
+def test_the_reads_never_rewrite_an_index(tmp_path, repo, monkeypatch):
     """A porcelain `git diff` or `git status` rewrites the index, under
     index.lock, when a tracked file's stat data is stale, and a `git add`
     beside it refuses: a `symbion commit` failed so while the GUI polled
     (2026-10-16). In a scratch repo, 4 of 400 adds refused beside a
     `git diff --numstat` loop, 0 beside plumbing. `--no-optional-locks`
     stops `status`, not `diff`."""
-    from symbion import cli, store
+    from symbion import api, cli, store
     s = tmp_path / "s"
     store.ensure_store(s)
+    (s / "docs").mkdir(exist_ok=True)
+    (s / "docs" / "x.md").write_text("x\n")
     _run(s, "add", "-A")
     _run(s, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base")
     for r in (s, repo):
-        for f in r.iterdir():
+        for f in [*r.iterdir(), s / "docs" / "x.md"]:
             if f.is_file():
                 os.utime(f, (0, 0))          # stale stat data, the same bytes
     before = {r: os.stat(r / ".git" / "index") for r in (s, repo)}
@@ -911,6 +1118,8 @@ def test_the_reads_never_rewrite_an_index(tmp_path, repo):
     assert cli._ignored_paths(s, "archive") == []
     assert gitref._dirty_paths(Config(project_root=repo)) == []
     assert gitref.diff_text(Config(project_root=repo), "HEAD~1", "--", "f0") == ""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    assert api.docs_brought(api.resolve(str(s)), ["docs/x.md"]) == []
     for r, st in before.items():
         now = os.stat(r / ".git" / "index")
         assert (now.st_ino, now.st_mtime_ns) == (st.st_ino, st.st_mtime_ns), r.name
@@ -1249,10 +1458,10 @@ def test_a_read_only_serve_keeps_a_bounded_number_of_answers(repo, monkeypatch):
     gitref._asked.cache_clear()
 
 
-def test_markdown_files_are_the_tracked_and_new_not_ignored_and_read_only_the_tracked(
+def test_doc_files_are_the_tracked_and_new_not_ignored_and_read_only_the_tracked(
         repo, monkeypatch):
-    """The Docs page lists them. The public demo shows only what git tracks:
-    the leak scan read those."""
+    """The Docs page lists them, by their endings in any case. The public
+    demo shows only what git tracks: the leak scan read those."""
     cfg = Config(project_root=repo)
     gitref._asked.cache_clear()
     (repo / "sub").mkdir()
@@ -1260,7 +1469,9 @@ def test_markdown_files_are_the_tracked_and_new_not_ignored_and_read_only_the_tr
         (repo / name).write_text("x\n")
     (repo / ".gitignore").write_text("secret.md\n")
     subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
-    assert sorted(gitref.markdown_files(cfg)) == ["README.md", "sub/Guide.MD"]
+    assert sorted(gitref.doc_files(cfg)) == ["README.md", "sub/Guide.MD"]
+    assert sorted(gitref.doc_files(cfg, ("md", "txt"))) == ["README.md", "notes.txt",
+                                                            "sub/Guide.MD"]
     monkeypatch.setenv("SYMBION_READ_ONLY", "1")
-    assert gitref.markdown_files(cfg) == ["README.md"]
-    assert gitref.markdown_files(repo / "nowhere") == []
+    assert gitref.doc_files(cfg) == ["README.md"]
+    assert gitref.doc_files(repo / "nowhere") == []

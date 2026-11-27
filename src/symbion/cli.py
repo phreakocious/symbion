@@ -177,7 +177,7 @@ def _skill_file(name: str) -> int:
 # Each change init makes, printed in the past tense once made, and as
 # `will <verb>` in the list a run without --yes prints instead.
 _PAST = {"create": "created", "write": "wrote", "link": "linked", "relink": "relinked",
-         "set": "set", "keep": "kept", "merge": "merged"}
+         "set": "set", "keep": "kept", "merge": "merged", "make": "made", "add": "added"}
 
 
 def _act(write: bool, verb: str, what: str) -> bool:
@@ -592,11 +592,22 @@ def _init(store_dir, cfg, store_from_env: bool = False, write: bool = False,
                          f"run it from the project (--dir naming the store if it is "
                          f"not ../<project>-notes)")
     changed = False
+    d = Path(store_dir)
     new = not store.exists(store_dir)
+    held = new and d.is_dir() and any(d.iterdir())      # a dir with files becomes the store
+    in_git = (d / ".git").exists()
+    ignore = d / ".gitignore"
+    missing = store.missing_ignores(d) if ignore.exists() else []
     if write:
         store.ensure_store(store_dir)       # an existing store gets any piece it lacks
-    if new:
+    if held and in_git:
+        changed |= _act(write, "make", f"{store_dir} a store: its git repo, files and history stay")
+    elif held:
+        changed |= _act(write, "make", f"{store_dir} a store: git init there, and its files stay")
+    elif new:
         changed |= _act(write, "create", f"{store_dir} (the store: a git repo)")
+    if missing:
+        changed |= _act(write, "add", f"{', '.join(missing)} to {ignore}")
     up = gitref.set_upstream(store_dir, write)
     if up:
         changed |= _act(write, "set", f"upstream {up}")   # a bare `git push` of the store works
@@ -881,23 +892,26 @@ def _session_cache() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "symbion" / "gotchas"
 
 
-def _list_gotchas(ctx, sid: str, deadline: float) -> None:
+def _list_gotchas(ctx, sid: str, deadline: float, start: bool = True) -> None:
     """The list gotchas.sh reads on each tool call: per catalog name a
     #gotcha row is on or refers to, the row's id and the line the agent gets
     when a call names it. A trap on a file reached a session only through
     `context --target`, which four sessions skipped (2026-10-02 to 10-10).
-    Written at session start, so a compacted session gets each line again.
-    # ponytail: a gotcha written mid-session reaches other sessions at their
-    # next start; rebuild in the hook when notes.jsonl is newer if that bites."""
+    Written at session start, so a compacted session gets each line again,
+    and again at this session's own gotcha writes (`_relist_gotchas`), which
+    keep what the hook has printed (`start=False`).
+    # ponytail: a gotcha another session or the user writes mid-session, and
+    # this session's `undo` or `rename` of one, reach this list at its next
+    # start; rebuild in the hook when notes.jsonl is newer if that bites."""
     d = _session_cache()
     d.mkdir(parents=True, exist_ok=True)
     week = time.time() - 7 * 86400
-    for f in d.iterdir():                  # one per session: keep a week's
+    for f in d.iterdir() if start else ():     # one per session: keep a week's
         # Another session's sweep may take a file first; it costs that file only.
         with contextlib.suppress(FileNotFoundError):
             if f.stat().st_mtime < week:
                 f.unlink(missing_ok=True)
-    for spent in ("seen", "edit", "listed"):    # what gotchas.sh has printed
+    for spent in ("seen", "edit", "listed") if start else ():   # what gotchas.sh has printed
         (d / f"{sid}.{spent}").unlink(missing_ok=True)
     lines = []
     side = store.read_side(ctx.store_dir)
@@ -941,12 +955,45 @@ def _list_gotchas(ctx, sid: str, deadline: float) -> None:
                     f"{ref} ({age}{churn}): {body}")
             # The root's dir name: gotchas.sh matches `<root>/<name>`, so a
             # row on README.md does not fire on src/README.md.
-            root = ctx.cfg.for_type(t.type).work_root
+            # The main checkout, wherever the write stands: gotchas.sh finds a
+            # linked worktree by its `.git` naming `<root>/.git/worktrees/`, and
+            # a rebuild from one named the worktree, which no main path matched.
+            root = ctx.cfg.for_type(t.type).project_root
             leaf = Path(root).name if root and not re.search(_UNSAFE, Path(root).name) else ""
+            # A doc's name is under the store's docs/: the store alone matched
+            # `<store>/NAME`, where no doc is (2026-11-24).
+            leaf += "/docs" if leaf and t.type == "doc" else ""
             lines.append(f"{n.id}\t{t.name}\t{json.dumps(text, ensure_ascii=False)[1:-1]}\t{leaf}\n")
     # Beside the list, not a field of it: the Codex hook keeps four fields.
     store._replace_atomically(d / f"{sid}.head", json.dumps(head, ensure_ascii=False)[1:-1])
     store._replace_atomically(d / sid, "".join(lines))
+    store._replace_atomically(d / f"{sid}.from", str(Path(ctx.store_dir).resolve()))
+
+
+def _relist_gotchas(ctx, wrote) -> None:
+    """The hook printed a gotcha this session had just edited with its old
+    lead, and the agent took the write for a failure (2026-11-24): the list
+    was written at session start. A write that touches a listed row, or a row
+    now tagged gotcha, rebuilds this session's list when it was built from
+    this store. Runs after the write has landed, so it never fails it."""
+    sid = store.session_key()
+    if not wrote or not sid or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
+        return
+    try:
+        if (_session_cache() / f"{sid}.from").read_text(encoding="utf-8") \
+                != str(Path(ctx.store_dir).resolve()):
+            return
+        listed = {ln.split("\t", 1)[0]
+                  for ln in (_session_cache() / sid).read_text(encoding="utf-8").splitlines()}
+        if not listed & wrote and not any("gotcha" in n.tags for n in
+                                          store.heads(store.load(ctx.store_dir)) if n.id in wrote):
+            return
+        _list_gotchas(ctx, sid, time.monotonic() + HOOK_HISTORY_TIMEOUT, start=False)
+    except OSError:                    # no list, or a cache it cannot write
+        pass
+    except Exception as e:
+        print(f"symbion: the gotcha hook keeps this session's old lines, from a bug in "
+              f"symbion: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 _UNSAFE = r"[\t\n\r\"\\]"           # what a field of gotchas.sh's list cannot hold
@@ -1073,6 +1120,37 @@ def _one_stream() -> bool:
     return bool(a.st_ino) and (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
+class _IdsLast:
+    """A write's stdout, held to its end, and its stderr, counted on the way
+    through. In one stream that is no terminal (an agent's shell, `2>&1 |`) a
+    pipe holds stdout to the end, so the ids print below the notes: an
+    agent's `2>&1 | tail -1` kept the id alone, and every note went unread
+    (2026-11-23). `release` counts the lines above on the last id's line,
+    when the write ends well and they are more than `routine`.
+    # ponytail: Windows and OpenBSD give a pipe no file id, so _one_stream is
+    # never true there and the id stays bare."""
+
+    def __init__(self):
+        self.out, self.err, self.buf = sys.stdout, sys.stderr, io.StringIO()
+        self.lines = self.routine = 0
+        self.ok = False
+        sys.stdout, sys.stderr = self.buf, self
+
+    def write(self, s):
+        self.lines += s.count("\n")
+        return self.err.write(s)
+
+    def __getattr__(self, name):                 # the rest of stderr, as it was
+        return getattr(self.err, name)
+
+    def release(self) -> None:
+        sys.stdout, sys.stderr = self.out, self.err
+        text, notes = self.buf.getvalue(), self.lines - self.routine
+        if self.ok and notes > 0 and text.endswith("\n"):
+            text = f"{text[:-1]}  ({summ._count(notes, 'line')} of notes above)\n"
+        self.out.write(text)
+
+
 def _gui(store_dir):
     """The URL of a serve on this store, for the ids a terminal prints; None
     in a pipe, whose line never changes."""
@@ -1196,7 +1274,7 @@ def _print_note(n, *, state=None, subject=None, full=True, head=None, gui=None,
             elif st == "unstamped":
                 st += f" ({summ.age_phrase(n.created_at)})"
             extra += f" state={st}" + (f" distance={dist}" if dist is not None else "")
-            if st == "rewritten" and successor is not None:
+            if st in ("rewritten", "committed") and successor is not None:
                 # Not `successor_state=`: a grep for `state=current` matched it.
                 extra += (f" successor={successor.sha[:7]} successor_reads={successor.state}"
                           + ("" if successor.same_tree is None
@@ -2181,8 +2259,9 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     li.add_argument("--json", action="store_true",
                     help="a JSON array of entries. `--limit 1` prints the keys every entry has; "
                          "a project entry's `target.name` is null. A "
-                         "verdict kind adds `state` and `distance`, a `rewritten` one "
-                         "`successor`, `successor_state` and `same_tree`, and a superseded entry "
+                         "verdict kind adds `state` and `distance`, a `rewritten` or "
+                         "`committed` one `successor` and `successor_state`, a `rewritten` one "
+                         "`same_tree` too, and a superseded entry "
                          "(`--all`) `head`. `writer` names who ran the write: an agent, `gui` "
                          "or `cli`, null when unknown")
 
@@ -2304,10 +2383,11 @@ def _build_parser(target_types, arc_scopes, seed_scopes, store_dir, kinds, input
     who.add_argument("--all", dest="everyone", action="store_true",
                      help="take every pending entry and file: by default a commit takes the entries "
                           "this agent session wrote, or with no session, your author's, and from "
-                          "another project's tree no file but arcs.jsonl and the new docs they name")
+                          "another project's tree no file but arcs.jsonl and the docs they name that are "
+                          "new or first committed by this session")
     who.add_argument("--author", default=None, metavar="NAME",
                      help="take NAME's pending entries that no agent session wrote (a script's, "
-                          "or the user's in serve or at a terminal) in place of yours")
+                          "or the user's in serve or at a terminal) as well as yours")
     sub.add_parser("push", help="git push the store to its remote; commit first")
     sub.add_parser("pull", help="fetch a shared store's origin and merge it; pending entries "
                                 "stay pending, each its session's")
@@ -2934,7 +3014,9 @@ def _name_dirty(ctx, written) -> None:
     an untracked scratch file counts too. An open pre-registration reads
     `pending`, and its resolve is stamped anew, so its add says nothing.
     `undo` works only until another write or a store commit, and the note
-    sent readers to it after one (2026-11-12): it names that bound."""
+    sent readers to it after one (2026-11-12): it names that bound. A stamp
+    with `dirty_tree` follows the commit that holds that tree, and the note
+    says so instead (the dirty-stamps design, 2026-11-26)."""
     miss = [n for n in written if (n.provenance or {}).get("dirty")
             and not (n.spec.status and n.spec.verdict and store.read_status(n) == "open")]
     if not miss:
@@ -2948,6 +3030,12 @@ def _name_dirty(ctx, written) -> None:
     has = (f"{summ._count(count, 'uncommitted path')} "
            f"({', '.join(paths[:3])}{', …' if count > 3 else ''})"
            if count else "uncommitted changes")    # a [provenance] command may name none
+    if prov.get("dirty_tree"):
+        print(f"note: {tree} has {has}, so {what} `unverifiable (dirty tree)` until one "
+              f"commit holds this exact tree, each of those paths as it is now, and then "
+              f"`committed as SHA`. An edit before that commit keeps it unverifiable. A run "
+              f"outside the repo takes --external", file=sys.stderr)
+        return
     me = " ".join(filter(None, ["symbion", _named_store(ctx)]))
     print(f"note: {tree} has {has}, so {what} "
           f"`unverifiable (dirty tree)` for good. To stamp a commit: `{me} undo "
@@ -3199,8 +3287,10 @@ def _no_note(note_id: str, store_dir=None) -> None:
         print(f"  did you mean {own[0]}?", file=sys.stderr)
     # A project's session looked up the rows it had filed in another
     # project's store, and each miss took a second call (2026-10-25).
+    # By the lookup's own rule (_expand_id): a date and a digit, which no lookup
+    # takes, named the one sibling row that starts with it (2026-11-20).
     for p, ids in _sibling_ids(store_dir) if store_dir else ():
-        if len(hits := _held(ids, tok)) == 1:
+        if len(hits := [i for i in ids if i == tok or i.endswith("-" + tok)]) == 1:
             where = shlex.quote(_from_here(p))
             print(f"  {where} has it: symbion --dir {where} show {hits[0]}", file=sys.stderr)
 
@@ -3260,8 +3350,9 @@ _REMOVED = "{} removed from notes.jsonl"  # gitref.committed says it alike
 def _commit_files(ctx, everyone: bool, author=None) -> tuple[list[str], list[str]]:
     """The store's changed files but notes.jsonl, split as `commit` takes and
     leaves them: from another project's tree (api.elsewhere) it takes only
-    arcs.jsonl and the new docs its entries name. Each file, as `commit`
-    names them: status shows an untracked dir as one."""
+    arcs.jsonl and the docs its entries name that are new or that this
+    session brought in (api.docs_brought). Each file, as `commit` names
+    them: status shows an untracked dir as one."""
     s = ctx.store_dir
     changed = (["diff", "HEAD", "--name-only", "-z"]
                if gitref._git(s, "rev-parse", "-q", "--verify", "HEAD").returncode == 0
@@ -3272,7 +3363,8 @@ def _commit_files(ctx, everyone: bool, author=None) -> tuple[list[str], list[str
                    - {store.NOTES_FILE})
     if everyone or not api.elsewhere(ctx):
         return files, []
-    take = {store.ARCS_FILE} | (new & set(api.docs_named(ctx, api.own_rows(ctx, author))))
+    named = api.docs_named(ctx, api.own_rows(ctx, author))
+    take = {store.ARCS_FILE} | (new & set(named)) | set(api.docs_brought(ctx, named))
     return [f for f in files if f in take], [f for f in files if f not in take]
 
 
@@ -4189,10 +4281,9 @@ def _dispatch(args, ctx) -> int:
                 st = api.verdict_state(cfg, n, git_head) if n.spec.verdict else None
                 d = summ.json_row(raw[n.id], raw, since[n.id], st)
                 if st:
-                    if st[0] == "rewritten" and (s := gitref.successor(cfg, n.provenance,
-                                                                       git_head)):
+                    if s := gitref.follow(cfg, n.provenance, st[0], git_head):
                         d |= {"successor": s.sha, "successor_state": s.state,
-                              "same_tree": s.same_tree}
+                              **({"same_tree": s.same_tree} if st[0] == "rewritten" else {})}
                 if n.id in heads_of:
                     d["head"] = heads_of[n.id].id
                 rows.append(d)
@@ -4243,8 +4334,7 @@ def _dispatch(args, ctx) -> int:
             for n in notes:
                 state = api.verdict_state(cfg, n, git_head) if n.spec.verdict else None
                 subject = subjects.get(n.target.name) if n.target.type == "commit" else None
-                succ = (gitref.successor(cfg, n.provenance, git_head)
-                        if state and state[0] == "rewritten" else None)
+                succ = gitref.follow(cfg, n.provenance, state[0], git_head) if state else None
                 _print_note(n, state=state, subject=subject, successor=succ,
                             full=args.full or bool(args.note_id), head=heads_of.get(n.id),
                             gui=gui, since=since[n.id], by_id=by_id,
@@ -5223,7 +5313,7 @@ def _main(argv) -> int:
                   "merge.symbion.driver in the clone's .git/config)", file=sys.stderr)
             return 2
         return merge.driver(Path(argv[1]), Path(argv[2]), Path(argv[3]), argv[4])
-    ctx = None
+    ctx = held = None
     try:
         dir_value, rest = _extract_dir(argv)
         if rest[:1] in (["-V"], ["--version"]):
@@ -5301,6 +5391,9 @@ def _main(argv) -> int:
         # repeatedly, 2026-10-14).
         rest, said = _alternates(rest, ctx.kinds, ctx.input_types)
         args = parser.parse_args(rest)
+        ids = args.cmd in ("add", "resolve", "supersede") or args.cmd == "arc" and args.acmd == "seed"
+        if ids and sys.stdout is not None and not sys.stdout.isatty() and _one_stream():
+            held = _IdsLast()
         for line in said:                        # once it ran: a refusal says its own
             if _first_in_session("alt", line):
                 print(f"note: {line}", file=sys.stderr)
@@ -5343,15 +5436,21 @@ def _main(argv) -> int:
                          "phases", "move")
             or args.acmd == "reconcile" and (args.apply or args.resolve_stale))
         if rc == 0 and write:
+            lines = held.lines if held else 0
             _say_pending(ctx)
+            if held:                             # every write ends on it: no note
+                held.routine = held.lines - lines
         if rc == 0 and row_write:
             _say_news(ctx, args.wrote)
+            _relist_gotchas(ctx, args.wrote)
         if rc == 0 and write:
             _say_upstream(ctx)
         # A refused write said it already; summary --hook says it in its text.
         if rc == 0 and args.cmd not in ("trust", "serve") and not getattr(args, "hook", False) \
                 and (note := _untrusted_note(ctx)):
             print(note, file=sys.stderr)
+        if held:
+            held.ok = rc == 0
         return rc
     except SystemExit as e:
         code = e.code
@@ -5419,6 +5518,9 @@ def _main(argv) -> int:
     except ValueError as e:                      # AmbiguousName subclasses this;
         print(f"error: {_untrusted(ctx, e)}", file=sys.stderr)    # its own clause must come first
         return 1
+    finally:
+        if held:
+            held.release()
 
 
 if __name__ == "__main__":

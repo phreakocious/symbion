@@ -7,9 +7,11 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from contextlib import contextmanager, suppress
@@ -286,12 +288,14 @@ def tracked(cfg, path) -> bool:
 _TRACKED: dict = {}     # read-only: a worktree's tracked paths, as `_asked` keeps git's answers
 
 
-def markdown_files(cfg_or_path) -> list[str]:
-    """The markdown files under a checkout or a directory in one, as the
-    file catalog lists them: tracked, or new and not ignored. Read-only, the
-    public demo, tracked only: the leak scan read those. [] outside a repo."""
+def doc_files(cfg_or_path, ends=("md",)) -> list[str]:
+    """The files under a checkout or a directory in one whose names end in
+    one of `ends`, in any case, as the file catalog lists them: tracked, or
+    new and not ignored. Read-only, the public demo, tracked only: the leak
+    scan read those. [] outside a repo."""
     new = () if store.read_only() else ("--others", "--exclude-standard")
-    r = _git(cfg_or_path, "ls-files", "-z", "--cached", *new, "--", ":(icase)*.md")
+    r = _git(cfg_or_path, "ls-files", "-z", "--cached", *new, "--",
+             *(f":(icase)*.{e}" for e in ends))
     return list(dict.fromkeys(n for n in r.stdout.split("\0") if n)) if r.returncode == 0 else []
 
 
@@ -493,6 +497,91 @@ def _dirty_paths(cfg) -> list[str]:
     return out
 
 
+# The most changed and new bytes a dirty write hashes: `add -A` reads each in
+# full. Beside new files of random bytes a stamp took 0.32 s at 20 MB and
+# 0.88 s at 90 MB; past the cap it takes 0.06 s and follows nothing
+# (2026-11-26). Code changes run to kilobytes.
+DIRTY_TREE_BYTES = 20_000_000
+
+
+def _size(p: Path) -> int:
+    try:
+        return p.lstat().st_size
+    except OSError:                # a deletion
+        return 0
+
+
+def _dirty_tree(cfg) -> str | None:
+    """The tree `git add -A` would commit from this work tree, so a dirty
+    stamp can follow the commit that holds it (the dirty-stamps design,
+    2026-11-26). Hashed in a copy of the index with a throwaway object
+    directory that reads the repo's as an alternate: nothing under the
+    repo's .git changes. None on any git failure, and where the tree could
+    match a commit that lacks an edit the run saw, or the hash would write
+    under .git: an assume-unchanged or skip-worktree entry, a sparse
+    checkout, a dirty submodule, a file with a clean filter to run (git-lfs
+    kept a copy under .git/lfs)."""
+    root = _root(cfg)
+    if root is None:
+        return None
+
+    def git(*args, input=None, env=None):
+        # surrogateescape: a path that is not UTF-8 goes back to git as it came.
+        # No compression: the objects are thrown away, and beside a 1 GB new
+        # file `add -A` took 25.5 s with it, 6.1 s without (2026-11-26).
+        return subprocess.run(["git", "-C", str(root), "-c", "core.splitIndex=false",
+                               "-c", "core.compression=0", *args],
+                              input=input, capture_output=True, text=True, encoding="utf-8",
+                              errors="surrogateescape", env=env)
+    if git("config", "--bool", "core.sparseCheckout").stdout.strip() == "true":
+        return None
+    r = git("ls-files", "-v", "-s", "-z")          # TAG MODE SHA STAGE\tPATH
+    if r.returncode:
+        return None
+    gitlinks = set()
+    for e in filter(None, r.stdout.split("\0")):
+        # A lowercase tag is assume-unchanged, S skip-worktree: `git add -A`
+        # skips their edits, which `git status` does not show either.
+        if e[:1].islower() or e[:1] == "S":
+            return None
+        meta, _, path = e.partition("\t")
+        if meta.split()[1:2] == ["160000"]:
+            gitlinks.add(path)
+    changed = git("diff-files", "--name-only", "-z")
+    new = git("ls-files", "-z", "--others", "--exclude-standard")
+    if changed.returncode or new.returncode:
+        return None
+    changed = set(filter(None, changed.stdout.split("\0")))
+    if changed & gitlinks:        # the tree holds the submodule's commit, not its edits
+        return None
+    paths = changed | set(filter(None, new.stdout.split("\0")))
+    if paths:
+        a = git("check-attr", "-z", "--stdin", "filter", input="\0".join(paths) + "\0")
+        f = a.stdout.split("\0")
+        if a.returncode or any(v not in ("unspecified", "unset") for v in f[2::3]):
+            return None
+    if sum(_size(Path(root, p)) for p in paths) > DIRTY_TREE_BYTES:
+        return None
+    index = Path(root, git("rev-parse", "--git-path", "index").stdout.strip())
+    objects = Path(root, git("rev-parse", "--git-path", "objects").stdout.strip()).resolve()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        try:
+            # Its mtime too: git re-reads an entry not older than the index,
+            # and a copy dated now trusted the stat of a same-size edit made
+            # in the index's second (10 of 10 runs, 2026-11-26).
+            shutil.copy2(index, Path(tmp, "index"))
+        except OSError:
+            return None
+        os.mkdir(Path(tmp, "objects"))
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp, "index")),
+               "GIT_OBJECT_DIRECTORY": str(Path(tmp, "objects")),
+               "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(objects)}
+        if git("add", "-A", env=env).returncode:
+            return None
+        t = git("write-tree", env=env)
+    tree = t.stdout.strip()
+    return tree if t.returncode == 0 and _HEX.fullmatch(tree) else None
+
 
 def provenance_stamp(cfg, spec, repo=None):
     """Verdict kinds only: the bit, not the label, decides. A configured
@@ -546,9 +635,14 @@ def provenance_stamp(cfg, spec, repo=None):
     r = _git(cfg, "show", "-s", "--no-show-signature", "--format=%ad%x00%s%x00%T",
              "--date=raw", head, "--", errors="replace")
     key = r.stdout.rstrip("\n").split("\0") if r.returncode == 0 else []
+    try:
+        dirty_tree = _dirty_tree(cfg) if paths else None
+    except OSError:                # the temp dir: the stamp lands without the tree
+        dirty_tree = None
     return {"sha": head, "dirty": bool(paths), **({"repo": repo} if repo else {}),
             **(dict(zip(("author_date", "subject", "tree"), key)) if len(key) == 3 else {}),
-            **({"dirty_count": len(paths), "dirty_paths": paths[:20]} if paths else {})}
+            **({"dirty_count": len(paths), "dirty_paths": paths[:20]} if paths else {}),
+            **({"dirty_tree": dirty_tree} if dirty_tree else {})}
 
 
 _HEX = re.compile(r"[0-9a-fA-F]{4,64}")
@@ -654,7 +748,10 @@ def check_state(cfg, prov, head: str | None = None):
     if not store.stamp_sha(prov):
         return ("unverifiable", None)
     if prov.get("dirty"):
-        return ("unverifiable", None)
+        # Never `current`: the run's tree was no commit's when written. Once
+        # one holds it, the state names that commit (the dirty-stamps design).
+        c = committed_as(cfg, prov, head)
+        return ("committed", c.distance) if c else ("unverifiable", None)
     # A commit id, never a ref: the literal `HEAD` an unborn branch once
     # stamped read `behind 0` for good.
     stamp = prov["sha"]
@@ -725,6 +822,75 @@ class Successor(NamedTuple):
     state: str
     distance: int | None
     same_tree: bool | None
+
+
+def committed_as(cfg, prov, head: str | None = None) -> Successor | None:
+    """The oldest commit in STAMP..HEAD whose tree is a dirty stamp's
+    `dirty_tree`: the commit that holds the tree the write saw (the
+    dirty-stamps design, 2026-11-26). Its `state` and `distance` are its own
+    relation to HEAD. None, at no git call, for a stamp without
+    `dirty_tree`; and for no match, or a stamp git has pruned."""
+    sha, tree = store.stamp_sha(prov), (prov or {}).get("dirty_tree")
+    if not (isinstance(sha, str) and isinstance(tree, str)
+            and _HEX.fullmatch(sha) and _HEX.fullmatch(tree)):
+        return None
+    if getattr(cfg, "repos", None):
+        routed = stamp_cfg(cfg, prov)
+        if routed.work_root != cfg.work_root:
+            head = None            # the caller's head is its own repo's
+        cfg = routed
+    head = _head_once(cfg) if head is None else head
+    if not head:
+        return None
+    key = ("committed", str(_root(cfg)), sha, tree.lower(), head)
+    found = _RELATIONS.get(key)
+    trees = _head_trees(cfg, head, prov.get("author_date")) if found is None else None
+    if found is None and trees is not None and tree.lower() not in trees:
+        found = _RELATIONS[key] = ""       # no commit HEAD reaches has the tree
+    if found is None:
+        r = _git(cfg, "log", "--no-show-signature", "--format=%H %T", f"{sha}..{head}", "--")
+        if r.returncode:           # a pruned stamp: not kept, a fetch can bring it
+            return None
+        hits = [f[0] for line in r.stdout.split("\n")
+                if len(f := line.split()) == 2 and f[1] == tree.lower()]
+        found = _RELATIONS[key] = hits[-1] if hits else ""     # log is newest first
+    if not found:
+        return None
+    state, distance = check_state(cfg, {"sha": found, "dirty": False}, head)
+    return Successor(found, state, distance, None) if state in ("current", "behind") else None
+
+
+def _head_trees(cfg, head: str, date) -> set | None:
+    """The tree of each commit HEAD reaches, committed from a day before
+    `date` (a stamp's raw author date) on, else all: a dirty stamp whose
+    tree is in none needs no walk of its own. 200 such rows took `list`
+    from 0.16 s to 2.5 s at one `git log` each (2026-11-26). Kept for one
+    heads_once scope, widened as _live_commits is; None on a failure."""
+    try:
+        since = int(str(date).split()[0])
+    except (ValueError, IndexError):
+        since = None
+    seen, key = _HEADS.get(), ("trees", str(_root(cfg)), head)
+    if seen is not None and key in seen and (seen[key][0] is None
+                                            or since is not None and seen[key][0] <= since):
+        return seen[key][1]
+    whole = since is None or (seen is not None and key in seen)
+    floor = () if whole else (
+        f"--since={datetime.fromtimestamp(since - 86400, timezone.utc).isoformat()}",)
+    r = _git(cfg, "log", head, "--no-show-signature", "--format=%T", *floor, "--")
+    if r.returncode:
+        return None
+    trees = set(r.stdout.split())
+    if seen is not None:
+        seen[key] = (None if whole else since, trees)
+    return trees
+
+
+def follow(cfg, prov, state: str, head: str | None = None) -> Successor | None:
+    """The commit a `rewritten` or a `committed` state names, else None."""
+    if state == "rewritten":
+        return successor(cfg, prov, head)
+    return committed_as(cfg, prov, head) if state == "committed" else None
 
 
 def _live_commits(cfg, since: int) -> dict:

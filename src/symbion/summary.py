@@ -172,6 +172,11 @@ def options_line(o) -> str:
     return " | ".join(o)
 
 
+def answer_key(s: str) -> str:
+    """A line as it matches an option: `No.` is the option `no`."""
+    return s.strip().rstrip(".").casefold()
+
+
 def picked(n, by_id) -> str | None:
     """The option a question's body gives on a line of its own, below its
     first line: an answer button writes the option's words alone. None when
@@ -184,9 +189,7 @@ def picked(n, by_id) -> str | None:
     None with no chain, `by_id`."""
     if by_id is None:
         return None
-
-    def key(s):
-        return s.strip().rstrip(".").casefold()
+    key = answer_key
 
     def added(new, old):
         return Counter(map(key, (new.body or "").splitlines())) - Counter(map(key, (old.body or "").splitlines()))

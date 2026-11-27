@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Request
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from nicegui import Client, app, ui
 from starlette.exceptions import HTTPException
 
@@ -23,7 +23,7 @@ from .chrome import ABOUT, SOURCE, own_write, shell, source_href, store_name
 from .notes import (NoteMarkdown, ago, commit_meta, demo_says, edit_dialog, file_buttons,
                     forge_buttons, heading, history, link_ids,
                     kind_class, read_only_refused, reading, refusal_shown, render_note,
-                    short_id, target_href, view_button)
+                    short_id, target_href, view_button, view_path)
 from .theme import (FAVICON, FONTS_DIR, FONTS_URL, MAP_EMPTY, MAP_NEW, MAP_OPEN, MAP_TEXT,
                     PALETTE)
 
@@ -247,6 +247,14 @@ def _commit_card(ctx, sha: str, loaded, every: bool = False) -> None:
         _not_shown(len(files) - len(shown), "file", target_href("commit", sha))
 
 
+# What the Docs page lists with no entry on it (the user, 2026-11-24: "docs
+# should handle .txt and .pdf"). A repo's .txt is build or test input:
+# CMakeLists.txt, requirements.txt, dumps; a store's docs/ holds only docs.
+REPO_DOCS = ("md", "pdf")
+STORE_DOCS = ("md", "txt", "pdf")
+REPO_ENDS = tuple(f".{e}" for e in REPO_DOCS)
+
+
 def _docs_board(ctx, title: str, docs, on, mark: str, all: str, aside: str = "") -> None:
     """A board of the Docs page: a row a file, with its entries and the open
     ones among them, and a read button where the viewer can show it. Past
@@ -308,12 +316,16 @@ def _wrap_board(ctx, wrap: dict) -> None:
 
 def _recent(ctx, n, since, git_head) -> bool:
     """Written since `since`, or current at HEAD. Only a row stamped at HEAD
-    can be current, so the rest cost no git call."""
+    can be current, or a dirty stamp that HEAD's tree holds (`committed as
+    X, current`), so the rest cost no git call."""
     sha = S.stamp_sha(n.provenance)
     if S.written_at(n) >= since:
         return True
     if not sha:
         return False
+    if (n.provenance or {}).get("dirty_tree"):
+        # Its stamp is the commit before HEAD's; current when HEAD holds its tree.
+        return api.verdict_state(ctx.cfg, n, git_head or None) == ("committed", 0)
     if ctx.cfg.repos and (n.provenance or {}).get("repo") != ctx.cfg.here:
         # `git_head` is the serve's repo's, or "" when it stands in none: a
         # stamp of another repo is read against its own HEAD.
@@ -416,6 +428,17 @@ def build_page(ctx, *, author: str) -> None:
         """The source, by way of this serve (`chrome.source_href`). A 302 is
         not cached, so each click reaches the access log."""
         return RedirectResponse(SOURCE + "#readme", status_code=302)
+
+    # A PDF the viewer shows (notes.viewable), for its <iframe> and its new
+    # tab: the browser draws it. Only a PDF, and only where view_path reads.
+    @app.get("/pdf")
+    def pdf(name: str = "", type: str = ""):
+        path = (view_path(ctx, name, type or None) or (None,))[0]
+        if path is None or path.suffix.lower() != ".pdf":
+            raise HTTPException(404, f"no PDF the viewer shows: {name}")
+        # Its name, for the viewer's title and a download: else both read "pdf".
+        return FileResponse(path, media_type="application/pdf", filename=path.name,
+                            content_disposition_type="inline")
 
     # The ⌘K palette's rows for what is typed (palette.py). A plain def:
     # FastAPI runs it on a thread, off the loop every page's socket shares.
@@ -713,22 +736,22 @@ def build_page(ctx, *, author: str) -> None:
     @ui.page("/docs")
     def docs_page(all: str = ""):
         """The user, 2026-10-16: "add Docs below Arcs in the sidebar and show
-        all the documents we know about". Every markdown file a row is on or
-        cites, and every store doc of any kind, the repo's, then the store's
-        docs/, the most named first."""
+        all the documents we know about". Every markdown or PDF file a row
+        is on or cites, and every store doc of any kind, the repo's, then the
+        store's docs/, the most named first."""
         shell(ctx, author, [("Docs", None)], here="/docs", cards=False)
         # A store doc of any kind an entry is on, a script or a record too: it
-        # had no page (a browser agent's review, 2026-11-11). The repo's: markdown.
+        # had no page (a browser agent's review, 2026-11-11). The repo's: markdown and PDF.
         on = {t: rows for t, rows in _naming(S.heads(S.load(ctx.store_dir))).items()
-              if t[1] and (t[0] == "doc" or t[1].lower().endswith(".md"))}
+              if t[1] and (t[0] == "doc" or t[1].lower().endswith(REPO_ENDS))}
         named = len(on)
         # Then those no entry names (the user, 2026-10-27: "README.md in
         # particular"). An item named as a path opens the same file.
         for typ, cfg in [(t, ctx.cfg.for_type(t)) for t in ctx.cfg.repos] or [("file", ctx.cfg)]:
-            for name in gitref.markdown_files(cfg):
+            for name in gitref.doc_files(cfg, REPO_DOCS):
                 if (typ, name) not in on and ("item", name) not in on:
                     on[(typ, name)] = []
-        for name in gitref.markdown_files(ctx.store_dir / "docs"):
+        for name in gitref.doc_files(ctx.store_dir / "docs", STORE_DOCS):
             on.setdefault(("doc", name), [])
         docs, root = ctx.store_dir / "docs", ctx.cfg.project_root
         try:
@@ -739,7 +762,7 @@ def build_page(ctx, *, author: str) -> None:
             # "on", as an entry is on its target and refs: "name" read as a
             # mention in a body, which counts for nothing here (2026-11-11)
             ui.label(f"{summ._count(named, 'doc')} with entries on them, the most first"
-                     + (f"; then {summ._count(len(on) - named, 'markdown file')} with none"
+                     + (f"; then {summ._count(len(on) - named, 'file')} with none"
                         if len(on) > named else "")).classes("sb-subtitle")
             _docs_board(ctx, "in the repo", [t for t in on if t[0] != "doc"], on, "docs-repo", all)
             _docs_board(ctx, "in the store", [t for t in on if t[0] == "doc"], on, "docs-store",

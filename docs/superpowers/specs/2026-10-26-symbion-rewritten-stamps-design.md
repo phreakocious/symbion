@@ -114,7 +114,8 @@ today: the lookup runs only for `dangling`. A dirty stamp still reads
   (the user's call, 2026-10-26).
 - A summary line for dangling checks.
 - A verb that reads a commit map. Build it when a miss shows up in the field.
-- A working-tree hash for dirty stamps. That is a separate problem.
+- A working-tree hash for dirty stamps. That is a separate problem. (Built
+  2026-11-26: `2026-11-26-symbion-dirty-stamps-design.md`.)
 
 ## Tests to aim
 

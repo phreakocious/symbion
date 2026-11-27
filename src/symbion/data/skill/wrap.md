@@ -22,6 +22,9 @@ below the open entries.
    - a trap on its file, tagged `gotcha`; a decision; a bug; a task, due when
      a job is still running.
 
+   Where `symbion schema` lists no `task` kind, a task here and below is the
+   kind it describes as a concrete next action.
+
    The entries the session touched get tied off:
    - each one it finished and left open: `resolve --body`, saying how;
    - each one whose truth changed: `supersede`;

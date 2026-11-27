@@ -771,9 +771,11 @@ def why_unverifiable(prov) -> str:
 
 
 def rewritten_words(s) -> str:
-    """What follows `rewritten` for a gitref.Successor: the commit the run's
-    became, the tree test, and that commit's own state. An unknown tree gets
-    no word, so it reads as neither answer (the rewritten-stamps design)."""
+    """What follows `rewritten` or `committed` for a gitref.Successor: the
+    commit the run's became, or the one that holds its tree, the tree test,
+    and that commit's own state. An unknown tree gets no word, so it reads
+    as neither answer (the rewritten-stamps design); `committed` has none,
+    its tree is the same by construction."""
     tree = {True: ", same tree", False: ", tree differs"}.get(s.same_tree, "")
     rel = s.state if s.distance is None or s.state == "current" else f"{s.state} {s.distance}"
     return f"as {s.sha[:7]}{tree}, {rel}"
@@ -973,7 +975,7 @@ def kind_losses(n: store.Note, kind: str, spec) -> list[str]:
 def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = None,
               add_refs=None, rm_refs=None, prepend_body: str | None = None,
               add_measurements=None, rm_measurements=None, external: bool = False,
-              replace_body=None, **fields) -> store.Note:
+              replace_body=None, options_seen=None, **fields) -> store.Note:
     """Target, provenance and target_blob are INHERITED from the superseded row
     and never re-resolved (a tag added later is no re-reading of the file), so
     an edit that names no target needs no canonicalization -- a departed
@@ -1002,7 +1004,9 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
     second landing as a stamped correction to an already-resolved row -- the
     same race shape as `retag`, and equally no data loss.
 
-    `refs` replaces the entry's refs; `add_refs` and `rm_refs` edit them."""
+    `refs` replaces the entry's refs; `add_refs` and `rm_refs` edit them.
+    `options_seen`: the `options` given apply only while the tip's are
+    still these (store's `_supersede_unlocked`)."""
     for key in ("provenance", "target_blob"):
         if key in fields:
             raise ValueError(
@@ -1046,7 +1050,7 @@ def supersede(ctx: Ctx, note_id: str, *, author: str, append_body: str | None = 
                            add_refs=add_refs, rm_refs=rm_refs, prepend_body=prepend_body,
                            replace_body=replace_body,
                            add_measurements=add_measurements, rm_measurements=rm_measurements,
-                           canonicalize=canonicalize,
+                           canonicalize=canonicalize, options_seen=options_seen,
                            target_types=ctx.target_types, **fields)
 
 
@@ -1121,11 +1125,14 @@ def reopen_and_place(ctx: Ctx, entry_id: str, *, phase=None, before=None, after=
 
 def own_rows(ctx: Ctx, author: str | None = None):
     """keep() for the CLI's `commit`: this session's pending rows (store.own_rows);
-    with `author` (`commit --author`), that author's rows no agent session wrote,
-    whoever runs it."""
+    with `author` (`commit --author`), that author's rows no agent session wrote
+    as well. In their place, a session that ran the summary's `--author NAME
+    now` after its own writes left them, named as another session's (2026-11-23)."""
+    mine = store.own_rows(ctx.store_dir, author_default())
     if author:
-        return store.own_rows(ctx.store_dir, author, sessionless=True)
-    return store.own_rows(ctx.store_dir, author_default())
+        theirs = store.own_rows(ctx.store_dir, author, sessionless=True)
+        return lambda r: mine(r) or theirs(r)
+    return mine
 
 
 def undo(ctx: Ctx, note_id: str | None, *, author: str, apply: bool = True) -> dict:
@@ -1147,24 +1154,55 @@ def undo(ctx: Ctx, note_id: str | None, *, author: str, apply: bool = True) -> d
 def elsewhere(ctx: Ctx) -> bool:
     """The store is another project's (Ctx.followed_owner), and the cwd is in
     neither that project nor the store. A commit from there takes no file but
-    the new docs its rows name: a dogfood row's commit from another project
-    took two files a session of the store's own had changed, and its push
-    shipped them (2026-10-31)."""
+    the docs its rows name, new or brought in by this session (docs_brought):
+    a dogfood row's commit from another project took two files a session of
+    the store's own had changed, and its push shipped them (2026-10-31)."""
     return ctx.followed_owner and not Path.cwd().resolve().is_relative_to(ctx.store_dir)
 
 
-def docs_named(ctx: Ctx, keep) -> list[str]:
-    """The docs/ files, store-relative, that the pending rows a commit takes
-    name as target or ref. A name that leads out of docs/ names nothing:
-    `doc:../notes.jsonl` would stage every pending row."""
-    rows = store.pending_rows(ctx.store_dir)
-    taken = store.with_bases(rows, keep)
-    names = sorted({o.get("name") for r in rows if taken(r)
+def _doc_paths(ctx: Ctx, rows) -> list[str]:
+    """The docs/ files, store-relative, that `rows` name as target or ref. A
+    name that leads out of docs/ names nothing: `doc:../notes.jsonl` would
+    stage every pending row."""
+    names = sorted({o.get("name") for r in rows
                     for o in (r.get("target") or {}, *(r.get("refs") or ()))
                     if isinstance(o, dict) and o.get("type") == "doc" and o.get("name")})
     root = ctx.store_dir.resolve()
     paths = (object_path(ctx, "doc", n) for n in names)
     return [p.relative_to(root).as_posix() for p in paths if p and p.is_file()]
+
+
+def docs_named(ctx: Ctx, keep) -> list[str]:
+    """The docs/ files that the pending rows a commit takes name (_doc_paths)."""
+    rows = store.pending_rows(ctx.store_dir)
+    return _doc_paths(ctx, filter(store.with_bases(rows, keep), rows))
+
+
+def docs_brought(ctx: Ctx, paths) -> list[str]:
+    """Of `paths` (docs_named), each tracked doc with an uncommitted change that
+    this agent session brought in: the commit that added it took a row of this
+    session naming it. A commit from another project's tree takes that edit, as
+    it took the doc when new: it left a session's edit to its own doc (2026-11-24).
+    Any other edit to a tracked doc is its writer's, maybe half written.
+    # ponytail: a commit's session marks last a week (store._forget_committed),
+    # so a doc brought in before that reads as another writer's."""
+    key, s = store.session_key(), ctx.store_dir
+    if not key or not paths:
+        return []
+    mine = {i for i, k in store.sessions(s, committed=True).items() if k == key}
+    # Plumbing: a porcelain diff rewrites the index, and a commit's `git add` beside it refuses.
+    changed = gitref._git(s, "--literal-pathspecs", "diff-index", "--name-only", "-z",
+                          "--no-renames", "HEAD", "--", *paths).stdout.split("\0")
+    out = []
+    for p in (p for p in paths if p in changed):
+        sha = gitref._git(s, "--literal-pathspecs", "log", "-1", "--no-show-signature",
+                          "--diff-filter=A", "--format=%H", "--", p).stdout.strip()
+        rows = sha and store.added_rows(gitref._git(
+            s, "show", "-U0", "--no-renames", "--format=", sha, "--", store.NOTES_FILE,
+            errors="replace", keep=False).stdout)
+        if rows and p in _doc_paths(ctx, [r for r in rows if r.get("id") in mine]):
+            out.append(p)
+    return out
 
 
 def commit(ctx: Ctx, message: str, *, author: str | None = None,
@@ -1175,16 +1213,18 @@ def commit(ctx: Ctx, message: str, *, author: str | None = None,
     GUI), only that author's pending rows go in, and the new docs/ files
     they name: a doc saved from the GUI had no other way in. With `everyone`,
     every row and file; else the caller's own rows (store.own_rows) and every
-    file, or from another project (`elsewhere`) the new docs/ files they name.
-    `as_author` (`commit --author`) takes that author's rows no agent session
-    wrote in place of the caller's. `wrap` marks a session's end: the message
-    is the next session's handoff."""
+    file, or from another project (`elsewhere`) the docs/ files they name that
+    are new or that this session brought in (docs_brought). `as_author`
+    (`commit --author`) takes that author's rows no agent session wrote as well
+    as the caller's. `wrap` marks the caller's session's end: the message is the
+    next session's handoff."""
     keep = (None if everyone else (lambda r: r.get("author") == author) if author
             else own_rows(ctx, as_author))
     named = bool(author) or (not everyone and elsewhere(ctx))
+    docs = docs_named(ctx, keep) if named else []
     ok = store.commit(ctx.store_dir, message, ctx.cfg, keep=keep, files=not named,
-                      wrap=(author or as_author or author_default()) if wrap else None,
-                      paths=docs_named(ctx, keep) if named else ())
+                      wrap=(author or author_default()) if wrap else None,
+                      paths=docs, edits=() if author else docs_brought(ctx, docs))
     gitref.set_upstream(ctx.store_dir)
     return ok
 

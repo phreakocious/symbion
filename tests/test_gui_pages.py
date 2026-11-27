@@ -429,14 +429,15 @@ async def test_a_write_on_an_entry_about_the_arc_lights_nothing(user: User, ctx_
     await asyncio.sleep(0.3)                                    # a few ticks
     assert _stale(user) == []
     (card,) = [c for c in cards(user) if c.props["data-id"] == about.id]
-    _emit(user, card, *((act, "ship") if act == "answer" else (act,)))
+    # The old page's poll may light before the reload lands: read the new page's.
+    await _reloaded(user, lambda: _emit(user, card, *((act, "ship") if act == "answer" else (act,))))
 
     def landed():
         head = store.chain_tip(store.load(ctx.store_dir), about.id)
         return {"star": "priority" in head.tags, "resolve": head.status == "resolved",
                 "answer": head.body.endswith("ship")}[act]
     await _until(landed)
-    await asyncio.sleep(0.3)                                    # a few ticks, and the reload
+    await asyncio.sleep(0.3)                                    # a few ticks
     assert _stale(user) == []
 
 
@@ -1146,6 +1147,37 @@ async def test_a_question_without_options_takes_typed_words_only(user: User, ctx
     part(user, "answer-field").type("8080").trigger("keydown.enter")
     assert _head(tmp_path, bare).body.rstrip().endswith("8080")
     assert _head(tmp_path, bare).author == "ada"
+
+
+@pytest.mark.parametrize("typed, kept", [("neither: it listens on 443", None),
+                                         ("8080.", ("80", "8080"))])
+async def test_typed_words_that_are_no_option_drop_the_options(user: User, ctx_with_notes,
+                                                               tmp_path, typed, kept):
+    """The asker's next addition drew the buttons the person had passed over
+    (the user, 2026-11-23). An option's words typed are a pick, as a click is,
+    and keep them."""
+    q = _q(ctx_with_notes, "Which port?", options=["80", "8080"])
+    await user.open("/")
+    part(user, "answer-field").type(typed).trigger("keydown.enter")
+    head = _head(tmp_path, q)
+    assert (head.body.rstrip().endswith(typed), head.options) == (True, kept)
+    api.supersede(ctx_with_notes, q, author="sam", append_body="And on the staging box?")
+    await user.open("/")
+    await see(user, "answer-row")
+    assert [b.text for b in parts(user, "answer-option")] == list(kept or ())
+
+
+async def test_an_answer_drops_only_the_options_its_card_drew(user: User, ctx_with_notes,
+                                                              tmp_path):
+    """Options the asker set after the card drew are none the person passed
+    over: the answer goes below them, and they stay."""
+    q = _q(ctx_with_notes, "Which port?", options=["80", "8080"])
+    await user.open("/")
+    field = part(user, "answer-field")
+    api.supersede(ctx_with_notes, q, author="sam", options=["443", "8443"])
+    field.type("neither: it listens on 9000").trigger("keydown.enter")
+    head = _head(tmp_path, q)
+    assert (head.body.rstrip().endswith("9000"), head.options) == (True, ("443", "8443"))
 
 
 async def _reloaded(user: User, by=None) -> None:
@@ -2418,7 +2450,7 @@ async def test_docs_lists_the_docs_entries_are_on(user: User, repo, tmp_path,
     await user.should_see(marker="place-docs")
     await user.open("/docs")
     await user.should_see("4 docs with entries on them, the most first; "
-                          "then 2 markdown files with none")
+                          "then 2 files with none")
     got = {}
     for board in ("docs-repo", "docs-store"):
         with user.scope(marker=board):
@@ -2454,6 +2486,60 @@ async def test_docs_lists_the_docs_entries_are_on(user: User, repo, tmp_path,
     with user.scope(marker="docs-store"):
         assert (len(user.find(marker="doc-link").elements), past()) == (5, 0)
         await user.should_not_see(marker="docs-more")
+
+
+PDF = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n%%EOF\n"
+
+
+async def test_docs_lists_txt_and_pdf_and_the_viewer_opens_a_pdf(user: User, repo, tmp_path,
+                                                                  monkeypatch):
+    """The user, 2026-11-24: "docs should handle .txt and .pdf". With no entry
+    on it, the Docs page lists a store doc in .txt or .pdf and a repo's PDF,
+    but not a repo's .txt: that is build or test input (CMakeLists.txt). A
+    PDF opens in the viewer, in an <iframe> from /pdf and in a new tab, and
+    /pdf serves only a PDF the viewer reads."""
+    ctx = api.resolve(str(tmp_path))
+    (repo / "manual.pdf").write_bytes(PDF)
+    (repo / "CMakeLists.txt").write_text("project(x)\n")
+    (repo / "notes.md").write_text("# n\n")
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs" / "run.txt").write_text("ok\n")
+    (tmp_path / "docs" / "scan.pdf").write_bytes(PDF)
+    (tmp_path / "docs" / "out.log").write_text("x\n")       # listed once an entry is on it
+    build_page(ctx, author="ada")
+    await user.open("/docs")
+    got = {}
+    for board in ("docs-repo", "docs-store"):
+        with user.scope(marker=board):
+            got[board] = sorted(a.text for a in user.find(marker="doc-link").elements)
+            got[board + " read"] = len(user.find(marker="file-open").elements)
+    assert got == {"docs-repo": ["manual.pdf", "notes.md"], "docs-repo read": 2,
+                   "docs-store": ["run.txt", "scan.pdf"], "docs-store read": 2}
+
+    await user.open("/object?type=doc&name=scan.pdf")
+    user.find(marker="file-open").click()
+    await user.should_see(marker="pdf-view", retries=40)
+    (frame,) = user.find(marker="pdf-view").elements
+    (tab,) = user.find(marker="pdf-tab").elements
+    assert frame.props["src"] == tab.props["href"] == "/pdf?name=scan.pdf&type=doc"
+    assert tab.props["target"] == "_blank"
+
+    async def get(query):
+        r = await user.http_client.get("/pdf?" + query)
+        return r.status_code, r.headers.get("content-type"), r.content
+    assert await get("name=scan.pdf&type=doc") == (200, "application/pdf", PDF)
+    r = await user.http_client.get("/pdf?name=scan.pdf&type=doc")
+    assert r.headers["content-disposition"] == 'inline; filename="scan.pdf"'   # its title
+    assert await get("name=manual.pdf") == (200, "application/pdf", PDF)
+    for query in ("name=run.txt&type=doc", "name=notes.md", "name=gone.pdf", "name=",
+                  "name=../p/manual.pdf&type=doc"):           # out of docs/, into the repo
+        assert (await get(query))[0] == 404, query
+    # Read-only, the public demo: only a PDF git tracks.
+    monkeypatch.setenv("SYMBION_READ_ONLY", "1")
+    try:
+        assert (await get("name=manual.pdf"))[0] == 404
+    finally:
+        gitref._asked.cache_clear()
 
 
 async def test_the_filter_reaches_the_rows_of_docs_tags_and_arcs(user: User, repo, tmp_path):
@@ -2674,7 +2760,8 @@ async def test_the_sidebar_lists_the_kinds_with_no_status_under_records(
 def test_the_viewer_reads_only_text_it_knows_inside_the_checkout(repo, tmp_path):
     """A target name is typed text: the viewer must not read through it. It
     shows markdown, a file pygments names a language for, and as plain text a
-    name mimetypes calls neither binary nor packed (`.env`, `LICENSE`, a log)."""
+    name mimetypes calls neither binary nor packed (`.env`, `LICENSE`, a log),
+    and a PDF (the user, 2026-11-24)."""
     from symbion.gui.notes import view_path
     ctx = api.resolve(str(tmp_path))
     (repo / "docs").mkdir()
@@ -2682,11 +2769,13 @@ def test_the_viewer_reads_only_text_it_knows_inside_the_checkout(repo, tmp_path)
     (repo / "x.py").write_text("x = 1")
     (repo / "Makefile").write_text("all:")
     (repo / "logo.png").write_bytes(b"\x89PNG")
+    (repo / "manual.PDF").write_bytes(b"%PDF")
     (repo / "notes.txt.gz").write_bytes(b"\x1f\x8b")
     (tmp_path / "out.md").write_text("outside")
     for name in (".env", "LICENSE", ".gitignore", "run.log"):
         (repo / name).write_text("A=1")
-    for name in ("docs/a.md", "x.py", "Makefile", ".env", "LICENSE", ".gitignore", "run.log"):
+    for name in ("docs/a.md", "x.py", "Makefile", ".env", "LICENSE", ".gitignore", "run.log",
+                 "manual.PDF"):
         assert view_path(ctx, name) == ((repo / name).resolve(), None), name
     for name in ("../out.md", str(tmp_path / "out.md"), "logo.png", "notes.txt.gz",
                  "gone.md", "docs", None):
@@ -3233,6 +3322,49 @@ async def test_a_checks_behind_chip_opens_the_commits_and_what_they_changed(
     assert "changed after the run" in _newest(user, "diff-view").content
     assert {n for n, _ in ran} == {"stamp_cfg", "commit_rows", "diff_text"}, ran
     assert threading.get_ident() not in {t for _, t in ran}, ran
+
+
+async def test_a_dirty_check_whose_tree_was_committed_reads_committed_as(user: User, repo,
+                                                                         tmp_path):
+    """The chip takes the matched commit's colour: that commit's tree is the
+    tree at the write. Its tip says the run was on uncommitted changes and names
+    the commit; a `behind` click reads from that commit, so the run's own
+    change is not in the diff (the dirty-stamps design, 2026-11-26). Old,
+    current at HEAD, it stays on the recent board."""
+    import json
+    from symbion import kinds as K
+    (repo / "f").write_text("the change the run saw\n")
+    ctx = api.resolve(str(tmp_path))
+    old = {"kind": "check", "target": {"type": "item", "name": "w"},
+           "created_at": "2020-01-01T00:00:00+00:00", "author": "ada", "body": "",
+           "checked": "run", "result": "old, its tree now HEAD's",
+           "provenance": gitref.provenance_stamp(ctx.cfg, K.DEFAULT_KINDS["check"])}
+    with open(store.notes_path(tmp_path), "a", encoding="utf-8") as f:
+        f.write(json.dumps({**old, "id": "20200101-000000-000000-aaa"}) + "\n")
+    stamp = old["provenance"]["sha"]
+    held = _commit_all(repo, "the fix")
+    build_page(ctx, author="ada")
+    await user.open("/")
+    await user.should_see("old, its tree now HEAD's")
+    await user.open("/object?type=item&name=w")
+    chip = part(user, "check-state")
+    assert (chip.text, "sb-chip-good" in chip.classes) == \
+        (f"committed — as {held[:7]}, current", True)
+    chip.hover()
+    await user.should_see(f"ran on uncommitted changes at {stamp[:7]}; committed as "
+                          f"{held[:7]}, the same tree")
+    await user.should_see(f"{held[:7]}, this checkout's HEAD")
+    (repo / "f").write_text("changed after the commit\n")
+    _commit_all(repo, "after the fix")
+    await user.open("/object?type=item&name=w")
+    chip = part(user, "check-state", content=f"committed — as {held[:7]}, behind 1")
+    assert "sb-chip-notable" in chip.classes
+    chip.click()
+    await user.should_see(marker="commit-list", retries=40)
+    await user.should_see("after the fix")
+    diff = re.sub(r"<[^>]+>", "", _newest(user, "diff-view").content)
+    # Read from the stamp, the diff would hold f as the stamp had it instead.
+    assert "changed after the commit" in diff and "the change the run saw" in diff, diff
 
 
 def test_the_reveal_command_selects_the_file_and_never_opens_it(monkeypatch, tmp_path):

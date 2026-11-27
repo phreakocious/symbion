@@ -49,6 +49,16 @@ def _sans_pending(err: str) -> str:
                   err)
 
 
+def _pipe_has_no_id() -> bool:
+    """Windows and OpenBSD give a pipe no file id, so there no two streams read as one."""
+    r, w = os.pipe()
+    try:
+        return not os.fstat(w).st_ino
+    finally:
+        os.close(r)
+        os.close(w)
+
+
 def _git(cwd, *a):
     subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True)
 
@@ -1194,11 +1204,7 @@ def test_a_partial_page_into_a_pipe_says_so_on_stderr(tmp_path, capsys, monkeypa
                               stdout=subprocess.PIPE, stderr=stderr, text=True, env=env)
     one = lst(subprocess.STDOUT).stdout
     # Windows and OpenBSD give a pipe no file id, so there the copy stays.
-    r, w = os.pipe()
-    no_id = not os.fstat(w).st_ino
-    os.close(r)
-    os.close(w)
-    assert one.count("26 entries, showing 25 newest") == (2 if no_id else 1), one
+    assert one.count("26 entries, showing 25 newest") == (2 if _pipe_has_no_id() else 1), one
     two = lst(subprocess.PIPE)
     assert two.stderr.startswith("note: 26 entries, showing 25 newest"), two.stderr
 
@@ -2544,12 +2550,15 @@ def test_term_words_a_rewritten_state():
         "rewritten as 4e1a9c2, tree differs, behind 3", term.WARN)
 
 
-def test_a_dirty_write_says_its_row_reads_unverifiable_for_good(repo, tmp_path, capsys):
-    """A check written on a dirty tree reads `unverifiable (dirty tree)`
-    from then on, and the write said nothing (2026-10-14). The write names
-    the paths; a clean one stays quiet. A pre-registration's resolve is
-    stamped anew, so it says so too, and names --external as add does; its
-    add stays quiet, and a resolve of a resolved row restamps nothing."""
+def test_a_dirty_write_says_its_row_reads_unverifiable_for_good(repo, tmp_path, capsys,
+                                                                monkeypatch):
+    """A check written on a dirty tree, with no tree hash to follow (one
+    refused or failed), reads `unverifiable (dirty tree)` from then on, and
+    the write said nothing (2026-10-14). The write names the paths; a clean
+    one stays quiet. A pre-registration's resolve is stamped anew, so it
+    says so too, and names --external as add does; its add stays quiet, and
+    a resolve of a resolved row restamps nothing."""
+    monkeypatch.setattr(gitref, "_dirty_tree", lambda cfg: None)
     store_dir = tmp_path / "store"
     run("add", "check", "--target", "project", "--checked", "x", "--result", "y",
         store_dir=store_dir)
@@ -2581,6 +2590,47 @@ def test_a_dirty_write_says_its_row_reads_unverifiable_for_good(repo, tmp_path, 
     assert "--external" in err
     run("resolve", pid, "--body", "and more", store_dir=store_dir)
     assert "note: the tree has" not in capsys.readouterr().err
+
+
+def test_a_dirty_write_says_its_row_follows_the_commit_of_its_tree(repo, tmp_path, capsys):
+    """A dirty write's note sent the agent to undo, commit, re-run and write
+    again, and so taught it to commit before it wrote: a check took a
+    commit its run never saw (2026-11-26). With the tree hashed, the note
+    says the row follows the commit that holds that tree. Once one does,
+    the agent line names it, and a grep for `state=current` misses it."""
+    s = tmp_path / "store"
+    (repo / "scratch").write_text("uncommitted")
+    assert run("add", "check", "--target", "project", "--checked", "x", "--result", "y",
+               store_dir=s) == 0
+    out, err = capsys.readouterr()
+    assert ("note: the tree has 1 uncommitted path (scratch), so this check entry reads "
+            "`unverifiable (dirty tree)` until one commit holds this exact tree, each of "
+            "those paths as it is now, and then `committed as SHA`. An edit before that "
+            "commit keeps it unverifiable. A run outside the repo takes --external") in err, err
+    assert " undo " not in err and "re-run" not in err
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "fix")
+    c = _head(repo)
+    assert run("list", "--kind", "check", store_dir=s) == 0
+    line = capsys.readouterr().out
+    assert f" state=committed distance=0 successor={c[:7]} successor_reads=current " in line
+    assert "same_tree" not in line and line.count("state=") == 1, line
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+         "--allow-empty", "-m", "later")
+    assert run("list", "--kind", "check", "--json", store_dir=s) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert (row["id"], row["state"], row["distance"], row["successor"],
+            row["successor_state"]) == (out.strip(), "committed", 1, c, "behind")
+    assert "same_tree" not in row
+
+
+def test_term_words_a_committed_state_in_its_commits_colour():
+    from symbion import term
+    c = "9f2c1ab" + "0" * 33
+    assert term._state(None, ("committed", 0), successor=gitref.Successor(c, "current", 0, None)) \
+        == ("committed as 9f2c1ab, current", term.GOOD)
+    assert term._state(None, ("committed", 3), successor=gitref.Successor(c, "behind", 3, None)) \
+        == ("committed as 9f2c1ab, behind 3", term.WARN)
 
 
 def test_resolve_external_stamps_a_pre_registration_judged_outside_the_repo(
@@ -4958,6 +5008,9 @@ def test_a_row_a_sibling_store_holds_is_found_there(tmp_path, capsys, monkeypatc
             (argv, err)
     assert run("show", "123456-abc", store_dir=here) == 1
     assert len(capsys.readouterr().err.splitlines()) == 1, "no store holds it: the miss alone"
+    # A date and a digit is no id or tail: it named the one sibling row it starts (2026-11-20).
+    assert run("show", there[:10], store_dir=here) == 1
+    assert len(capsys.readouterr().err.splitlines()) == 1, "a prefix no lookup takes: the miss alone"
     assert run("add", "note", "--target", "project", "--body",
                f"as {there[-10:]} says, not 123456-abc", store_dir=here) == 0
     assert "matches 123456-abc (cited" in capsys.readouterr().err
@@ -7061,6 +7114,37 @@ def test_push_sends_the_store_to_origin_and_names_what_it_leaves(tmp_path, capfd
     assert "pushed" not in capfd.readouterr().out, "nothing new went"
 
 
+def test_a_write_in_one_stream_counts_the_notes_above_its_id(tmp_path):
+    """One pipe takes both streams in an agent's shell, and holds stdout to the
+    end, so a write's id prints below its notes: `2>&1 | tail -1` kept the id
+    alone, and the notes went unread (2026-11-23). The id's line counts the
+    lines above it but the `not committed` line every write ends on; with no
+    other note, or with stdout apart, the id stands bare."""
+    store.ensure_store(tmp_path)
+
+    def write(body, err=subprocess.STDOUT):
+        return subprocess.run([sys.executable, "-m", "symbion", "--dir", str(tmp_path), "add",
+                               "note", "--target", "project:", "--body", body],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err,
+                              text=True)
+
+    r = write("cites 999999-abc")
+    *above, last = r.stdout.splitlines()
+    notes = _sans_pending("".join(f"{ln}\n" for ln in above)).splitlines()
+    assert r.returncode == 0 and len(above) > len(notes) > 0, r.stdout
+    assert "no entry in this store matches 999999-abc" in notes[0], r.stdout
+    # Where a pipe has no file id the two streams never read as one: the id stays bare.
+    count = "" if _pipe_has_no_id() else rf"  \({summ._count(len(notes), 'line')} of notes above\)"
+    assert re.fullmatch(rf"\d{{8}}-\d{{6}}-\d{{6}}-[0-9a-f]{{3}}{count}", last), r.stdout
+    r = write("a plain note")
+    *above, last = r.stdout.splitlines()
+    assert r.returncode == 0 and "not committed" in above[-1], r.stdout
+    assert re.fullmatch(r"\d{8}-\d{6}-\d{6}-[0-9a-f]{3}", last), r.stdout
+    r = write("cites 999998-abd", err=subprocess.PIPE)
+    assert "999998-abd" in r.stderr and re.fullmatch(r"\d{8}-\d{6}-\d{6}-[0-9a-f]{3}\n",
+                                                     r.stdout), (r.stdout, r.stderr)
+
+
 def test_push_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capfd):
     run("add", "--kind", "note", "--type", "project", "--body", "x", store_dir=tmp_path)
     run("commit", store_dir=tmp_path)
@@ -7344,15 +7428,34 @@ def test_commit_author_takes_the_entries_no_session_wrote(tmp_path, capsys, monk
                      capsys.readouterr().out)
     assert run("commit", "--author", "nightly", store_dir=tmp_path) == 0
     assert store.pending_rows(tmp_path) == []
-    # In a session: ada's sessionless answer is named, and --author ada leaves the session's own.
+    # In a session, --author ada takes ada's sessionless answer and the session's own
+    # too. It took ada's alone: a session that ran the `--author ada now` it started
+    # on, after writing, left its own row, named as another session's (2026-11-23).
     run("add", "question", "--target", "project", "--body", "q", "--author", "ada",
         store_dir=tmp_path)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
     run("add", "note", "--target", "project", "--body", "mine", store_dir=tmp_path)
     capsys.readouterr()
     assert run("commit", "--author", "ada", store_dir=tmp_path) == 0
-    assert [r["body"] for r in store.pending_rows(tmp_path)] == ["mine"]
-    run("commit", store_dir=tmp_path)
+    assert store.pending_rows(tmp_path) == []
+    assert "left pending, " not in capsys.readouterr().out
+    # The session's addition to ada's pending answer goes with it, and the wrap is
+    # the caller's: `Wrap: ada` would say ada ended the session.
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    q = _add(tmp_path, capsys, "question", "--target", "project", "--body", "q2",
+             "--author", "ada")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    monkeypatch.setenv("SYMBION_AUTHOR", "claude")
+    run("supersede", q, "--append", "--body", "an addition", store_dir=tmp_path)
+    capsys.readouterr()
+    run("commit", "--author", "ada", "--dry-run", store_dir=tmp_path)
+    assert "would leave, " not in capsys.readouterr().out
+    assert run("commit", "--author", "ada", "--wrap", "-m", "h", store_dir=tmp_path) == 0
+    assert store.pending_rows(tmp_path) == []
+    msg = subprocess.run(["git", "-C", str(tmp_path), "log", "-1", "--format=%B"],
+                         capture_output=True, text=True).stdout
+    assert msg.strip().endswith("Wrap: claude"), msg
+    monkeypatch.delenv("SYMBION_AUTHOR")
     # A live session's row beside a sessionless one: no --author, as --all waits.
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
     run("add", "note", "--target", "project", "--body", "again", "--author", "ada",
@@ -7514,6 +7617,54 @@ def test_a_commit_that_leaves_the_stores_files_leaves_a_staged_one(tmp_path, cap
                           capture_output=True, text=True).stdout.split()
     assert took == ["docs/mine.md", "notes.jsonl"]
     assert (s / "docs" / "theirs.md").read_text() == "v2\n"
+
+
+def test_a_commit_from_another_projects_tree_takes_its_sessions_edit_to_its_doc(
+        tmp_path, capsys, monkeypatch):
+    """A session wrote a doc from another project's tree, and its commit took
+    it as new. It then edited the doc and appended to its entry, and the next
+    commit left the edit: every edit to a tracked doc read as its writer's
+    (2026-11-24). An edit to a doc this session brought in goes in; another
+    writer's doc that the same entry cites stays left."""
+    proj, s = tmp_path / "proj", tmp_path / "proj-notes"
+    proj.mkdir()
+    _git(proj, "init", "-q", "-b", "main")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s0")    # a session of proj's own
+    (s / "docs").mkdir(parents=True)
+    (s / "docs" / "theirs.md").write_text("v1\n")
+    run("add", "note", "--target", "project", "--body", "their plan", "--ref", "doc:theirs.md",
+        store_dir=s)
+    run("commit", "--all", store_dir=s)
+    capsys.readouterr()
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")    # the cwd: another project
+    (s / "docs" / "mine.md").write_text("v1\n")
+    run("add", "note", "--target", "project", "--body", "from afar", "--ref", "doc:mine.md",
+        "--ref", "doc:theirs.md", store_dir=s)
+    nid = capsys.readouterr().out.strip()
+    run("commit", store_dir=s)
+    assert "1 file: docs/mine.md\n" in capsys.readouterr().out
+    (s / "docs" / "theirs.md").write_text("v2, half written\n")
+    (s / "docs" / "mine.md").write_text("v2\n")
+    assert run("supersede", nid, "--append", "--body", "mine.md has v2", store_dir=s) == 0
+    capsys.readouterr()
+    assert run("commit", "--dry-run", store_dir=s) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("would commit: entries user 1; 1 file\n"), out
+    assert "\n  docs/mine.md\nwould leave, as the store is another project's: 1 file\n" \
+           "  docs/theirs.md\n" in out, out
+    assert run("commit", store_dir=s) == 0
+    out = capsys.readouterr().out
+    assert "committed: entries user 1; 1 file: docs/mine.md\n" in out, out
+    assert "left uncommitted, as the store is another project's: 1 file: docs/theirs.md;" in out, out
+    head = lambda name: subprocess.run(["git", "-C", str(s), "show", f"HEAD:docs/{name}"],
+                                       capture_output=True, text=True).stdout
+    assert (head("mine.md"), head("theirs.md")) == ("v2\n", "v1\n")
+    (s / "docs" / "mine.md").write_text("v3\n")          # a second round: the add is no longer
+    assert run("supersede", nid, "--append", "--body", "v3", store_dir=s) == 0   # the newest
+    capsys.readouterr()
+    assert run("commit", store_dir=s) == 0
+    assert "committed: entries user 1; 1 file: docs/mine.md\n" in capsys.readouterr().out
+    assert (head("mine.md"), head("theirs.md")) == ("v3\n", "v1\n")
 
 
 def test_commit_on_a_store_with_no_remote_says_it_is_on_one_disk(tmp_path, capsys):

@@ -41,8 +41,8 @@ A kind is a label on three bits, and the bits are all symbion knows:
     commits short of the stamp. `diverged`: the stamp is on another branch.
   - `rewritten as SHA`: an amend or a rebase moved the stamp to SHA, whose
     state follows. `dangling`: no branch holds it. `unverifiable`: git lost it.
-  - `unverifiable (dirty tree)`: the tree had uncommitted changes at the
-    write. This never clears.
+  - `unverifiable (dirty tree)`: uncommitted changes at the write. A commit
+    of that exact tree makes it `committed as SHA`: write right after the run.
   - `external`, with its age: `--external` stamps a run on something outside
     the repo (a host, a live database) with its time, not HEAD.
 
@@ -124,9 +124,9 @@ model you hand work to, writes under its own name (`--author sonnet-review`).
 
 A write is pending until `symbion commit`, and on this disk only until
 `symbion push`. `commit` takes the entries this session wrote, under any author
-(`--author NAME` takes NAME's written outside any session),
+(`--author NAME` also takes NAME's written outside any session),
 and the store's changed files (from another project's tree, only `arcs.jsonl` and
-the new docs they name); `--all` takes every entry and file, `--dry-run` lists what it would take. Each write and each commit says what is
+the docs they name, new or first committed by this session); `--all` takes every entry and file, `--dry-run` lists what it would take. Each write and each commit says what is
 still pending or unpushed.
 
 ## Reading

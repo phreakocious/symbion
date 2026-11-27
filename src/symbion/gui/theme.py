@@ -291,6 +291,7 @@ body[data-sb-drop]::after { content: attr(data-sb-drop); position: fixed; inset:
    side, the unified drawing comes too, and a window too narrow for two sides
    shows it instead, with no toggle. */
 .sb-diff-card { width: min(1400px, 96vw); }
+.sb-pdf { width: 100%; height: 80vh; border: 0; }
 .sb-diff-mode { flex: none; }
 .sb-diff-mode .q-btn { white-space: nowrap; }
 .sb-diff-narrow { display: none; }

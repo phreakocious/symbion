@@ -1655,8 +1655,6 @@ def _git_buttons(ctx, author: str, heads, on_stale) -> None:
     async def tick():
         began = writes[0]
         state = await run.io_bound(read)      # git, off the event loop
-        if state is None:                     # the app is stopping
-            return
         if writes[0] != began:                # the page's own write ran during the read
             return
         if state[:6] != shown[0][:6]:

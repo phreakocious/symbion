@@ -22,7 +22,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from types import SimpleNamespace
 from typing import NamedTuple
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi.responses import PlainTextResponse
 from markdown_it.token import Token
@@ -371,6 +371,10 @@ def check_tip(cfg, prov, state, distance, at=None) -> str:
         moved = {"sha": s.sha, **({"repo": prov["repo"]} if "repo" in prov else {})}
         return (f"{at}; rewritten as {s.sha[:7]}, matched by author date and subject{tree}\n"
                 + check_tip(cfg, moved, s.state, s.distance, at=s.sha[:7]))
+    if state == "committed" and (s := gitref.committed_as(cfg, prov)):
+        held = {"sha": s.sha, **({"repo": prov["repo"]} if "repo" in prov else {})}
+        return (f"ran on uncommitted changes at {sha[:7]}; committed as {s.sha[:7]}, "
+                f"the same tree\n" + check_tip(cfg, held, s.state, s.distance, at=s.sha[:7]))
     if state not in ("behind", "ahead"):
         return at
     cfg = gitref.stamp_cfg(cfg, prov)            # the commits of the stamp's repo
@@ -405,13 +409,16 @@ def _check_chip(ctx, n, git_head=None) -> tuple[dict, object, object]:
         sha = S.stamp_sha(n.provenance)
         if b := gitref.unmerged(gitref.stamp_cfg(ctx.cfg, n.provenance), [sha]).get(sha):
             text = f"diverged — on {b}"
-    elif state == "rewritten" and (s := gitref.successor(ctx.cfg, n.provenance, git_head)):
-        text = f"rewritten — {api.rewritten_words(s)}"
+    elif state in ("rewritten", "committed") and (
+            s := gitref.follow(ctx.cfg, n.provenance, state, git_head)):
+        text = f"{state} — {api.rewritten_words(s)}"
     cls = {"current": "sb-chip-good", "behind": "sb-chip-notable", "external": "",
            "pending": "", "unstamped": "", "rewritten": "sb-chip-notable",
            "ahead": "sb-chip-notable",
            "diverged": "sb-chip-notable", "dangling": "sb-chip-bad",
-           "unverifiable": "sb-chip-bad"}[state]
+           "unverifiable": "sb-chip-bad",
+           # That commit's tree is the tree at the write: its own state's colour.
+           "committed": "sb-chip-good" if distance == 0 else "sb-chip-notable"}[state]
     chip = {"t": text, "c": f"sb-chip {cls}".strip(), "m": "check-state"}
     if fixed_tip:
         return chip | {"tip": fixed_tip}, None, None
@@ -419,6 +426,11 @@ def _check_chip(ctx, n, git_head=None) -> tuple[dict, object, object]:
         return chip, None, None
     # Filled on first hover: a `git log` per badge at render time doubled
     # the cost of a board of checks (45 badges: 1.5s to 2.9s).
+    if state == "committed" and distance:          # `behind`, read from the commit
+        held = gitref.committed_as(ctx.cfg, n.provenance, git_head)
+        return chip | {"tip": "", "key": "check", "open": True}, \
+            lambda: check_tip(ctx.cfg, n.provenance, state, distance) + f"\n{_CLICK['behind']}", \
+            lambda: check_dialog(ctx, n, "behind", distance, at=held and held.sha)
     if state not in ("behind", "ahead"):
         return chip | {"tip": "", "key": "check"}, \
             lambda: check_tip(ctx.cfg, n.provenance, state, distance), None
@@ -571,7 +583,9 @@ def view_path(ctx, name, ttype=None):
         return (path, None) if _viewable(path.name) else None
     # ponytail: the default branch only; a file only another branch holds reads nothing
     cfg = None if ttype == "doc" else ctx.cfg.for_type(ttype)   # a repo's row: its repo's file
-    branch = cfg is not None and _viewable(name) and gitref.only_on_default_branch(cfg, name)
+    # ponytail: a PDF reads from disk only (`/pdf`); serve git's blob if a branch's is asked for
+    branch = cfg is not None and _viewable(name) and not _pdf(name) \
+        and gitref.only_on_default_branch(cfg, name)
     return (None, branch) if branch else None
 
 
@@ -585,12 +599,17 @@ def fenced(text: str, filename: str) -> str:
     return f"{fence}{lang}\n{text.removesuffix(chr(10))}\n{fence}"
 
 
+def _pdf(filename: str) -> bool:
+    return filename.lower().endswith(".pdf")
+
+
 def _viewable(filename: str) -> bool:
-    """Markdown, a file pygments names a language for, or else plain text
-    unless mimetypes calls the name binary or packed: `.env` and `LICENSE`
-    had controls that open them elsewhere and no read (the user, 2026-11-11).
-    A name nothing knows reads as text, and the click refuses a binary one."""
-    if filename.lower().endswith(".md") or _lexer(filename) is not None:
+    """Markdown, a PDF (the user, 2026-11-24), a file pygments names a
+    language for, or else plain text unless mimetypes calls the name binary
+    or packed: `.env` and `LICENSE` had controls that open them elsewhere and
+    no read (the user, 2026-11-11). A name nothing knows reads as text, and
+    the click refuses a binary one."""
+    if filename.lower().endswith(".md") or _pdf(filename) or _lexer(filename) is not None:
         return True
     kind, packed = mimetypes.guess_type(filename)
     return packed is None and (kind is None or kind.startswith("text/"))
@@ -773,6 +792,7 @@ def viewable(ctx, name, ttype=None):
         return None
     branch = src[1]
     md = (src[0].name if src[0] else name).lower().endswith(".md")
+    pdf = _pdf(src[0].name if src[0] else name)
     revealable = src[0] is not None and _reveal_cmd(src[0]) is not None
 
     def click(shift: bool):
@@ -782,6 +802,8 @@ def viewable(ctx, name, ttype=None):
 
     def _open():
         path, branch = view_path(ctx, name, ttype) or (None, None)
+        if pdf and path:
+            return _pdf_view(name, ttype, path)
         try:
             text = (path.read_text(encoding="utf-8", errors="replace") if path else
                     gitref.blob_text(ctx.cfg.for_type(ttype), branch, name) if branch else None)
@@ -805,7 +827,27 @@ def viewable(ctx, name, ttype=None):
 
     tip = (f"read {name}" + (f", as on {branch}" if branch else "")
            + (f" · shift-click: {_reveal_label()}" if revealable else ""))
-    return ("article" if md else "code"), tip, click
+    return ("article" if md else "picture_as_pdf" if pdf else "code"), tip, click
+
+
+def _pdf_view(name, ttype, path) -> None:
+    """A PDF in the viewer: the browser draws it in an <iframe> from `/pdf`
+    (pages.py). A phone's browser may draw only its first page there, or
+    none, so the head links to it in a new tab, as a real link: a tab the
+    server opens after the click, a popup blocker may stop."""
+    src = "/pdf?" + urlencode({"name": name} | ({"type": ttype} if ttype else {}))
+
+    def head():
+        b = ui.button(icon="open_in_browser").props("flat dense round size=sm color=muted") \
+            .tooltip("open in a new tab").mark("pdf-tab")
+        # set, not parsed: a file name may hold a quote
+        b._props.update({"href": src, "target": "_blank", "rel": "noopener",
+                         "aria-label": "open in a new tab"})
+
+    def fill():
+        ui.element("iframe").classes("sb-pdf").mark("pdf-view")._props.update(
+            {"src": src, "title": name})
+    viewer(name, fill, mono=True, reveal=path, head=head, wide=True)
 
 
 def _commit_viewable(ctx, sha):
@@ -985,11 +1027,12 @@ async def since_dialog(ctx, n):
     return await diff_dialog(f"{path} since this entry", text or "", lead=lead, head=head)
 
 
-async def check_dialog(ctx, n, state: str, distance: int):
+async def check_dialog(ctx, n, state: str, distance: int, at: str | None = None):
     """A check's `behind N` or `ahead N`, opened: the commits between its
     stamp and HEAD, and for `behind`, what they changed, the whole tree.
+    `at` is the commit a `committed` stamp's tree is in, read from instead.
     A coroutine, for the click's handler; git runs on a worker thread."""
-    sha = S.stamp_sha(n.provenance)
+    sha = at or S.stamp_sha(n.provenance)
     def read():
         cfg = gitref.stamp_cfg(ctx.cfg, n.provenance)
         rows = gitref.commit_rows(cfg, [f"{sha}..HEAD" if state == "behind" else f"HEAD..{sha}"],
@@ -998,7 +1041,7 @@ async def check_dialog(ctx, n, state: str, distance: int):
     cfg, rows, text = await run.io_bound(read)
 
     def lead() -> None:
-        ui.label(f"stamped at {sha[:7]}; " +
+        ui.label(f"{'committed as' if at else 'stamped at'} {sha[:7]}; " +
                  (f"HEAD is {summ._count(distance, 'commit')} past it, newest first"
                   if state == "behind" else
                   f"it is {summ._count(distance, 'commit')} past HEAD, newest first")) \
@@ -1031,6 +1074,18 @@ def _waits_on_you(n, author, rd: Reading) -> bool:
     other side's question waits on that side's person."""
     return summ.on_side(rd.by_id, n, rd.side) and (n.supersedes is None
                                                    or summ.asks(author, rd.by_id, n))
+
+
+def _passed_over(options, text) -> dict:
+    """The fields that drop a question's `options` when `text`, the person's
+    answer, gives none of them on a line of its own: the asker's next addition
+    drew the buttons the person had passed over (the user, 2026-11-23). An
+    option's words typed are a pick, as a click is. Only the options the
+    person saw: ones the asker set since stay (`options_seen`)."""
+    given = {summ.answer_key(line) for line in text.splitlines()}
+    if not options or any(summ.answer_key(o) in given for o in options):
+        return {}
+    return {"options": None, "options_seen": options}
 
 
 class Card(Element, component="card.js"):
@@ -1167,7 +1222,8 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
         if demo_says("adds your answer below the question"):
             return
         try:
-            api.supersede(ctx, n.id, author=author, append_body=text)
+            api.supersede(ctx, n.id, author=author, append_body=text,
+                          **_passed_over(n.options, text))
         except ValueError as e:
             ui.notify(str(e), type="negative")
             return
@@ -1206,7 +1262,7 @@ def render_note(ctx, n, refresh, *, author: str, show_target: bool = False,
         if what == "star" and actions:
             toggle_star(ctx, n, refresh, author=author)
         elif what == "edit" and actions:
-            edit_dialog(ctx, n, refresh, author=author)
+            edit_dialog(ctx, n, refresh, author=author, answering=answering)
         elif what == "resolve" and resolvable:
             resolve()
         elif what == "copy":
@@ -1553,9 +1609,12 @@ def discard_dialog(ctx, author: str) -> None:
 _EDITS = "sb-edit-drafts"       # app.storage.tab: an edit closed unsaved, by entry id
 
 
-def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> None:
+def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False,
+                answering: bool = False) -> None:
     """Supersede with edits. `resolving=True` is the resolve path for a
-    status+verdict row: the result is required and the row closes on save."""
+    status+verdict row: the result is required and the row closes on save.
+    `answering`: the card takes the person's answer, so words added here
+    are one, as its field takes them."""
     tab = app.storage.tab           # read here: the close handler runs in no page slot
     kept = (tab.get(_EDITS) or {}).get(n.id)
     with ui.dialog().mark("edit-dialog") as dialog, ui.card().classes("bg-panel"):
@@ -1757,6 +1816,9 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
             kinded = {"kind": kind.value} if kind is not None and kind.value != n.kind else {}
             if kinded and n.options and kind.value != "question":
                 kinded["options"] = None            # named under the select
+            # With a resolve beside them too: a reopen would draw the buttons again.
+            answered = _passed_over(n.options, added) \
+                if answering and added.strip() and "options" not in kinded else {}
             if demo_says("saves the edit"):
                 return
             from .chrome import own_write       # chrome imports this module
@@ -1766,7 +1828,7 @@ def edit_dialog(ctx, n, refresh, *, author: str, resolving: bool = False) -> Non
                                   tags=kept + [t for t in final if t not in n.tags and t not in kept],
                                   # unchanged, the tip's, unchecked: an entry in a gone arc saves
                                   **({"arc_id": arc_v} if arc_v != n.arc_id else {}),
-                                  **verdict, **closing, **dated, **on, **kinded)
+                                  **verdict, **closing, **dated, **on, **kinded, **answered)
             except S.NoBody:
                 ui.notify("this edit leaves the entry with no text: write some, or cancel",
                           type="warning")

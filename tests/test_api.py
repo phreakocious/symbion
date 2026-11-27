@@ -389,6 +389,7 @@ _NON_WRITERS = {
     "commit",            # writes git, not a note
     "own_rows",          # a read: which pending rows `commit` would take
     "docs_named",        # a read: which docs/ files those rows name
+    "docs_brought",      # a read: which of them this session brought in
     "elsewhere",         # a read: whether the cwd stands outside the store's project
     "push",              # ditto
     "pull",              # writes git, and moves no row's author
@@ -1269,9 +1270,11 @@ def _tracked_docs(store_dir):
                           capture_output=True, text=True).stdout.split()
 
 
-def test_a_gui_commit_leaves_another_writers_edit_to_a_tracked_doc(repo, tmp_path):
+def test_a_gui_commit_leaves_another_writers_edit_to_a_tracked_doc(repo, tmp_path, monkeypatch):
     """A resolve copies its base's refs, so a GUI commit of one took an
-    agent's uncommitted edit to the doc the task named."""
+    agent's uncommitted edit to the doc the task named. A serve started in
+    that agent's session still leaves it: the edit is the agent's."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
     ctx = api.resolve(str(tmp_path))
     api.save_doc(ctx, "plan.md", "v1\n")
     api.add(ctx, {"kind": "note", "target": {"type": "project", "name": None},
@@ -1379,7 +1382,7 @@ def test_every_api_write_refuses_when_read_only(tmp_path, monkeypatch):
     READS = {"Ctx", "Pulled", "Synced", "add_fields", "as_dropped", "as_object", "author_default",
              "canonicalize_names", "canonicalize_rows", "check_arc", "check_arc_targets",
              "check_measurements", "check_name", "check_options", "check_refs",
-             "check_target", "docs_named", "elsewhere", "fields_from_row", "free_doc_name", "gui_author",
+             "check_target", "docs_brought", "docs_named", "elsewhere", "fields_from_row", "free_doc_name", "gui_author",
              "harvest_hashtags", "harvest_kind", "kind_as_type", "kind_losses", "known_files",
              "no_arc", "object_path", "own_rows", "resolve", "seed_names",
              "rewritten_words", "shell_author", "verdict_state", "why_unverifiable"}

@@ -68,9 +68,11 @@ The **target** is the one thing an entry is about. An entry has exactly
 one. Click it to open the target's page: every entry on it or pointing at
 it, open work first; a `project` chip lists the project-wide entries. The Targets page lists every target that has entries.
 The Docs page lists every file in the store's `docs/` an entry is on, of
-any type, and every markdown file of the project's an entry is on or
+any type, and every markdown or PDF file of the project's an entry is on or
 points at, the most named first, each with a
-button that opens it.
+button that opens it. Below them are the markdown, text and PDF files in
+`docs/` and the project's markdown and PDF files that no entry names. A PDF
+opens in the browser's own viewer, and its dialog links to it in a new tab.
 The Map page draws the entries as tiles, grouped on up to three of target,
 tag, kind, status, author, arc and the week written. A tile's area is its
 entries, its colour its open ones. A click on a tile lists its entries below
@@ -83,7 +85,7 @@ A target has a type and a name:
 - `file:src/app.py` is a file in the project. The name is checked against
   the project's files, so part of a path finds the whole one. The `<>`
   button beside the chip opens the file, from the default branch when the
-  branch checked out lacks it. The card counts the commits that changed the
+  branch checked out lacks it (a PDF opens only from the checkout). The card counts the commits that changed the
   file since the entry was written: a high count means the entry may be out
   of date. Click the count to see those commits and what they changed in
   the file, and to read the file as the entry saw it.
@@ -185,8 +187,14 @@ chip says how that commit relates to the project now:
   the chip goes on with the new commit's state. The new code may differ.
 - `dangling`: no branch holds the run's commit any more, and no rewrite
   explains it, as after a squash. Run the check again.
-- `unverifiable`, with the reason, such as uncommitted changes when it ran.
-  This never clears.
+- `committed as 9f2c1ab`: the entry was written on uncommitted changes, and
+  9f2c1ab is the first commit since that holds exactly the tree at the write.
+  The chip goes on with that commit's state.
+- `unverifiable`, with the reason, such as uncommitted changes when it was
+  written. For those, it clears once a commit holds the tree at the write.
+  It never clears where the write could not record that tree, such as past
+  20 MB of changed and new files or with a changed git-lfs file, nor for an
+  entry written before 0.18.0.
 - `external`, with its age: the run was on something outside the project,
   such as a server. Only time makes it stale.
 - `unstamped`, with its age: written before symbion stamped checks, so no
@@ -224,7 +232,10 @@ row's page in a new tab.
 A question someone else wrote last takes an answer on its card: a button
 for each answer its asker offered, the default first, or your own words
 and Enter. The answer is added below the question, as you; whoever asked
-acts on it and resolves the question.
+acts on it and resolves the question. Words of your own that are none of
+the offered answers take those answers off the question, whether typed
+there or added in the question's edit dialog; answers its asker offered
+since your page drew stay.
 
 The undo arrow appears in the top bar while the store's last write is
 yours and not yet committed. It takes that write back. There is one undo,

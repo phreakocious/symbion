@@ -1289,6 +1289,43 @@ async def test_an_edited_body_takes_the_added_text_after_it(user: User, repo, tm
     assert head.body == "first\n\nmore"
 
 
+def _asked(ctx, author="sam"):
+    return api.add(ctx, {"kind": "question", "target": {"type": "project", "name": None},
+                         "body": "Which port?", "options": ["80", "8080"]}, author=author)
+
+
+@pytest.mark.parametrize("text, resolve, kept", [("neither: it listens on 443", False, None),
+                                                 ("neither: it listens on 443", True, None),
+                                                 ("8080.", False, ("80", "8080"))])
+async def test_words_added_in_the_dialog_answer_a_question_waiting_on_the_person(
+        user: User, repo, tmp_path, text, resolve, kept):
+    """Text added here on a question whose card takes the person's answer is
+    that answer, as the card's field takes it: words that are none of the
+    options drop them, with a resolve beside them too, since a reopen drew the
+    buttons again; an option's words keep them."""
+    ctx = api.resolve(str(tmp_path))
+    n = _asked(ctx)
+
+    def resolving():
+        user.find(marker="edit-resolve").elements.pop().set_value(True)
+    head = await _append_in_dialog(user, ctx, n, text, meanwhile=resolving if resolve else None)
+    assert (head.body.endswith(text), head.options, store.read_status(head)) == \
+        (True, kept, "resolved" if resolve else "open")
+
+
+@pytest.mark.parametrize("asker, picked", [("ada", None), ("sam", "8080")])
+async def test_words_added_where_the_card_takes_no_answer_keep_the_options(
+        user: User, repo, tmp_path, asker, picked):
+    """The person's own question, and one they have answered, take no answer
+    on the card: text added in the dialog there is an edit."""
+    ctx = api.resolve(str(tmp_path))
+    n = _asked(ctx, author=asker)
+    if picked:
+        n = api.supersede(ctx, n.id, author="ada", append_body=picked)
+    head = await _append_in_dialog(user, ctx, n, "and on the backup box?")
+    assert (head.body.endswith("backup box?"), head.options) == (True, ("80", "8080"))
+
+
 async def test_the_edit_dialog_moves_an_entry_and_its_refs(user: User, repo, tmp_path):
     """The dialog could not change what an entry is on (a tester,
     2026-10-15): its target and `also on` are fields here too."""

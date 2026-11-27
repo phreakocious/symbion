@@ -1,6 +1,6 @@
 [project]
 name = "symbion"
-version = "0.17.0"
+version = "0.18.0"
 description = "A ticket queue your coding agent keeps: each new Claude Code, Codex or Hermes session starts with the open bugs, tasks and questions. Plain JSONL in a git repo beside yours. No server, no MCP."
 keywords = ["claude-code", "codex", "hermes", "agent-memory", "ai-agents", "issue-tracker", "session-handoff", "context", "jsonl", "git"]
 readme = "README.md"
@@ -21,12 +21,15 @@ Issues = "https://github.com/phreakocious/symbion/issues"
 symbion = "symbion.cli:main"
 
 [project.optional-dependencies]
-gui = ["nicegui>=3.19", "pygments>=2.13"]
+# The floor is the NiceGUI the suite runs on: a lower one goes untested.
+gui = ["nicegui>=4.1", "pygments>=2.13"]
 # ruff has no OpenBSD wheel and builds only with Rust; the lint test skips there.
 test = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff>=0.15; platform_system != 'OpenBSD'"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Unset, pytest-asyncio 1.5 warns once per xdist worker; "function" is its future default.
+asyncio_default_fixture_loop_scope = "function"
 # NiceGUI's user fixture runpy's this file to discover an app's pages, and
 # defaults it to ./main.py. symbion has no such entry point -- pages are
 # registered by build_page(ctx) against a resolved store -- and the gui tests

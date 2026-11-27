@@ -575,8 +575,12 @@ def test_setup_command_carries_the_specs_strings():
     assert "in a call of its own, run `symbion init` again" in install
     # "each path and what is written there" left out the install command and where it
     # put the CLI (stranger runs, 2026-11-04); an append to a file with no final
-    # newline joined its last line (2026-11-06).
-    assert "the exact install command and where it puts the CLI" in install
+    # newline joined its last line (2026-11-06). The agent asked in a dialog with no
+    # message before it, and named no bin dir (2026-11-12): the list goes in the
+    # question, and a fact line gives the bin dir.
+    assert "in one question whose text lists one line per write: the exact install " \
+           "command and the bin dir above" in install
+    assert "pipx environment --value PIPX_BIN_DIR" in text.split("\n1. ")[0]
     assert "after a newline if the file lacks a final one" in install
     # agy never reads CLAUDE.md, and its model skipped a parenthetical naming its
     # file; a new AGENTS.md would hide CLAUDE.md from Pi (live run, 2026-11-03).
@@ -611,7 +615,14 @@ def test_setup_command_carries_the_specs_strings():
     four = next(s for s in steps if s[0] == "4")
     assert "Under Hermes, every `symbion init` takes `--agent hermes`" in four
     assert "Hermes reads the first of `.hermes.md`, `AGENTS.override.md`, `AGENTS.md` and `CLAUDE.md`" in four
-    assert "in full" in next(s for s in steps if "Run `symbion skill adoption`" in s), "a dialog alone hid the table"
+    # Prose before a tool call reached the user as one summary line: the table, asked
+    # about in a dialog, and step 1's sentences never showed; a turn's last message and
+    # a question's text did (stranger runs, Claude Code 2.1.332, 2026-11-26).
+    adopt = next(s for s in steps if "Run `symbion skill adoption`" in s)
+    for s in ("in full as the last thing in your turn", "no question dialog or tool call after them",
+              "The user's reply is the approval"):
+        assert s in adopt, s
+    assert steps[1].startswith("1. Step 5's question opens with two sentences"), steps[1]
     assert "--no-browser" in next(s for s in steps if "symbion serve" in s and s[0] == "8")
 
 

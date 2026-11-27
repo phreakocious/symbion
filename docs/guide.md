@@ -32,8 +32,8 @@ and the hooks run the installed package's own `session_start.sh` and
    the line.
 2. It follows `adoption.md`: it reads the project's TODO files, handoff notes,
    Claude Code memory and git log, and shows a table of the entries it would make
-   and the sources it would retire. On your yes, it writes them and commits the
-   store. A retired file's `rm` is yours to run. A store that already has
+   and the sources it would retire, then waits for your reply: yes, no, or what
+   to change. On yes, it writes them and commits the store. A retired file's `rm` is yours to run. A store that already has
    entries, from symbion installed before the plugin, say, gets asked first
    whether to look for what it lacks.
 
@@ -184,8 +184,9 @@ the session-start hook writes under
 `~/.cache/symbion/gotchas/`, and the package's directory from
 `~/.cache/symbion/skill_dir`, which the plugin's session-start hook writes from
 `symbion skill --path` when it is missing or stale. So it costs a few
-milliseconds and never runs `symbion`. A gotcha written after a session starts,
-by you or by another session, reaches it at its next start, resume, `/clear` or
+milliseconds and never runs `symbion`. A gotcha the session itself writes or
+edits reaches its list at that write. One written after a session starts, by you
+or by another session, reaches it at its next start, resume, `/clear` or
 compaction. The plugin's skill is `symbion:symbion`: its stub runs `symbion
 skill`, which prints the installed skill with this store's kinds in it.
 
@@ -348,14 +349,15 @@ validated together before any is written. Either way:
 which no commit message records. It pays first: dated, re-checkable, and
 visibly stale once HEAD moves. A check stamps HEAD and whether the tree is
 dirty, untracked files included. Until step 3's line is committed, the tree is
-dirty and the check reads `unverifiable (dirty tree)`. Commit, write it again,
-and it reads `current`. Files the checked command writes count too, so git-ignore
+dirty and the check reads `unverifiable (dirty tree)`. Commit the tree as it
+stands, and it reads `committed as SHA, current`, unless the write's note said it
+stays unverifiable for good; an edit before that commit keeps it unverifiable. Files the checked command writes count too, so git-ignore
 `__pycache__/` before checking `pytest`. A check on something outside the repo
 (DNS, a host) takes `--external` and shows its age instead.
 
 ```bash
 symbion add check --target commit:HEAD --checked "pytest -q" --result "147 passed"
-symbion list --kind check    # unverifiable when dirty, current when clean, behind N once HEAD moves
+symbion list --kind check    # current when clean; unverifiable when dirty, until a commit holds that tree
 ```
 
 **The first checklist is an arc over free-form items.** `add` each item with a
@@ -410,11 +412,13 @@ then, so a session that changed only the repo still leaves its handoff. The firs
 the ones that session wrote; at a plain terminal, your author's. Two sessions on one store each commit
 their own. It names the entries it left and the newest one's age, and `commit --all`
 takes them too, for a session that ended without committing. `commit --author NAME`
-takes NAME's entries that no agent session wrote: a script's, or yours from `serve` or
+also takes NAME's entries that no agent session wrote: a script's, or yours from `serve` or
 a terminal. Such an entry is whole once written, so the lines that name it say to take
 it now. From another project's
-tree, as with `--dir ../other-notes`, it takes no file but the new docs your entries
-name: the store's other changed files are its own project's work, and it names them.
+tree, as with `--dir ../other-notes`, it takes no file but `arcs.jsonl` and the docs
+your entries name that are new or that your session first committed: the store's other changed
+files, another writer's edit to a doc among them, are its own project's work, and it
+names them.
 A line the last commit holds that is gone from `notes.jsonl`, with no copy an edit
 kept under a new id (a hand edit, a repair), is no session's: `commit` and its dry
 run name it, and only `commit --all` takes the removal.
@@ -523,9 +527,11 @@ to an entry stays good (`serve` prints it, and `--port` picks another). It has:
 - the commits behind a card's `N commits since` or `behind N`, and what they
   changed, a click away;
 - a Docs page: every file in the store's `docs/` an entry is on, of any
-  type, and every markdown file of the project's an entry is on or points
-  at, the most named first, each with its
-  entries, the open ones among them, and a button that opens it;
+  type, and every markdown or PDF file of the project's an entry is on or
+  points at, the most named first, each with its
+  entries, the open ones among them, and a button that opens it; then the
+  markdown, text and PDF files in `docs/` and the project's markdown and PDF
+  files that no entry names. A PDF opens in the browser's own viewer;
 - a Map page: the store's entries as a treemap, grouped on up to three axes
   (target, tag, kind, status, author, arc, week written). A tile's area is its
   entries, its colour its open ones; a click lists a tile's entries, a click on
@@ -570,6 +576,9 @@ to an entry stays good (`serve` prints it, and `--port` picks another). It has:
   not redraw by itself. The button lists those entries beside the page, with
   a reload at the top. In the installed app, the icon's badge counts the
   entries others wrote since you last opened a page.
+
+The page needs Chrome or Edge 121 or later, or Safari 17.2 or later: NiceGUI
+4's minimum. NiceGUI names no minimum for Firefox.
 
 Chrome and Edge can install the page as an app (the install icon in the
 address bar). Each store is an app of its own, because each has its own port.
